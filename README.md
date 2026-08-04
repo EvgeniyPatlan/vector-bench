@@ -45,6 +45,7 @@ database from an ANN library, and are where these three diverge most.
 | [docs/03-running-manually.md](docs/03-running-manually.md) | **Standalone.** Run each engine by hand with `docker run` and raw SQL — no framework involved |
 | [docs/04-engine-notes.md](docs/04-engine-notes.md) | What each implementation does, and the traps in each |
 | [docs/05-methodology.md](docs/05-methodology.md) | What is measured, how, fairness policy, and known asymmetries |
+| [docs/06-new-machine.md](docs/06-new-machine.md) | Moving the framework to another machine and running it there |
 
 If you only want to try the three engines yourself, read
 [03-running-manually.md](docs/03-running-manually.md) — it needs nothing from
