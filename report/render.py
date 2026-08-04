@@ -113,6 +113,21 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
 
+    if summary.get("failed_phases"):
+        parts.append(
+            "### Phases that FAILED — these results are incomplete\n\n"
+            "The run did not finish every unit it was asked to. Any engine or "
+            "resource pass listed here is **missing from the comparisons below**, "
+            "and its absence is a failure rather than a finding.\n"
+        )
+        rows = [[_label(f.get("engine", "?")), f.get("phase", "?"),
+                 f.get("resource_pass", "?"), f.get("dataset", "?"),
+                 str(f.get("exit_code", "?")),
+                 f"{(f.get('duration_s') or 0) / 60:.1f} min"]
+                for f in summary["failed_phases"]]
+        parts.append(_md_table(
+            ["Engine", "Phase", "Pass", "Dataset", "Exit code", "Ran for"], rows))
+
     if summary.get("plan_failures"):
         parts.append(
             "### Measurements that did not use the vector index\n\n"
@@ -222,14 +237,24 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
 
 
 def _build_table(summary: Dict[str, Any]) -> str:
+    # Ingest rate lives on the `ingest` record, not on `index_build`; reading it
+    # off the build record produced an em dash in every row.
+    ingest_by_key = {
+        (i.get("engine"), i.get("dataset"), i.get("resource_pass"), i.get("build_mode")):
+            i.get("ingest_rows_per_s")
+        for i in summary.get("ingest", [])
+    }
+
     rows = []
     for r in sorted(summary.get("build", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""), r.get("m") or 0)):
+        ingest_rate = ingest_by_key.get(
+            (r.get("engine"), r.get("dataset"), r.get("resource_pass"), r.get("build_mode")))
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"), str(r.get("m", "—")),
             r.get("build_mode") or "—",
             _fmt(r.get("build_wall_s"), 1, " s"),
-            _fmt(r.get("ingest_rows_per_s"), 0, " rows/s"),
+            _fmt(ingest_rate, 0, " rows/s"),
             _fmt_bytes(r.get("peak_rss_bytes")),
             _fmt_bytes(r.get("index_bytes")),
             "yes" if (r.get("extra") or {}).get("separable_build") else "no",

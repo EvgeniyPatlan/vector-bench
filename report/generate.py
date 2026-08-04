@@ -62,7 +62,8 @@ def load_manifest(run_dir: str) -> Dict[str, Any]:
         return json.load(fh)
 
 
-def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize(records: List[Dict[str, Any]],
+              manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Headline figures the narrative sections are written from."""
     from report.loaders import pareto_frontier
 
@@ -76,6 +77,7 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         "per_dataset": {},
         "plan_failures": [],
         "short_result_cases": [],
+        "failed_phases": [],
     }
 
     # Any measurement taken while the vector index was NOT in the plan is a
@@ -118,8 +120,16 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # Build-cost and concurrency headlines.
     for phase, key in (("index_build", "build"), ("concurrency", "concurrency"),
-                       ("filtered", "filtered"), ("churn", "churn")):
+                       ("filtered", "filtered"), ("churn", "churn"),
+                       ("ingest", "ingest")):
         summary[key] = [r for r in records if r.get("phase") == phase]
+
+    # A phase that failed leaves a hole in the results. Without this the report
+    # simply omits that engine/pass and a reader cannot distinguish "not
+    # measured" from "measured and unremarkable".
+    for phase in (manifest or {}).get("phases", []):
+        if phase.get("status") != "completed":
+            summary["failed_phases"].append(phase)
 
     return summary
 
@@ -155,14 +165,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[report] no records found — nothing to report", file=sys.stderr)
         return 1
 
-    # Persist the merged flat dataset so the raw numbers are queryable without
-    # re-deriving anything from HDF5.
-    merged_path = os.path.join(out_dir, "records.jsonl")
-    with open(merged_path, "w") as fh:
-        for r in records:
-            fh.write(json.dumps(r, sort_keys=True, default=str) + "\n")
-    print(f"[report] merged records -> {merged_path}")
-
     memory = loaders.load_memory_series(run_dir)
 
     # Fill in peak memory from the timeseries where the harness could not read
@@ -176,7 +178,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             if match:
                 r["peak_rss_bytes"] = match
 
-    summary = summarize(records)
+    # Persisted AFTER the enrichment above, not before: writing it earlier left
+    # records.jsonl missing the peak-RSS values the rendered report displayed,
+    # so the raw data and the report disagreed.
+    merged_path = os.path.join(out_dir, "records.jsonl")
+    with open(merged_path, "w") as fh:
+        for r in records:
+            fh.write(json.dumps(r, sort_keys=True, default=str) + "\n")
+    print(f"[report] merged records -> {merged_path}")
+
+    summary = summarize(records, manifest)
     chart_paths: Dict[str, Dict[str, str]] = {}
 
     for dataset in summary["datasets"]:
