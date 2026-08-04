@@ -40,6 +40,9 @@ SERVER_STOP_TIMEOUT_S = int(os.environ.get("VB_SERVER_STOP_TIMEOUT", "300"))
 ENTRYPOINT = os.environ.get("VB_ENTRYPOINT", "/usr/local/bin/vb-entrypoint")
 # How often a long load reports progress, in seconds.
 PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
+# Rows per executemany. The ops harness uses the same value; matching them
+# keeps the two measurement paths comparable on ingest.
+INSERT_BATCH = int(os.environ.get("VB_INSERT_BATCH", "500"))
 
 TABLE = "t1"
 DATABASE = "ann"
@@ -274,23 +277,42 @@ class VBMySQLBase(BaseANN):
             f"[vb] index storage: {self._index_bytes:,} bytes", file=sys.stderr
         )
 
-    def _insert_serial(self, cur, X: numpy.ndarray) -> None:
+    def _insert_serial(self, cur, X: numpy.ndarray, offset: int = 0,
+                       label: str = "") -> None:
+        """Load rows in batches inside explicit transactions.
+
+        Batching is not an optimisation here, it is the difference between a
+        usable load and an unusable one. One `execute` per row costs a network
+        round-trip and — with autocommit on — a transaction commit per row,
+        which on a 1.2M-row dataset measured about 5 rows/s per thread against
+        767 rows/s for the batched path the ops harness uses. Same server, same
+        client, same data; the loop was the whole difference.
+        """
         sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
         total = len(X)
         started = time.time()
         next_report = started + PROGRESS_INTERVAL_S
+        rows: List[Any] = []
+
         for i, embedding in enumerate(X):
-            cur.execute(sql, (i, i % 100, to_binary_f32(embedding)))
-            now = time.time()
-            if now >= next_report:
-                rate = (i + 1) / max(now - started, 1e-9)
-                eta = (total - i - 1) / max(rate, 1e-9)
-                print(
-                    f"[vb] {i + 1:,}/{total:,} rows, {rate:,.0f} rows/s, "
-                    f"ETA {eta / 60:.1f} min",
-                    file=sys.stderr,
-                )
-                next_report = now + PROGRESS_INTERVAL_S
+            idx = offset + i
+            rows.append((idx, idx % 100, to_binary_f32(embedding)))
+            if len(rows) >= INSERT_BATCH:
+                cur.executemany(sql, rows)
+                cur.execute("COMMIT")
+                rows = []
+                now = time.time()
+                if now >= next_report:
+                    rate = (i + 1) / max(now - started, 1e-9)
+                    eta = (total - i - 1) / max(rate, 1e-9)
+                    print(
+                        f"[vb] {label}{i + 1:,}/{total:,} rows, {rate:,.0f} rows/s, "
+                        f"ETA {eta / 60:.1f} min",
+                        file=sys.stderr,
+                    )
+                    next_report = now + PROGRESS_INTERVAL_S
+        if rows:
+            cur.executemany(sql, rows)
         cur.execute("COMMIT")
 
     def _insert_parallel(self, X: numpy.ndarray) -> None:
@@ -303,28 +325,10 @@ class VBMySQLBase(BaseANN):
             conn = self._connect()
             cur = conn.cursor()
             cur.execute(f"USE {DATABASE}")
-            sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
-            started = time.time()
-            # Progress is reported on a TIME interval, not every N rows. These
-            # engines maintain the HNSW graph on every INSERT, and on a large
-            # dimensionality that can mean tens of rows per second — a
-            # row-count trigger then produces no output for many minutes and a
-            # working load is indistinguishable from a hung one.
-            next_report = started + PROGRESS_INTERVAL_S
-            for offset, embedding in enumerate(X[lo:hi]):
-                idx = lo + offset
-                cur.execute(sql, (idx, idx % 100, to_binary_f32(embedding)))
-                now = time.time()
-                if lo == 0 and now >= next_report:
-                    rate = (offset + 1) / max(now - started, 1e-9)
-                    remaining = (hi - lo - offset - 1) / max(rate, 1e-9)
-                    print(
-                        f"[vb] shard 0: {offset + 1:,}/{hi - lo:,} rows, "
-                        f"{rate:,.0f} rows/s/thread, ETA {remaining / 60:.1f} min",
-                        file=sys.stderr,
-                    )
-                    next_report = now + PROGRESS_INTERVAL_S
-            cur.execute("COMMIT")
+            # Same batched path as the serial loader; see _insert_serial for
+            # why per-row inserts are not viable at this scale.
+            self._insert_serial(cur, X[lo:hi], offset=lo,
+                                label="shard 0: " if lo == 0 else "")
             cur.close()
             conn.close()
 

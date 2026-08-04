@@ -188,6 +188,8 @@ def cmd_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 3
 
+    _print_load_estimate(profile, engines, datasets, passes, phases)
+
     checkpoints = _load_checkpoints(paths["checkpoints"]) if args.resume else set()
     if checkpoints:
         print(f"resuming: {len(checkpoints)} unit(s) already complete")
@@ -322,6 +324,65 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
         ann_pass.fix_ownership(paths["run_dir"], image)
         print(f"report: {os.path.join(paths['run_dir'], 'report', 'report.html')}")
     return rc
+
+
+# Measured batched ingest rates, rows/s, from smoke runs on a Xeon Gold 6230.
+# Rough by design — they exist to turn "why is this taking so long" into a
+# number you see before committing the machine, not to be precise.
+_INGEST_ROWS_PER_S = {"mariadb": 400, "alisql": 150, "pgvector": 5600}
+_DATASET_ROWS = {
+    "fashion-mnist-784-euclidean": 60_000,
+    "glove-100-angular": 1_183_514,
+    "sift-128-euclidean": 1_000_000,
+    "gist-960-euclidean": 1_000_000,
+    "glove-25-angular": 1_183_514,
+    "deep-image-96-angular": 9_990_000,
+}
+
+
+def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
+                         datasets: List[str], passes: List[str],
+                         phases: List[str]) -> None:
+    """Estimate ingest time before the run starts.
+
+    ann-benchmarks reloads the whole dataset for every M value, and the
+    incrementally-building engines ingest at a few hundred rows per second. That
+    multiplies quietly: a seven-value M grid over four datasets is days of pure
+    loading. Showing the number up front is the difference between choosing that
+    and discovering it six hours in.
+    """
+    m_count = max(1, len(profile.get("ann", {}).get("m_values", [16])))
+    total_h = 0.0
+    rows_per_pass: List[str] = []
+
+    for engine in engines:
+        rate = _INGEST_ROWS_PER_S.get(engine, 300)
+        engine_h = 0.0
+        for dataset in datasets:
+            rows = _DATASET_ROWS.get(dataset)
+            if not rows:
+                continue
+            if "ann" in phases:
+                engine_h += (rows / rate) * m_count / 3600
+            if "ops" in phases:
+                ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
+                engine_h += (rows / rate) * ops_m / 3600
+        engine_h *= len(passes)
+        total_h += engine_h
+        rows_per_pass.append(f"{engine} ~{engine_h:.1f} h")
+
+    if total_h < 1:
+        return
+    print(f"\nestimated ingest time (loading only, before any queries):")
+    print("  " + "  |  ".join(rows_per_pass))
+    print(f"  total ~{total_h:.1f} h across {len(passes)} pass(es), "
+          f"{m_count} M value(s)")
+    if total_h > 12:
+        print(f"  ! This is a long run. Each M value costs a full reload of every "
+              f"dataset,\n    and MHNSW/VIDX build incrementally at a few hundred "
+              f"rows/s. Reduce\n    ann.m_values or the dataset list to cut it "
+              f"roughly proportionally.")
+    print()
 
 
 def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],

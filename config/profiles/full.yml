@@ -19,9 +19,17 @@ runs: 3
 
 ann:
   enabled: true
-  # M is the only build-quality axis MariaDB and AliSQL expose, so it carries
-  # the whole build-quality sweep for them.
-  m_values: [6, 8, 12, 16, 24, 32, 48]
+  # THREE values, not seven. ann-benchmarks reloads the entire dataset for every
+  # M, and MHNSW and VIDX build their graphs incrementally at a few hundred rows
+  # per second — so each extra M costs a full reload of every dataset. At seven
+  # values the load time alone was ~16 h per pass for MariaDB and ~42 h for
+  # AliSQL, before a single query ran; across both passes that is roughly five
+  # days of pure ingest. Three values still define a Pareto frontier.
+  #
+  # Raise this only if you have measured how long a load takes on your hardware
+  # and have the days to spare. pgvector is unaffected either way: its bulk
+  # build is ~15x faster than the incremental builders.
+  m_values: [8, 16, 32]
   ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
   pgvector_ef_construction: 200
   pgvector_build_modes: [post, incremental]
