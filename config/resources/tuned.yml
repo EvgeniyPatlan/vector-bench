@@ -20,9 +20,14 @@ memory:
   server_limit_gb: 0
   client_limit_gb: 8
   host_fraction: 0.6
-  buffer_fraction: 0.45
-  graph_cache_fraction: 0.35
-  maintenance_fraction: 0.15
+  # These must leave real headroom. At 0.45/0.35/0.15 the three together came to
+  # 95% of the container limit, leaving almost nothing for connections, sorting
+  # and the query executor. The manifest warned about it and pgvector's tuned
+  # pass then died. 0.35/0.25/0.10 totals 70%, a normal shape for a database
+  # given a dedicated machine.
+  buffer_fraction: 0.35
+  graph_cache_fraction: 0.25
+  maintenance_fraction: 0.10
   postgres_absorbs_graph_cache: true
 
 build:
@@ -31,6 +36,11 @@ build:
   # incrementally on INSERT and have no equivalent, which is precisely the
   # difference this pass is meant to show.
   threads: 0
+  # Without a cap, a 40-core server resolved to 76 parallel maintenance workers.
+  # That exhausted the container's /dev/shm with dynamic shared memory segments
+  # and killed pgvector's tuned pass outright, while helping nothing: parallel
+  # index build stops paying well before this many workers.
+  max_threads: 8
 
 isolation:
   # AliSQL still requires RC; the others run at their own defaults here, because

@@ -34,9 +34,12 @@ memory:
   #                  (PostgreSQL has no equivalent: pgvector serves graph pages
   #                   from shared_buffers, so its buffer fraction absorbs this)
   #   maintenance -> maintenance_work_mem (PostgreSQL only)
-  buffer_fraction: 0.35
-  graph_cache_fraction: 0.35
-  maintenance_fraction: 0.15
+  # Total 70%, leaving headroom for connections, sorting and the executor.
+  # These previously summed to 85%, close enough to the container limit to risk
+  # an OOM kill that would look like an engine failure.
+  buffer_fraction: 0.30
+  graph_cache_fraction: 0.30
+  maintenance_fraction: 0.10
   # pgvector has no separate graph cache, so its buffer budget is the sum of the
   # buffer and graph-cache fractions. Without this pgvector would be given
   # markedly less resident memory than the other two for the same total limit.

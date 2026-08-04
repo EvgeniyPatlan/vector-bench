@@ -371,7 +371,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
     ]
 
     for stem, paths in sorted(chart_paths.items()):
-        if stem.startswith("pareto-") or stem.startswith("paretozoom-"):
+        if stem.split("-")[0] in ("pareto", "paretozoom", "qpsatrecall", "latency"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
@@ -384,7 +384,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         _build_table(summary),
     ]
     for stem, paths in sorted(chart_paths.items()):
-        if stem.startswith("build-"):
+        if stem.split("-")[0] in ("build", "storage"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
@@ -418,7 +418,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         _churn_table(summary),
     ]
     for stem, paths in sorted(chart_paths.items()):
-        if stem.startswith("churn-") or stem == "memory-timeline":
+        if stem.split("-")[0] in ("churn", "churnimpact", "passcompare") or stem == "memory-timeline":
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
@@ -657,16 +657,16 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
          _md_tables_to_html(_known_asymmetries()), ""),
         ("4. Recall vs throughput",
          _md_tables_to_html(_headline_tables(summary)),
-         figures("pareto-") + figures("paretozoom-")),
+         figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")),
         ("5. Index build cost",
-         _md_tables_to_html(_build_table(summary)), figures("build-")),
+         _md_tables_to_html(_build_table(summary)), figures("build-") + figures("storage-")),
         ("6. Concurrency scaling",
          _md_tables_to_html(_concurrency_table(summary)), figures("concurrency-")),
         ("7. Filtered (hybrid) search",
          _md_tables_to_html(_filtered_table(summary)), figures("filtered-")),
         ("8. Churn",
          _md_tables_to_html(_churn_table(summary)),
-         figures("churn-") + figures("memory-timeline")),
+         figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
     ]
 
     body = "".join(

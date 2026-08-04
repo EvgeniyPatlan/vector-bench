@@ -203,10 +203,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("pareto", charts.pareto, (dict(by_engine), dataset, k)),
             ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.85, **kw),
              (dict(by_engine), dataset, k)),
+            ("qpsatrecall", charts.qps_at_recall, (summary, dataset)),
+            ("latency", charts.latency_percentiles, (records, dataset)),
             ("build", charts.build_cost, (records, dataset)),
+            ("storage", charts.storage_breakdown, (records, dataset)),
             ("concurrency", charts.concurrency, (records, dataset)),
             ("filtered", charts.filtered, (records, dataset)),
             ("churn", charts.churn, (records, dataset)),
+            ("churnimpact", charts.churn_impact, (records, dataset)),
+            ("passcompare", charts.pass_comparison, (records, dataset)),
         ):
             stem = f"{name}-{safe}"
             try:

@@ -414,3 +414,290 @@ def memory_timeline(series: Dict[str, List[Dict[str, Any]]], out_dir: str,
         return None
     ax.legend(frameon=False, fontsize=8, ncol=2)
     return _save(fig, out_dir, stem)
+
+# ---------------------------------------------------------------------------
+# Headline: throughput at a recall floor
+# ---------------------------------------------------------------------------
+
+def qps_at_recall(summary: Dict[str, Any], dataset: str, out_dir: str,
+                  stem: str, floors: Sequence[float] = (0.90, 0.95, 0.99)
+                  ) -> Optional[Dict[str, str]]:
+    """Grouped bars: best QPS each engine reaches at each recall floor.
+
+    This is the comparison an operator actually makes — "how fast is it at an
+    accuracy I can accept" — and it is hard to read off a Pareto curve, because
+    the eye compares the curves rather than their heights at one x.
+    """
+    per_engine = (summary.get("per_dataset", {}) or {}).get(dataset, {})
+    if not per_engine:
+        return None
+
+    engines = sorted(per_engine)
+    fig, ax = _new_axes(
+        f"Throughput at a recall floor — {dataset}",
+        "", "Queries per second  (higher is better ↑)", figsize=(9.5, 5.2),
+    )
+    width = 0.8 / max(len(engines), 1)
+    xs = range(len(floors))
+    plotted = False
+
+    for i, engine in enumerate(engines):
+        style = style_for(engine)
+        vals = [per_engine[engine].get(f"qps_at_recall_{int(f * 100)}") for f in floors]
+        offs = [x + i * width - 0.4 + width / 2 for x in xs]
+        heights = [v if v else 0 for v in vals]
+        if any(heights):
+            plotted = True
+        bars = ax.bar(offs, heights, width * 0.92, color=style["color"],
+                      label=style["label"], edgecolor="none")
+        for b, v in zip(bars, vals):
+            # An engine that never reaches a floor gets an explicit marker, not
+            # a zero bar that reads as "measured and very slow".
+            ax.text(b.get_x() + b.get_width() / 2,
+                    b.get_height() if v else 0,
+                    f"{v:,.0f}" if v else "not reached",
+                    ha="center", va="bottom", fontsize=7.5,
+                    color=style["color"] if v else "#999999",
+                    rotation=0 if v else 90)
+
+    if not plotted:
+        plt.close(fig)
+        return None
+
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels([f"recall ≥ {f:.2f}" for f in floors])
+    # Headroom so the value labels above the tallest bars do not collide with
+    # the legend.
+    ax.set_ylim(top=ax.get_ylim()[1] * 1.18)
+    ax.legend(frameon=False, fontsize=10, loc="upper right")
+    return _save(fig, out_dir, stem)
+
+
+# ---------------------------------------------------------------------------
+# Normalized vs tuned
+# ---------------------------------------------------------------------------
+
+def pass_comparison(records: List[Dict[str, Any]], dataset: str, out_dir: str,
+                    stem: str) -> Optional[Dict[str, str]]:
+    """What tuning actually bought, per engine and per dimension.
+
+    Both passes are measured but nothing previously compared them directly, so
+    the central question the two-pass design exists to answer — does tuning
+    change the ranking? — had to be reconstructed by hand from two tables.
+    """
+    dims = [
+        ("recall_qps", "qps", "Query throughput", lambda r: r.get("clients") in (1, None)),
+        ("index_build", "build_wall_s", "Index build time", lambda r: True),
+        ("concurrency", "qps", "Throughput @ max clients", lambda r: True),
+        ("filtered", "qps", "Filtered throughput", lambda r: True),
+    ]
+
+    engines, panels = set(), []
+    for phase, field, label, keep in dims:
+        by = {}
+        for r in records:
+            if (r.get("phase") != phase or r.get("dataset") != dataset
+                    or not keep(r) or r.get(field) is None):
+                continue
+            key = (r["engine"], r.get("resource_pass"))
+            # Best observed value per (engine, pass): max for throughput,
+            # min for build time, since lower is better there.
+            prev = by.get(key)
+            val = r[field]
+            by[key] = val if prev is None else (
+                min(prev, val) if field.endswith("_s") else max(prev, val))
+            engines.add(r["engine"])
+        panels.append((label, field, by))
+
+    engines = sorted(engines)
+    if not engines or not any(p[2] for p in panels):
+        return None
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.8))
+    fig.patch.set_alpha(0.0)
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, (label, field, by) in zip(axes, panels):
+        ax.patch.set_alpha(0.0)
+        ax.grid(True, axis="y", **GRID)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        lower_better = field.endswith("_s")
+        ax.set_ylabel(f"{label}  ({'lower' if lower_better else 'higher'} is better"
+                      f" {'↓' if lower_better else '↑'})", fontsize=9)
+
+        for i, engine in enumerate(engines):
+            style = style_for(engine)
+            n = by.get((engine, "normalized"))
+            u = by.get((engine, "tuned"))
+            ax.bar(i - 0.19, n or 0, 0.36, color=style["color"], alpha=0.45,
+                   edgecolor="none")
+            ax.bar(i + 0.19, u or 0, 0.36, color=style["color"], edgecolor="none")
+            if n and u:
+                delta = (u - n) / n
+                better = (delta < 0) if lower_better else (delta > 0)
+                ax.text(i, max(n, u), f"{delta:+.0%}", ha="center", va="bottom",
+                        fontsize=8,
+                        color="#2ca02c" if better else "#d62728")
+        ax.set_xticks(range(len(engines)))
+        ax.set_xticklabels([style_for(e)["label"].split(" (")[0] for e in engines],
+                           fontsize=8, rotation=15, ha="right")
+
+    fig.suptitle(f"Normalized (pale) vs tuned (solid) — {dataset}\n"
+                 f"percentage is the change tuning produced", fontsize=12, y=1.06)
+    fig.tight_layout()
+    return _save(fig, out_dir, stem)
+
+
+# ---------------------------------------------------------------------------
+# Latency distribution
+# ---------------------------------------------------------------------------
+
+def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
+                        out_dir: str, stem: str) -> Optional[Dict[str, str]]:
+    """p50 / p95 / p99 against search width.
+
+    Mean latency hides the tail, and the tail is what a service-level objective
+    is written against. An engine with a good p50 and a bad p99 is a different
+    proposition from one with both merely acceptable.
+    """
+    by_engine: Dict[str, List[Dict[str, Any]]] = {}
+    for r in records:
+        if (r.get("phase") == "recall_qps" and r.get("dataset") == dataset
+                and r.get("ef_search") and r.get("latency_p99_ms")):
+            by_engine.setdefault(r["engine"], []).append(r)
+    if not by_engine:
+        return None
+
+    fig, ax = _new_axes(
+        f"Query latency distribution — {dataset}",
+        "ef_search  (search width)",
+        "Latency (ms)  (lower is better ↓)", figsize=(9.5, 5.4),
+    )
+    ax.set_xscale("log", base=2)
+
+    for engine, rows in sorted(by_engine.items()):
+        style = style_for(engine)
+        rows = sorted(rows, key=lambda r: r["ef_search"])
+        ef = [r["ef_search"] for r in rows]
+        p50 = [r.get("latency_p50_ms") for r in rows]
+        p99 = [r.get("latency_p99_ms") for r in rows]
+        # Band between p50 and p99 makes the spread visible at a glance; the
+        # solid line is p50 so the medians stay comparable across engines.
+        ax.fill_between(ef, p50, p99, color=style["color"], alpha=0.13, linewidth=0)
+        ax.plot(ef, p50, color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=1.9, markersize=5,
+                label=f"{style['label']} p50")
+        ax.plot(ef, p99, color=style["color"], linestyle=":", linewidth=1.2,
+                alpha=0.85)
+
+    ax.legend(frameon=False, fontsize=9)
+    ax.text(0.99, 0.02, "shaded band = p50 to p99;  dotted = p99",
+            transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=8, color="#888888")
+    return _save(fig, out_dir, stem)
+
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+def storage_breakdown(records: List[Dict[str, Any]], dataset: str, out_dir: str,
+                      stem: str) -> Optional[Dict[str, str]]:
+    """Index vs table bytes, stacked.
+
+    Index size alone is misleading between these engines: pgvector's HNSW keeps
+    the vectors inside the index, while MHNSW and VIDX keep them in the table
+    and store only the graph. Only the total is comparable.
+    """
+    rows = [r for r in records
+            if r.get("phase") == "index_build" and r.get("dataset") == dataset
+            and (r.get("index_bytes") or r.get("table_bytes"))]
+    if not rows:
+        return None
+
+    labels, index_b, table_b, colors = [], [], [], []
+    for r in sorted(rows, key=lambda r: (r["engine"], str(r.get("resource_pass")),
+                                         str(r.get("build_mode")))):
+        tag = style_for(r["engine"])["label"].split(" (")[0]
+        extra = [x for x in (r.get("resource_pass"), r.get("build_mode")) if x]
+        labels.append(f"{tag}\n{' / '.join(extra)}")
+        index_b.append((r.get("index_bytes") or 0))
+        table_b.append((r.get("table_bytes") or 0))
+        colors.append(style_for(r["engine"])["color"])
+
+    fig, ax = _new_axes(f"On-disk footprint — {dataset}", "",
+                        "Bytes  (lower is better ↓)", figsize=(max(8, 1.5 * len(labels)), 5.2))
+    ax.yaxis.set_major_formatter(FuncFormatter(_bytes_formatter))
+    xs = range(len(labels))
+    ax.bar(xs, index_b, 0.62, color=colors, edgecolor="none", label="index")
+    ax.bar(xs, table_b, 0.62, bottom=index_b, color=colors, alpha=0.4,
+           edgecolor="none", label="table")
+    for x, (i, tb) in enumerate(zip(index_b, table_b)):
+        ax.text(x, i + tb, _bytes_formatter(i + tb, 0), ha="center", va="bottom",
+                fontsize=8)
+    ax.set_xticks(list(xs))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylim(top=ax.get_ylim()[1] * 1.12)
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
+    # Below the axes, not inside them: at seven bars the in-plot version
+    # overlapped the data it was explaining.
+    fig.text(0.5, -0.06,
+             "solid = index, pale = table.  pgvector stores vectors inside the index; "
+             "MHNSW and VIDX keep them in the table — only the totals are comparable.",
+             ha="center", va="top", fontsize=8, color="#888888")
+    return _save(fig, out_dir, stem)
+
+
+# ---------------------------------------------------------------------------
+# Churn impact
+# ---------------------------------------------------------------------------
+
+def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
+                 stem: str) -> Optional[Dict[str, str]]:
+    """Throughput retained after churn, as a fraction of the pre-churn baseline.
+
+    Recall usually survives churn; throughput does not, and that is invisible in
+    a recall-only view. Plotted as a retention ratio so engines with different
+    absolute speeds can be compared on how well they hold up.
+    """
+    baseline, after = {}, {}
+    for r in records:
+        if r.get("phase") != "churn" or r.get("dataset") != dataset or not r.get("qps"):
+            continue
+        key = (r["engine"], r.get("resource_pass"), r.get("build_mode"))
+        if (r.get("churn_fraction") or 0) == 0:
+            baseline[key] = r["qps"]
+        else:
+            after.setdefault(key, []).append((r["churn_fraction"], r["qps"]))
+    if not baseline or not after:
+        return None
+
+    fig, ax = _new_axes(f"Throughput retained after churn — {dataset}",
+                        "Cumulative fraction of rows deleted and re-inserted",
+                        "QPS as a fraction of pre-churn  (higher is better ↑)",
+                        figsize=(9, 5.2))
+    plotted = False
+    for key, points in sorted(after.items()):
+        base = baseline.get(key)
+        if not base:
+            continue
+        plotted = True
+        style = style_for(key[0])
+        points = sorted(points)
+        label = style["label"]
+        if key[2]:
+            label += f" ({key[2]})"
+        ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] / base for p in points],
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=1.9, markersize=6,
+                label=f"{label} / {key[1]}")
+
+    if not plotted:
+        plt.close(fig)
+        return None
+    ax.axhline(1.0, color="#888888", linewidth=1.0, linestyle=":")
+    ax.text(0.0, 1.01, " no degradation", fontsize=8, color="#888888", va="bottom")
+    ax.legend(frameon=False, fontsize=8)
+    return _save(fig, out_dir, stem)

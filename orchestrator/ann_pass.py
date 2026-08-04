@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -179,7 +180,41 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     print(f"[ann] {engine} / {dataset}: cpuset={resolved.server_cpuset} "
           f"mem={resolved.server_memory_bytes / 1024**3:.1f}GB")
     print(f"[ann] server flags: {' '.join(flags)}")
-    return docker_ctl.run_foreground(spec, timeout=timeout_s)
+
+    results_dir = annb_results_dir(paths, resource_pass)
+    before = _count_results(results_dir, engine, dataset)
+    rc = docker_ctl.run_foreground(spec, timeout=timeout_s)
+    after = _count_results(results_dir, engine, dataset)
+
+    # ann-benchmarks exits 0 when it has nothing to run — including when the
+    # algorithm module failed to import or every configuration errored. A run
+    # that produced no new result files is a failure however cheerfully it
+    # exited, and reporting it as success would silently drop an entire
+    # engine/pass from the comparison.
+    if rc == 0 and after == before:
+        print(
+            f"[ann] FAILED: {engine} / {dataset} exited 0 but produced no new "
+            f"result files in {results_dir} (still {after}). The algorithm module "
+            f"most likely failed to import or every configuration errored — check "
+            f"the container output above.",
+            file=sys.stderr,
+        )
+        return 1
+    if rc == 0:
+        print(f"[ann] {after - before} new result file(s)")
+    return rc
+
+
+def _count_results(results_dir: str, engine: str, dataset: str) -> int:
+    """Number of ann-benchmarks result files for this engine and dataset."""
+    root = os.path.join(results_dir, dataset)
+    if not os.path.isdir(root):
+        return 0
+    return sum(
+        len([f for f in files if f.endswith(".hdf5")])
+        for base, _dirs, files in os.walk(root)
+        if os.path.basename(base) == engine
+    )
 
 
 def fix_ownership(path: str, image: str) -> None:

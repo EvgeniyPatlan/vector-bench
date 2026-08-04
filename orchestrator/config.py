@@ -182,6 +182,36 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     if build_threads <= 0:
         build_threads = len(server_cpus)
 
+    # Hard cap. "threads: 0" means "match the cpuset", which on a 40-core server
+    # resolved to 76 parallel maintenance workers -- absurd for an index build,
+    # and enough to exhaust the container's /dev/shm with dynamic shared memory
+    # segments, which is exactly how pgvector's tuned pass died. Parallel index
+    # build stops paying past a handful of workers regardless.
+    max_threads = int(build_cfg.get("max_threads", 8) or 8)
+    if build_threads > max_threads:
+        warnings.append(
+            f"build threads clamped from {build_threads} to {max_threads}; "
+            f"parallel index build does not benefit beyond a handful of workers "
+            f"and each one consumes shared memory (raise build.max_threads to override)"
+        )
+        build_threads = max_threads
+
+    # Dynamic shared memory for parallel workers lives in /dev/shm. Size it from
+    # the parallelism actually granted rather than trusting a fixed value that
+    # silently becomes too small when build.threads is raised.
+    shm_size = str(docker_cfg.get("shm_size", "2g"))
+    try:
+        shm_gb = float(shm_size.rstrip("gG"))
+        needed_gb = 1.0 + 0.5 * build_threads
+        if shm_gb < needed_gb:
+            warnings.append(
+                f"shm_size raised from {shm_size} to {needed_gb:.0f}g to cover "
+                f"{build_threads} parallel workers' shared memory segments"
+            )
+            shm_size = f"{needed_gb:.0f}g"
+    except ValueError:
+        pass
+
     return ResolvedResources(
         name=resources.get("name", "unnamed"),
         server_cpuset=format_cpuset(server_cpus),
@@ -193,7 +223,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         graph_cache_bytes=graph_cache_bytes,
         maintenance_bytes=maintenance_bytes,
         build_threads=build_threads,
-        shm_size=str(docker_cfg.get("shm_size", "2g")),
+        shm_size=shm_size,
         transaction_isolation=str(iso_cfg.get("transaction_isolation", "engine_default")),
         hybrid_cpu=bool(sysinfo.cpu.hybrid),
         core_class_used=prefer if sysinfo.cpu.hybrid else "uniform",
