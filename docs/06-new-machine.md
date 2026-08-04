@@ -195,6 +195,45 @@ To regenerate the report locally from copied results:
 
 ---
 
+## Updating an existing checkout
+
+Most changes do **not** require rebuilding images. The images contain only the
+compiled servers plus a pinned Python stack; the orchestrator, ops harness,
+report generator, profiles and resource configs are all read from the working
+tree at run time.
+
+```bash
+cd ~/vector-bench
+git pull
+python3 -m pytest tests/ -q        # confirm the pull is sane
+```
+
+That is usually the whole procedure. Decide whether more is needed by what the
+pull touched:
+
+| Changed path | What to do |
+| --- | --- |
+| `orchestrator/`, `harness/`, `report/`, `config/profiles/`, `config/resources/`, `docs/` | Nothing. Picked up on the next run. |
+| `overlay/` | Nothing — the working copy is refreshed on every run. |
+| `docker/`, `config/engines/` (build flags or source tag) | Rebuild that engine: `./run-benchmark.sh build --engines <name> --march native` |
+
+To check whether a rebuild is required after pulling:
+
+```bash
+git diff --name-only HEAD@{1} HEAD -- docker/ config/engines/
+```
+
+Empty output means your images are still valid.
+
+Re-running the report over results you already have needs no new measurement at
+all — useful after a report-generator fix:
+
+```bash
+./run-benchmark.sh report --run-dir results/<run-id>
+```
+
+---
+
 ## Optional: reuse local vendor repos instead of cloning
 
 If the target already has MariaDB, AliSQL or ann-benchmarks checkouts, point at

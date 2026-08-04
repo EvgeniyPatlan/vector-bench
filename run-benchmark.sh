@@ -40,14 +40,18 @@ EOF
   exit 1
 fi
 
-# First run bootstraps the ann-benchmarks working copy. It is disposable and
-# regenerated from the read-only vendor checkout plus our overlay.
+# Refresh the ann-benchmarks working copy on EVERY run, not just the first.
+#
+# It is a disposable clone of the vendor checkout with our overlay copied over
+# it. Doing this only when the clone was missing meant that after a `git pull`
+# touching overlay/, the working copy silently kept the old algorithm modules —
+# you would pull a fix and then not run it, with nothing to indicate why. The
+# script reuses an existing clone and just re-applies the overlay, so this costs
+# well under a second.
 case "${1:-}" in
   run|render)
-    if [[ ! -d "$VB_ROOT/work/ann-benchmarks/.git" ]]; then
-      echo "==> preparing the ann-benchmarks working copy (first run)" >&2
-      "$VB_ROOT/scripts/prepare-harness.sh"
-    fi
+    "$VB_ROOT/scripts/prepare-harness.sh" >/dev/null || {
+      echo "failed to prepare the ann-benchmarks working copy" >&2; exit 1; }
     ;;
 esac
 
