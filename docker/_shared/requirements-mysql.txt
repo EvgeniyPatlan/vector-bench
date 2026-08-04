@@ -1,0 +1,19 @@
+# Client stack for the MySQL-family bench images (MariaDB and AliSQL).
+#
+# MariaDB Connector/Python is used for BOTH engines on purpose. Connector/C
+# speaks the MySQL protocol, so one driver with binary-protocol prepared
+# statements talks to MariaDB 11.8 and to AliSQL 8.0.44 alike. Driving the two
+# engines through different clients would put part of any measured difference
+# in the client rather than in the server.
+#
+# --no-binary is required, not a preference. The published wheels are compiled
+# against a specific MariaDB Connector/C and refuse to load against another:
+#
+#   ImportError: MariaDB Connector/Python was build with MariaDB Connector/C
+#   3.4.9, while the loaded MariaDB Connector/C library has version 3.3.17.
+#
+# Building from source makes the extension compile against whatever
+# libmariadb-dev the image actually has, so the image works on any base whose
+# Connector/C version happens to differ from the wheel's.
+--no-binary mariadb
+mariadb==1.1.10

@@ -1,0 +1,160 @@
+# AliSQL engine definition.
+#
+# Vector support: VIDX (sql/vidx/vidx_hnsw.cc), shipped in AliSQL-8.0.44-2.
+# Base is MySQL 8.0.44. AliSQL vendors all third-party code (including boost
+# 1.77) inside the tree and has no git submodules, so its source export is a
+# pure offline `git archive`.
+name: alisql
+display_name: AliSQL
+family: mysql
+
+source:
+  tag: AliSQL-8.0.44-2
+  upstream: https://github.com/alibaba/AliSQL.git
+  submodules: ""
+
+image:
+  runtime: vector-bench/alisql-runtime
+  bench: vector-bench/alisql-bench
+  base: ubuntu:24.04
+
+build:
+  type: RelWithDebInfo
+  march: x86-64-v3
+  # Mirrors AliSQL's own build.sh release configuration, minus unit tests.
+  #
+  # DuckDB: do NOT try to switch it off. Two separate traps here, both found the
+  # hard way:
+  #
+  #  1. `MYSQL_CHECK_DUCKDB()` is called unconditionally on Linux (CMakeLists.txt,
+  #     inside `IF(LINUX)`), so the bundled DuckDB in extra/duckdb is compiled as
+  #     an ExternalProject on every build no matter what. There is no flag that
+  #     skips it.
+  #  2. `-DWITH_DUCKDB_STORAGE_ENGINE=OFF` does not merely fail to save time — it
+  #     produces a BROKEN BUILD. sql/CMakeLists.txt compiles sql/duckdb/*.cc into
+  #     mysqld unconditionally, and those headers include
+  #     storage/duckdb/delta_appender.h. Setting the flag OFF moves
+  #     storage/duckdb/*.cc into a MODULE_ONLY plugin, so the final link of
+  #     mysqld fails with `undefined reference to DeltaAppender::cleanup()`.
+  #     The flag is therefore left at its default (ON), which is also what
+  #     AliSQL's own build.sh uses.
+  #
+  # The DuckDB ExternalProject also runs `make ... > /dev/null 2>&1`, so the
+  # build appears to stall for a long stretch with no output. That is expected.
+  # Budget 1.5-3 hours for a cold AliSQL build and several GB of scratch space.
+  cmake_flags:
+    - -DFORCE_INSOURCE_BUILD=ON
+    - -DWITH_UNIT_TESTS=0
+    - -DWITH_DEBUG=0
+    - -DINSTALL_LAYOUT=STANDALONE
+    - -DMYSQL_MAINTAINER_MODE=0
+    - -DWITH_EMBEDDED_SERVER=0
+    - -DWITH_EXTRA_CHARSETS=all
+    - -DWITH_ZLIB=bundled
+    - -DWITH_ZSTD=bundled
+    - -DWITH_TIRPC=bundled
+    - -DWITH_MYISAM_STORAGE_ENGINE=1
+    - -DWITH_INNOBASE_STORAGE_ENGINE=1
+    - -DWITH_CSV_STORAGE_ENGINE=1
+    - -DWITH_PERFSCHEMA_STORAGE_ENGINE=0
+    - -DWITH_EXAMPLE_STORAGE_ENGINE=0
+    - -DWITH_TEMPTABLE_STORAGE_ENGINE=1
+    - -DDEFAULT_CHARSET=utf8mb4
+    - -DDEFAULT_COLLATION=utf8mb4_0900_ai_ci
+    - -DWITH_BOOST=extra/boost/boost_1_77_0
+    # Large MySQL components with no bearing on vector search.
+    #
+    # MySQL Cluster is the big one and takes TWO flags to actually switch off.
+    # `-DWITH_NDB=OFF` alone is not enough: storage/ndb/CMakeLists.txt gates the
+    # build on WITH_NDBCLUSTER_STORAGE_ENGINE, which the plugin system sets from
+    # MYSQL_ADD_PLUGIN(ndbcluster ... DEFAULT STATIC_ONLY) regardless of
+    # WITH_NDB — cmake still prints "Building ndbcluster plugin" and compiles
+    # thousands of files. PLUGIN_NDBCLUSTER=NO is what the plugin system reads.
+    - -DWITH_NDB=OFF
+    - -DPLUGIN_NDBCLUSTER=NO
+    - -DWITH_ROUTER=OFF
+    - -DWITH_MYSQLX=OFF
+    - -DWITH_AUTHENTICATION_LDAP=OFF
+    - -DWITH_AUTHENTICATION_FIDO=OFF
+    - -DWITH_AUTHENTICATION_CLIENT_PLUGINS=OFF
+  # AliSQL's build.sh sets -D_GLIBCXX_USE_CXX11_ABI=0 on x86_64. We deliberately
+  # do NOT, and leave this empty. DuckDB is built by its own Makefile as a
+  # separate ExternalProject and sets its own flags, so forcing the old ABI on
+  # mysqld while DuckDB uses the compiler default produced link errors of the
+  # form `undefined reference to duckdb::InternalException::InternalException(
+  # std::__cxx11::basic_string...)`. Letting every component use the toolchain
+  # default keeps mysqld and libduckdb on one ABI, which is what actually links.
+  extra_cxxflags: ""
+
+sql:
+  # Vector features ship disabled, and every vector operation demands RC.
+  # Getting either of these wrong yields ER_VECTOR_DISABLED / ER_NOT_SUPPORTED_YET.
+  session_setup:
+    - "SET SESSION transaction_isolation = 'READ-COMMITTED'"
+    - "SET SESSION default_storage_engine = InnoDB"
+  global_setup:
+    - "SET GLOBAL vidx_disabled = OFF"
+  create_table: |
+    CREATE TABLE {table} (
+      id INT PRIMARY KEY,
+      v VECTOR({dim}) NOT NULL,
+      VECTOR INDEX vi (v) M={m} DISTANCE={metric}
+    ) ENGINE={engine}
+  # Field_vector::store() accepts a binary string of exactly 4*dim bytes, so we
+  # bind raw float32 exactly as for MariaDB rather than paying VEC_FROMTEXT()
+  # text-parsing cost. Keeping the client path identical across the two
+  # MySQL-family engines is what makes their ingest numbers comparable.
+  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
+  vector_binding: binary_f32
+  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
+  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
+  set_ef_search: "SET vidx_hnsw_ef_search = {ef_search}"
+  explain: "EXPLAIN {query}"
+  index_plan_marker: "vi"
+  metrics:
+    angular: COSINE
+    euclidean: EUCLIDEAN
+
+server:
+  common:
+    # --no-defaults is NOT listed here. mariadbd/mysqld require it to be
+    # the first argument; the entrypoint supplies it there, and a second
+    # copy arriving later makes the server exit 2 at startup.
+    # See mariadb.yml: --skip-grant-tables would implicitly disable networking
+    # on MySQL 8. The bench account comes from --init-file instead.
+    - --skip-name-resolve
+    - --vidx-disabled=OFF
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --vidx-hnsw-cache-size={graph_cache_bytes}
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+    - --transaction-isolation=READ-COMMITTED
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --vidx-hnsw-cache-size={graph_cache_bytes}
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --transaction-isolation=READ-COMMITTED
+    - --skip-log-bin
+
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB]
+
+capabilities:
+  ef_construction_tunable: false
+  m_per_index: true
+  requires_read_committed: true
+  filtered_search: true
+
+# AliSQL's optimizer costs the vector index against a full scan and will choose
+# a plain scan when the LIMIT is large relative to the row count — its own
+# mysql-test/suite/rds/t/vidx_dml.test shows LIMIT 16 using the index and
+# LIMIT 17 falling back to JT_ALL on a 100-row table. A silent fallback would
+# measure brute force at 100% recall and make the comparison meaningless, so
+# the driver verifies the plan and can force the index.
+plan_guard:
+  verify_index_used: true
+  force_index_hint: "FORCE INDEX (vi)"

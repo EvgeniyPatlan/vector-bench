@@ -1,0 +1,30 @@
+# Default (full-profile) pgvector sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile.
+#
+# efConstruction is pinned to 200 here — pgvector's default. It is the one build
+# quality knob that MariaDB and AliSQL do not expose, so varying it in the
+# headline comparison would hand pgvector a tuning axis the others lack. The
+# tuned profile does sweep it, reported separately.
+#
+# build_mode distinguishes pgvector's bulk post-load index build from the
+# incremental build MHNSW and VIDX are forced into. Both are measured because
+# they answer different questions.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: PGVector
+    disabled: false
+    docker_tag: vector-bench/pgvector-bench
+    module: ann_benchmarks.algorithms.pgvector
+    name: pgvector
+    run_groups:
+      post_build:
+        arg_groups: [{M: [6, 8, 16, 24, 32], efConstruction: 200, build_mode: 'post'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+      incremental_build:
+        arg_groups: [{M: [8, 16, 32], efConstruction: 200, build_mode: 'incremental'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

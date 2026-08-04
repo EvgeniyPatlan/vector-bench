@@ -1,0 +1,106 @@
+# PostgreSQL + pgvector engine definition.
+#
+# The reference point outside the MySQL family. HNSW only, so the comparison
+# stays an implementation comparison rather than an algorithm comparison.
+name: pgvector
+display_name: PostgreSQL + pgvector
+family: postgres
+
+source:
+  tag: v0.8.6
+  upstream: https://github.com/pgvector/pgvector.git
+  submodules: ""
+
+image:
+  runtime: vector-bench/pgvector-runtime
+  bench: vector-bench/pgvector-bench
+  base: postgres:17-bookworm
+
+build:
+  # pgvector compiles its distance kernels with these; -march is applied on top.
+  march: x86-64-v3
+  optflags: "-O3 -fno-semantic-interposition"
+
+sql:
+  session_setup:
+    - "SET jit = off"
+  create_table: |
+    CREATE TABLE {table} (
+      id   int PRIMARY KEY,
+      tag  int,
+      embedding vector({dim})
+    )
+  # PLAIN storage keeps vectors inline instead of TOASTing them, which is what
+  # pgvector's own documentation recommends for benchmark-sized vectors.
+  post_create:
+    - "ALTER TABLE {table} ALTER COLUMN embedding SET STORAGE PLAIN"
+  create_index: |
+    CREATE INDEX {table}_embedding_idx ON {table}
+    USING hnsw (embedding {opclass}) WITH (m = {m}, ef_construction = {ef_construction})
+  insert: "INSERT INTO {table} (id, tag, embedding) VALUES (%s, %s, %s)"
+  copy: "COPY {table} (id, tag, embedding) FROM STDIN"
+  vector_binding: pgvector
+  query: "SELECT id FROM {table} ORDER BY embedding {op} %s LIMIT {k}"
+  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY embedding {op} %s LIMIT {k}"
+  set_ef_search: "SET hnsw.ef_search = {ef_search}"
+  explain: "EXPLAIN (FORMAT JSON) {query}"
+  index_plan_marker: "Index Scan"
+  metrics:
+    angular:   {opclass: vector_cosine_ops, op: "<=>"}
+    euclidean: {opclass: vector_l2_ops,     op: "<->"}
+
+server:
+  common:
+    - -c
+    - "fsync=off"
+    - -c
+    - "full_page_writes=off"
+  normalized:
+    - -c
+    - "shared_buffers={buffer_bytes}B"
+    - -c
+    - "maintenance_work_mem={maintenance_bytes}B"
+    - -c
+    - "max_parallel_maintenance_workers=0"
+    - -c
+    - "max_parallel_workers_per_gather=0"
+    - -c
+    - "synchronous_commit=off"
+  tuned:
+    - -c
+    - "shared_buffers={buffer_bytes}B"
+    - -c
+    - "maintenance_work_mem={maintenance_bytes}B"
+    - -c
+    - "max_parallel_maintenance_workers={build_threads}"
+    - -c
+    - "max_parallel_workers={build_threads}"
+    - -c
+    - "max_worker_processes={build_threads}"
+    - -c
+    - "synchronous_commit=off"
+    - -c
+    - "wal_level=minimal"
+    - -c
+    - "max_wal_senders=0"
+    - -c
+    - "checkpoint_timeout=30min"
+    - -c
+    - "max_wal_size=16GB"
+
+storage_engines:
+  normalized: [heap]
+  tuned: [heap]
+
+capabilities:
+  # The one asymmetry that matters most: only pgvector lets you tune build
+  # quality. It is therefore pinned to its default in the normalized pass so it
+  # is not handed a tuning axis MariaDB and AliSQL do not have.
+  ef_construction_tunable: true
+  ef_construction_normalized: 200
+  m_per_index: true
+  requires_read_committed: false
+  filtered_search: true
+  # pgvector 0.8 added iterative index scans, which materially change filtered
+  # search behaviour. Recorded so the report can say which mode produced a number.
+  iterative_scan_modes: [off, relaxed_order, strict_order]

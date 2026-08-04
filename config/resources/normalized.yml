@@ -1,0 +1,67 @@
+# Normalized resource pass — identical constraints for every engine.
+#
+# The point of this pass is that any difference in the results belongs to the
+# implementations, not to how much machine each one was handed. Every value here
+# is applied identically to all three engines; where an engine has no equivalent
+# knob, that is recorded as an asymmetry rather than quietly skipped.
+name: normalized
+description: Identical CPU, memory and cache budget for every engine
+
+cpu:
+  # Logical CPUs granted to the server container. Resolved to an explicit
+  # cpuset at run time so the same physical cores are used every time.
+  server_cpus: 8
+  # Separate cores for the harness/client container. Sharing cores between the
+  # client and the server would make the client's cost look like server latency.
+  client_cpus: 4
+  # On hybrid CPUs (Intel P-core/E-core), pin to one core class only. Mixing
+  # them produces run-to-run variance that exceeds the effect being measured.
+  prefer_cores: performance
+  # Exclude SMT siblings: two threads on one physical core do not behave like
+  # two cores, and which sibling a client lands on would become a random variable.
+  allow_smt: false
+
+memory:
+  # Hard container limit. The engine must fit its buffer pool, graph cache and
+  # working set inside this.
+  server_limit_gb: 16
+  client_limit_gb: 8
+
+  # How that budget is divided. Fractions rather than absolutes so the same
+  # config works on a 16 GB and a 256 GB machine.
+  #   buffer      -> innodb_buffer_pool_size | shared_buffers
+  #   graph_cache -> mhnsw_max_cache_size | vidx_hnsw_cache_size
+  #                  (PostgreSQL has no equivalent: pgvector serves graph pages
+  #                   from shared_buffers, so its buffer fraction absorbs this)
+  #   maintenance -> maintenance_work_mem (PostgreSQL only)
+  buffer_fraction: 0.35
+  graph_cache_fraction: 0.35
+  maintenance_fraction: 0.15
+  # pgvector has no separate graph cache, so its buffer budget is the sum of the
+  # buffer and graph-cache fractions. Without this pgvector would be given
+  # markedly less resident memory than the other two for the same total limit.
+  postgres_absorbs_graph_cache: true
+
+build:
+  # Single-threaded index build everywhere. pgvector can parallelise its bulk
+  # build; MHNSW and VIDX cannot parallelise their incremental one, so allowing
+  # parallelism here would compare thread counts rather than implementations.
+  threads: 1
+
+isolation:
+  # AliSQL requires READ COMMITTED for any vector operation. Setting the others
+  # to RC as well removes isolation level as a variable.
+  transaction_isolation: READ-COMMITTED
+
+durability:
+  # Relaxed identically on all three. Vector benchmarks are dominated by graph
+  # traversal, and leaving each engine at its own default durability would
+  # compare fsync policies instead.
+  relaxed: true
+
+docker:
+  # Shared memory for the server container. PostgreSQL in particular fails in
+  # obscure ways with the 64 MB Docker default.
+  shm_size: 2g
+  # No network access beyond the benchmark network.
+  network_isolated: true

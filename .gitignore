@@ -1,0 +1,24 @@
+# Working directories — all regenerable, never committed
+/sources/
+/work/
+/datasets/
+/results/
+/.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local overrides
+config/local.yml
+.env

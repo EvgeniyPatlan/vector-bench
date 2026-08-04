@@ -1,0 +1,38 @@
+# Dev profile — the fastest possible exercise of the whole ops path.
+#
+# Intended for validating framework changes, not for measuring anything. Pair it
+# with the tiny synthetic dataset produced by tests/make-tiny-dataset.sh so a
+# full ops cycle (build, concurrency, filtered, churn) runs in about a minute
+# per engine and needs no dataset download.
+name: dev
+description: Minimal ops-only cycle on a tiny synthetic dataset (~1 min/engine)
+
+datasets:
+  - tiny-16-euclidean
+
+k: 10
+runs: 1
+
+ann:
+  # ann-benchmarks validates --dataset against its own registry, which does not
+  # contain the synthetic dataset, so the recall/QPS path is off here.
+  enabled: false
+  m_values: [16]
+  ef_search: [10, 40]
+  pgvector_ef_construction: 200
+  pgvector_build_modes: [post]
+  batch: false
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  workloads: [build, concurrency, filtered, churn]
+  m_values: [16]
+  ef_search: 40
+  subset_rows: null
+  load_threads: 1
+  max_queries: 100
+  client_counts: [1, 2]
+  concurrency_duration_s: 4
+  selectivities: [0.10, 0.50]
+  churn_fractions: [0.10]

@@ -1,0 +1,108 @@
+# MariaDB engine definition.
+#
+# Vector support: MHNSW (sql/vector_mhnsw.cc), GA since the 11.7/11.8 series.
+name: mariadb
+display_name: MariaDB
+family: mysql
+
+source:
+  tag: mariadb-11.8.8
+  upstream: https://github.com/MariaDB/server.git
+  # `git archive` cannot carry submodules and the local checkout has none
+  # populated, so prepare-sources.sh clones and initialises only these.
+  # Everything else (columnstore, rocksdb, wsrep, wolfssl, marias3, duckdb)
+  # is disabled in the build and deliberately not fetched.
+  submodules: libmariadb
+
+image:
+  runtime: vector-bench/mariadb-runtime
+  bench: vector-bench/mariadb-bench
+  base: ubuntu:24.04
+
+build:
+  type: RelWithDebInfo
+  # -march for the distance kernels. `native` gives the engine its best shot but
+  # makes the image non-portable; x86-64-v3 (AVX2/FMA) is the portable default.
+  # Set to `native` in the tuned pass on the machine that will run the benchmark.
+  march: x86-64-v3
+  cmake_flags:
+    - -DPLUGIN_COLUMNSTORE=NO
+    - -DPLUGIN_ROCKSDB=NO
+    - -DPLUGIN_S3=NO
+    - -DPLUGIN_MROONGA=NO
+    - -DPLUGIN_CONNECT=NO
+    - -DPLUGIN_SPIDER=NO
+    - -DPLUGIN_OQGRAPH=NO
+    - -DPLUGIN_SPHINX=NO
+    - -DPLUGIN_TOKUDB=NO
+    - -DPLUGIN_PERFSCHEMA=NO
+    - -DWITH_WSREP=OFF
+    - -DWITH_UNIT_TESTS=OFF
+    - -DWITH_EMBEDDED_SERVER=OFF
+    - -DWITH_SSL=system
+    - -DWITH_ZLIB=system
+
+# How this engine expresses vector search. Consumed by the ops-harness driver
+# and by the doc generator so the manual instructions never drift from the code.
+sql:
+  # Session setup executed on every connection before any vector work.
+  session_setup:
+    - "SET SESSION default_storage_engine = InnoDB"
+  # {dim}, {metric}, {m}, {engine} are substituted by the driver.
+  create_table: |
+    CREATE TABLE {table} (
+      id INT PRIMARY KEY,
+      v VECTOR({dim}) NOT NULL,
+      VECTOR INDEX (v) M={m} DISTANCE={metric}
+    ) ENGINE={engine}
+  # MariaDB accepts a raw little-endian float32 binary string for VECTOR.
+  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
+  vector_binding: binary_f32
+  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
+  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
+  set_ef_search: "SET mhnsw_ef_search = {ef_search}"
+  explain: "EXPLAIN {query}"
+  # A plan is only accepted if this appears in EXPLAIN output. Guards against
+  # silently benchmarking a brute-force scan.
+  index_plan_marker: "v"
+  metrics:
+    angular: cosine
+    euclidean: euclidean
+
+# Server knobs, per fairness pass. {mem_bytes} etc. are filled by the harness.
+server:
+  common:
+    # --no-defaults is NOT listed here. mariadbd/mysqld require it to be
+    # the first argument; the entrypoint supplies it there, and a second
+    # copy arriving later makes the server exit 2 at startup.
+    # --skip-grant-tables is deliberately absent. On MySQL 8 (and therefore
+    # AliSQL) it implicitly enables --skip-networking, which would leave the
+    # server unreachable over TCP from the harness container. Both MySQL-family
+    # engines run with grants enabled and create the bench account from an
+    # --init-file, so their startup and auth paths are identical.
+    - --skip-name-resolve
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --mhnsw-max-cache-size={graph_cache_bytes}
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+    - --transaction-isolation=READ-COMMITTED
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --mhnsw-max-cache-size={graph_cache_bytes}
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --skip-log-bin
+
+# Storage engines to test. InnoDB is the headline (AliSQL cannot do MyISAM);
+# MyISAM is an extra MariaDB-only curve, reported separately and labelled.
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB, MyISAM]
+
+capabilities:
+  ef_construction_tunable: false
+  m_per_index: true
+  requires_read_committed: false
+  filtered_search: true

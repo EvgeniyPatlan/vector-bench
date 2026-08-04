@@ -1,0 +1,47 @@
+# Full profile — the one the report is written from.
+#
+# Four datasets spanning low-to-high dimensionality and both metric spaces, a
+# dense enough M x ef_search grid to draw a clean Pareto frontier, and all four
+# ops dimensions at full depth. Expect a day or more per resource pass; the
+# orchestrator checkpoints per (engine, dataset, config) so an interruption
+# costs one data point, not the run.
+name: full
+description: Dense sweep across four datasets, all workloads (24h+ per pass)
+
+datasets:
+  - fashion-mnist-784-euclidean
+  - glove-100-angular
+  - sift-128-euclidean
+  - gist-960-euclidean
+
+k: 10
+runs: 3
+
+ann:
+  enabled: true
+  # M is the only build-quality axis MariaDB and AliSQL expose, so it carries
+  # the whole build-quality sweep for them.
+  m_values: [6, 8, 12, 16, 24, 32, 48]
+  ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
+  pgvector_ef_construction: 200
+  pgvector_build_modes: [post, incremental]
+  batch: false
+  # MyISAM is a MariaDB-only extra curve; AliSQL's VIDX is InnoDB-only, so it
+  # never appears in the three-way comparison. Reported separately and labelled.
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  workloads: [build, concurrency, filtered, churn]
+  m_values: [8, 16, 32]
+  ef_search: 100
+  subset_rows: null
+  load_threads: 1
+  max_queries: 2000
+  client_counts: [1, 2, 4, 8, 16, 32]
+  concurrency_duration_s: 30
+  selectivities: [0.01, 0.10, 0.50]
+  churn_fractions: [0.10, 0.25]
+  # pgvector 0.8 only. Filtered search behaves very differently per mode, so all
+  # three are measured rather than leaving the default unstated.
+  pgvector_iterative_scan: [off, relaxed_order]

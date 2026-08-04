@@ -1,0 +1,55 @@
+# Tuned resource pass — each engine configured the way its vendor recommends.
+#
+# This answers "what can this engine actually do", which the normalized pass
+# deliberately does not. It confounds implementation quality with documentation
+# quality, so it is reported alongside the normalized pass and never instead of it.
+name: tuned
+description: Vendor-recommended configuration, full machine
+
+cpu:
+  # 0 means "all available cores". On a hybrid CPU the orchestrator still pins
+  # to one core class, because the alternative is not "more performance" but
+  # "unrepeatable numbers".
+  server_cpus: 0
+  client_cpus: 4
+  prefer_cores: performance
+  allow_smt: true
+
+memory:
+  # 0 means "a large fraction of host RAM", resolved at run time.
+  server_limit_gb: 0
+  client_limit_gb: 8
+  host_fraction: 0.6
+  buffer_fraction: 0.45
+  graph_cache_fraction: 0.35
+  maintenance_fraction: 0.15
+  postgres_absorbs_graph_cache: true
+
+build:
+  # 0 means "match the server cpuset size". Only pgvector can use this — its
+  # bulk build parallelises across maintenance workers. MHNSW and VIDX build
+  # incrementally on INSERT and have no equivalent, which is precisely the
+  # difference this pass is meant to show.
+  threads: 0
+
+isolation:
+  # AliSQL still requires RC; the others run at their own defaults here, because
+  # that is what a vendor-recommended deployment looks like.
+  transaction_isolation: engine_default
+
+durability:
+  relaxed: true
+
+docker:
+  shm_size: 8g
+  network_isolated: true
+
+# Extra curves that only make sense once each engine is allowed its own idioms.
+extras:
+  # MariaDB supports MyISAM for vector tables and its own published benchmark
+  # uses it. AliSQL cannot, so this is a MariaDB-only curve, labelled as such.
+  mariadb_storage_engines: [InnoDB, MyISAM]
+  # The one build knob only pgvector exposes. Swept here, pinned in the
+  # normalized pass so pgvector is not handed a tuning axis the others lack.
+  pgvector_ef_construction: [64, 200, 400]
+  pgvector_iterative_scan: [off, relaxed_order]

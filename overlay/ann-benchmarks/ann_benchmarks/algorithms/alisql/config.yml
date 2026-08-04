@@ -1,0 +1,20 @@
+# Default (full-profile) AliSQL sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile.
+#
+# AliSQL's VIDX allows M in [3, 200] and is InnoDB-only. `efConstruction` is not
+# exposed, same as MariaDB (see docs/05-methodology.md, "Known asymmetries").
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: AliSQL
+    disabled: false
+    docker_tag: vector-bench/alisql-bench
+    module: ann_benchmarks.algorithms.alisql
+    name: alisql
+    run_groups:
+      innodb:
+        arg_groups: [{M: [6, 8, 16, 24, 32], engine: 'InnoDB'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

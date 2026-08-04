@@ -1,0 +1,20 @@
+# Python stack for the *-bench images.
+#
+# Pinned to the versions ann-benchmarks itself pins, so the harness behaves the
+# same inside every engine image. Adding an unpinned package here would let two
+# engine images drift apart and silently change what is being compared.
+ansicolors==1.1.8
+h5py==3.11.0
+numpy==1.26.4
+pyyaml==6.0.1
+psutil==5.9.8
+scikit-learn==1.4.2
+matplotlib==3.8.4
+jinja2==3.1.4
+docker==7.1.0
+
+# Database clients are NOT listed here. They are per-family:
+#   requirements-mysql.txt  -> MariaDB and AliSQL images
+#   (psycopg is installed directly by the pgvector Dockerfile)
+# Keeping them out of the shared file means the pgvector image does not need
+# libmariadb-dev, and the MySQL images do not need libpq.

@@ -1,0 +1,44 @@
+# Smoke profile — the gate every long run must pass first.
+#
+# Proves the whole pipeline end to end for all three engines in roughly 15
+# minutes: images build, servers start, vector DDL is accepted, the index is
+# actually used, records are written, and the report generates. It is not a
+# measurement — the grids are far too sparse to draw a Pareto curve from.
+name: smoke
+description: End-to-end pipeline validation on the smallest dataset (~15 min)
+
+datasets:
+  - fashion-mnist-784-euclidean
+
+k: 10
+runs: 1
+
+ann:
+  enabled: true
+  m_values: [16]
+  ef_search: [10, 40, 160]
+  # pgvector's ef_construction is pinned to its default; it is the one build
+  # knob MariaDB and AliSQL do not expose (see docs/05-methodology.md).
+  pgvector_ef_construction: 200
+  # Both modes, deliberately. `post` is pgvector's idiomatic bulk build;
+  # `incremental` mirrors what MHNSW and VIDX are forced to do and is the
+  # like-for-like build comparison. The smoke profile is the gate before every
+  # long run, so it must exercise both code paths — an incremental-mode bug
+  # would otherwise only surface hours into the full sweep.
+  pgvector_build_modes: [post, incremental]
+  batch: false
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  workloads: [build, concurrency, filtered, churn]
+  m_values: [16]
+  ef_search: 100
+  # Only load part of the training set so a failure surfaces in minutes.
+  subset_rows: 20000
+  load_threads: 1
+  max_queries: 200
+  client_counts: [1, 4]
+  concurrency_duration_s: 8
+  selectivities: [0.10]
+  churn_fractions: [0.10]

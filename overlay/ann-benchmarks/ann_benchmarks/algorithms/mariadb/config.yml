@@ -1,0 +1,27 @@
+# Default (full-profile) MariaDB sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile, so editing it here only changes the standalone default.
+#
+# `M` is passed as an index option in DDL, matching how AliSQL takes it.
+# `efConstruction` is deliberately absent: MariaDB MHNSW does not expose it
+# (see docs/05-methodology.md, "Known asymmetries").
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: MariaDB
+    disabled: false
+    docker_tag: vector-bench/mariadb-bench
+    module: ann_benchmarks.algorithms.mariadb
+    name: mariadb
+    run_groups:
+      innodb:
+        arg_groups: [{M: [6, 8, 16, 24, 32], engine: 'InnoDB'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+      # MariaDB-only extra curve. AliSQL's VIDX is InnoDB-only, so this is never
+      # part of the headline three-way comparison — it is reported separately.
+      myisam:
+        arg_groups: [{M: [6, 8, 16, 24, 32], engine: 'MyISAM'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

@@ -1,0 +1,36 @@
+# Quick profile — real numbers, coarse grid. Roughly 2–4 hours per pass.
+#
+# Enough to see whether the engines separate at all and where. Use it to decide
+# whether the full profile is worth the machine time, and to catch configuration
+# problems that only appear at realistic dataset sizes.
+name: quick
+description: Coarse but real measurement on two datasets (~2-4 h per pass)
+
+datasets:
+  - fashion-mnist-784-euclidean
+  - glove-100-angular
+
+k: 10
+runs: 2
+
+ann:
+  enabled: true
+  m_values: [8, 16, 32]
+  ef_search: [10, 20, 40, 80, 160, 320]
+  pgvector_ef_construction: 200
+  pgvector_build_modes: [post, incremental]
+  batch: false
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  workloads: [build, concurrency, filtered, churn]
+  m_values: [16]
+  ef_search: 100
+  subset_rows: null
+  load_threads: 1
+  max_queries: 1000
+  client_counts: [1, 2, 4, 8, 16]
+  concurrency_duration_s: 15
+  selectivities: [0.01, 0.10, 0.50]
+  churn_fractions: [0.10, 0.25]
