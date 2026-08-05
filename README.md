@@ -41,7 +41,7 @@ chmod +x run-benchmark.sh scripts/*.sh tests/*.sh
 
 ./run-benchmark.sh build --march native    # ~2-4 h, AliSQL dominates
 ./run-benchmark.sh fetch                   # ~5 GB of datasets
-./run-benchmark.sh run --profile smoke     # ~15 min gate — do not skip
+./run-benchmark.sh run --profile smoke     # ~30 min gate — do not skip
 ./run-benchmark.sh run --profile main      # ~2 days: the real measurement
 ```
 
@@ -161,8 +161,8 @@ python3 -m pytest tests/ -q          # 73 unit tests, ~2 s
 ./run-benchmark.sh run --profile smoke
 ```
 
-The smoke profile takes ~15 minutes and exercises every stage for all three
-engines. **Do not skip it** — far cheaper than discovering a broken image eight
+The smoke profile takes ~30 minutes per resource pass and exercises every stage
+for all three engines. **Do not skip it** — far cheaper than discovering a broken image eight
 hours into a full run.
 
 There is also a one-minute synthetic cycle needing no dataset download:
@@ -238,10 +238,11 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 | Profile | Datasets | Ingest time | Use for |
 | --- | --- | ---: | --- |
 | `dev` | tiny synthetic | ~1 min | validating framework changes |
-| `smoke` | fashion-mnist | ~15 min | the gate before any long run |
+| `smoke` | fashion-mnist | ~30 min | the gate before any long run |
 | `quick` | fashion-mnist + glove-100 | ~14 h | coarse but real numbers |
 | **`main`** | glove-100 + sift-128 | **~46 h** | **the report** |
 | `full` | all four, both passes | ~272 h | the complete space, rarely run whole |
+| `mariadb-blog` | dbpedia-openai-1000k, 1536 dims | ~72 h | reproducing MariaDB's published big-vector benchmark |
 
 Times are measured ingest only, three engines, before any query runs. `full`
 describes the measurement space rather than recommending it. Narrow with

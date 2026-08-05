@@ -344,7 +344,35 @@ _DATASET_ROWS = {
     "gist-960-euclidean": 1_000_000,
     "glove-25-angular": 1_183_514,
     "deep-image-96-angular": 9_990_000,
+    # MariaDB's big-vector benchmark corpus. At 1536 dimensions the per-row
+    # cost is far above the others, so the row count alone understates it —
+    # see _DIM_PENALTY below.
+    "dbpedia-openai-1000k-angular": 1_000_000,
+    "dbpedia-openai-500k-angular": 500_000,
+    "dbpedia-openai-100k-angular": 100_000,
 }
+
+# Ingest rate falls with dimensionality: every graph traversal during insert
+# costs distance computations proportional to the vector width. The reference
+# rates above were measured on 100-dim data, so wider datasets are scaled down.
+# Sublinear because SIMD amortises part of it.
+_REFERENCE_DIMS = 100
+_DATASET_DIMS = {
+    "fashion-mnist-784-euclidean": 784,
+    "glove-100-angular": 100,
+    "sift-128-euclidean": 128,
+    "gist-960-euclidean": 960,
+    "glove-25-angular": 25,
+    "deep-image-96-angular": 96,
+    "dbpedia-openai-1000k-angular": 1536,
+    "dbpedia-openai-500k-angular": 1536,
+    "dbpedia-openai-100k-angular": 1536,
+}
+
+
+def _dim_penalty(dataset: str) -> float:
+    dims = _DATASET_DIMS.get(dataset, _REFERENCE_DIMS)
+    return max(1.0, (dims / _REFERENCE_DIMS) ** 0.6)
 
 
 def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
@@ -369,11 +397,12 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
             rows = _DATASET_ROWS.get(dataset)
             if not rows:
                 continue
+            effective = rate / _dim_penalty(dataset)
             if "ann" in phases:
-                engine_h += (rows / rate) * m_count / 3600
+                engine_h += (rows / effective) * m_count / 3600
             if "ops" in phases:
                 ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
-                engine_h += (rows / rate) * ops_m / 3600
+                engine_h += (rows / effective) * ops_m / 3600
         engine_h *= len(passes)
         total_h += engine_h
         rows_per_pass.append(f"{engine} ~{engine_h:.1f} h")

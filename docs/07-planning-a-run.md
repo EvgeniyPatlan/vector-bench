@@ -59,10 +59,11 @@ above.
 | Profile | Datasets | Passes | Ingest |
 | --- | --- | --- | ---: |
 | `dev` | tiny synthetic | 1 | ~1 min |
-| `smoke` | fashion-mnist | 1 | ~15 min |
+| `smoke` | fashion-mnist | 1 | ~30 min |
 | `quick` | fashion-mnist, glove-100 | 1 | ~14 h |
 | `main` | glove-100, sift-128 | 1 | **~46 h (~2 days)** |
 | `full` | all four | 2 | **~272 h (~11 days)** |
+| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~72 h (~3 days)** |
 
 `full` describes the complete measurement space. It is not a recommendation.
 Running it end to end is a deliberate decision to spend a fortnight, and
@@ -182,7 +183,41 @@ from the checkpoint file.
 
 ---
 
-## 6. Sizing a new dataset
+## 6. Reproducing MariaDB's published benchmark
+
+MariaDB's [big vector search benchmark](https://mariadb.org/big-vector-search-benchmark-10-databases-comparison/)
+used **dbpedia-openai-1000k** — one million DBpedia texts as 1536-dimensional
+OpenAI embeddings, angular distance — run through their fork of ann-benchmarks,
+which is what this framework is built on.
+
+That dataset is **not** published as a prebuilt HDF5, so it has to be built
+locally from HuggingFace:
+
+```bash
+./scripts/generate-dataset.sh dbpedia-openai-1000k-angular   # multi-GB download,
+                                                             # hours, ~20 GB working space
+./run-benchmark.sh run --profile mariadb-blog --engines mariadb,pgvector
+```
+
+Ground truth is computed by brute force inside the generator, which is the slow
+part.
+
+### What will not match, and why
+
+| Difference | Effect |
+| --- | --- |
+| Their CPU (Xeon E5-2660 v4) has **no AVX-512** | If yours does, MHNSW and VIDX take wider SIMD paths and will look faster than published. The largest single source of divergence, and not configurable away — building `--march x86-64-v3` gets closer at the cost of not measuring your own hardware. |
+| They compared ten systems | This framework covers MariaDB, AliSQL and pgvector. The other seven are out of scope. |
+| Versions | MariaDB 11.8.8 here vs their 11.8 **and** 12.3; pgvector 0.8.6 vs their master of 2026-02-08. |
+| Index parameters were not published | The M and ef_search grids in the profile are ann-benchmarks' conventional ranges, not a claim to match theirs. |
+
+At 1536 dimensions this is the heaviest run the framework supports — roughly 5×
+the per-row cost of glove-100. Start with `--engines mariadb,pgvector` (~20 h)
+and add AliSQL (~52 h more) only if the time is worth it to you.
+
+---
+
+## 7. Sizing a new dataset
 
 Before adding a dataset, estimate its load:
 
@@ -197,7 +232,7 @@ into a sweep.
 
 ---
 
-## 7. A note on the numbers in this document
+## 8. A note on the numbers in this document
 
 The ingest rates here come from real runs on a dual-socket Xeon Gold 6230 with
 AVX-512, engines built `--march=native`. They will differ on your hardware,

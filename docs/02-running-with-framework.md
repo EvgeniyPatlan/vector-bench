@@ -42,8 +42,8 @@ cd vector-bench
 > separately (`--engines alisql`) if you want to start measuring the other two
 > sooner.
 
-The smoke profile takes about 15 minutes and exercises every stage for all
-three engines. **Do not skip it.** It is far cheaper to discover a broken image
+The smoke profile takes about 30 minutes per resource pass and exercises every
+stage for all three engines. **Do not skip it.** It is far cheaper to discover a broken image
 or a missing dataset here than eight hours into a full run.
 
 When it finishes:

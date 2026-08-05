@@ -1,0 +1,73 @@
+# Reproduces MariaDB's "Big vector search benchmark: 10 databases compared"
+# as closely as this framework can.
+#   https://mariadb.org/big-vector-search-benchmark-10-databases-comparison/
+#
+# What that benchmark used, from the article:
+#   dataset   dbpedia-openai-1000k — 1M DBpedia texts as 1536-dim OpenAI
+#             embeddings, angular distance
+#   tool      their fork of ann-benchmarks (this framework is built on it)
+#   engines   MariaDB 12.3 and 11.8, pgvector master, plus eight others
+#   hardware  Intel Xeon E5-2660 v4 @ 2.00GHz — AVX2, NO AVX-512
+#
+# Index parameters were not published, so the M and ef_search grids below are
+# ann-benchmarks' conventional ranges rather than a claim to match theirs.
+#
+# WHERE THIS WILL DIFFER FROM THE PUBLISHED RESULTS, unavoidably:
+#
+#   * Hardware. Their CPU has no AVX-512. If yours does — a Xeon Gold 6230
+#     does — MariaDB MHNSW and AliSQL VIDX both take wider SIMD paths and will
+#     look faster than published. This is the single largest source of
+#     divergence and it cannot be configured away; build with
+#     `--march x86-64-v3` to get closer, at the cost of not measuring your own
+#     hardware.
+#   * Engines. This framework compares MariaDB, AliSQL and pgvector. The
+#     article's other seven systems are out of scope here.
+#   * Versions. MariaDB 11.8.8 here against their 11.8 and 12.3; pgvector
+#     0.8.6 against their master branch of 2026-02-08.
+#
+# COST. 1M vectors at 1536 dimensions is by far the heaviest thing this
+# framework can run. Loading is roughly 15x the per-row work of glove-100, so
+# on the order of 8-10 h per load for MariaDB and 25-30 h for AliSQL. The ann
+# phase alone, one M value, all three engines, is on the order of two days.
+# Start with `--engines mariadb,pgvector` and add AliSQL only if you have the
+# time to spend.
+name: mariadb-blog
+description: MariaDB big-vector benchmark corpus — dbpedia-openai-1000k, 1536 dims (days)
+
+datasets:
+  - dbpedia-openai-1000k-angular
+
+k: 10
+runs: 1
+
+ann:
+  enabled: true
+  # One M. At this dimensionality each additional value is another full load of
+  # a million 1536-dim vectors; the recall/QPS curve comes from the ef_search
+  # sweep, which reuses the built index and is nearly free.
+  m_values: [16]
+  ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
+  pgvector_ef_construction: 200
+  pgvector_build_modes: [post]
+  batch: false
+  # The preview article notes MariaDB tested both InnoDB and MyISAM. InnoDB is
+  # the headline here because AliSQL's VIDX is InnoDB-only; add MyISAM via the
+  # tuned pass if you want MariaDB's best case.
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  # Build cost is the interesting ops dimension at this scale — it is where the
+  # incremental builders diverge most from pgvector's bulk build. Concurrency,
+  # filtered and churn each add another full load or a long query sweep, so they
+  # are off by default. Enable them deliberately.
+  workloads: [build]
+  m_values: [16]
+  ef_search: 100
+  subset_rows: null
+  load_threads: 1
+  max_queries: 500
+  client_counts: [1, 4, 16]
+  concurrency_duration_s: 30
+  selectivities: [0.10]
+  churn_fractions: [0.10]
