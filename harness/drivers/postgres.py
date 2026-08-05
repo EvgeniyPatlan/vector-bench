@@ -12,6 +12,7 @@ INSERT. `build_mode` selects which of the two comparisons is being made.
 
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -25,6 +26,8 @@ try:
     import pgvector.psycopg
 except ImportError:  # pragma: no cover - only the bench image has these
     psycopg = None
+
+PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
 
 INDEX = f"{TABLE}_embedding_idx"
 OPCLASS = {"angular": "vector_cosine_ops", "euclidean": "vector_l2_ops"}
@@ -117,13 +120,26 @@ class PostgresDriver(EngineDriver):
         threads = max(1, threads)
         start = time.perf_counter()
 
-        def copy_range(lo: int, hi: int, cur) -> None:
+        def copy_range(lo: int, hi: int, cur, report: bool = False) -> None:
+            span = hi - lo
+            began = time.perf_counter()
+            next_report = began + PROGRESS_INTERVAL_S
             with cur.copy(f"COPY {TABLE} (id, tag, embedding) FROM STDIN") as copy:
                 for i in range(lo, hi):
                     copy.write_row((start_id + i, int(tags[i]), vectors[i]))
+                    if report and (i - lo) % 5000 == 0:
+                        now = time.perf_counter()
+                        if now >= next_report:
+                            done = i - lo + 1
+                            rate = done / max(now - began, 1e-9)
+                            eta = (span - done) / max(rate, 1e-9)
+                            print(f"[pgvector]   {done:,}/{span:,} rows, "
+                                  f"{rate:,.0f} rows/s, ETA {eta / 60:.1f} min",
+                                  flush=True)
+                            next_report = now + PROGRESS_INTERVAL_S
 
         if threads == 1:
-            copy_range(0, total, self._cur)
+            copy_range(0, total, self._cur, report=True)
         else:
             bounds = [(total * i // threads, total * (i + 1) // threads)
                       for i in range(threads)]
@@ -132,7 +148,7 @@ class PostgresDriver(EngineDriver):
                 lo, hi = bound
                 conn = self._open()
                 try:
-                    copy_range(lo, hi, conn.cursor())
+                    copy_range(lo, hi, conn.cursor(), report=(lo == 0))
                 finally:
                     conn.close()
 

@@ -22,6 +22,8 @@ import numpy
 
 from .base import DATABASE, TABLE, ConnectionSpec, EngineDriver, IndexSpec, LoadResult
 
+PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
+
 try:
     import mariadb as _connector
 except ImportError:  # pragma: no cover - only the bench image has it
@@ -149,7 +151,8 @@ class MySQLFamilyDriver(EngineDriver):
         start = time.perf_counter()
 
         if threads == 1:
-            self._load_range(self._cur, vectors, tags, start_id, 0, total)
+            self._load_range(self._cur, vectors, tags, start_id, 0, total,
+                             report=True)
         else:
             bounds = [(total * i // threads, total * (i + 1) // threads)
                       for i in range(threads)]
@@ -166,7 +169,9 @@ class MySQLFamilyDriver(EngineDriver):
                     cur.execute(f"USE {DATABASE}")
                     for stmt in self.dialect.session_setup:
                         cur.execute(stmt)
-                    self._load_range(cur, vectors, tags, start_id, lo, hi)
+                    # Only the first shard reports, or the threads interleave.
+                    self._load_range(cur, vectors, tags, start_id, lo, hi,
+                                     report=(lo == 0))
                     cur.close()
                 finally:
                     conn.close()
@@ -178,9 +183,21 @@ class MySQLFamilyDriver(EngineDriver):
         return LoadResult(rows=total, wall_seconds=elapsed, threads=threads)
 
     def _load_range(self, cur, vectors, tags, start_id: int, lo: int, hi: int,
-                    batch: int = 500) -> None:
+                    batch: int = 500, report: bool = False) -> None:
+        """Load a contiguous range in batches.
+
+        Reports progress on a TIME interval when `report` is set. These engines
+        maintain the HNSW graph on every INSERT, so a million-row load runs for
+        a long time at a rate that falls as the graph grows; without periodic
+        output there is no way to tell a working load from a hung one, and no
+        way to answer "how long will this take" except by waiting.
+        """
         sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
         rows: List[Tuple[int, int, bytes]] = []
+        total = hi - lo
+        started = time.perf_counter()
+        next_report = started + PROGRESS_INTERVAL_S
+
         for i in range(lo, hi):
             rows.append((start_id + i, int(tags[i]), to_binary_f32(vectors[i])))
             if len(rows) >= batch:
@@ -189,6 +206,14 @@ class MySQLFamilyDriver(EngineDriver):
                 # itself, and mutating the object it was handed is a needless
                 # bet on executemany() having fully consumed it.
                 rows = []
+                now = time.perf_counter()
+                if report and now >= next_report:
+                    done = i - lo + 1
+                    rate = done / max(now - started, 1e-9)
+                    eta = (total - done) / max(rate, 1e-9)
+                    print(f"[{self.name}]   {done:,}/{total:,} rows, "
+                          f"{rate:,.0f} rows/s, ETA {eta / 60:.1f} min", flush=True)
+                    next_report = now + PROGRESS_INTERVAL_S
         if rows:
             cur.executemany(sql, rows)
         cur.execute("COMMIT")
