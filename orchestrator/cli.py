@@ -190,7 +190,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     _print_load_estimate(profile, engines, datasets, passes, phases)
 
-    checkpoints = _load_checkpoints(paths["checkpoints"]) if args.resume else set()
+    # Always load the file so completed sub-units are recorded against it;
+    # only *honour* them when --resume was asked for.
+    recorded = _load_checkpoints(paths["checkpoints"])
+    checkpoints = recorded if args.resume else set()
     if checkpoints:
         print(f"resuming: {len(checkpoints)} unit(s) already complete")
 
@@ -229,7 +232,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     try:
                         rc = _run_unit(phase, engine, dataset, profile, engine_cfg,
                                        resources, resolved, resource_pass, paths,
-                                       run_id, args)
+                                       run_id, args, checkpoints=checkpoints)
                     except Exception as exc:  # noqa: BLE001
                         rc = 1
                         # The traceback matters: these failures are usually in
@@ -326,10 +329,14 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
     return rc
 
 
-# Measured batched ingest rates, rows/s, from smoke runs on a Xeon Gold 6230.
-# Rough by design — they exist to turn "why is this taking so long" into a
-# number you see before committing the machine, not to be precise.
-_INGEST_ROWS_PER_S = {"mariadb": 400, "alisql": 150, "pgvector": 5600}
+# Measured ingest rates, rows/s, on a Xeon Gold 6230.
+#
+# These were originally guessed at 400/150/5600 from a 60k-row smoke run. A
+# real 1.18M-row load measured MariaDB at 147 rows/s average — 2.7x slower —
+# because HNSW insert cost rises as the graph grows and rises again with M
+# (glove-100: ~320 rows/s at M=8, ~70 at M=32). An estimate that is optimistic
+# by 3x is worse than none, so these are the observed mid-grid numbers.
+_INGEST_ROWS_PER_S = {"mariadb": 150, "alisql": 55, "pgvector": 3000}
 _DATASET_ROWS = {
     "fashion-mnist-784-euclidean": 60_000,
     "glove-100-angular": 1_183_514,
@@ -388,7 +395,8 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
 def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
               engine_cfg: Dict[str, Any], resources: Dict[str, Any],
               resolved: Any, resource_pass: str, paths: Dict[str, str],
-              run_id: str, args: argparse.Namespace) -> int:
+              run_id: str, args: argparse.Namespace,
+              checkpoints: Optional[set] = None) -> int:
     if phase == "ann":
         if not profile.get("ann", {}).get("enabled", True):
             print("[ann] disabled in profile; skipping")
@@ -413,6 +421,15 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
         for m in m_values:
             for build_mode in build_modes:
                 tag = f"m{m}-{build_mode}"
+                # Checkpoint per (M, build_mode), not just per phase. A single
+                # ops phase can be a dozen hours spread over several M values,
+                # and each M is an independent unit of work: recording only the
+                # whole phase meant an interruption threw away every M that had
+                # already completed.
+                sub_key = f"{resource_pass}/{engine}/{dataset}/ops/{tag}"
+                if checkpoints is not None and sub_key in checkpoints:
+                    print(f"[skip] {sub_key} (already complete)")
+                    continue
                 output = os.path.join(paths["run_dir"],
                                       f"ops-{engine}-{dataset}-{resource_pass}-{tag}.jsonl")
                 memory_ts = os.path.join(paths["run_dir"],
@@ -425,6 +442,9 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                                      paths, run_id, dataset, tag) as run:
                     rc = run.run_harness(harness_args, output,
                                          memory_timeseries=memory_ts)
+                if rc == 0 and checkpoints is not None:
+                    _save_checkpoint(paths["checkpoints"], sub_key)
+                    checkpoints.add(sub_key)
                 worst_rc = worst_rc or rc
         return worst_rc
 

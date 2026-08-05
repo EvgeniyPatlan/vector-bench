@@ -1,0 +1,63 @@
+# Main profile — the one to actually run.
+#
+# `full` exists to describe the complete measurement space. On real hardware
+# that space is about 22 days for three engines across four datasets and two
+# resource passes, because MHNSW and VIDX build their graphs incrementally and
+# the cost rises steeply with M: on glove-100, M=8 loads at ~320 rows/s and
+# M=32 at ~70. This profile is what fits in a day and still answers the
+# questions the smoke run raised.
+#
+# Differences from `full`:
+#   * two datasets, not four   — glove-100 (angular) and sift-128 (euclidean)
+#                                cover both metric spaces at 1M scale. gist-960
+#                                is dropped: at 960 dims it alone is ~19 h of
+#                                loading per phase.
+#   * concurrency to 32 clients — the smoke run's most striking result was
+#                                MariaDB saturating at 2 clients; this is where
+#                                that gets confirmed or overturned.
+#   * filtered starts at 10%    — 1% selectivity measured 0.9 QPS on MariaDB,
+#                                so 2000 queries there costs 37 minutes per
+#                                configuration for one point on a curve.
+#   * fewer filtered queries    — 500, not 2000. At sub-1 QPS the query count
+#                                is the whole cost.
+name: main
+description: Two datasets at 1M scale, both metric spaces (~1 day, normalized pass)
+
+datasets:
+  - glove-100-angular
+  - sift-128-euclidean
+
+k: 10
+runs: 2
+
+ann:
+  enabled: true
+  # M=32 is where the high-recall end of the frontier lives and it is also
+  # ~65% of the grid's load cost. Keep it; drop the middle instead if you need
+  # to cut further.
+  m_values: [8, 32]
+  ef_search: [10, 20, 40, 80, 160, 320]
+  pgvector_ef_construction: 200
+  pgvector_build_modes: [post, incremental]
+  batch: false
+  mariadb_storage_engines: [InnoDB]
+
+ops:
+  enabled: true
+  workloads: [build, concurrency, filtered, churn]
+  # One M for the ops dimensions. Build cost, concurrency and churn are about
+  # engine behaviour, not about sweeping the index parameter — and each extra M
+  # here costs another full load of a million rows.
+  m_values: [16]
+  ef_search: 100
+  subset_rows: null
+  load_threads: 1
+  max_queries: 500
+  client_counts: [1, 2, 4, 8, 16, 32]
+  concurrency_duration_s: 30
+  # 1% is deliberately absent: it cost 37 minutes per configuration on MariaDB
+  # at 0.9 QPS. Measure it separately with --profile full if the low-selectivity
+  # case matters to you.
+  selectivities: [0.10, 0.50]
+  churn_fractions: [0.10, 0.25]
+  pgvector_iterative_scan: [off, relaxed_order]
