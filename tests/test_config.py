@@ -324,3 +324,57 @@ class TestNothingToRunHandling:
         import inspect
         from orchestrator.docker_ctl import run_foreground
         assert "sink" in inspect.signature(run_foreground).parameters
+
+
+class TestBenignTracebackSuppression:
+    """A traceback that means "already done" must not reach the operator.
+
+    ann-benchmarks reports "every configuration has results" by raising, so it
+    prints a Python traceback for a completely normal condition. Explaining it
+    in advance was not enough: a traceback reads as a crash regardless of what
+    precedes it. A traceback that means anything ELSE must still get through.
+    """
+
+    def _run(self, lines):
+        from orchestrator.ann_pass import _SuppressNothingToRun
+        f = _SuppressNothingToRun()
+        out = []
+        for line in lines:
+            out.extend(f(line))
+        out.extend(f(None))
+        return out
+
+    def test_nothing_to_run_traceback_is_dropped(self):
+        out = self._run([
+            "annb - INFO - running only mariadb",
+            "Traceback (most recent call last):",
+            '  File "/home/app/run.py", line 7, in <module>',
+            "    main()",
+            '  File "/home/app/ann_benchmarks/main.py", line 344, in main',
+            '    raise Exception("Nothing to run")',
+            "Exception: Nothing to run",
+        ])
+        assert out == ["annb - INFO - running only mariadb"]
+        assert not any("Traceback" in line for line in out)
+
+    def test_a_real_traceback_still_reaches_the_operator(self):
+        out = self._run([
+            "Traceback (most recent call last):",
+            '  File "/home/app/run.py", line 7, in <module>',
+            "    main()",
+            "Exception: could not connect to the server",
+        ])
+        assert any("Traceback" in line for line in out)
+        assert any("could not connect" in line for line in out)
+
+    def test_ordinary_output_passes_through_untouched(self):
+        lines = ["[vb] loading 60,000 vectors", "Processed 1000/10000 queries..."]
+        assert self._run(lines) == lines
+
+    def test_an_unterminated_traceback_is_flushed_not_swallowed(self):
+        # A container killed mid-traceback must not lose the evidence.
+        out = self._run([
+            "Traceback (most recent call last):",
+            '  File "/home/app/run.py", line 7, in <module>',
+        ])
+        assert any("Traceback" in line for line in out)

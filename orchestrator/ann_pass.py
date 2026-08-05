@@ -192,14 +192,14 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # already done" by raising and printing a full traceback, which is
     # indistinguishable from a crash unless you already know to expect it.
     if before and not force:
-        print(
-            f"[ann] {before} existing result file(s) for {engine} / {dataset}. "
-            f"If every configuration is already present, ann-benchmarks will "
-            f"print a Traceback ending in Exception: {NOTHING_TO_RUN!r} — that "
-            f"is expected and is handled as success, not a crash."
-        )
+        print(f"[ann] {before} existing result file(s) for {engine} / "
+              f"{dataset}; already-computed configurations will be skipped")
     output: List[str] = []
-    rc = docker_ctl.run_foreground(spec, timeout=timeout_s, sink=output)
+    rc = docker_ctl.run_foreground(
+        spec, timeout=timeout_s, sink=output,
+        # Only filter when a benign traceback is actually possible.
+        line_filter=_SuppressNothingToRun() if (before and not force) else None,
+    )
     after = _count_results(results_dir, engine, dataset)
     text = "\n".join(output)
 
@@ -245,6 +245,44 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
         else:
             print(f"[ann] {after - before} new result file(s), {after} total")
     return rc
+
+
+class _SuppressNothingToRun:
+    """Hide ann-benchmarks' traceback when it only means "already done".
+
+    ann-benchmarks reports "every configuration has results" by raising, so it
+    prints a full Python traceback for a condition that is completely normal
+    here. Explaining that in advance was not enough — a traceback in the output
+    reads as a crash no matter what precedes it.
+
+    Lines are held from "Traceback (most recent call last):" onwards and
+    released only if the traceback turns out to be something else. A real
+    failure is therefore never swallowed, merely delayed by a few lines.
+    """
+
+    def __init__(self) -> None:
+        self._held: Optional[List[str]] = None
+
+    def __call__(self, line: Optional[str]) -> List[str]:
+        if line is None:                              # end of stream
+            held, self._held = self._held, None
+            return held or []
+
+        if self._held is None:
+            if line.startswith("Traceback (most recent call last)"):
+                self._held = [line]
+                return []
+            return [line]
+
+        self._held.append(line)
+        if line.startswith("Exception: ") or line.startswith("  File "):
+            if NOTHING_TO_RUN in line:
+                self._held = None                     # benign: drop it entirely
+                return []
+            if line.startswith("Exception: "):
+                held, self._held = self._held, None   # some other error: show it
+                return held
+        return []
 
 
 def _count_results(results_dir: str, engine: str, dataset: str) -> int:

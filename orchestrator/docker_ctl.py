@@ -166,7 +166,8 @@ def start(spec: ContainerSpec) -> str:
 
 def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
                    stream: bool = True,
-                   sink: Optional[List[str]] = None) -> int:
+                   sink: Optional[List[str]] = None,
+                   line_filter: Optional[Any] = None) -> int:
     """Run a container in the foreground, streaming its output.
 
     Used for the measurement containers, whose logs are the primary record of
@@ -175,6 +176,11 @@ def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
     `sink` collects the streamed lines. An exit code alone cannot distinguish
     "this tool failed" from "this tool considers having nothing to do an
     error", and at least one dependency here takes the latter view.
+
+    `line_filter(line) -> list[str]` decides what actually reaches the operator.
+    It returns the lines to print, so it can hold some back and release them
+    later — which is what suppressing a known-benign multi-line traceback
+    requires. Everything still reaches `sink` regardless.
     """
     spec.detach = False
     remove(spec.name)
@@ -194,9 +200,13 @@ def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
         assert process.stdout is not None
         for line in process.stdout:
             line = line.rstrip()
-            print(line)
             if sink is not None:
                 sink.append(line)
+            for shown in (line_filter(line) if line_filter else [line]):
+                print(shown)
+        if line_filter is not None:
+            for shown in line_filter(None):      # flush anything held back
+                print(shown)
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         print(f"[docker] timeout after {timeout}s; killing {spec.name}")
