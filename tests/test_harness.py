@@ -352,3 +352,72 @@ class TestSubsetGroundTruth:
             str(tmp_path), dataset, 5, 0.50, indexed_rows=300)
         assert a.max() < 100
         assert b.max() >= 100, "the 300-row truth was served from the 100-row cache"
+
+
+class TestProgress:
+    """Progress reporting must be time-driven and must not spam.
+
+    Every long phase in this harness independently shipped with no output, so a
+    working run was indistinguishable from a hung one. These guard the shared
+    helper that replaced four near-identical loops.
+    """
+
+    def _capture(self):
+        import io
+        return io.StringIO()
+
+    def test_reports_rate_and_eta_on_a_time_interval(self):
+        import time as _t
+        from harness.progress import Progress
+        buf = self._capture()
+        p = Progress(100, "widgets", prefix="eng", interval_s=0.05, stream=buf)
+        for _ in range(100):
+            p.step()
+            _t.sleep(0.002)
+        p.finish()
+        out = buf.getvalue()
+        assert "widgets" in out and "ETA" in out and "/s" in out
+        assert out.count("\n") >= 2
+
+    def test_silent_when_work_finishes_inside_one_interval(self):
+        # A count-based trigger would print here; a time-based one must not.
+        from harness.progress import Progress
+        buf = self._capture()
+        p = Progress(10, "fast", interval_s=60, stream=buf)
+        for _ in range(10):
+            p.step()
+        p.finish()
+        assert buf.getvalue() == ""
+
+    def test_heartbeat_reports_liveness_then_completion(self):
+        import time as _t
+        from harness.progress import Heartbeat
+        buf = self._capture()
+        with Heartbeat("long thing", prefix="eng", interval_s=0.05, stream=buf):
+            _t.sleep(0.22)
+        out = buf.getvalue()
+        assert "still running" in out
+        assert "done in" in out
+
+    def test_heartbeat_silent_for_short_operations(self):
+        from harness.progress import Heartbeat
+        buf = self._capture()
+        with Heartbeat("quick", interval_s=60, stream=buf):
+            pass
+        assert buf.getvalue() == ""
+
+    def test_interval_is_configurable_from_the_environment(self):
+        # Operators on very slow hardware need to widen it without a code change.
+        import importlib, os
+        import harness.progress as prog
+        old = os.environ.get("VB_PROGRESS_INTERVAL")
+        try:
+            os.environ["VB_PROGRESS_INTERVAL"] = "7"
+            importlib.reload(prog)
+            assert prog.DEFAULT_INTERVAL_S == 7.0
+        finally:
+            if old is None:
+                os.environ.pop("VB_PROGRESS_INTERVAL", None)
+            else:
+                os.environ["VB_PROGRESS_INTERVAL"] = old
+            importlib.reload(prog)

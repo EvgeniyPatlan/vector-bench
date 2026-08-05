@@ -30,6 +30,7 @@ from ..datasets import Dataset
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector, merge_collectors
 from ..metrics.records import PHASE_CONCURRENCY, Record
+from ..progress import Heartbeat
 from .context import RunContext
 
 DriverFactory = Callable[[], EngineDriver]
@@ -143,9 +144,16 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         for w in workers:
             w.start()
 
-        # Wait for every client to finish warming up, then time the window.
+        # Warm-up is unbounded from the operator's point of view: every client
+        # runs `warmup` queries before the barrier releases, and on a slow
+        # configuration that is minutes of silence before the measured window
+        # even starts.
+        print(f"[concurrency] {clients} client(s): warming up "
+              f"({warmup} queries each), then measuring for {duration_s:.0f}s",
+              flush=True)
         try:
-            ready.wait(timeout=300)
+            with Heartbeat(f"{clients}-client warm-up", prefix="concurrency"):
+                ready.wait(timeout=300)
         except threading.BrokenBarrierError:
             ready.abort()
             raise RuntimeError("a client failed during warm-up")

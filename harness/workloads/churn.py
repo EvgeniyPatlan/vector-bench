@@ -25,6 +25,7 @@ from ..datasets import (Dataset, assign_tags, cached_ground_truth,
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector, Timer
 from ..metrics.records import PHASE_CHURN, Record
+from ..progress import Heartbeat, Progress
 from .context import RunContext
 
 DEFAULT_FRACTIONS = (0.10, 0.25)
@@ -39,13 +40,16 @@ def _measure(driver: EngineDriver, queries: numpy.ndarray, k: int,
 
     collector = LatencyCollector(warmup=0)
     returned: List[List[int]] = []
+    progress = Progress(len(queries), "churn queries", prefix=driver.name)
     collector.start()
     for q in queries:
         started = time.perf_counter()
         ids = driver.query(q, k)
         collector.add(time.perf_counter() - started)
         returned.append(ids)
+        progress.step()
     collector.stop()
+    progress.finish()
 
     # Ground truth refers to original ids; rows that were re-inserted now carry
     # new ids, so the expected set is translated rather than the results.
@@ -115,13 +119,15 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         print(f"[churn] {driver.name}: deleting and re-inserting {count:,} rows "
               f"(cumulative {fraction:.0%})")
 
-        with Timer() as delete_timer:
-            driver.delete_ids(current_ids)
+        with Heartbeat(f"deleting {len(current_ids):,} rows", prefix=driver.name):
+            with Timer() as delete_timer:
+                driver.delete_ids(current_ids)
 
         new_ids = list(range(next_id, next_id + len(original_ids)))
         next_id += len(original_ids)
-        with Timer() as insert_timer:
-            driver.insert_rows(new_ids, vectors, tags)
+        with Heartbeat(f"re-inserting {len(new_ids):,} rows", prefix=driver.name):
+            with Timer() as insert_timer:
+                driver.insert_rows(new_ids, vectors, tags)
 
         for original, new in zip(original_ids, new_ids):
             id_map[original] = new

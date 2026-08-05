@@ -26,6 +26,7 @@ from ..datasets import Dataset, assign_tags
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import Timer
 from ..metrics.records import PHASE_BUILD, PHASE_INGEST, Record, Recorder
+from ..progress import Heartbeat
 from .context import RunContext
 
 
@@ -61,8 +62,11 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
 
     build_seconds = 0.0
     if not incremental:
-        with Timer() as build_timer:
-            driver.create_index(index)
+        # A bulk CREATE INDEX is a single call that can run for many minutes
+        # with no way to report fractional progress.
+        with Heartbeat("bulk index build", prefix=driver.name):
+            with Timer() as build_timer:
+                driver.create_index(index)
         build_seconds = build_timer.elapsed
         print(f"[{driver.name}] bulk index build: {build_seconds:.1f}s")
 

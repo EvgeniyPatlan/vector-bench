@@ -33,6 +33,7 @@ from ..datasets import (Dataset, cached_filtered_ground_truth, recall_at_k,
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector
 from ..metrics.records import PHASE_FILTERED, Record
+from ..progress import Heartbeat, Progress
 from .context import RunContext
 
 DEFAULT_SELECTIVITIES = (0.01, 0.10, 0.50)
@@ -64,28 +65,41 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
 
         print(
             f"[filtered] {driver.name}: computing exact ground truth for "
-            f"tag < {threshold} ({actual_selectivity:.0%} of rows)…"
+            f"tag < {threshold} ({actual_selectivity:.0%} of rows)…",
+            flush=True,
         )
         # indexed_rows matters: a profile may have loaded only part of the
         # training set, and ground truth over the full set would score every
         # engine against rows it was never given.
-        truth = cached_filtered_ground_truth(
-            ctx.cache_dir, dataset, ctx.k, actual_selectivity,
-            indexed_rows=indexed_rows,
-        )
+        # Brute force inside NumPy: no fractional progress to report, but it can
+        # run for minutes on a large corpus, so at least say it is alive.
+        with Heartbeat(f"ground truth for tag < {threshold}",
+                       prefix=f"filtered] {driver.name}"):
+            truth = cached_filtered_ground_truth(
+                ctx.cache_dir, dataset, ctx.k, actual_selectivity,
+                indexed_rows=indexed_rows,
+            )
         truth = truth[:len(queries)]
 
         index_used = driver.explain_uses_vector_index(
             queries[0], ctx.k, tag_threshold=threshold
         )
 
-        for i in range(min(warmup, len(queries))):
-            driver.query_filtered(queries[i], ctx.k, threshold)
+        with Heartbeat(f"warm-up ({min(warmup, len(queries))} queries)",
+                       prefix=driver.name):
+            for i in range(min(warmup, len(queries))):
+                driver.query_filtered(queries[i], ctx.k, threshold)
 
         collector = LatencyCollector(warmup=0)
         returned: List[List[int]] = []
         short_results = 0
 
+        # Filtered queries can be far slower than unfiltered ones — a selective
+        # predicate forces the engine to examine many more candidates to find k
+        # that qualify — so this loop needs progress of its own.
+        progress = Progress(len(queries),
+                            f"filtered {actual_selectivity:.0%} queries",
+                            prefix=driver.name)
         collector.start()
         for q in queries:
             started = time.perf_counter()
@@ -94,7 +108,9 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             returned.append(ids)
             if len(ids) < ctx.k:
                 short_results += 1
+            progress.step()
         collector.stop()
+        progress.finish()
 
         recall = recall_at_k(returned, truth, ctx.k)
         stats = collector.stats()
