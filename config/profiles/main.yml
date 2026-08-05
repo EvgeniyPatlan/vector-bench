@@ -5,7 +5,8 @@
 # resource passes, because MHNSW and VIDX build their graphs incrementally and
 # the cost rises steeply with M: on glove-100, M=8 loads at ~320 rows/s and
 # M=32 at ~70. This profile is what fits in a day and still answers the
-# questions the smoke run raised.
+# questions the smoke run raised. Expect roughly two days for the normalized
+# pass across all three engines; AliSQL dominates it at ~55 rows/s ingest.
 #
 # Differences from `full`:
 #   * two datasets, not four   — glove-100 (angular) and sift-128 (euclidean)
@@ -21,7 +22,7 @@
 #   * fewer filtered queries    — 500, not 2000. At sub-1 QPS the query count
 #                                is the whole cost.
 name: main
-description: Two datasets at 1M scale, both metric spaces (~1 day, normalized pass)
+description: Two datasets at 1M scale, both metric spaces (~2 days, normalized pass)
 
 datasets:
   - glove-100-angular
