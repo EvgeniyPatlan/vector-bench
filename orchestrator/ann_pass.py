@@ -187,6 +187,17 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
 
     results_dir = annb_results_dir(paths, resource_pass)
     before = _count_results(results_dir, engine, dataset)
+
+    # Warn before the fact, not after. ann-benchmarks signals "everything is
+    # already done" by raising and printing a full traceback, which is
+    # indistinguishable from a crash unless you already know to expect it.
+    if before and not force:
+        print(
+            f"[ann] {before} existing result file(s) for {engine} / {dataset}. "
+            f"If every configuration is already present, ann-benchmarks will "
+            f"print a Traceback ending in Exception: {NOTHING_TO_RUN!r} — that "
+            f"is expected and is handled as success, not a crash."
+        )
     output: List[str] = []
     rc = docker_ctl.run_foreground(spec, timeout=timeout_s, sink=output)
     after = _count_results(results_dir, engine, dataset)

@@ -357,6 +357,8 @@ _DATASET_ROWS = {
 # rates above were measured on 100-dim data, so wider datasets are scaled down.
 # Sublinear because SIMD amortises part of it.
 _REFERENCE_DIMS = 100
+# The reference rates are for a ~1M-row corpus; smaller ones ingest faster.
+_REFERENCE_ROWS = 1_000_000
 _DATASET_DIMS = {
     "fashion-mnist-784-euclidean": 784,
     "glove-100-angular": 100,
@@ -370,9 +372,45 @@ _DATASET_DIMS = {
 }
 
 
+# Rates measured directly, per (engine, dataset), on a Xeon Gold 6230. These
+# beat any model and are used whenever available.
+_MEASURED_ROWS_PER_S = {
+    ("mariadb", "fashion-mnist-784-euclidean"): 745,
+    ("alisql", "fashion-mnist-784-euclidean"): 150,
+    ("pgvector", "fashion-mnist-784-euclidean"): 5655,
+    ("mariadb", "glove-100-angular"): 147,
+}
+
+
 def _dim_penalty(dataset: str) -> float:
     dims = _DATASET_DIMS.get(dataset, _REFERENCE_DIMS)
     return max(1.0, (dims / _REFERENCE_DIMS) ** 0.6)
+
+
+def _size_penalty(dataset: str) -> float:
+    """How much slower ingest is on this corpus because the graph is bigger.
+
+    HNSW insert cost grows with the number of nodes already indexed, and on
+    these engines that dominates dimensionality outright. Measured on one
+    machine with MariaDB: 60k rows at 784 dims ran at 745 rows/s while 1.18M
+    rows at 100 dims ran at 147 — twenty times the rows and nearly eight times
+    *fewer* dimensions, and still five times slower.
+
+    An earlier version scaled only by dimensionality, using a rate measured at
+    1.18M rows, and was therefore ~17x too pessimistic on a 60k dataset. The
+    reference rates below correspond to a 1M-row corpus.
+    """
+    rows = _DATASET_ROWS.get(dataset, _REFERENCE_ROWS)
+    return max(0.05, (rows / _REFERENCE_ROWS) ** 0.55)
+
+
+def _effective_rate(engine: str, dataset: str) -> float:
+    """Rows/s for this engine on this corpus: measured if known, else modelled."""
+    measured = _MEASURED_ROWS_PER_S.get((engine, dataset))
+    if measured:
+        return float(measured)
+    base = _INGEST_ROWS_PER_S.get(engine, 300)
+    return base / (_dim_penalty(dataset) * _size_penalty(dataset))
 
 
 def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
@@ -391,13 +429,12 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
     rows_per_pass: List[str] = []
 
     for engine in engines:
-        rate = _INGEST_ROWS_PER_S.get(engine, 300)
         engine_h = 0.0
         for dataset in datasets:
             rows = _DATASET_ROWS.get(dataset)
             if not rows:
                 continue
-            effective = rate / _dim_penalty(dataset)
+            effective = _effective_rate(engine, dataset)
             if "ann" in phases:
                 engine_h += (rows / effective) * m_count / 3600
             if "ops" in phases:
