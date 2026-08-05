@@ -59,10 +59,16 @@ done
 [[ -n "$IMAGE" ]] || die "no bench image found; run: ./run-benchmark.sh build"
 
 avail=$(df -B1 --output=avail "$VB_DATASETS" | tail -1 | tr -d ' ')
-warn "Generating '$DATASET'. This is not a download — it builds the dataset and"
-warn "computes exact ground truth by brute force. For the 1000k/1536-dim corpus"
-warn "expect a multi-GB HuggingFace download, hours of computation, and roughly"
-warn "20 GB of working space. You have $(human_bytes "$avail") free."
+warn "Generating '$DATASET'. This is not a plain download — it fetches the source"
+warn "corpus and then computes exact ground truth by brute force."
+warn ""
+warn "For the dbpedia family: ann-benchmarks downloads the FULL 1M-row HuggingFace"
+warn "dataset and then selects the first N rows. Choosing a smaller variant does"
+warn "NOT reduce the download (~6-10 GB); it only shrinks the ground-truth"
+warn "computation and every later engine load."
+warn ""
+warn "Budget hours of computation for the 1000k variant and ~20 GB of working"
+warn "space. You have $(human_bytes "$avail") free."
 info "using $IMAGE"
 
 # --network is required here, unlike every other container this framework runs:

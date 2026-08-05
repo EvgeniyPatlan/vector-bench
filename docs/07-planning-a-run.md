@@ -202,6 +202,12 @@ locally from HuggingFace:
 Ground truth is computed by brute force inside the generator, which is the slow
 part.
 
+**The download is the same size whichever variant you pick.** ann-benchmarks
+fetches the full 1M-row HuggingFace dataset and then selects the first N rows,
+so `dbpedia-openai-100k-angular` downloads exactly as much as the 1000k one — it
+only shrinks the ground-truth computation and every subsequent engine load.
+There is no saving in starting small except in run time.
+
 ### What will not match, and why
 
 | Difference | Effect |
