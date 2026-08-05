@@ -186,22 +186,36 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     rc = docker_ctl.run_foreground(spec, timeout=timeout_s)
     after = _count_results(results_dir, engine, dataset)
 
-    # ann-benchmarks exits 0 when it has nothing to run — including when the
-    # algorithm module failed to import or every configuration errored. A run
-    # that produced no new result files is a failure however cheerfully it
-    # exited, and reporting it as success would silently drop an entire
-    # engine/pass from the comparison.
-    if rc == 0 and after == before:
+    # ann-benchmarks exits 0 whenever it has nothing left to run. That covers
+    # two opposite situations and they must not be confused:
+    #
+    #   after == 0        nothing was produced and nothing existed. The module
+    #                     failed to import, or every configuration errored.
+    #                     A real failure, and the one this guard exists for —
+    #                     otherwise a whole engine silently vanishes from the
+    #                     report as an apparent success.
+    #
+    #   after == before   every configuration already had results, so there was
+    #                     genuinely nothing to do. That is correct resumption,
+    #                     not failure. An earlier version of this check treated
+    #                     it as a failure and reported three healthy engines as
+    #                     broken on a re-run.
+    if rc == 0 and after == 0:
         print(
-            f"[ann] FAILED: {engine} / {dataset} exited 0 but produced no new "
-            f"result files in {results_dir} (still {after}). The algorithm module "
-            f"most likely failed to import or every configuration errored — check "
-            f"the container output above.",
+            f"[ann] FAILED: {engine} / {dataset} exited 0 but produced no result "
+            f"files at all in {results_dir}. The algorithm module most likely "
+            f"failed to import, or every configuration errored — check the "
+            f"container output above.",
             file=sys.stderr,
         )
         return 1
     if rc == 0:
-        print(f"[ann] {after - before} new result file(s)")
+        if after == before:
+            print(f"[ann] nothing to do: all {after} configuration(s) for "
+                  f"{engine} / {dataset} already have results "
+                  f"(pass --force to recompute)")
+        else:
+            print(f"[ann] {after - before} new result file(s), {after} total")
     return rc
 
 

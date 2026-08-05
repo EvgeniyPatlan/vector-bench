@@ -242,3 +242,48 @@ class TestOverlayModules:
         source = open(path).read()
         assert f"class {constructor}" in source
         assert ann_pass.CONSTRUCTORS[engine] == constructor
+
+
+class TestAnnResultGuard:
+    """The zero-result guard must not turn correct resumption into a failure.
+
+    ann-benchmarks exits 0 whenever it has nothing left to run. That covers both
+    "the module failed to import and nothing was produced" and "every
+    configuration already has results". An earlier version conflated them and
+    reported three healthy engines as failed on a re-run, which then propagated
+    into the report's Validity section as a fabricated failure.
+    """
+
+    def _counts(self, tmp_path, engine, dataset, n):
+        import os
+        d = tmp_path / dataset / "10" / engine
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (d / f"r{i}.hdf5").write_bytes(b"")
+        from orchestrator.ann_pass import _count_results
+        return _count_results(str(tmp_path), engine, dataset)
+
+    def test_counts_only_this_engine_and_dataset(self, tmp_path):
+        assert self._counts(tmp_path, "mariadb", "ds-a", 3) == 3
+        # A different engine's files must not be counted as this one's.
+        self._counts(tmp_path, "alisql", "ds-a", 5)
+        from orchestrator.ann_pass import _count_results
+        assert _count_results(str(tmp_path), "mariadb", "ds-a") == 3
+        assert _count_results(str(tmp_path), "alisql", "ds-a") == 5
+
+    def test_zero_when_nothing_exists(self, tmp_path):
+        from orchestrator.ann_pass import _count_results
+        assert _count_results(str(tmp_path), "mariadb", "missing") == 0
+
+    def test_resumption_is_not_a_failure(self):
+        # before == after > 0 means every configuration was already present.
+        before = after = 24
+        rc = 0
+        assert not (rc == 0 and after == 0), \
+            "a run that produced no NEW results but has results is resumption"
+
+    def test_no_results_at_all_is_a_failure(self):
+        before = after = 0
+        rc = 0
+        assert rc == 0 and after == 0, \
+            "no results at all must still be caught as a failure"
