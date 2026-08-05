@@ -42,8 +42,15 @@ chmod +x run-benchmark.sh scripts/*.sh tests/*.sh
 ./run-benchmark.sh build --march native    # ~2-4 h, AliSQL dominates
 ./run-benchmark.sh fetch                   # ~5 GB of datasets
 ./run-benchmark.sh run --profile smoke     # ~15 min gate — do not skip
-./run-benchmark.sh run --profile full --resource-pass both
+./run-benchmark.sh run --profile main      # ~2 days: the real measurement
 ```
+
+> **Check the runtime before you start.** MHNSW and VIDX build their graphs on
+> every INSERT — ~150 rows/s for MariaDB and ~55 for AliSQL on a 1M-row dataset
+> — and every M value reloads the whole dataset. `--profile full
+> --resource-pass both` is **~11 days of ingest** before a single query runs.
+> `main` is the profile sized to be run. Every run prints its own estimate
+> first; see [docs/07-planning-a-run.md](docs/07-planning-a-run.md).
 
 The report lands in `results/<run-id>/report/report.html` — self-contained,
 charts inlined, no network needed to view it.
@@ -168,13 +175,16 @@ There is also a one-minute synthetic cycle needing no dataset download:
 ### 5. Measure
 
 ```bash
-./run-benchmark.sh run --profile full --resource-pass both
+./run-benchmark.sh run --profile main                              # ~2 days
+./run-benchmark.sh run --profile main --datasets glove-100-angular # ~1 day
 ```
 
-Resumable — every `(pass, engine, dataset, phase)` unit is checkpointed:
+Resumable. Work is checkpointed per `(pass, engine, dataset, phase)` and, inside
+an ops phase, per `(M, build_mode)` — an ops phase can run a dozen hours across
+several M values, so an interruption does not discard the ones already done:
 
 ```bash
-./run-benchmark.sh run --profile full --resume --run-id full-<timestamp>
+./run-benchmark.sh run --profile main --resume --run-id main-<timestamp>
 ```
 
 ### 6. Read the report
@@ -213,7 +223,7 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--profile` | `quick` | `dev`, `smoke`, `quick`, `full`, or your own |
+| `--profile` | `quick` | `dev`, `smoke`, `quick`, **`main`**, `full`, or your own |
 | `--engines` | all three | e.g. `mariadb,alisql` |
 | `--datasets` | from profile | Override the profile's dataset list |
 | `--resource-pass` | `both` | `normalized`, `tuned`, or `both` |
@@ -225,12 +235,19 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 
 ### Profiles
 
-| Profile | Datasets | Runtime | Use for |
-| --- | --- | --- | --- |
-| `dev` | tiny synthetic | ~1 min/engine | validating framework changes |
+| Profile | Datasets | Ingest time | Use for |
+| --- | --- | ---: | --- |
+| `dev` | tiny synthetic | ~1 min | validating framework changes |
 | `smoke` | fashion-mnist | ~15 min | the gate before any long run |
-| `quick` | 2 datasets | 2–4 h per pass | coarse but real numbers |
-| `full` | 4 datasets | 24 h+ per pass | the report |
+| `quick` | fashion-mnist + glove-100 | ~14 h | coarse but real numbers |
+| **`main`** | glove-100 + sift-128 | **~46 h** | **the report** |
+| `full` | all four, both passes | ~272 h | the complete space, rarely run whole |
+
+Times are measured ingest only, three engines, before any query runs. `full`
+describes the measurement space rather than recommending it. Narrow with
+`--datasets` and `--resource-pass`; see
+[docs/07-planning-a-run.md](docs/07-planning-a-run.md) for what each cut costs
+you scientifically.
 
 Profiles are plain YAML — copy and edit:
 
@@ -273,6 +290,12 @@ used, and measure recall by hand. It is standalone and needs nothing else here.
 
 ## Things that will ruin your results
 
+**Check the runtime before starting.** `--profile full --resource-pass both` is
+~272 h of ingest — about 11 days — before a single query runs, because MHNSW and
+VIDX build incrementally at 55–150 rows/s and every M value reloads the whole
+dataset. Use `main`, read the estimate the run prints, and see
+[docs/07-planning-a-run.md](docs/07-planning-a-run.md).
+
 **Give the machine to the benchmark.** A competing build distorted MariaDB's
 numbers by 2× during development. The harness reports CPU, SIMD and cpuset
 problems in its Validity section, but a concurrent workload is invisible to it.
@@ -312,6 +335,7 @@ on a value its vendor plainly intended you to change.
 | [04-engine-notes.md](docs/04-engine-notes.md) | What each implementation does, and the traps in each |
 | [05-methodology.md](docs/05-methodology.md) | What is measured, how, fairness policy, known asymmetries |
 | [06-new-machine.md](docs/06-new-machine.md) | Moving the framework to another machine |
+| [07-planning-a-run.md](docs/07-planning-a-run.md) | **Read before a long run.** Measured ingest rates, what each profile costs, how to scope, resumption |
 
 ---
 

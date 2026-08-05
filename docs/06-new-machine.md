@@ -140,8 +140,13 @@ There is also a one-minute synthetic cycle that needs no dataset download:
 ## 6. Measure
 
 ```bash
-./run-benchmark.sh run --profile full --resource-pass both
+./run-benchmark.sh run --profile main
 ```
+
+`main` is the profile sized to actually be run — two datasets at 1M scale,
+roughly two days of ingest. `full --resource-pass both` describes the complete
+measurement space and is about **eleven days** on this hardware; see
+[07-planning-a-run.md](07-planning-a-run.md) before choosing it.
 
 Give the machine to it. Nothing else running — no CI, no other containers, no
 builds. Concurrent load distorts results by around 2× and the harness cannot
@@ -151,7 +156,7 @@ competing workload is invisible to it.
 Resumable after an interruption:
 
 ```bash
-./run-benchmark.sh run --profile full --resume --run-id full-<timestamp>
+./run-benchmark.sh run --profile main --resume --run-id main-<timestamp>
 ```
 
 ---

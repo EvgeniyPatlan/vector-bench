@@ -78,13 +78,18 @@ an interrupted run can resume without recomputing points it already has.
 # Download the rest of the datasets first (~5 GB).
 ./run-benchmark.sh fetch
 
-# Coarse but real: two datasets, ~2-4 h per resource pass.
-./run-benchmark.sh run --profile quick
+# The profile sized to actually be run: two datasets at 1M scale, ~2 days.
+./run-benchmark.sh run --profile main
 
-# The full sweep. Four datasets, dense grid, both resource passes.
-# Budget a day or more per pass and give the machine to it.
-./run-benchmark.sh run --profile full --resource-pass both
+# One dataset, ~1 day — a complete three-way comparison at 1M scale.
+./run-benchmark.sh run --profile main --datasets glove-100-angular
 ```
+
+> `--profile full --resource-pass both` is **~272 h of ingest — about 11 days**
+> — before a single query runs. It describes the complete measurement space; it
+> is not a recommendation. Every run prints its own estimate before starting.
+> [07-planning-a-run.md](07-planning-a-run.md) has the measured rates and what
+> each way of narrowing the scope costs you.
 
 ## 3. Commands
 
@@ -142,11 +147,14 @@ The value used is baked into each image and reported in the manifest.
 
 ## 5. Resumption and failures
 
-Every `(resource pass, engine, dataset, phase)` unit is checkpointed on success.
-After an interruption:
+Work is checkpointed on success at two levels: per
+`(resource pass, engine, dataset, phase)`, and within an ops phase per
+`(M, build_mode)`. The second matters — an ops phase can run a dozen hours
+across several M values, and checkpointing only the whole phase would discard
+every M that had already finished. After an interruption:
 
 ```bash
-./run-benchmark.sh run --profile full --resume --run-id full-20260803-120000
+./run-benchmark.sh run --profile main --resume --run-id main-20260804-185624
 ```
 
 Completed units are skipped, so an interruption costs one unit rather than the
