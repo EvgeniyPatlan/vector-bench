@@ -26,11 +26,19 @@
 #     0.8.6 against their master branch of 2026-02-08.
 #
 # COST. 1M vectors at 1536 dimensions is by far the heaviest thing this
-# framework can run. Loading is roughly 15x the per-row work of glove-100, so
-# on the order of 8-10 h per load for MariaDB and 25-30 h for AliSQL. The ann
-# phase alone, one M value, all three engines, is on the order of two days.
-# Start with `--engines mariadb,pgvector` and add AliSQL only if you have the
-# time to spend.
+# framework can run: roughly 5x the per-row work of glove-100. Estimated ingest
+# is ~1 h for pgvector, ~19 h for MariaDB and ~52 h for AliSQL — about three
+# days for all three.
+#
+# Run all three. AliSQL is 72% of that time, which makes it tempting to drop,
+# but MariaDB vs AliSQL is the comparison this project exists to make — the
+# article's framing is MariaDB against everything else, which is not the same
+# question. Dropping AliSQL to save time removes half the comparison rather
+# than trimming it.
+#
+# If three days is too long, cut the corpus instead: dbpedia-openai-500k-angular
+# and -100k-angular are the same embeddings at smaller scale and keep all three
+# engines in the picture.
 name: mariadb-blog
 description: MariaDB big-vector benchmark corpus — dbpedia-openai-1000k, 1536 dims (days)
 

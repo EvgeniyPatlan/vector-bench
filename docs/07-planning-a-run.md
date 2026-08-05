@@ -196,7 +196,7 @@ locally from HuggingFace:
 ```bash
 ./scripts/generate-dataset.sh dbpedia-openai-1000k-angular   # multi-GB download,
                                                              # hours, ~20 GB working space
-./run-benchmark.sh run --profile mariadb-blog --engines mariadb,pgvector
+./run-benchmark.sh run --profile mariadb-blog
 ```
 
 Ground truth is computed by brute force inside the generator, which is the slow
@@ -212,8 +212,21 @@ part.
 | Index parameters were not published | The M and ef_search grids in the profile are ann-benchmarks' conventional ranges, not a claim to match theirs. |
 
 At 1536 dimensions this is the heaviest run the framework supports — roughly 5×
-the per-row cost of glove-100. Start with `--engines mariadb,pgvector` (~20 h)
-and add AliSQL (~52 h more) only if the time is worth it to you.
+the per-row cost of glove-100. Estimated ingest:
+
+| Engine | Ingest |
+| --- | ---: |
+| pgvector | ~1 h |
+| MariaDB | ~19 h |
+| AliSQL | ~52 h |
+| **all three** | **~72 h** |
+
+AliSQL is 72% of that, which makes it the obvious thing to drop. Resist it:
+MariaDB versus AliSQL is the comparison this framework was built for, and the
+article's framing — MariaDB against everything else — is a different question.
+If three days is too long, **cut the corpus rather than the engine list**:
+`dbpedia-openai-500k-angular` and `-100k-angular` are the same embeddings at
+smaller scale and keep all three engines in the picture.
 
 ---
 
