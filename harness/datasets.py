@@ -42,6 +42,25 @@ KNOWN_DATASETS: Dict[str, Dict[str, object]] = {
         "metric": EUCLIDEAN, "approx_bytes": 3_600 * 1024**2,
         "role": "stress",
     },
+    # Generated locally by scripts/generate-dataset.sh, not downloadable. The
+    # corpus MariaDB used for its big-vector benchmark. Row counts are the
+    # generator's actual split (10,000 of the million are held out as queries),
+    # not the round number in the name.
+    "dbpedia-openai-100k-angular": {
+        "dim": 1536, "train": 90_000, "test": 10_000,
+        "metric": ANGULAR, "approx_bytes": 590 * 1024**2,
+        "role": "stress",
+    },
+    "dbpedia-openai-500k-angular": {
+        "dim": 1536, "train": 490_000, "test": 10_000,
+        "metric": ANGULAR, "approx_bytes": 3_070 * 1024**2,
+        "role": "stress",
+    },
+    "dbpedia-openai-1000k-angular": {
+        "dim": 1536, "train": 990_000, "test": 10_000,
+        "metric": ANGULAR, "approx_bytes": 6_170 * 1024**2,
+        "role": "stress",
+    },
 }
 
 

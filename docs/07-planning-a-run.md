@@ -217,6 +217,38 @@ There is no saving in starting small except in run time.
 | Versions | MariaDB 11.8.8 here vs their 11.8 **and** 12.3; pgvector 0.8.6 vs their master of 2026-02-08. |
 | Index parameters were not published | The M and ef_search grids in the profile are ann-benchmarks' conventional ranges, not a claim to match theirs. |
 
+### Memory, which is the part that surprises people
+
+In the recall/QPS pass the database server and the ann-benchmarks client run in
+the **same container**, so they share one cgroup limit. The client is not a
+thin driver: ann-benchmarks holds the entire corpus in RAM **twice** — `main.py`
+loads it once to read the dimension, and the forked worker loads it again for
+itself. Neither copy is shared.
+
+For dbpedia-openai-1000k that is 6.1 GB of corpus, so ~13 GB of client, on top
+of whatever the engine is given:
+
+| Corpus | File | Client needs | Container (with a 16 GB engine budget) |
+| --- | ---: | ---: | ---: |
+| fashion-mnist-784 | 0.2 GB | 1.5 GB | 17.5 GB |
+| glove-100 | 0.5 GB | 2.0 GB | 18.0 GB |
+| dbpedia-openai-1000k | 6.2 GB | 14.6 GB | **30.6 GB** |
+
+The harness sizes the container as *engine budget + client estimate* and prints
+both, so the engine's own budget stays identical across engines — which is what
+makes the normalized pass mean anything — while the client's copies of the
+corpus are added on top rather than taken out of the engine's share.
+
+Plan for **~32 GB of free RAM** for a 1536-dimensional run, or lower
+`memory.server_limit_gb` in the resource profile.
+
+> Earlier versions sized the container to the engine budget alone. On
+> dbpedia-openai-1000k the client was OOM-killed seconds after loading, and
+> because only the forked worker died, ann-benchmarks exited 0 having written
+> nothing — it does not check worker exit codes. If you see `Terminating 1
+> workers` immediately after `Got a train set of size ...` and no results,
+> that is what happened. Check `dmesg -T | tail`.
+
 At 1536 dimensions this is the heaviest run the framework supports — roughly 5×
 the per-row cost of glove-100. Estimated ingest:
 

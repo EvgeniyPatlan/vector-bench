@@ -434,3 +434,43 @@ class TestMissingDatasetGuidance:
         for d in ("glove-100-angular", "sift-128-euclidean",
                   "fashion-mnist-784-euclidean", "gist-960-euclidean"):
             assert not _is_generated(d)
+
+
+
+class TestAnnClientMemory:
+    """The ann pass shares one cgroup between the server and the client.
+
+    Sizing that cgroup to the engine budget alone OOM-killed the client on
+    dbpedia-openai-1000k, and because only the forked worker died the run
+    exited 0 with no results and no error. These pin the sizing that prevents it.
+    """
+
+    @staticmethod
+    def _corpus(tmp_path, name, size_bytes):
+        path = tmp_path / f"{name}.hdf5"
+        with open(path, "wb") as fh:
+            fh.truncate(size_bytes)
+        return path
+
+    def test_scales_with_corpus_size(self, tmp_path):
+        self._corpus(tmp_path, "big", 6 * 1024 ** 3)
+        self._corpus(tmp_path, "small", 200 * 1024 ** 2)
+        big = ann_pass.client_memory_bytes(str(tmp_path), "big")
+        small = ann_pass.client_memory_bytes(str(tmp_path), "small")
+        assert big > small
+        # Two full copies is the floor: main.py loads the corpus to read the
+        # dimension and the forked worker loads it again for itself.
+        assert big > 2 * 6 * 1024 ** 3
+
+    def test_covers_the_corpus_that_failed(self, tmp_path):
+        """dbpedia-openai-1000k is 6.17 GB; the client needs over 12.3 GB."""
+        self._corpus(tmp_path, "dbpedia-openai-1000k-angular", int(6.17 * 1024 ** 3))
+        got = ann_pass.client_memory_bytes(str(tmp_path), "dbpedia-openai-1000k-angular")
+        assert got >= int(2 * 6.17 * 1024 ** 3)
+
+    def test_missing_corpus_does_not_raise(self, tmp_path):
+        """Sizing happens before the fetch check, so absence must be survivable."""
+        assert ann_pass.client_memory_bytes(str(tmp_path), "not-downloaded-yet") > 0
+
+    def test_host_ram_probe_never_raises(self):
+        assert ann_pass._host_ram_bytes() >= 0

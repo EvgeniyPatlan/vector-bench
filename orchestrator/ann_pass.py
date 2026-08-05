@@ -127,6 +127,45 @@ def write_config(work_dir: str, engine: str, body: Dict[str, Any]) -> str:
     return path
 
 
+# In the ann pass the database server and the ann-benchmarks client share one
+# container, so they also share one cgroup memory limit. The client's share is
+# not small and is not constant: ann-benchmarks loads the corpus into RAM twice
+# over — once in the parent process (main.py calls get_dataset() to learn the
+# dimension) and again inside the forked worker (runner.run() calls it again on
+# its own). Neither copy is shared; the second is a fresh h5py read.
+#
+# 2.0x for those two copies, 0.2x for the transient float32 conversion numpy
+# makes while reading, and a flat 1 GB for the interpreter, the connector and
+# the query set.
+_CLIENT_COPIES = 2.2
+_CLIENT_BASE_BYTES = 1 * 1024**3
+
+
+def _host_ram_bytes() -> int:
+    """Total host RAM, or 0 if it cannot be determined."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def client_memory_bytes(datasets_dir: str, dataset: str) -> int:
+    """Estimate what the ann-benchmarks client needs resident for this dataset.
+
+    Sized from the HDF5 file on disk rather than a lookup table so that
+    generated corpora (the dbpedia family) are covered without anyone having to
+    remember to add them. The train matrix is >98% of these files, which makes
+    file size a good proxy and, unlike h5py, one the host orchestrator can read
+    without any dependency at all.
+    """
+    path = os.path.join(datasets_dir, f"{dataset}.hdf5")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return _CLIENT_BASE_BYTES
+    return int(size * _CLIENT_COPIES) + _CLIENT_BASE_BYTES
+
+
 def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
                engine_cfg: Dict[str, Any], resolved: ResolvedResources,
                resource_pass: str, paths: Dict[str, str], run_id: str,
@@ -141,6 +180,18 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
 
     flags = server_args(engine_cfg, resource_pass, resolved)
     container = f"{run_id}-annb-{engine}-{dataset}".replace("_", "-")[:60]
+
+    # The engine's own budget stays exactly as the resource profile specifies —
+    # that is what makes the normalized pass comparable across engines. The
+    # client's copies of the corpus are not an engine resource, so they are
+    # added on top of the container limit rather than taken out of it.
+    #
+    # Sizing the container to the engine budget alone silently capped the client
+    # too: on dbpedia-openai-1000k (6.1 GB corpus) the worker was OOM-killed the
+    # moment it finished loading, and because only the forked child died, the
+    # parent exited 0 with no results and no error.
+    client_bytes = client_memory_bytes(paths["datasets"], dataset)
+    container_memory_bytes = resolved.server_memory_bytes + client_bytes
 
     command = [
         "run.py", "--local",
@@ -161,7 +212,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
         # No network needed: the dataset is mounted and the server is in-process.
         network="none",
         cpuset=resolved.server_cpuset,
-        memory_bytes=resolved.server_memory_bytes,
+        memory_bytes=container_memory_bytes,
         shm_size=resolved.shm_size,
         entrypoint="python3",
         workdir="/home/app",
@@ -182,8 +233,23 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     )
 
     print(f"[ann] {engine} / {dataset}: cpuset={resolved.server_cpuset} "
-          f"mem={resolved.server_memory_bytes / 1024**3:.1f}GB")
+          f"mem={container_memory_bytes / 1024**3:.1f}GB "
+          f"(engine {resolved.server_memory_bytes / 1024**3:.1f}GB "
+          f"+ client {client_bytes / 1024**3:.1f}GB for the in-RAM corpus)")
     print(f"[ann] server flags: {' '.join(flags)}")
+
+    # Better to say this now than to have the OOM killer say it later, when it
+    # will arrive as a silent zero-result exit rather than an error.
+    host_ram = _host_ram_bytes()
+    if host_ram and container_memory_bytes > host_ram * 0.9:
+        print(
+            f"[ann] WARNING: this container needs "
+            f"{container_memory_bytes / 1024**3:.1f} GB but the host has only "
+            f"{host_ram / 1024**3:.1f} GB. Expect the kernel to kill the client "
+            f"mid-load. Lower memory.server_limit_gb in the resource profile, or "
+            f"use a smaller corpus.",
+            file=sys.stderr,
+        )
 
     results_dir = annb_results_dir(paths, resource_pass)
     before = _count_results(results_dir, engine, dataset)
@@ -229,13 +295,37 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # logs those per-definition and still exits 0. Without this check a whole
     # engine disappears from the report as an apparent success.
     if rc == 0 and after == 0:
+        # ann-benchmarks runs each definition in a forked worker and never
+        # checks its exit code: main() joins, logs "Terminating N workers" from
+        # a finally block, and returns 0. So a worker killed by the OOM killer
+        # is indistinguishable from a clean run except that nothing was written.
+        # That is by far the most common cause here, because the client holds
+        # the whole corpus in RAM twice, so name it first and show the numbers.
+        killed_silently = "Terminating" in text and "Traceback" not in text
         print(
             f"[ann] FAILED: {engine} / {dataset} exited 0 but produced no result "
-            f"files at all in {results_dir}. The algorithm module most likely "
-            f"failed to import, or every configuration errored — check the "
-            f"container output above.",
+            f"files at all in {results_dir}.",
             file=sys.stderr,
         )
+        if killed_silently:
+            print(
+                f"[ann] The worker died without raising, which almost always means "
+                f"the kernel OOM-killed it: ann-benchmarks does not check worker "
+                f"exit codes, so a kill shows up as a silent zero-result success.\n"
+                f"[ann]   container limit : {container_memory_bytes / 1024**3:.1f} GB\n"
+                f"[ann]   engine budget   : {resolved.server_memory_bytes / 1024**3:.1f} GB "
+                f"(buffer pool is allocated up front)\n"
+                f"[ann]   client estimate : {client_bytes / 1024**3:.1f} GB "
+                f"(corpus is held in RAM twice)\n"
+                f"[ann] Confirm with: dmesg -T | tail  — look for Killed process ... python3",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[ann] The algorithm module most likely failed to import, or every "
+                f"configuration errored — check the container output above.",
+                file=sys.stderr,
+            )
         return 1
     if rc == 0:
         if after == before:
