@@ -378,3 +378,59 @@ class TestBenignTracebackSuppression:
             '  File "/home/app/run.py", line 7, in <module>',
         ])
         assert any("Traceback" in line for line in out)
+
+
+class TestDefaultResourcePass:
+    """A profile may pick its own default pass; an explicit flag still wins.
+
+    --resource-pass defaulted to "both", which silently doubled every profile's
+    cost. For mariadb-blog that is ~144 h of ingest over a million 1536-dim
+    vectors — not something anyone should end up running because a flag
+    defaulted rather than because they chose it.
+    """
+
+    def _resolve(self, argv):
+        from orchestrator.cli import build_parser
+        from orchestrator.config import load_profile
+        args = build_parser().parse_args(argv)
+        profile = load_profile(args.profile)
+        requested = (args.resource_pass or profile.get("default_resource_pass")
+                     or "both")
+        return ["normalized", "tuned"] if requested == "both" else [requested]
+
+    def test_profile_default_is_used_when_the_flag_is_absent(self):
+        assert self._resolve(["run", "--profile", "mariadb-blog"]) == ["normalized"]
+
+    def test_explicit_flag_overrides_the_profile(self):
+        assert self._resolve(
+            ["run", "--profile", "mariadb-blog", "--resource-pass", "both"]
+        ) == ["normalized", "tuned"]
+
+    def test_profiles_without_a_declared_default_still_get_both(self):
+        # Long-standing behaviour for every other profile must not change.
+        assert self._resolve(["run", "--profile", "main"]) == ["normalized", "tuned"]
+
+    def test_the_heaviest_profile_does_not_default_to_both(self):
+        from orchestrator.config import load_profile
+        p = load_profile("mariadb-blog")
+        assert p.get("default_resource_pass") == "normalized"
+
+
+class TestMissingDatasetGuidance:
+    """Tell people the command that will actually work.
+
+    Most datasets are downloaded; the dbpedia family is constructed locally and
+    is not published as a prebuilt HDF5. Advising `fetch` for those sends the
+    operator to a 404 before a multi-day run.
+    """
+
+    def test_dbpedia_is_recognised_as_generated(self):
+        from orchestrator.cli import _is_generated
+        assert _is_generated("dbpedia-openai-1000k-angular")
+        assert _is_generated("dbpedia-openai-100k-angular")
+
+    def test_published_datasets_are_not_flagged_as_generated(self):
+        from orchestrator.cli import _is_generated
+        for d in ("glove-100-angular", "sift-128-euclidean",
+                  "fashion-mnist-784-euclidean", "gist-960-euclidean"):
+            assert not _is_generated(d)

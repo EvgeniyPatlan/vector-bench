@@ -150,8 +150,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     engines = [e.strip() for e in (args.engines or ",".join(ALL_ENGINES)).split(",") if e.strip()]
     datasets = ([d.strip() for d in args.datasets.split(",") if d.strip()]
                 if args.datasets else list(profile.get("datasets", [])))
-    passes = (["normalized", "tuned"] if args.resource_pass == "both"
-              else [args.resource_pass])
+    # A profile may declare its own default pass. `mariadb-blog` does, because
+    # running both passes over a 1536-dim million-vector corpus is ~144 h and
+    # nobody chooses that by omission. An explicit --resource-pass always wins.
+    requested = args.resource_pass or profile.get("default_resource_pass") or "both"
+    passes = (["normalized", "tuned"] if requested == "both" else [requested])
+    if args.resource_pass is None and requested != "both":
+        print(f"note: profile '{profile.get('name')}' defaults to the "
+              f"'{requested}' pass only; override with --resource-pass both")
     phases = (["ann", "ops"] if args.phases == "both" else [args.phases])
 
     unknown = set(engines) - set(ALL_ENGINES)
@@ -183,9 +189,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     missing = [d for d in datasets
                if not os.path.exists(os.path.join(paths["datasets"], f"{d}.hdf5"))]
     if missing:
-        print(f"\nmissing datasets: {', '.join(missing)}\n"
-              f"fetch them first:  ./run-benchmark.sh fetch --datasets {','.join(missing)}",
-              file=sys.stderr)
+        # Not every dataset is fetchable. A few — the dbpedia family among them
+        # — are built locally from a source corpus and are not published as
+        # prebuilt HDF5, so telling the operator to `fetch` them sends them to a
+        # 404.
+        fetchable = [d for d in missing if not _is_generated(d)]
+        generated = [d for d in missing if _is_generated(d)]
+        print(f"\nmissing datasets: {', '.join(missing)}", file=sys.stderr)
+        if fetchable:
+            print(f"  download:  ./run-benchmark.sh fetch --datasets "
+                  f"{','.join(fetchable)}", file=sys.stderr)
+        for d in generated:
+            print(f"  generate:  ./scripts/generate-dataset.sh {d}\n"
+                  f"             (not published as a prebuilt file — it is built "
+                  f"from a source corpus,\n"
+                  f"              which means a multi-GB download and brute-force "
+                  f"ground truth)", file=sys.stderr)
         return 3
 
     _print_load_estimate(profile, engines, datasets, passes, phases)
@@ -413,6 +432,15 @@ def _effective_rate(engine: str, dataset: str) -> float:
     return base / (_dim_penalty(dataset) * _size_penalty(dataset))
 
 
+# Datasets ann-benchmarks constructs locally rather than publishing as HDF5.
+# `fetch` cannot retrieve these; scripts/generate-dataset.sh builds them.
+_GENERATED_DATASET_PREFIXES = ("dbpedia-openai-",)
+
+
+def _is_generated(dataset: str) -> bool:
+    return dataset.startswith(_GENERATED_DATASET_PREFIXES)
+
+
 def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
                          datasets: List[str], passes: List[str],
                          phases: List[str]) -> None:
@@ -573,8 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="comma-separated subset of mariadb,alisql,pgvector")
     run.add_argument("--datasets", default=None,
                      help="override the profile's dataset list")
-    run.add_argument("--resource-pass", default="both",
-                     choices=("normalized", "tuned", "both"))
+    # No argparse default: an unset value lets the profile choose, and falls
+    # back to "both" only when the profile is silent.
+    run.add_argument("--resource-pass", default=None,
+                     choices=("normalized", "tuned", "both"),
+                     help="normalized, tuned, or both "
+                          "(default: the profile's choice, else both)")
     run.add_argument("--phases", default="both", choices=("ann", "ops", "both"))
     run.add_argument("--run-id", default=None)
     run.add_argument("--resume", action="store_true",
