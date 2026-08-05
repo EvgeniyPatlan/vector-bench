@@ -24,6 +24,10 @@ from .config import ResolvedResources, server_args
 # Constructor class names, as ann-benchmarks expects them in config.yml.
 CONSTRUCTORS = {"mariadb": "MariaDB", "alisql": "AliSQL", "pgvector": "PGVector"}
 
+# ann-benchmarks raises this when every configuration is already done.
+# See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
+NOTHING_TO_RUN = "Nothing to run"
+
 
 def annb_results_dir(paths: Dict[str, str], resource_pass: str) -> str:
     """Result tree for one resource pass.
@@ -183,23 +187,36 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
 
     results_dir = annb_results_dir(paths, resource_pass)
     before = _count_results(results_dir, engine, dataset)
-    rc = docker_ctl.run_foreground(spec, timeout=timeout_s)
+    output: List[str] = []
+    rc = docker_ctl.run_foreground(spec, timeout=timeout_s, sink=output)
     after = _count_results(results_dir, engine, dataset)
+    text = "\n".join(output)
 
-    # ann-benchmarks exits 0 whenever it has nothing left to run. That covers
-    # two opposite situations and they must not be confused:
-    #
-    #   after == 0        nothing was produced and nothing existed. The module
-    #                     failed to import, or every configuration errored.
-    #                     A real failure, and the one this guard exists for —
-    #                     otherwise a whole engine silently vanishes from the
-    #                     report as an apparent success.
-    #
-    #   after == before   every configuration already had results, so there was
-    #                     genuinely nothing to do. That is correct resumption,
-    #                     not failure. An earlier version of this check treated
-    #                     it as a failure and reported three healthy engines as
-    #                     broken on a re-run.
+    # ann-benchmarks treats "every configuration already has results" as an
+    # error: main() raises Exception("Nothing to run") and the process exits
+    # non-zero. For us that is successful resumption, not failure — the whole
+    # point of leaving the results tree in place between runs. Recognise it
+    # rather than reporting three healthy engines as broken.
+    if rc != 0 and NOTHING_TO_RUN in text:
+        if after > 0:
+            print(
+                f"[ann] nothing to do: all {after} configuration(s) for "
+                f"{engine} / {dataset} already have results in {results_dir}. "
+                f"Pass --force to recompute them."
+            )
+            return 0
+        print(
+            f"[ann] FAILED: ann-benchmarks had nothing to run and there are no "
+            f"existing results in {results_dir}. The rendered config matched no "
+            f"definitions, or the algorithm module failed to import.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # A clean exit that produced nothing at all, with nothing already present,
+    # means every configuration errored inside the run loop — ann-benchmarks
+    # logs those per-definition and still exits 0. Without this check a whole
+    # engine disappears from the report as an apparent success.
     if rc == 0 and after == 0:
         print(
             f"[ann] FAILED: {engine} / {dataset} exited 0 but produced no result "

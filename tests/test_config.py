@@ -287,3 +287,40 @@ class TestAnnResultGuard:
         rc = 0
         assert rc == 0 and after == 0, \
             "no results at all must still be caught as a failure"
+
+
+class TestNothingToRunHandling:
+    """ann-benchmarks exits NON-ZERO when it has nothing left to run.
+
+    `main()` raises Exception("Nothing to run") once every configuration
+    already has results. That is successful resumption from this framework's
+    point of view — the results tree is deliberately kept between runs — but
+    taken at face value it reports healthy engines as failed, which then
+    propagates into the report's Validity section as a fabricated failure.
+    """
+
+    def test_marker_matches_upstream_text(self):
+        # If upstream ever rewords this, the detection silently stops working
+        # and failures reappear. Pin the string we depend on.
+        from orchestrator.ann_pass import NOTHING_TO_RUN
+        assert NOTHING_TO_RUN == "Nothing to run"
+
+    def test_marker_is_found_in_a_realistic_traceback(self):
+        from orchestrator.ann_pass import NOTHING_TO_RUN
+        captured = "\n".join([
+            "2026-08-05 16:54:21,185 - annb - INFO - running only mariadb",
+            "Traceback (most recent call last):",
+            '  File "/home/app/run.py", line 7, in <module>',
+            "    main()",
+            '  File "/home/app/ann_benchmarks/main.py", line 344, in main',
+            '    raise Exception("Nothing to run")',
+            "Exception: Nothing to run",
+        ])
+        assert NOTHING_TO_RUN in captured
+
+    def test_run_foreground_accepts_a_sink(self):
+        # The handling depends on being able to read what was streamed; an exit
+        # code alone cannot tell these cases apart.
+        import inspect
+        from orchestrator.docker_ctl import run_foreground
+        assert "sink" in inspect.signature(run_foreground).parameters

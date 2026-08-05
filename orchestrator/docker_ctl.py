@@ -165,21 +165,27 @@ def start(spec: ContainerSpec) -> str:
 
 
 def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
-                   stream: bool = True) -> int:
+                   stream: bool = True,
+                   sink: Optional[List[str]] = None) -> int:
     """Run a container in the foreground, streaming its output.
 
     Used for the measurement containers, whose logs are the primary record of
     what happened and must reach the operator live rather than after the fact.
+
+    `sink` collects the streamed lines. An exit code alone cannot distinguish
+    "this tool failed" from "this tool considers having nothing to do an
+    error", and at least one dependency here takes the latter view.
     """
     spec.detach = False
     remove(spec.name)
     args = _spec_args(spec)
     if not stream:
         proc = _run(args, check=False, timeout=timeout)
-        if proc.stdout:
-            print(proc.stdout)
-        if proc.stderr:
-            print(proc.stderr)
+        for chunk in (proc.stdout, proc.stderr):
+            if chunk:
+                print(chunk)
+                if sink is not None:
+                    sink.extend(chunk.splitlines())
         return proc.returncode
 
     process = subprocess.Popen(args, stdout=subprocess.PIPE,
@@ -187,7 +193,10 @@ def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
     try:
         assert process.stdout is not None
         for line in process.stdout:
-            print(line.rstrip())
+            line = line.rstrip()
+            print(line)
+            if sink is not None:
+                sink.append(line)
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         print(f"[docker] timeout after {timeout}s; killing {spec.name}")
