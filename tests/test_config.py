@@ -474,3 +474,12 @@ class TestAnnClientMemory:
 
     def test_host_ram_probe_never_raises(self):
         assert ann_pass._host_ram_bytes() >= 0
+
+    def test_ops_client_floor_also_scales(self, tmp_path):
+        """The ops client is a second container with the same exposure."""
+        from orchestrator.ops_pass import ops_client_memory_bytes
+        self._corpus(tmp_path, "dbpedia-openai-1000k-angular", int(6.17 * 1024 ** 3))
+        got = ops_client_memory_bytes(str(tmp_path), "dbpedia-openai-1000k-angular")
+        # Must clear the fixed 8 GB client_limit_gb that would otherwise apply.
+        assert got > 8 * 1024 ** 3
+        assert ops_client_memory_bytes(str(tmp_path), "absent") > 0

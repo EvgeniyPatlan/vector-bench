@@ -64,6 +64,24 @@ SERVER_DATA_MOUNT = {
 }
 
 
+# The ops client loads the corpus once (unlike the ann client, which loads it
+# twice) and then needs working space for the brute-force ground truth it
+# computes over the qualifying subset. 1.5x the file plus a flat 2 GB covers
+# both, and the caller takes the max against the configured client limit so
+# small corpora keep the profile's value.
+_OPS_CLIENT_COPIES = 1.5
+_OPS_CLIENT_BASE_BYTES = 2 * 1024**3
+
+
+def ops_client_memory_bytes(datasets_dir: str, dataset: str) -> int:
+    """Floor for the ops client's container memory, sized to the corpus."""
+    try:
+        size = os.path.getsize(os.path.join(datasets_dir, f"{dataset}.hdf5"))
+    except OSError:
+        return _OPS_CLIENT_BASE_BYTES
+    return int(size * _OPS_CLIENT_COPIES) + _OPS_CLIENT_BASE_BYTES
+
+
 class OpsRun:
     """Manages the server/client container pair for one ops measurement."""
 
@@ -187,7 +205,13 @@ class OpsRun:
             image=image,
             network=self.network,
             cpuset=self.resolved.client_cpuset,
-            memory_bytes=self.resolved.client_memory_bytes,
+            # The ops client loads the corpus once and then computes ground
+            # truth over it by brute force, which needs working space on top.
+            # A fixed client_limit_gb is fine at 100 dimensions and far too
+            # small at 1536, where the corpus alone is 6 GB — see the same
+            # failure mode in ann_pass.client_memory_bytes().
+            memory_bytes=max(self.resolved.client_memory_bytes,
+                             ops_client_memory_bytes(self.paths['datasets'], self.dataset)),
             entrypoint="python3",
             workdir="/opt",
             env={
