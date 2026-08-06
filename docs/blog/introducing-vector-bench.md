@@ -35,12 +35,15 @@ correct. Putting a number on "usually" is what most of this benchmark does.
 
 ## How the indexes work
 
-**HNSW** stands for Hierarchical Navigable Small World. It's a proximity graph
-built in layers. Every vector is a node, linked to some number of its nearest
-neighbours. The top layer is sparse and its edges cover long distances. Each
-layer below is denser and more local. A search starts at the top, walks greedily
-toward the query vector, drops down a layer, and repeats until it reaches the
-bottom.
+**HNSW** stands for Hierarchical Navigable Small World. If you know how a skip
+list works, the shape is familiar.
+
+It's a graph of vectors, built in layers. Every vector is a node, linked to some
+number of its nearest neighbours. The top layer has few nodes and its links jump
+long distances across the data. Each layer below has more nodes and shorter
+links. A search starts at the top and keeps hopping to whichever neighbour is
+closest to the query vector. When it can't get closer it drops a layer and
+carries on, until it runs out of layers.
 
 Two parameters matter:
 
@@ -54,12 +57,15 @@ Two parameters matter:
 There's also **ef_construction**, which is the same idea applied while the index
 is being built. Not every engine exposes it.
 
-**IVF** stands for Inverted File. It partitions instead of linking. At build
-time it clusters the vectors into `nlist` cells, each with a centroid. At query
-time it compares the query against the centroids and scans only the nearest
-`nprobe` cells. It builds much faster than HNSW and uses less memory, but
-generally gives worse recall at the same latency. It misses when the true
-neighbour sits just across a cell boundary.
+**IVF** stands for Inverted File. It partitions the data instead of linking it,
+not unlike list partitioning on a table.
+
+At build time it groups the vectors into `nlist` clusters, and each cluster gets
+one representative vector at its centre. At query time it compares the query
+against those representatives, picks the closest `nprobe` clusters, and searches
+only inside those. It builds much faster than HNSW and uses less memory, but
+usually gives worse recall at the same speed. It misses when the true neighbour
+happens to sit just outside the clusters it looked in.
 
 We only test engines running HNSW, which is what most databases have shipped.
 Scoring an IVF engine on the same chart would mostly measure the difference
@@ -136,15 +142,16 @@ has nothing to do with its vector search.
 
 **Recall against throughput.** Sweep `ef_search` against a fixed index and
 record recall and QPS at each point. Repeat at a few values of M. k=10
-throughout. The query vectors come from the dataset's held-out query set, never
-from the rows we loaded, because searching for vectors that are already in the
-index is a much easier problem.
+throughout. The query vectors are the ones the dataset ships for this purpose.
+They are not rows we loaded, because searching for a vector that's already in
+the index is a much easier problem and would flatter everyone.
 
-The two parameters behave differently, and that shapes how long a run takes.
-`ef_search` is a session variable, so sweeping it reuses the same index and
-extra points are nearly free. M is structural. Every value of M means dropping
-the table and reloading the whole corpus, which takes hours. So the profiles
-carry many `ef_search` points and only a few values of M.
+The two settings behave very differently, and that decides how long a run
+takes. `ef_search` is just a session variable, so sweeping it reuses the index
+that's already built and each extra point is nearly free. M is baked into the
+index. Every value of M means dropping the table and loading the whole dataset
+again, which takes hours. So we test many values of `ef_search` and only a few
+values of M.
 
 **Build cost.** Wall time, rows per second, index size on disk, and peak memory.
 
@@ -160,16 +167,17 @@ two paths. So putting a bulk-build number next to another engine's incremental
 number isn't a comparison of engines. We measure both paths wherever an engine
 has both, and the report labels which is which.
 
-Peak memory is read from the server container's cgroup, and the server is the
-only thing in that container. The test client runs in a second container over a
+Peak memory comes from the server container's own accounting, and the server is
+the only thing in that container. The test client runs in a second container over a
 private network. Otherwise the several GB of Python arrays holding the dataset
 would be charged to the database.
 
 **Concurrency.** QPS and latency percentiles from 1 to 32 clients. Engines cache
 their graphs in quite different ways, and that only becomes visible when clients
-compete for the same cache. We report scaling efficiency next to raw QPS. An
-engine that stops gaining throughput at 2 clients while its p99 latency degrades
-15x is behaving very differently from one that scales.
+compete for the same cache. Next to the raw QPS we report how much of the
+ideal speedup each engine actually got. An engine that stops gaining throughput
+at 2 clients while its p99 latency gets 15 times worse is behaving very
+differently from one that keeps scaling.
 
 **Filtered search**, at selectivities down to 1% of rows passing.
 
@@ -216,12 +224,15 @@ clearly placeholders get sized from a shared budget, since judging an engine on
 a 16 MiB graph cache doesn't measure anything. All of these appear in a "known
 asymmetries" section above the results.
 
-Several of these implementations ship hand-written AVX-512 distance kernels. A
-512-bit FMA covers 16 floats in one instruction, so the same index on a CPU
-without AVX-512 is a materially different benchmark, and the penalty isn't the
-same across engines. The CPU model and its ISA flags go into every run's
-manifest, along with engine versions and commits, image IDs, and the resource
-limits as they actually resolved rather than as requested. The report generator
+Several of these implementations ship hand-written AVX-512 code for the distance
+calculations. One AVX-512 instruction does the arithmetic for 16 floats at once,
+so distance maths runs several times faster on a CPU that supports it. The same
+index on a machine without AVX-512 is effectively a different benchmark, and the
+slowdown isn't the same for every engine.
+
+So the CPU model and its feature flags go into every run's manifest, along with
+engine versions and commits, image IDs, and the resource limits as they actually
+resolved rather than as requested. The report generator
 won't run without a manifest.
 
 ## Reading the results
@@ -238,9 +249,10 @@ indistinguishable from a conservatively tuned index unless you read the plan.
 It happens for ordinary reasons. One engine's optimizer costs the vector index
 against a table scan and picks the scan once the LIMIT is above roughly a
 quarter of the table, and we haven't found a setting that moves it. Another
-falls back with no error and no warning when the distance operator in the query
-doesn't match the operator class the index was built with. A one-character
-difference gets you a sequential scan and a sort.
+falls back with no error and no warning if the query asks for a different
+distance than the index was built for. Build the index for cosine, write the
+query with the L2 operator, and you get a sequential scan and a sort with
+nothing to tell you about it.
 
 So every driver runs EXPLAIN for each configuration and checks that the index
 name appears in the plan.
@@ -253,8 +265,9 @@ Anything that scanned goes into validity. This is the easiest way to produce
 impressive vector benchmark numbers by accident.
 
 For the recall and throughput results themselves, the useful presentation is a
-curve rather than a number. Sweep `ef_search`, plot recall against QPS, and take
-the upper-left edge of the points. One engine beats another only where its curve
+curve rather than a number. Sweep `ef_search`, plot recall on one axis and QPS
+on the other, and keep the best points: for each level of accuracy, the highest
+throughput anything reached at it. One engine beats another only where its curve
 sits above the other's at the same recall. If the curves cross, the answer
 depends on how accurate you need to be.
 
