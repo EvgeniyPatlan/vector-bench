@@ -24,7 +24,7 @@ second, they have told you nothing, and they may not know it.
 ## Why we built our own
 
 We wanted to compare MariaDB's vector search with AliSQL's, and then with
-pgvector. ann-benchmarks already exists and it's good, and we use it for part of
+pgvector. ann-benchmarks already exists and it's good, and we use it for half of
 this, but it was built to compare vector libraries and dedicated vector stores.
 Our questions were different. How long does it take to load a million vectors
 into a running server? What happens when you add a WHERE clause? What does the
@@ -35,6 +35,31 @@ reason anyone uses these features.
 All three engines implement HNSW. We kept it that way deliberately, so that
 differences come from the implementation instead of from someone choosing IVF
 and someone else choosing HNSW.
+
+## What we took from ann-benchmarks
+
+The recall and throughput half of this is
+[ann-benchmarks](https://github.com/erikbern/ann-benchmarks), Erik Bernhardsson's
+suite, MIT licensed. We didn't write our own recall measurement.
+
+What we add is three algorithm modules, one per engine, and a generated config
+for each. We don't touch the runner, the metrics code or the dataset handling.
+For a benchmark that distinction is the whole point: the recall numbers come out
+of the same code that produced the published ANN results everyone already
+compares against, and not out of something we wrote ourselves to measure
+ourselves. The commit we ran against goes into every manifest.
+
+The vendor checkout stays read-only. Each run clones it into a throwaway working
+copy and drops our modules in there, so nothing we do can quietly change the
+thing doing the measuring.
+
+MariaDB's own big vector search benchmark ran on a fork of ann-benchmarks as
+well, which is part of why we picked it. Same tool, so the results are
+comparable in kind.
+
+The other half, build cost and concurrency and filtered search and churn, is
+ours. ann-benchmarks isn't built to ask those questions and there's no reason it
+should be.
 
 ## What recall is
 
@@ -50,8 +75,8 @@ the number we report.
 The correct answer comes from brute force, computed once and shipped with the
 dataset. That's the only reason scoring an approximate index is possible at all.
 
-Recall is something you configure. Every HNSW
-implementation has a knob for how wide to search: `mhnsw_ef_search`,
+Recall is something you configure. Every HNSW implementation has a knob for how
+wide to search: `mhnsw_ef_search`,
 `vidx_hnsw_ef_search`, `hnsw.ef_search`. Turn it up, the engine visits more
 candidates, recall goes up and throughput goes down. That's the 3,678 against
 409 above. Which means a QPS number without recall can't be checked, and a
@@ -99,10 +124,9 @@ pgvector look slow for a reason that has nothing to do with pgvector.
 ## What we measure
 
 **Recall against throughput**, swept across the search-width knob at several
-values of M, one point per configuration. This part runs through
-ann-benchmarks so the numbers are comparable in kind to published ANN results.
-k=10 throughout, and the queries are the dataset's own held-out set, never rows
-taken from the corpus.
+values of M, one point per configuration. This part runs through ann-benchmarks,
+as described above. k=10 throughout, and the queries are the dataset's own
+held-out set, never rows taken from the corpus.
 
 **Build cost**: wall time, ingest rate, index size on disk, peak RSS.
 
