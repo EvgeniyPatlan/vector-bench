@@ -1,290 +1,232 @@
-# What we measure, and why one number is never the answer
+# How we benchmark vector search in databases
 
-Same index. Same machine. Same data. Same queries. One configuration knob
-changed:
+vector-bench is a harness that compares vector search built into general-purpose
+databases. Right now that's MariaDB (MHNSW), AliSQL (VIDX), and PostgreSQL with
+pgvector. Same hardware, same containers, same datasets, same queries, and the
+engines built from pinned tags with the same compiler flags.
 
-| `mhnsw_ef_search` | recall@10 | queries/sec |
-| ---: | ---: | ---: |
-| 10 | 0.9593 | 3,678 |
-| 800 | 0.9987 | 409 |
+We're publishing the method before the numbers. Results come in a later post,
+and we'll be adding more databases as we go, so it's worth writing down what
+we measure and how before anyone has to trust a chart.
 
-Both rows are true statements about the same index. Nine times the throughput
-separates them. Anyone quoting either number on its own is telling you nothing —
-and both are available to whoever is doing the quoting.
+Here's why that matters. Take one MariaDB index, don't touch the data, change
+one setting. At `mhnsw_ef_search=10` it does 3,678 queries a second and finds
+95.9% of the correct answers. At 800 it does 409 and finds 99.9%. Same index,
+same machine, nine times the throughput between them, and both numbers are
+true. Quote either one by itself and you've said nothing at all.
 
-That is the problem `vector-bench` exists to solve. This post is about the
-method: what gets measured, how, and how to read the output. The results come
-later, and they will cover more databases than they do today.
+That's the whole problem. Vector search has a speed/accuracy dial on it, and
+anyone can pick the setting that flatters them.
 
----
+## Why we built it
 
-## What this is
+We wanted to know how MariaDB's vector search compares to AliSQL's, and later
+to pgvector. There are good ANN benchmarks already (we use ann-benchmarks for
+part of this), but they're built to compare vector libraries and dedicated
+vector stores. We had different questions. What does it cost to load a million
+vectors into a running database? What happens when you put a WHERE clause on
+the query? What happens after a month of deletes and inserts? Those are
+database questions, and they're the reason you'd keep vectors in MySQL or
+Postgres instead of running a separate system.
 
-A harness that compares vector search built into general-purpose databases. Not
-a comparison of dedicated vector stores, and not a comparison of ANN libraries —
-the question is what you get when the vectors live next to the rest of your data.
+All three engines implement HNSW, which we did on purpose. With the algorithm
+held constant, whatever we see is down to the implementation and not to
+somebody picking a different index type.
 
-Three engines are wired up today: MariaDB (MHNSW), AliSQL (VIDX) and PostgreSQL
-with pgvector. All three implement HNSW, which is deliberate: with the algorithm
-held constant, differences belong to the implementations rather than to the
-choice of index. More engines will be added, and the method is built to absorb
-them without changing what the existing numbers mean.
+## What recall is
 
-Everything runs in containers built from pinned upstream tags, so a run is
-reproducible on hardware other than ours and the binaries are ours rather than a
-vendor's convenience build.
+Approximate nearest neighbour search is approximate on purpose. Finding the
+actual nearest 10 vectors out of a million means computing a million distances,
+every time. HNSW walks a graph instead, looks at a few thousand candidates and
+returns what it found. Usually that's right. Not always.
 
----
+Recall@10 is the share of the correct top 10 that the engine actually gave
+back. If 9 of the 10 rows it returned belong in the true top 10, that query
+scored 0.9. Average it over the query set and that's your recall.
 
-## What recall actually is
+The correct answer comes from brute force: every query compared against every
+vector, computed once. The standard datasets ship with it, which is the only
+reason you can score an approximate index at all.
 
-Approximate nearest neighbour search is approximate on purpose. Finding the true
-10 nearest vectors in a million means computing a million distances. An HNSW
-index instead walks a graph, visits a few thousand candidates, and returns what
-it found. It is usually right. It is not always right.
+Two things follow from this, and they shape everything else we do.
 
-**Recall@k is the fraction of the true top-k that the engine actually
-returned.** Ask for 10 neighbours, get 9 that belong in the true top 10, and
-that query scored 0.9. Average over the query set and you have recall@10, which
-is what we report throughout.
+Recall isn't a property of an engine, it's a setting. Every HNSW
+implementation has a knob for how wide to search (`mhnsw_ef_search`,
+`vidx_hnsw_ef_search`, `hnsw.ef_search`). Turn it up and the engine looks at
+more candidates, recall goes up, throughput goes down. That's the 3,678 against
+409 from the top of this post.
 
-The "true" answer comes from brute force — every query compared against every
-vector, computed once. Standard datasets ship with it. When a workload changes
-what "correct" means, we recompute it rather than reuse it; more on that below.
+So a single number can't be checked. QPS without recall is meaningless, and so
+is recall without QPS, because perfect recall is free if you're willing to scan
+the whole table. We never report one without the other.
 
-Two consequences drive the whole design:
+## What we measure
 
-**Recall is a dial, not a property.** Every HNSW implementation exposes a
-search-width knob — `mhnsw_ef_search`, `vidx_hnsw_ef_search`, `hnsw.ef_search`.
-Turn it up, the engine visits more candidates, recall rises, throughput falls.
-That is the table at the top of this post. An engine does not *have* a QPS
-figure; it has a curve, and where you sit on it is your choice.
+Recall against throughput is the standard ANN measurement and we do it, but
+it's the least interesting part. The rest is where databases differ from
+libraries.
 
-**So a single number is unfalsifiable.** A QPS figure without its recall cannot
-be checked. Neither can a recall figure without its throughput — perfect recall
-is free if you are willing to scan the table. We never report one without the
-other, and neither should anyone else.
+**Recall vs throughput.** Sweep the search-width knob against a fixed index, at
+several values of the graph parameter M. Every point is one recall/QPS pair. We
+run this through ann-benchmarks, so the numbers are comparable in kind to
+published ANN results. k=10 everywhere, and the queries are the dataset's own
+held-out query set, never rows sampled from the corpus.
 
----
+**Build cost.** How long it takes to get the data indexed, the ingest rate, the
+size of the index on disk, and peak memory.
 
-## What exactly gets measured
+This one needs care, because the engines don't do the same thing. MHNSW and
+VIDX build the graph on every INSERT, there's no bulk mode. pgvector builds its
+graph in one pass after the data is already loaded. Those are different
+operations and comparing them gives you a number that means nothing: in one of
+our runs pgvector's bulk path did 5,692 rows/s and its own incremental path did
+312, an 18x gap that's entirely about when the graph gets built. So we measure
+both paths wherever an engine has both, and the report says which is which.
 
-Recall against throughput is the standard ANN metric and it is table stakes. The
-dimensions that follow are the ones that separate *a database* from *an ANN
-library*, and they are where most of the design effort went.
+Peak memory comes from the container's cgroup, with the server alone in that
+container. The harness runs somewhere else. If we shared, the NumPy arrays
+holding the dataset would get charged to the database and every memory number
+would be wrong.
 
-### 1. Recall vs throughput
+**Concurrency.** QPS and latency percentiles from 1 to 32 clients. Single-client
+throughput tells you nothing about a server under load, and these three cache
+their graphs in completely different ways (one cache per table object, a shared
+cache plus a per-transaction one, or no vector cache at all with the graph
+served out of the normal buffer pool). You only see that when clients start
+competing. We report scaling efficiency next to raw QPS, because an engine that
+stops scaling at 2 clients while p99 latency gets 15x worse is telling you
+something the throughput column won't.
 
-Sweep the search-width knob across its useful range against a fixed index, at
-several values of the graph parameter `M`. Each point is one (recall, QPS) pair.
-This runs through ann-benchmarks — the same tooling the field already uses — so
-the numbers are comparable in kind to published ANN results.
-
-`k=10` throughout. Query sets are the datasets' own held-out queries, never
-sampled from the corpus.
-
-### 2. Index build cost
-
-Time, resulting index size, ingest rate and peak RSS to get the corpus indexed.
-
-This is where the most care is needed, because the engines do not do the same
-thing. MHNSW and VIDX maintain the HNSW graph on **every INSERT**; there is no
-bulk build. pgvector constructs its graph in one pass **after** the data lands.
-Comparing an incremental rate against a bulk rate is not a comparison, however
-tempting the ratio looks — in one run pgvector's bulk path measured 5,692 rows/s
-against 312 rows/s for its own incremental path, an 18× spread that belongs
-entirely to build strategy.
-
-So both paths are measured wherever an engine supports both, and the report
-labels which is which. "Engine X builds faster" and "engine X builds faster when
-allowed to bulk build" are different claims.
-
-Peak memory comes from the container's own cgroup (`memory.peak`), with the
-server running alone in that container. If the harness shared it, the NumPy
-arrays holding the dataset would be charged to the engine and every memory
-number would be wrong.
-
-### 3. Concurrency
-
-QPS and latency percentiles from 1 to 32 concurrent clients.
-
-Single-client throughput says nothing about behaviour under load, and these
-engines cache their graphs very differently — one cache per table object, a
-shared cache plus a per-transaction one, or no vector-specific cache at all with
-graph pages served from the general buffer pool. Those choices only become
-visible when clients contend.
-
-We report scaling efficiency alongside raw QPS, because an engine that stops
-scaling at two clients while p99 latency degrades 15× is telling you something a
-throughput column alone will not.
-
-### 4. Filtered search
-
-Vector search with a `WHERE` clause — the case that supposedly justifies keeping
-vectors in your database rather than in a dedicated store. Measured at several
+**Filtered search.** Vector search with a WHERE clause, which is supposedly the
+reason to keep vectors in your database at all. We run it at several
 selectivities, down to 1% of rows passing the filter.
 
-Filtering changes what "correct" means. The true top-10 among rows where
-`tag < 10` is not the true top-10 overall, so the harness **recomputes exact
-ground truth by brute force over the qualifying subset** for every selectivity.
-Scoring filtered results against unfiltered truth would report near-zero recall
-for every engine and teach you nothing.
+Filtering changes what the right answer is. The true top 10 among rows where
+`tag < 10` isn't the true top 10 overall, so we recompute exact ground truth by
+brute force over the rows that pass, for every selectivity. Scoring filtered
+results against unfiltered truth would give every engine near-zero recall and
+tell you nothing.
 
-It also reports **how many queries returned fewer than k results**. An engine
-can exhaust its candidate list before finding 10 rows that pass the filter; in
-one run that happened on 81 of 200 queries. Recall computed over short result
-sets is not wrong, but it is not comparable to recall over full ones unless the
-count is sitting next to it.
+We also count how many queries came back with fewer than 10 rows. An engine can
+run out of candidates before it finds 10 that pass the filter, and in one run
+that happened on 81 queries out of 200. Recall over short result sets isn't
+wrong exactly, but it isn't comparable to recall over full ones unless the count
+is sitting right next to it.
 
-### 5. Churn
+**Churn.** Recall and throughput before and after deleting and re-inserting a
+chunk of the corpus. HNSW graphs are supposed to degrade under deletes, so we
+check. If you're writing to this data continuously, this matters more than any
+static number above it.
 
-Recall and throughput before and after deleting and re-inserting a share of the
-corpus. HNSW graphs are widely expected to degrade under deletion, and for any
-workload with ongoing writes this matters more than any static number above it.
+## How we keep it fair
 
----
+We run everything twice.
 
-## How the comparison is kept fair
+The **normalized** pass gives every engine identical CPU, memory and cache
+budgets. If something differs here, it's the implementation and not the
+resources it was handed.
 
-### Two passes, on purpose
+The **tuned** pass lets each engine use what its own documentation recommends.
+More realistic, less controlled, which is why it doesn't replace the first one.
+If a result holds in both passes it's about the engine. If it flips, that's
+interesting on its own.
 
-**Normalized** hands every engine identical CPU, memory and cache budgets. Any
-difference in the results belongs to the implementations rather than to how much
-machine each one was given.
+Server and client are in separate containers on a private network. CPUs are
+pinned explicitly, SMT siblings excluded, P-cores and E-cores never mixed
+(that variance is bigger than a lot of what we're trying to measure).
+Durability is relaxed the same way everywhere, because leaving each engine on
+its own defaults would compare fsync policies instead of vector search.
 
-**Tuned** lets each engine use settings its own documentation recommends. This
-is the more realistic comparison and the less controlled one, which is why it
-does not replace the normalized pass.
+Some differences can't be normalized away, so we write them down instead of
+pretending:
 
-Running both is the point. If a ranking survives both, it is about the engines.
-If it flips, that is a finding in itself.
+- `ef_construction` only exists in pgvector. MariaDB refuses it outright with
+  `ERROR 1911 (HY000): Unknown option 'EF_CONSTRUCTION'`. In the normalized pass
+  we pin pgvector to its default rather than give it a tuning knob the others
+  don't have.
+- AliSQL's VIDX only works on InnoDB and needs READ COMMITTED, so we put
+  everything on READ COMMITTED and take isolation level out of the picture.
+- Both MySQL-family engines ship a 16 MiB default graph cache, which is far too
+  small for a real corpus. We set both from one budget instead of judging either
+  on a number its vendor clearly expects you to change.
 
-### Identical containment
+Every run writes a manifest with the CPU model and its SIMD flags, engine source
+tags and commits, image IDs, and the resource limits as they actually got
+resolved (not as we asked for them). The report generator won't produce a report
+without one, and every report ends with the commands to reproduce that run.
 
-Server and client run in separate containers on a private network, with explicit
-cpuset pinning, SMT siblings excluded, and P-cores and E-cores never mixed. Same
-compiler flags for every engine. Durability relaxed identically across all of
-them — leaving each at its own default would compare fsync policies rather than
-vector search.
+## How to read the results
 
-### Asymmetries we cannot remove, and do not hide
+**Check the validity section first.** Our reports go environment, validity,
+known asymmetries, and only then results. If a phase failed, if an engine
+returned short result sets, if the CPU turned out to have no AVX-512, it's in
+front of the charts and not in a footnote at the bottom.
 
-Some differences cannot be normalized away, so the report states them rather
-than papering over them:
+**Watch for the full scan.** All three engines will quietly stop using the
+vector index and scan the table instead. A scan gives exact results, slowly, so
+in the output it looks like high recall and low throughput. You can't tell that
+apart from a carefully tuned index unless you look at the query plan.
 
-- `ef_construction` is exposed only by pgvector. MariaDB rejects it outright
-  (`ERROR 1911 (HY000): Unknown option 'EF_CONSTRUCTION'`). The normalized pass
-  pins pgvector to its default rather than handing it a tuning axis the others
-  lack.
-- AliSQL's VIDX is InnoDB-only and requires READ COMMITTED, so every engine is
-  set to READ COMMITTED to remove isolation level as a variable.
-- Both MySQL-family engines ship a 16 MiB default graph cache, far too small for
-  any real corpus. Both are set from one budget rather than judged on a value
-  their vendors plainly intended you to change.
+This is not hypothetical. AliSQL costs the index against a scan and picks the
+scan once the LIMIT is somewhere above 25-28% of the table (on a 100-row table
+the switch happens between LIMIT 25 and LIMIT 40, and `ef_search` doesn't affect
+it at all). pgvector falls back silently, no error and no warning, if the
+operator in your query doesn't match the index's operator class: use `<->`
+against a `vector_cosine_ops` index and you get a Seq Scan and a Sort.
 
-Every run writes a manifest: CPU model and SIMD flags, engine source tags and
-commits, image IDs, and the resource limits as actually resolved rather than as
-requested. The report generator refuses to produce a report without one, and
-every report ends with a section on reproducing that exact run. A result without
-its environment is not a result.
+So every driver runs EXPLAIN for every configuration and records whether the
+index was used. Anything that scanned shows up in validity. This is the easiest
+way to produce impressive nonsense in a vector benchmark, and a good reason to
+be suspicious of any that doesn't mention it.
 
----
+**Read the curve, not the point.** Because recall trades against speed, the
+honest way to show this is a curve: sweep the search width, plot recall against
+QPS, take the upper-left edge. One engine is faster than another only if its
+curve sits above the other's at the same recall. If the curves cross, the answer
+depends on how accurate you need to be, and that's a real answer.
 
-## How to read the output
+Curves are also annoying to read, because your eye compares shapes instead of
+heights at one point. So we also plot the thing you actually want to know, which
+is how fast it goes at an accuracy you'd accept: bars at recall floors of 0.90,
+0.95 and 0.99. Pick your floor, read across.
 
-### Validity first
+## What we don't measure
 
-The report's section order is deliberate: environment, then validity, then known
-asymmetries, then results. If a run lost an engine to a failure, if an engine
-returned short result sets, if the CPU lacks AVX-512 — that appears **before**
-any chart. A caveat that arrives after the number has been read is a caveat that
-has already failed.
+Your hardware. MHNSW and VIDX both have AVX-512 distance kernels, so results
+from a machine without AVX-512 don't transfer to one with it. That's why the CPU
+and its SIMD flags are in every manifest.
 
-### The trap that invalidates everything
+Anything past about a million vectors. Our datasets are 60k to 1M and mostly fit
+in cache. At 10M the graphs go to disk and the ordering could change completely.
 
-All three engines can silently decline to use the vector index and fall back to
-a full table scan. A scan returns **exact** results, slowly. In the output that
-looks like *high recall, low throughput* — indistinguishable from a
-conservatively-tuned index unless you check the query plan.
+Anything else running on the box. During development a build we'd left running
+moved one engine's numbers by 2x. We check CPU, SIMD and cpuset, but we can't
+see your other workload. Run this on a quiet machine.
 
-It is not theoretical. Both of these are reproducible today:
+Your queries. Standard datasets are standard, not representative of whatever
+you're doing.
 
-- AliSQL costs the vector index against a table scan and picks the scan when the
-  `LIMIT` exceeds roughly 25–28% of rows — on a 100-row table the crossover sits
-  between `LIMIT 25` and `LIMIT 40`. It does not depend on `ef_search` at all.
-- pgvector falls back with no error and no warning when the query operator does
-  not match the index's operator class: `<->` against a `vector_cosine_ops`
-  index gives you a `Seq Scan` and a `Sort`.
+## Adding another database
 
-So every driver runs `EXPLAIN` for each configuration and records whether the
-index was used. Any measurement where it was not is flagged in Validity, not
-buried in a footnote. This is the single easiest way to produce impressive
-nonsense in a vector benchmark, and the reason to distrust any that does not
-mention it.
+The list will grow, so we made adding one cheap. Each engine needs four things:
+a Dockerfile that builds a runtime image and a bench image from a pinned tag, a
+config declaring ports and credentials and which server flags map to the
+normalized budget, an ann-benchmarks module for the recall/QPS side, and a
+driver for the ops side (create index, load, query, filtered query, index size,
+and a check that answers whether the index actually got used).
 
-### The frontier, and the question you actually have
+Nothing else moves. Adding an engine doesn't change what any existing number
+means, which is what lets us publish results before the list is finished.
 
-Because recall trades against speed, the honest presentation is a curve. Sweep
-the search width, plot recall against QPS, take the upper-left envelope: for
-each recall level, the best throughput achieved at it.
+## What's next
 
-An engine is faster than another **only if its frontier sits above the other's
-at the same recall.** Curves that cross mean the answer depends on your accuracy
-target — a real result, not a hedge.
+Results. The harness is running end to end on all three engines and we have
+million-vector runs going now. Those get published with the manifests and the
+raw per-configuration records, so you can check them rather than take our word
+for it.
 
-Curves are also awkward to read, because the eye compares shapes rather than
-heights at one x. So the report also gives the comparison an operator actually
-makes — *how fast is it at an accuracy I can accept* — as bars at recall floors
-of 0.90, 0.95 and 0.99. Pick your floor, read across.
-
----
-
-## What this does not measure
-
-**Hardware.** MHNSW and VIDX both document AVX-512 distance kernels. Results
-from a machine without AVX-512 do not transfer to one with it, which is why the
-CPU model and its SIMD flags are recorded in every manifest.
-
-**Scale beyond ~1M vectors.** Current corpora are 60k–1M and largely
-cache-resident. At 10M the graphs go to disk and rankings may invert entirely.
-
-**Anything sharing the machine.** During development, a competing build
-distorted one engine's numbers by 2×. The harness reports CPU, SIMD and cpuset
-problems; a concurrent workload is invisible to it. Run on a quiet box.
-
-**Your query distribution.** Standard datasets are standard, not representative
-of you.
-
----
-
-## Adding an engine
-
-The engine list will grow, so the cost of growing it is part of the design. Each
-engine contributes four things:
-
-1. A multi-stage Dockerfile producing a runtime image and a bench image from a
-   pinned upstream tag.
-2. A config declaring its ports, credentials, server flags and which knobs map
-   to the normalized budget.
-3. An ann-benchmarks module for the recall/QPS path.
-4. A driver for the ops path implementing a small interface — create index,
-   load, query, filtered query, index size, and a plan check that answers *was
-   the index used*.
-
-Nothing else changes. Adding an engine does not alter what any existing number
-means, which is what makes it safe to publish results before the list is
-complete.
-
----
-
-## What comes next
-
-Results. The harness is validated end to end on all three engines across both
-measurement paths, and full runs at million-vector scale are underway. Those
-will be published with the manifests, the raw per-configuration records, and the
-methodology above to argue with.
-
-The harness, the drivers and the documentation are at
-[github.com/EvgeniyPatlan/vector-bench](https://github.com/EvgeniyPatlan/vector-bench).
-If you think a measurement here is wrong or unfair to an engine, the useful form
-of that argument is a run.
+Everything is on GitHub at
+[github.com/EvgeniyPatlan/vector-bench](https://github.com/EvgeniyPatlan/vector-bench):
+the harness, the drivers, the Dockerfiles and the docs. If you think we're
+measuring something wrong, or being unfair to an engine you know well, tell us.
+Better yet, run it yourself and show us the output.
