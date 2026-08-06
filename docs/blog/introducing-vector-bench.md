@@ -54,6 +54,10 @@ Two parameters matter:
   session variable, so you can change it per query. Higher means the search
   visits more nodes, finds better answers and runs slower.
 
+![Three panels showing an HNSW search descending from a sparse top layer to a
+dense bottom layer, getting closer to the query vector at each
+step](img/hnsw.svg)
+
 There's also **ef_construction**, which is the same idea applied while the index
 is being built. Not every engine exposes it.
 
@@ -67,6 +71,10 @@ only inside those. It builds much faster than HNSW and uses less memory, but
 usually gives worse recall at the same speed. It misses when the true neighbour
 happens to sit just outside the clusters it looked in.
 
+![Vectors grouped into eight clusters, each with a representative vector, with
+the two clusters nearest the query highlighted as the only ones
+searched](img/ivf.svg)
+
 We only test engines running HNSW, which is what most databases have shipped.
 Scoring an IVF engine on the same chart would mostly measure the difference
 between two algorithms rather than how well each database implemented one, so
@@ -78,6 +86,10 @@ IVF-only engines go in their own bucket.
 of the ten rows returned belong in the real top 10, that query scored 0.9.
 Average over the query set and you have recall@10. A reported recall of 0.9593
 means that on average about 9.6 of every 10 rows returned were correct.
+
+![A query vector with the true ten nearest neighbours circled: eight were
+returned correctly, two were missed, and two rows from outside the circle were
+returned instead](img/recall.svg)
 
 Scoring it requires knowing the right answer. That's the **ground truth**,
 computed once by brute force with no index involved. The public ANN datasets
@@ -171,6 +183,10 @@ Peak memory comes from the server container's own accounting, and the server is
 the only thing in that container. The test client runs in a second container over a
 private network. Otherwise the several GB of Python arrays holding the dataset
 would be charged to the database.
+
+![The server container holding only the database with a pinned cpuset and a hard
+memory limit, connected over a private network to a separate client container
+running the harness](img/harness.svg)
 
 **Concurrency.** QPS and latency percentiles from 1 to 32 clients. Engines cache
 their graphs in quite different ways, and that only becomes visible when clients
@@ -270,6 +286,10 @@ on the other, and keep the best points: for each level of accuracy, the highest
 throughput anything reached at it. One engine beats another only where its curve
 sits above the other's at the same recall. If the curves cross, the answer
 depends on how accurate you need to be.
+
+![Left: the measured sweep, throughput falling from 3,678 to 409 queries per
+second as recall rises from 0.959 to 0.999. Right: two curves crossing, so which
+engine is faster depends on the recall you need](img/tradeoff.svg)
 
 Curves invite comparing shapes instead of heights at one point, so there are
 also bar charts of QPS at recall floors of 0.90, 0.95 and 0.99. Pick the
