@@ -148,7 +148,7 @@ def hnsw() -> None:
             else:
                 return path
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.4, 4.5))
+    fig, axes = plt.subplots(1, 3, figsize=(10.2, 4.3))
     titles = ["top layer\nfew nodes, long links",
               "middle layer\nmore nodes, shorter links",
               "bottom layer\nevery node, local links"]
@@ -174,20 +174,20 @@ def hnsw() -> None:
 
         if idx is layers[0]:
             ax.annotate("entry point", base[entry], textcoords="offset points",
-                        xytext=(10, -14), fontsize=8.5, color=ACCENT)
+                        xytext=(10, -14), fontsize=10.5, color=ACCENT)
             # Label the query here too, otherwise the star reads as a stray mark
             # in the panel where the top layer has no nodes near it.
             ax.annotate("query vector", q, textcoords="offset points",
-                        xytext=(0, 14), ha="center", fontsize=8.5, color=INK)
+                        xytext=(0, 14), ha="center", fontsize=10.5, color=INK)
         if idx is layers[-1]:
             ax.annotate("query vector", q, textcoords="offset points",
-                        xytext=(8, -16), fontsize=8.5, color=INK)
+                        xytext=(8, -16), fontsize=10.5, color=INK)
             ax.annotate("neighbours returned\nfrom around here", base[path[-1]],
                         textcoords="offset points", xytext=(-58, 24),
-                        fontsize=8.5, color=ACCENT, ha="center")
+                        fontsize=10.5, color=ACCENT, ha="center")
 
         start = path[-1]
-        ax.set_title(title, fontsize=10, color=INK, pad=8)
+        ax.set_title(title, fontsize=12, color=INK, pad=8)
         _bare(ax)
         ax.set_xlim(-0.8, 10.8)
         ax.set_ylim(-0.8, 10.8)
@@ -200,7 +200,7 @@ def hnsw() -> None:
             color=ACCENT, lw=1.8))
 
     fig.suptitle("HNSW: the search drops a layer when no neighbour is closer",
-                 fontsize=12.5, color=INK, y=1.0)
+                 fontsize=14.5, color=INK, y=1.0)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     _finish(fig, "hnsw")
 

@@ -6,7 +6,7 @@
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-08-06T21:12:16.359386</dc:date>
+    <dc:date>2026-08-06T21:12:57.446182</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -40,19 +40,19 @@ z
    <g id="patch_3">
     <path d="M 231.283849 83.584 
 Q 263.877343 83.584 296.470838 83.584 
-" clip-path="url(#p6b5fd0afab)" style="fill: none; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
+" clip-path="url(#p024507f143)" style="fill: none; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
     <path d="M 237.283849 86.584 
 L 231.283849 83.584 
 L 237.283849 80.584 
 L 237.283849 86.584 
 z
-" clip-path="url(#p6b5fd0afab)" style="fill: #1f2328; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
+" clip-path="url(#p024507f143)" style="fill: #1f2328; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
     <path d="M 290.470838 80.584 
 L 296.470838 83.584 
 L 290.470838 86.584 
 L 290.470838 80.584 
 z
-" clip-path="url(#p6b5fd0afab)" style="fill: #1f2328; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
+" clip-path="url(#p024507f143)" style="fill: #1f2328; stroke: #1f2328; stroke-width: 1.5; stroke-linecap: round"/>
    </g>
    <g id="matplotlib.axis_1"/>
    <g id="matplotlib.axis_2"/>
@@ -67,7 +67,7 @@ Q 16.128 15.9296 16.128 23.568
 L 16.128 143.6 
 Q 16.128 151.2384 23.94 151.2384 
 z
-" clip-path="url(#p6b5fd0afab)" style="fill: #ffffff; stroke: #0969da; stroke-width: 1.6; stroke-linejoin: miter"/>
+" clip-path="url(#p024507f143)" style="fill: #ffffff; stroke: #0969da; stroke-width: 1.6; stroke-linejoin: miter"/>
    </g>
    <g id="patch_5">
     <path d="M 308.52 151.2384 
@@ -80,7 +80,7 @@ Q 300.708 15.9296 300.708 23.568
 L 300.708 143.6 
 Q 300.708 151.2384 308.52 151.2384 
 z
-" clip-path="url(#p6b5fd0afab)" style="fill: #ffffff; stroke: #8b949e; stroke-width: 1.6; stroke-linejoin: miter"/>
+" clip-path="url(#p024507f143)" style="fill: #ffffff; stroke: #8b949e; stroke-width: 1.6; stroke-linejoin: miter"/>
    </g>
    <g id="text_1">
     <!-- server container -->
@@ -1945,7 +1945,7 @@ z
   </g>
  </g>
  <defs>
-  <clipPath id="p6b5fd0afab">
+  <clipPath id="p024507f143">
    <rect x="7.2" y="7.2" width="513.36" height="171.864"/>
   </clipPath>
  </defs>
