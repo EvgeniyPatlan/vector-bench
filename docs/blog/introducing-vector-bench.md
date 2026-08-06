@@ -1,13 +1,18 @@
 # How we benchmark vector search in databases
 
-vector-bench compares vector search built into general-purpose databases. Right
-now that's MariaDB (MHNSW), AliSQL (VIDX) and PostgreSQL with pgvector, all
-three built from pinned tags in containers with the same compiler flags, run on
-the same hardware against the same datasets.
+vector-bench is a tool for running vector search performance tests against
+databases, without having to build the whole apparatus yourself every time. You
+point it at the engines you care about and it builds them from pinned tags,
+gives each one the same containers and the same hardware and the same datasets,
+runs the same measurements against all of them and writes a report.
 
-The results go in a separate post, and we'll be adding more databases over time.
-This one is about the method, because a vector benchmark is unusually easy to
-get wrong and most of the wrong answers look fine in a chart.
+We're using it on MariaDB (MHNSW), AliSQL (VIDX) and PostgreSQL with pgvector,
+because those are the ones we wanted to check first. The list isn't the point
+and it will grow.
+
+The results go in a separate post. This one is about the method, because a
+vector benchmark is unusually easy to get wrong and most of the wrong answers
+look fine in a chart.
 
 Here's the short version of why. Take one MariaDB index, leave the data alone,
 change one setting:
@@ -21,20 +26,36 @@ Nine times the throughput, same index, same machine, same query set. Both rows
 are true. If someone tells you their database does 3,678 vector queries a
 second, they have told you nothing, and they may not know it.
 
-## Why we built our own
+## Why we built it
 
-We wanted to compare MariaDB's vector search with AliSQL's, and then with
-pgvector. ann-benchmarks already exists and it's good, and we use it for half of
-this, but it was built to compare vector libraries and dedicated vector stores.
-Our questions were different. How long does it take to load a million vectors
-into a running server? What happens when you add a WHERE clause? What does the
-index look like after a few million deletes and inserts? Those only matter if
-the vectors live in your database next to everything else, which is the whole
-reason anyone uses these features.
+Every database is adding vector search, and every one of them publishes numbers.
+Checking those numbers yourself means building each engine, pinning versions,
+setting up datasets and ground truth, writing a client per engine, keeping the
+hardware identical, and then doing all of it again for the next engine you want
+to look at. That's a week of work before you measure anything, and most of it is
+the same work every time.
 
-All three engines implement HNSW. We kept it that way deliberately, so that
-differences come from the implementation instead of from someone choosing IVF
-and someone else choosing HNSW.
+So the goal was to do that once. Adding an engine should be a config and a
+driver, not a project. Running the tests should be one command:
+
+```bash
+./run-benchmark.sh build --march native   # engines, from pinned tags
+./run-benchmark.sh fetch                  # datasets and ground truth
+./run-benchmark.sh run --profile main     # measure, then report
+```
+
+ann-benchmarks already exists and it's good, and we use it for half of this, but
+it was built to compare vector libraries and dedicated vector stores. The
+questions we had were about databases. How long does it take to load a million
+vectors into a running server? What happens when you add a WHERE clause? What
+does the index look like after a few million deletes and inserts? Those only
+matter if the vectors live in your database next to everything else, which is
+the whole reason anyone uses these features.
+
+One rule about what goes in: every engine we test has to be running HNSW. That
+keeps the comparison about implementations rather than about one engine picking
+IVF and another picking HNSW. If we add something that only does IVF it goes in
+its own bucket.
 
 ## What we took from ann-benchmarks
 
@@ -297,24 +318,33 @@ your other workload.
 Your query distribution. Standard datasets are standard, not representative of
 what you're doing.
 
-## Adding another database
+## Adding a database
 
-We expect the list to grow, so each engine needs four things and nothing else: a
-Dockerfile producing a runtime image and a bench image from a pinned tag, a
-config declaring ports, credentials and which server flags map to the normalized
-budget, an ann-benchmarks module for the recall/QPS side, and a driver
-implementing create index, load, query, filtered query, index size, and the
-EXPLAIN check. Adding one doesn't change what any existing number means, which
-is what lets us publish results before the list is complete.
+This is the part we cared most about getting right, because the whole point was
+to not rebuild the apparatus for every new engine. Each one needs four things:
+
+- a Dockerfile producing a runtime image and a bench image from a pinned tag
+- a config declaring ports, credentials, and which server flags map to the
+  normalized memory and CPU budget
+- an ann-benchmarks module for the recall/QPS side
+- a driver implementing create index, load, query, filtered query, index size,
+  and the EXPLAIN check that says whether the index was used
+
+The driver is about 200 lines and the rest is configuration. Nothing else in the
+harness changes, and adding an engine doesn't change what any existing number
+means, so results can be published before the list is finished.
+
+If you want a database measured that isn't in there yet, that's the shape of the
+work, and we'd rather have the driver than the request.
 
 ## What's next
 
-Million-vector runs are going now, and those results get published with the
-manifests and the raw per-configuration records so you can check them instead of
-trusting them.
+Million-vector runs are going now. Those results get published with the
+manifests and the raw per-configuration records, so you can check them instead
+of trusting them.
 
 Everything is at
 [github.com/EvgeniyPatlan/vector-bench](https://github.com/EvgeniyPatlan/vector-bench):
 harness, drivers, Dockerfiles, docs. If we're measuring something wrong, or
 being unfair to an engine you know better than we do, tell us. Running it
-yourself and sending the output is even better.
+yourself and sending us the output is even better.
