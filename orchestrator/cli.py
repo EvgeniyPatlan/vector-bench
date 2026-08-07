@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import traceback
@@ -35,6 +36,8 @@ from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources,
                                  merge_resource_overrides, resolve_resources)
 from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
+
+GB = 1024 ** 3
 
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
 
@@ -210,6 +213,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 3
 
     _print_load_estimate(profile, engines, datasets, passes, phases)
+
+    if _check_free_disk(paths, engines, datasets, passes) and not args.force:
+        print("  Re-run with --force to start anyway.", file=sys.stderr)
+        return 4
 
     # Always load the file so completed sub-units are recorded against it;
     # only *honour* them when --resume was asked for.
@@ -450,6 +457,61 @@ _GENERATED_DATASET_PREFIXES = ("dbpedia-openai-",)
 def _is_generated(dataset: str) -> bool:
     return dataset.startswith(_GENERATED_DATASET_PREFIXES)
 
+
+
+# What one engine leaves on disk for one dataset, as a multiple of the corpus
+# file. The table and the index each roughly match the raw vectors, and the
+# MySQL family also writes a redo log and a doublewrite buffer. Measured on
+# dbpedia-openai-1000k: a 6.2 GB corpus produced a 7.7 GB table and a 3.9 GB
+# index per engine.
+_DISK_PER_ENGINE = 2.2
+_DISK_HEADROOM_GB = 10.0
+
+
+def _check_free_disk(paths: Dict[str, Any], engines: List[str],
+                     datasets: List[str], passes: List[str]) -> bool:
+    """Warn before a run that cannot fit. Returns True if it looks too tight.
+
+    A pgvector phase once died two seconds in because the volume had nowhere to
+    put the cluster, and nothing in the run said so — it looked like an engine
+    failure for a while. Cheap to check, expensive to discover eight hours in.
+    """
+    target = paths.get("results") or paths.get("run_dir") or "."
+    try:
+        usage = shutil.disk_usage(target)
+    except OSError:
+        return False
+
+    corpus_bytes = 0
+    for d in datasets:
+        path = os.path.join(paths["datasets"], f"{d}.hdf5")
+        try:
+            corpus_bytes += os.path.getsize(path)
+        except OSError:
+            from harness.datasets import KNOWN_DATASETS
+            corpus_bytes += int(KNOWN_DATASETS.get(d, {}).get("approx_bytes", 0) or 0)
+
+    # Engines run one at a time and their volumes are torn down after each, so
+    # the peak is one engine's footprint rather than the sum. Passes reuse the
+    # same space for the same reason.
+    need = corpus_bytes * _DISK_PER_ENGINE + _DISK_HEADROOM_GB * GB
+    free = usage.free
+
+    print(f"disk: {free / GB:.0f} GB free at {target}, "
+          f"run needs about {need / GB:.0f} GB "
+          f"({len(engines)} engine(s), largest corpus footprint plus headroom)")
+    if free >= need:
+        return False
+
+    print(
+        f"\n! Not enough free disk. {free / GB:.0f} GB available, "
+        f"about {need / GB:.0f} GB needed.\n"
+        f"  An engine that cannot write its data directory fails within seconds "
+        f"and looks like an engine fault, not a disk fault.\n"
+        f"  Free space, or point VB_ROOT at a larger filesystem.",
+        file=sys.stderr,
+    )
+    return True
 
 def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
                          datasets: List[str], passes: List[str],

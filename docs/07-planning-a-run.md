@@ -159,6 +159,21 @@ moving is not, however slow it looks.
 
 ---
 
+## 4a. Before you start: disk
+
+A run needs roughly `corpus size x 2.2 + 10 GB`. The table and the index each
+come out close to the size of the raw vectors, and the MySQL family also writes
+a redo log and a doublewrite buffer. On dbpedia-openai-1000k that is a 6.2 GB
+corpus producing a 7.7 GB table and a 3.9 GB index per engine.
+
+Engines run one at a time and their volumes are removed after each, so the peak
+is one engine's footprint rather than the sum of all three.
+
+The run checks this before starting and refuses if it looks too tight. It is
+worth having: a pgvector phase once died two seconds in because the volume had
+nowhere to put the cluster, and it read as an engine failure for a while before
+anyone thought to check `df`.
+
 ## 5. Interruption and resumption
 
 Work is checkpointed at two levels:
@@ -180,6 +195,23 @@ retries exactly those.
 ann-benchmarks additionally skips result files it has already produced, so an
 interrupted recall sweep resumes at configuration granularity without any help
 from the checkpoint file.
+
+That skip is keyed on the algorithm and its index parameters, and knows nothing
+about the resource budget. So recall results are stored under
+`results/annb/<pass>/<config fingerprint>/`, where the fingerprint covers the
+memory budget, the cache split, the build threads, the core count and a manual
+measurement version.
+
+Change the budget and you get a new tree and a fresh measurement. Change
+nothing and resumption works exactly as before. Without this, a dbpedia run
+re-launched at 64 GB returned every recall point byte-identical to the earlier
+16 GB attempt, because ann-benchmarks found the files already on disk and
+reported success in under a second. The report then carried a manifest saying
+64 GB above a curve measured at 16.
+
+If you need to recompute a tree that is genuinely current, `--force` does it.
+Any result file older than the run reporting it is now flagged in the report's
+Validity section.
 
 ---
 

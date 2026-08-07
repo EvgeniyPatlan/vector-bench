@@ -109,6 +109,12 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                             "batch_mode": bool(attrs.get("batch_mode", False)),
                             "run_count": _maybe_int(attrs.get("run_count")),
                             "source_file": os.path.relpath(path, annb_dir),
+                            # Used to detect a result file that predates the
+                            # run it is being reported under. ann-benchmarks
+                            # skips configurations that already have results,
+                            # so an unchanged tree silently reappears in a new
+                            # report.
+                            "source_mtime": os.path.getmtime(path),
                         },
                     }
                     if attrs.get("index_size") is not None:

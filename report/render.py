@@ -109,6 +109,18 @@ def _md_table(headers: List[str], rows: List[List[str]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def _fmt_age(run_started: Any, measured_at: Any) -> str:
+    try:
+        delta = float(run_started) - float(measured_at)
+    except (TypeError, ValueError):
+        return "—"
+    if delta < 3600:
+        return f"{delta / 60:.0f} min"
+    if delta < 86400:
+        return f"{delta / 3600:.1f} h"
+    return f"{delta / 86400:.1f} days"
+
+
 def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
@@ -149,6 +161,26 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             ["Engine", "Dataset", "Phase", "M", "ef_search", "Selectivity"], rows))
         if len(summary["plan_failures"]) > 40:
             parts.append(f"\n_…and {len(summary['plan_failures']) - 40} more._\n")
+
+    if summary.get("stale_ann"):
+        parts.append(
+            "\n### Recall results that predate this run\n\n"
+            "ann-benchmarks skips any configuration that already has a result "
+            "file and reports that as success, so a re-run after a configuration "
+            "change returns instantly with the **previous** numbers. The recall "
+            "and throughput figures below were measured before this run started "
+            "and do not reflect its resource limits or harness version. Re-run "
+            "the ann phase with `--force` to recompute them.\n"
+        )
+        seen, rows = set(), []
+        for c in summary["stale_ann"]:
+            key = (c.get("engine"), c.get("dataset"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append([_label(c.get("engine", "?")), c.get("dataset", "?"),
+                         _fmt_age(c.get("run_started"), c.get("measured_at"))])
+        parts.append(_md_table(["Engine", "Dataset", "Measured before this run by"], rows))
 
     if summary.get("memory_pressure"):
         parts.append(

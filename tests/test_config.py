@@ -543,3 +543,113 @@ class TestMemoryCeilingDetection:
         from report.loaders import ceiling_pressure
         rows = [{"rss_bytes": 16 * self.GB}] * 5
         assert ceiling_pressure(rows, None) is None
+
+
+class TestAnnResultFingerprint:
+    """A curve measured at 16 GB is not a curve measured at 64 GB.
+
+    ann-benchmarks caches by algorithm and index parameters only, so a re-run
+    after a budget change returned every point byte-identical to the previous
+    one and the report carried a 64 GB manifest above a 16 GB curve.
+    """
+
+    BASE = dict(server_memory_bytes=16 * 1024 ** 3, buffer_bytes=5153960755,
+                graph_cache_bytes=5153960755, maintenance_bytes=1717986918,
+                build_threads=1, server_cpu_count=8)
+
+    def test_budget_change_changes_the_fingerprint(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        bigger = dict(self.BASE, server_memory_bytes=64 * 1024 ** 3)
+        assert ann_fingerprint(self.BASE) != ann_fingerprint(bigger)
+
+    def test_same_config_resumes(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        assert ann_fingerprint(self.BASE) == ann_fingerprint(dict(self.BASE))
+
+    def test_cpu_count_counts_too(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        other = dict(self.BASE, server_cpu_count=16)
+        assert ann_fingerprint(self.BASE) != ann_fingerprint(other)
+
+    def test_measurement_version_invalidates_everything(self):
+        """Bumping it must change the digest, or a harness fix reuses old numbers."""
+        from orchestrator import ann_pass
+        before = ann_pass.ann_fingerprint(self.BASE)
+        original = ann_pass.ANN_MEASUREMENT_VERSION
+        try:
+            ann_pass.ANN_MEASUREMENT_VERSION = original + 1
+            assert ann_pass.ann_fingerprint(self.BASE) != before
+        finally:
+            ann_pass.ANN_MEASUREMENT_VERSION = original
+
+    def test_results_dir_is_namespaced_by_config(self, tmp_path):
+        from orchestrator.ann_pass import annb_results_dir, ann_fingerprint
+        paths = {"annb_results": str(tmp_path)}
+        plain = annb_results_dir(paths, "normalized")
+        keyed = annb_results_dir(paths, "normalized", self.BASE)
+        assert plain != keyed
+        assert ann_fingerprint(self.BASE) in keyed
+        assert os.path.isdir(keyed)
+
+
+class TestFreeDiskPreflight:
+    """pgvector died two seconds in because the volume had nowhere to go."""
+
+    def test_blocks_when_the_disk_is_too_small(self, tmp_path, monkeypatch):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.shutil, "disk_usage",
+                            lambda _p: type("U", (), {"free": 5 * cli.GB,
+                                                      "total": 100 * cli.GB,
+                                                      "used": 95 * cli.GB})())
+        paths = {"results": str(tmp_path), "datasets": str(tmp_path)}
+        assert cli._check_free_disk(
+            paths, ["mariadb"], ["dbpedia-openai-1000k-angular"], ["normalized"]) is True
+
+    def test_passes_when_there_is_room(self, tmp_path, monkeypatch):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.shutil, "disk_usage",
+                            lambda _p: type("U", (), {"free": 500 * cli.GB,
+                                                      "total": 900 * cli.GB,
+                                                      "used": 400 * cli.GB})())
+        paths = {"results": str(tmp_path), "datasets": str(tmp_path)}
+        assert cli._check_free_disk(
+            paths, ["mariadb", "alisql", "pgvector"],
+            ["dbpedia-openai-1000k-angular"], ["normalized"]) is False
+
+    def test_unreadable_target_does_not_block(self, monkeypatch):
+        from orchestrator import cli
+        def boom(_p):
+            raise OSError("no such filesystem")
+        monkeypatch.setattr(cli.shutil, "disk_usage", boom)
+        assert cli._check_free_disk(
+            {"results": "/nonexistent", "datasets": "/nonexistent"},
+            ["mariadb"], ["glove-100-angular"], ["normalized"]) is False
+
+
+class TestStaleAnnDetection:
+    """A result file older than the run it is reported under is not a result."""
+
+    MANIFEST = {"started_at": "2026-08-07T05:41:02Z",
+                "config": {"resource_pass": "normalized", "resolved_resources": {}}}
+
+    def _record(self, mtime):
+        return {"phase": "recall_qps", "engine": "mariadb", "dataset": "d",
+                "ef_search": 10, "recall_at_k": 0.95, "qps": 100.0,
+                "source_mtime": mtime, "source_file": "x.hdf5"}
+
+    def test_flags_a_file_written_before_the_run(self):
+        from report.generate import summarize, _parse_ts
+        old = _parse_ts("2026-08-05T22:00:00Z")
+        s = summarize([self._record(old)], self.MANIFEST)
+        assert len(s["stale_ann"]) == 1
+
+    def test_silent_for_a_file_written_during_the_run(self):
+        from report.generate import summarize, _parse_ts
+        fresh = _parse_ts("2026-08-07T09:00:00Z")
+        s = summarize([self._record(fresh)], self.MANIFEST)
+        assert s["stale_ann"] == []
+
+    def test_silent_without_a_start_time(self):
+        from report.generate import summarize
+        s = summarize([self._record(1.0)], {"config": {}})
+        assert s["stale_ann"] == []

@@ -11,6 +11,7 @@ project is required.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -29,8 +30,45 @@ CONSTRUCTORS = {"mariadb": "MariaDB", "alisql": "AliSQL", "pgvector": "PGVector"
 NOTHING_TO_RUN = "Nothing to run"
 
 
-def annb_results_dir(paths: Dict[str, str], resource_pass: str) -> str:
-    """Result tree for one resource pass.
+# Bump when the measurement path itself changes in a way that makes older
+# numbers non-comparable, even at an identical resource configuration. Adding
+# the per-configuration warmup was such a change: without it the first
+# ef_search point paid for a cold cache and landed below the second.
+ANN_MEASUREMENT_VERSION = 2
+
+
+def ann_fingerprint(resolved: Any) -> str:
+    """Short digest of everything that makes two ann runs incomparable.
+
+    ann-benchmarks caches by algorithm and index parameters. It has no idea how
+    much memory the engine was given or how many cores it had, so a result
+    measured under one budget is silently reused under another.
+
+    That is not hypothetical. A dbpedia run was re-launched at 64 GB after the
+    first attempt had run at 16 GB, and every recall point came back
+    byte-identical to the old ones because the files were already on disk. The
+    report then carried a manifest saying 64 GB above a curve measured at 16.
+    """
+    # Accepts a ResolvedResources or the dict a manifest stores, so the report
+    # can recompute the fingerprint without rebuilding the resource objects.
+    get = (resolved.get if isinstance(resolved, dict)
+           else lambda k, d=None: getattr(resolved, k, d))
+    fields = (
+        ANN_MEASUREMENT_VERSION,
+        get("server_memory_bytes"),
+        get("buffer_bytes"),
+        get("graph_cache_bytes"),
+        get("maintenance_bytes"),
+        get("build_threads"),
+        get("server_cpu_count"),
+    )
+    blob = "|".join(str(f) for f in fields).encode()
+    return hashlib.sha256(blob).hexdigest()[:8]
+
+
+def annb_results_dir(paths: Dict[str, str], resource_pass: str,
+                     resolved: Optional[ResolvedResources] = None) -> str:
+    """Result tree for one resource pass and one resource configuration.
 
     ann-benchmarks derives its result filenames from the algorithm and its
     parameters, with no notion of a resource pass. Sharing one tree would make
@@ -38,8 +76,16 @@ def annb_results_dir(paths: Dict[str, str], resource_pass: str) -> str:
     the report would then present normalized numbers as tuned ones. Separate
     trees keep the two passes independent and keep resumption working within
     each.
+
+    The configuration fingerprint extends the same reasoning to the budget: a
+    curve measured at 16 GB is not a curve measured at 64 GB, and resumption
+    should not treat them as interchangeable. Runs at an unchanged
+    configuration still resume normally, because the fingerprint is unchanged.
     """
-    path = os.path.join(paths["annb_results"], resource_pass)
+    parts = [paths["annb_results"], resource_pass]
+    if resolved is not None:
+        parts.append(ann_fingerprint(resolved))
+    path = os.path.join(*parts)
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -226,7 +272,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
         volumes=[
             f"{paths['work_annb']}:/home/app:rw",
             f"{paths['datasets']}:/home/app/data:rw",
-            f"{annb_results_dir(paths, resource_pass)}:/home/app/results:rw",
+            f"{annb_results_dir(paths, resource_pass, resolved)}:/home/app/results:rw",
         ],
         command=command,
         detach=False,
@@ -251,7 +297,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             file=sys.stderr,
         )
 
-    results_dir = annb_results_dir(paths, resource_pass)
+    results_dir = annb_results_dir(paths, resource_pass, resolved)
     before = _count_results(results_dir, engine, dataset)
 
     # Warn before the fact, not after. ann-benchmarks signals "everything is

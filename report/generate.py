@@ -62,6 +62,18 @@ def load_manifest(run_dir: str) -> Dict[str, Any]:
         return json.load(fh)
 
 
+def _parse_ts(value: Any) -> Optional[float]:
+    """Manifest timestamps are ISO-8601 Z; return epoch seconds or None."""
+    if not value:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def summarize(records: List[Dict[str, Any]],
               manifest: Optional[Dict[str, Any]] = None,
               memory: Optional[Dict[str, List[Dict[str, Any]]]] = None
@@ -81,7 +93,24 @@ def summarize(records: List[Dict[str, Any]],
         "short_result_cases": [],
         "failed_phases": [],
         "memory_pressure": [],
+        "stale_ann": [],
     }
+
+    # ann-benchmarks skips configurations that already have result files, and
+    # reports that as success. A re-run after a config change therefore returns
+    # instantly with the previous numbers, and nothing in the records says so.
+    started = _parse_ts((manifest or {}).get("started_at"))
+    if started:
+        for r in recall_records:
+            mtime = r.get("source_mtime")
+            if mtime and mtime < started:
+                summary["stale_ann"].append({
+                    "engine": r.get("engine"),
+                    "dataset": r.get("dataset"),
+                    "measured_at": mtime,
+                    "run_started": started,
+                    "source_file": r.get("source_file"),
+                })
 
     # An engine that spent the phase against its cgroup limit was reclaiming
     # continuously, so its numbers describe the memory budget and not the
@@ -152,6 +181,28 @@ def summarize(records: List[Dict[str, Any]],
     return summary
 
 
+def _narrow_to_this_run(annb_dir: str, manifest: Dict[str, Any]) -> str:
+    """Point the loader at the tree this run actually wrote, if it exists.
+
+    Results are stored under <pass>/<config fingerprint>. Walking the parent
+    would pull in every configuration ever measured on this machine, which is
+    how a 16 GB curve ended up in a report whose manifest said 64 GB. Falls
+    back to the whole tree for older runs that predate the fingerprint, where
+    the staleness check below is the only guard.
+    """
+    cfg = manifest.get("config") or {}
+    resolved = cfg.get("resolved_resources") or {}
+    pass_name = cfg.get("resource_pass")
+    if not (resolved and pass_name):
+        return annb_dir
+    from orchestrator.ann_pass import ann_fingerprint
+    candidate = os.path.join(annb_dir, pass_name, ann_fingerprint(resolved))
+    if os.path.isdir(candidate):
+        print(f"[report] ann-bench tree: {pass_name}/{os.path.basename(candidate)}")
+        return candidate
+    return annb_dir
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     run_dir = os.path.abspath(args.run_dir)
@@ -159,6 +210,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_id = manifest.get("run_id", os.path.basename(run_dir))
 
     annb_dir = args.annb_results or os.path.join(os.path.dirname(run_dir), "annb")
+    annb_dir = _narrow_to_this_run(annb_dir, manifest)
     datasets_dir = args.datasets_dir or os.path.join(VB_ROOT, "datasets")
     if not os.path.isdir(datasets_dir):
         datasets_dir = "/datasets"
