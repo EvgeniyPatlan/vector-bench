@@ -63,6 +63,21 @@ runs: 1
 resources:
   memory:
     server_limit_gb: 64
+  cpu:
+    # The normalized pass gives the client 4 cores, which is fine when the
+    # concurrency grid tops out low. Driving 32 concurrent clients from 4 cores
+    # measures the client, not the server, and every engine would report the
+    # same ceiling — which is indistinguishable from "they all saturate here".
+    #
+    # This is not a hypothetical worry about a future run. The existing
+    # glove-100 result (MariaDB flat at ~325 QPS from 2 clients through 32) was
+    # taken with 4 client cores and 8 server cores, and cannot currently be told
+    # apart from the client running out of CPU. 16 client cores keeps the ratio
+    # at 2 threads per core at the top of the grid.
+    #
+    # 8 server + 16 client is 24 of this machine's 40 physical cores. The
+    # allocation is identical for every engine, so the comparison stays fair.
+    client_cpus: 16
 
 # Normalized only unless asked otherwise. Both passes over a million 1536-dim
 # vectors is ~144 h of ingest, and that is not something anyone should end up
@@ -87,16 +102,32 @@ ann:
 ops:
   enabled: true
   # Build cost is the interesting ops dimension at this scale — it is where the
-  # incremental builders diverge most from pgvector's bulk build. Concurrency,
-  # filtered and churn each add another full load or a long query sweep, so they
-  # are off by default. Enable them deliberately.
-  workloads: [build]
+  # incremental builders diverge most from pgvector's bulk build.
+  #
+  # Concurrency is on because it is nearly free: the harness loads the corpus
+  # once and runs every requested workload against that same table, so
+  # concurrency costs only its own query time (six minutes per engine) rather
+  # than another 3-7 hour load.
+  #
+  # Filtered and churn stay off. Filtered has to recompute exact ground truth by
+  # brute force over the qualifying subset, and churn rewrites 10% of a million
+  # rows at the engine's incremental insert rate, which is 20-40 minutes on its
+  # own. Enable them deliberately when that is the question being asked.
+  workloads: [build, concurrency]
   m_values: [16]
   ef_search: 100
   subset_rows: null
   load_threads: 1
   max_queries: 500
-  client_counts: [1, 4, 16]
-  concurrency_duration_s: 30
+  # [1, 4, 16] would have missed the most interesting concurrency result we
+  # have so far: on glove-100 MariaDB saturated at TWO clients and then stayed
+  # flat from 4 through 32 while p99 degraded 15x. A grid that jumps 1 -> 4
+  # steps straight over the knee and reports a flat line with no explanation.
+  # Each extra point is one more `concurrency_duration_s`, so resolution here
+  # is nearly free.
+  client_counts: [1, 2, 4, 8, 16, 32]
+  # 30s at these throughputs is a few thousand queries, which is thin for a p99.
+  # Six points at 60s is six minutes per engine.
+  concurrency_duration_s: 60
   selectivities: [0.10]
   churn_fractions: [0.10]
