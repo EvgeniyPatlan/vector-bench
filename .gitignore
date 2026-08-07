@@ -19,6 +19,10 @@ venv/
 *.swp
 .DS_Store
 
+# Blog drafts and their figures live outside the repo, next to the .docx.
+# This is here so a stray `git add -A` cannot pull them back in.
+/docs/blog/
+
 # Local overrides
 config/local.yml
 .env

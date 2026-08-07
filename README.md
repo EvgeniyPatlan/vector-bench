@@ -337,7 +337,6 @@ on a value its vendor plainly intended you to change.
 | [05-methodology.md](docs/05-methodology.md) | What is measured, how, fairness policy, known asymmetries |
 | [06-new-machine.md](docs/06-new-machine.md) | Moving the framework to another machine |
 | [07-planning-a-run.md](docs/07-planning-a-run.md) | **Read before a long run.** Measured ingest rates, what each profile costs, how to scope, resumption |
-| [blog/introducing-vector-bench.md](docs/blog/introducing-vector-bench.md) | **Start here if you are new to this.** The methodology post: what recall is, what the five measured dimensions are and why, how fairness is enforced, how to read the output |
 
 ---
 
