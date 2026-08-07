@@ -63,7 +63,7 @@ above.
 | `quick` | fashion-mnist, glove-100 | 1 | ~14 h |
 | `main` | glove-100, sift-128 | 1 | **~46 h (~2 days)** |
 | `full` | all four | 2 | **~272 h (~11 days)** |
-| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~72 h (~3 days)** |
+| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) |
 
 `full` describes the complete measurement space. It is not a recommendation.
 Running it end to end is a deliberate decision to spend a fortnight, and
@@ -217,6 +217,36 @@ There is no saving in starting small except in run time.
 | Versions | MariaDB 11.8.8 here vs their 11.8 **and** 12.3; pgvector 0.8.6 vs their master of 2026-02-08. |
 | Index parameters were not published | The M and ef_search grids in the profile are ann-benchmarks' conventional ranges, not a claim to match theirs. |
 
+### Measured: what a full 1M x 1536 run actually cost
+
+The first complete `mariadb-blog` run, on a Xeon Gold 6230 (40 physical cores,
+187 GB RAM, AVX-512, `--march=native`), 990,000 x 1536, M=16, normalized pass:
+
+| Engine | Ingest | Index | Table | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| MariaDB | 83.8 rows/s, 3.3 h | 3.88 GB | 7.69 GB | 8.25 GB |
+| AliSQL | 41.4 rows/s, 6.6 h | 3.87 GB | 7.66 GB | 16.0 GB (at the limit) |
+| pgvector | — | — | — | 16.0 GB, OOM-killed |
+
+Total wall clock for the run was 28.4 hours, about 6 of them wasted on the
+pgvector phases before they died.
+
+**The 16 GB normalized budget was the problem.** The table alone is 7.7 GB and
+the index 3.9 GB. MariaDB fitted with headroom, AliSQL spent 55% of its phase
+pinned at the ceiling reclaiming continuously, and pgvector was OOM-killed 42%
+of the way in. A pass where only one engine fits measures which engine fits,
+not which is faster.
+
+The profile now asks for 64 GB through a `resources:` block, and the report
+flags any engine that ran against its limit in the Validity section. If you add
+a corpus of this size, set its budget deliberately:
+
+```yaml
+resources:
+  memory:
+    server_limit_gb: 64
+```
+
 ### Memory, which is the part that surprises people
 
 In the recall/QPS pass the database server and the ann-benchmarks client run in
@@ -254,10 +284,15 @@ the per-row cost of glove-100. Estimated ingest:
 
 | Engine | Ingest |
 | --- | ---: |
-| pgvector | ~1 h |
-| MariaDB | ~19 h |
-| AliSQL | ~52 h |
-| **all three** | **~72 h** |
+| pgvector | ~0.5 h |
+| MariaDB | ~3.3 h (measured) |
+| AliSQL | ~6.7 h (measured) |
+| **all three** | **~10.5 h** |
+
+An earlier version of this table said 19 h and 52 h for MariaDB and AliSQL. Those
+came from the formula, which overcharges for dimensionality once per-row cost is
+dominated by graph traversal rather than by the distance computation. The
+measured rates are now in `_MEASURED_ROWS_PER_S`.
 
 AliSQL is 72% of that, which makes it the obvious thing to drop. Resist it:
 MariaDB versus AliSQL is the comparison this framework was built for, and the

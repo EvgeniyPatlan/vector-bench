@@ -60,6 +60,15 @@ def to_binary_f32(vector) -> bytes:
     return numpy.asarray(vector, dtype="<f4").tobytes()
 
 
+
+# Queries run before each configuration is timed. The first measured point
+# otherwise pays for a cold graph cache and lands slower than the next one,
+# which inverts the low end of the recall/QPS curve: on a 990k x 1536 corpus
+# both MySQL-family engines reported ef_search=10 as slower than ef_search=20,
+# which cannot happen once the cache is warm.
+WARMUP_QUERIES = int(os.environ.get("VB_WARMUP_QUERIES", "30"))
+
+
 @dataclass
 class Dialect:
     """Everything that differs between MariaDB and AliSQL."""
@@ -352,6 +361,30 @@ class VBMySQLBase(BaseANN):
         # and would quietly poison the comparison.
         if self.dialect.verify_index_used and self._plan_verified is None:
             self._plan_verified = self._verify_plan()
+        self._warm_cache()
+
+    def _warm_cache(self) -> None:
+        """Run throwaway queries so the timed ones do not pay for a cold cache.
+
+        Random vectors rather than the benchmark's own query set, which the
+        module never sees and must not: warming with the vectors about to be
+        measured would prime exactly the graph regions those queries need and
+        flatter the result.
+        """
+        if WARMUP_QUERIES <= 0:
+            return
+        try:
+            dim = self._dim_from_table()
+        except Exception:
+            return
+        rng = numpy.random.RandomState(0)
+        for _ in range(WARMUP_QUERIES):
+            probe = to_binary_f32(rng.normal(size=dim).astype("<f4"))
+            try:
+                self._cur.execute(self._query_sql(10), (probe,))
+                self._cur.fetchall()
+            except Exception:
+                return
 
     def _query_sql(self, k: int, force_index: bool = False) -> str:
         hint = f" {self.dialect.force_index_hint}" if force_index else ""

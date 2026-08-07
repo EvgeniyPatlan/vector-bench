@@ -32,7 +32,8 @@ sys.path.insert(0, VB_ROOT)
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
 from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
-                                 load_profile, load_resources, resolve_resources)
+                                 load_profile, load_resources,
+                                 merge_resource_overrides, resolve_resources)
 from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
@@ -118,7 +119,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 def cmd_render(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile)
-    resources = load_resources(args.resource_pass)
+    resources = merge_resource_overrides(
+        load_resources(args.resource_pass), profile)
     work = paths_for("render")["work_annb"]
     if not os.path.isdir(work):
         print(f"ann-benchmarks working copy missing at {work}; "
@@ -219,7 +221,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     failures: List[str] = []
 
     for resource_pass in passes:
-        resources = load_resources(resource_pass)
+        resources = merge_resource_overrides(
+            load_resources(resource_pass), profile)
         for engine in engines:
             engine_cfg = load_engine(engine)
             resolved = resolve_resources(resources, engine, info)
@@ -398,6 +401,13 @@ _MEASURED_ROWS_PER_S = {
     ("alisql", "fashion-mnist-784-euclidean"): 150,
     ("pgvector", "fashion-mnist-784-euclidean"): 5655,
     ("mariadb", "glove-100-angular"): 147,
+    # Measured on dbpedia-openai-1000k (990k x 1536, M=16). The formula-based
+    # fallback predicted ~19 h for MariaDB and ~52 h for AliSQL against actuals
+    # of 3.3 h and 6.6 h, so it was 6-8x pessimistic at this dimensionality:
+    # _dim_penalty overcharges for width once the per-row cost is dominated by
+    # graph traversal rather than by the distance computation itself.
+    ("mariadb", "dbpedia-openai-1000k-angular"): 84,
+    ("alisql", "dbpedia-openai-1000k-angular"): 41,
 }
 
 

@@ -41,6 +41,37 @@ def load_resources(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "resources", f"{name}.yml"))
 
 
+def merge_resource_overrides(resources: Dict[str, Any],
+                             profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply a profile's `resources:` block on top of the resource pass.
+
+    Resource passes are sized for the common case, and the common case is a
+    corpus that fits comfortably. A profile that loads a million 1536-dimension
+    vectors needs a bigger budget than one that loads 60,000 at 784, and without
+    this the only options were to edit the shared pass (changing every other
+    profile) or to run under a budget that cannot hold the data.
+
+    Returns a new dict; the inputs are not modified, so a caller can resolve
+    several profiles against one loaded pass.
+    """
+    override = (profile or {}).get("resources") or {}
+    if not override:
+        return resources
+
+    def deep_merge(base: Dict[str, Any], top: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(base)
+        for key, value in top.items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = deep_merge(out[key], value)
+            else:
+                out[key] = value
+        return out
+
+    merged = deep_merge(resources, override)
+    merged["_overridden_by_profile"] = sorted(override)
+    return merged
+
+
 def load_engine(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "engines", f"{name}.yml"))
 

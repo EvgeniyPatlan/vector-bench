@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.metrics import sysinfo  # noqa: E402
 from orchestrator import ann_pass  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
+                                 merge_resource_overrides,
                                  load_profile, load_resources, resolve_resources,
                                  server_args)
 
@@ -483,3 +484,62 @@ class TestAnnClientMemory:
         # Must clear the fixed 8 GB client_limit_gb that would otherwise apply.
         assert got > 8 * 1024 ** 3
         assert ops_client_memory_bytes(str(tmp_path), "absent") > 0
+
+
+class TestProfileResourceOverrides:
+    """A profile can raise the budget its corpus needs.
+
+    dbpedia-openai-1000k does not fit the shared 16 GB pass: pgvector was
+    OOM-killed and AliSQL ran the whole phase at the ceiling, which made the
+    normalized pass a test of who fits in 16 GB.
+    """
+
+    def test_deep_merges_without_dropping_siblings(self):
+        base = {"memory": {"server_limit_gb": 16, "buffer_fraction": 0.30},
+                "cpu": {"server_cpus": 8}}
+        got = merge_resource_overrides(
+            base, {"resources": {"memory": {"server_limit_gb": 64}}})
+        assert got["memory"]["server_limit_gb"] == 64
+        assert got["memory"]["buffer_fraction"] == 0.30   # sibling survives
+        assert got["cpu"] == {"server_cpus": 8}           # other sections survive
+
+    def test_does_not_mutate_the_loaded_pass(self):
+        base = {"memory": {"server_limit_gb": 16}}
+        merge_resource_overrides(
+            base, {"resources": {"memory": {"server_limit_gb": 64}}})
+        assert base["memory"]["server_limit_gb"] == 16
+
+    def test_profile_without_overrides_is_a_passthrough(self):
+        base = {"memory": {"server_limit_gb": 16}}
+        assert merge_resource_overrides(base, {}) is base
+
+    def test_mariadb_blog_profile_asks_for_64gb(self):
+        prof = load_profile("mariadb-blog")
+        merged = merge_resource_overrides(
+            load_resources("normalized"), prof)
+        assert merged["memory"]["server_limit_gb"] == 64
+
+
+class TestMemoryCeilingDetection:
+    """An engine pinned at its cgroup limit is reclaiming, not benchmarking."""
+
+    GB = 1024 ** 3
+
+    def test_flags_a_phase_spent_at_the_limit(self):
+        from report.loaders import ceiling_pressure
+        rows = [{"rss_bytes": int(v * self.GB)}
+                for v in (0.3, 6, 10, 14, 15.9, 16.0, 15.95, 15.93)]
+        got = ceiling_pressure(rows, 16 * self.GB)
+        assert got is not None
+        assert got["fraction_at_ceiling"] == pytest.approx(0.5)
+        assert got["peak_bytes"] == 16 * self.GB
+
+    def test_silent_when_there_is_headroom(self):
+        from report.loaders import ceiling_pressure
+        rows = [{"rss_bytes": int(8.25 * self.GB)}] * 20
+        assert ceiling_pressure(rows, 16 * self.GB) is None
+
+    def test_silent_without_a_known_limit(self):
+        from report.loaders import ceiling_pressure
+        rows = [{"rss_bytes": 16 * self.GB}] * 5
+        assert ceiling_pressure(rows, None) is None

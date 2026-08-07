@@ -63,7 +63,9 @@ def load_manifest(run_dir: str) -> Dict[str, Any]:
 
 
 def summarize(records: List[Dict[str, Any]],
-              manifest: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+              manifest: Optional[Dict[str, Any]] = None,
+              memory: Optional[Dict[str, List[Dict[str, Any]]]] = None
+              ) -> Dict[str, Any]:
     """Headline figures the narrative sections are written from."""
     from report.loaders import pareto_frontier
 
@@ -78,7 +80,23 @@ def summarize(records: List[Dict[str, Any]],
         "plan_failures": [],
         "short_result_cases": [],
         "failed_phases": [],
+        "memory_pressure": [],
     }
+
+    # An engine that spent the phase against its cgroup limit was reclaiming
+    # continuously, so its numbers describe the memory budget and not the
+    # implementation. Nothing in the records shows this.
+    limit = (((manifest or {}).get("config") or {})
+             .get("resolved_resources") or {}).get("server_memory_bytes")
+    for name, rows in sorted((memory or {}).items()):
+        from report.loaders import ceiling_pressure
+        pressure = ceiling_pressure(rows, limit)
+        if not pressure:
+            continue
+        engine = name.split("-", 1)[0]
+        pressure["engine"] = engine
+        pressure["series"] = name
+        summary["memory_pressure"].append(pressure)
 
     # Any measurement taken while the vector index was NOT in the plan is a
     # full scan, and must be surfaced rather than averaged into a curve.
@@ -187,7 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             fh.write(json.dumps(r, sort_keys=True, default=str) + "\n")
     print(f"[report] merged records -> {merged_path}")
 
-    summary = summarize(records, manifest)
+    summary = summarize(records, manifest, memory)
     chart_paths: Dict[str, Dict[str, str]] = {}
 
     for dataset in summary["datasets"]:

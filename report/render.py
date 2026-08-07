@@ -150,6 +150,25 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         if len(summary["plan_failures"]) > 40:
             parts.append(f"\n_…and {len(summary['plan_failures']) - 40} more._\n")
 
+    if summary.get("memory_pressure"):
+        parts.append(
+            "\n### Engines that ran against their memory limit\n\n"
+            "These phases spent part of their run at the container memory limit, "
+            "which means the kernel was reclaiming continuously. Throughput and "
+            "latency for them describe **the budget they were given rather than "
+            "the implementation**, and they are not comparable with an engine that "
+            "had headroom. Raise `memory.server_limit_gb` for this corpus and "
+            "re-run before drawing any conclusion from these numbers.\n"
+        )
+        rows = [[_label(c.get("engine", "?")),
+                 _fmt_bytes(c.get("peak_bytes")),
+                 _fmt_bytes(c.get("limit_bytes")),
+                 f"{c.get('fraction_at_ceiling', 0):.0%}",
+                 f"{c.get('first_hit_fraction', 0):.0%} in"]
+                for c in summary["memory_pressure"]]
+        parts.append(_md_table(
+            ["Engine", "Peak", "Limit", "Time at the limit", "First reached"], rows))
+
     if summary.get("short_result_cases"):
         parts.append(
             "\n### Filtered queries that returned fewer than k results\n\n"

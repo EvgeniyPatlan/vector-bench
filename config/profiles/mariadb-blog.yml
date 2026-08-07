@@ -48,6 +48,22 @@ datasets:
 k: 10
 runs: 1
 
+# This corpus does not fit the shared 16 GB budget, and the first run proved it
+# the expensive way: the table is 7.7 GB and the index 3.9 GB, so pgvector was
+# OOM-killed by the cgroup after three hours and AliSQL spent its entire ops
+# phase pinned at the ceiling, reclaiming continuously. MariaDB peaked at
+# 8.25 GB and was the only engine the budget actually fitted, which made the
+# "normalized" pass a measurement of who fits in 16 GB rather than who is
+# faster.
+#
+# 64 GB holds the table, the index and working memory for all three with room
+# to spare. Raise it further only if a future corpus needs it; the point of the
+# normalized pass is that every engine gets the same budget, not that the
+# budget is large.
+resources:
+  memory:
+    server_limit_gb: 64
+
 # Normalized only unless asked otherwise. Both passes over a million 1536-dim
 # vectors is ~144 h of ingest, and that is not something anyone should end up
 # running because a flag defaulted. Override with --resource-pass both.

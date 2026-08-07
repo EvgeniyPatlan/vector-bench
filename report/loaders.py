@@ -188,6 +188,44 @@ def peak_from_series(rows: List[Dict[str, Any]]) -> Optional[int]:
     return max(values) if values else None
 
 
+# Within this of the container limit counts as "at the ceiling". cgroup peak
+# accounting cannot exceed memory.max, so an engine under sustained pressure
+# reports a value just below the limit rather than above it, and an exact
+# comparison would never fire.
+_CEILING_TOLERANCE = 0.98
+
+
+def ceiling_pressure(rows: List[Dict[str, Any]],
+                     limit_bytes: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Detect a phase that spent significant time against its memory limit.
+
+    An engine pinned at its cgroup limit is reclaiming continuously, so its
+    throughput and latency describe the budget rather than the implementation.
+    That is invisible in the records themselves: the phase either succeeds with
+    depressed numbers or is OOM-killed and shows up only as a non-zero exit.
+
+    Returns None when there is nothing to report, so callers can filter falsy.
+    """
+    if not limit_bytes:
+        return None
+    values = [r.get("rss_bytes") for r in rows if r.get("rss_bytes")]
+    if not values:
+        return None
+    threshold = limit_bytes * _CEILING_TOLERANCE
+    at_ceiling = sum(1 for v in values if v >= threshold)
+    if not at_ceiling:
+        return None
+    first = next(i for i, v in enumerate(values) if v >= threshold)
+    return {
+        "peak_bytes": max(values),
+        "limit_bytes": limit_bytes,
+        "samples": len(values),
+        "samples_at_ceiling": at_ceiling,
+        "fraction_at_ceiling": at_ceiling / len(values),
+        "first_hit_fraction": first / len(values),
+    }
+
+
 def _maybe_int(value: Any) -> Optional[int]:
     try:
         if value is None:

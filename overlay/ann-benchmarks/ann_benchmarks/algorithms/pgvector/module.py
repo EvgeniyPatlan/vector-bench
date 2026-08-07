@@ -51,6 +51,15 @@ OPCLASS = {"angular": "vector_cosine_ops", "euclidean": "vector_l2_ops"}
 OPERATOR = {"angular": "<=>", "euclidean": "<->"}
 
 
+
+# Queries run before each configuration is timed. The first measured point
+# otherwise pays for a cold graph cache and lands slower than the next one,
+# which inverts the low end of the recall/QPS curve: on a 990k x 1536 corpus
+# both MySQL-family engines reported ef_search=10 as slower than ef_search=20,
+# which cannot happen once the cache is warm.
+WARMUP_QUERIES = int(os.environ.get("VB_WARMUP_QUERIES", "30"))
+
+
 class PGVector(BaseANN):
     def __init__(self, metric: str, method_param: Dict[str, Any]):
         if psycopg is None:
@@ -73,6 +82,7 @@ class PGVector(BaseANN):
         self._load_seconds = 0.0
         self._build_seconds = 0.0
         self._plan_verified: Optional[bool] = None
+        self._dim: Optional[int] = None
         self._batch_results: List[List[int]] = []
 
         self._query_sql = (
@@ -136,6 +146,7 @@ class PGVector(BaseANN):
 
     def fit(self, X: numpy.ndarray) -> None:
         dim = int(X.shape[1])
+        self._dim = dim
         cur = self._cur
 
         cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
@@ -203,6 +214,22 @@ class PGVector(BaseANN):
         self._cur.execute(f"SET hnsw.ef_search = {self._ef_search}")
         if self._plan_verified is None:
             self._plan_verified = self._verify_plan()
+        self._warm_cache()
+
+    def _warm_cache(self) -> None:
+        """Run throwaway queries so the timed ones do not pay for a cold cache.
+
+        Random vectors, not the benchmark's query set: warming with the vectors
+        about to be measured would prime the exact graph regions they need.
+        """
+        if WARMUP_QUERIES <= 0 or not self._dim:
+            return
+        rng = numpy.random.RandomState(0)
+        for _ in range(WARMUP_QUERIES):
+            try:
+                self.query(rng.normal(size=self._dim).astype(numpy.float32), 10)
+            except Exception:
+                return
 
     def _verify_plan(self, k: int = 10) -> bool:
         """Confirm the planner picked the HNSW index rather than a seq scan.
