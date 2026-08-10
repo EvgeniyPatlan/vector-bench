@@ -14,6 +14,7 @@ other rather than against the ann-benchmarks in-process numbers.
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -108,7 +109,13 @@ class OpsRun:
 
     def __enter__(self) -> "OpsRun":
         docker_ctl.create_network(self.network, internal=True)
-        docker_ctl.create_volume(self.volume)
+        # Backed by a directory under VB_ROOT rather than Docker's data-root,
+        # so the corpus lands on the filesystem the checkout is on. See
+        # docker_ctl.create_volume.
+        docker_ctl.create_volume(
+            self.volume,
+            device=os.path.join(self.paths["engine_state"], "ops", self.volume),
+        )
         self._start_server()
         return self
 
@@ -248,6 +255,11 @@ class OpsRun:
         docker_ctl.remove(self.client_name)
         docker_ctl.remove_network(self.network)
         docker_ctl.remove_volume(self.volume)
+        # Removing a bind-backed volume leaves the host directory behind, so
+        # without this every configuration would leak a full copy of the corpus
+        # and the index onto disk.
+        shutil.rmtree(os.path.join(self.paths["engine_state"], "ops", self.volume),
+                      ignore_errors=True)
 
 
 def harness_args(profile: Dict[str, Any], m: int, engine: str,

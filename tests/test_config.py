@@ -653,3 +653,73 @@ class TestStaleAnnDetection:
         from report.generate import summarize
         s = summarize([self._record(1.0)], {"config": {}})
         assert s["stale_ann"] == []
+
+
+class TestEngineDataPlacement:
+    """Engine data must not land on Docker's data-root by accident.
+
+    A pgvector ann phase died at `initdb: could not create directory
+    ".../pg_wal": No space left on device` while the filesystem holding the
+    checkout had over 100 GB free. The container was writing its data directory
+    into its own writable layer, under /var/lib/docker on the root volume.
+    """
+
+    def test_every_engine_has_a_declared_data_mount(self):
+        from orchestrator.ann_pass import DATA_MOUNT
+        from orchestrator.cli import ALL_ENGINES
+        assert set(DATA_MOUNT) == set(ALL_ENGINES)
+        assert all(p.startswith("/var/lib/") for p in DATA_MOUNT.values())
+
+    def test_engine_state_lives_under_the_checkout(self):
+        from orchestrator.cli import paths_for, VB_ROOT
+        paths = paths_for("x")
+        assert paths["engine_state"].startswith(VB_ROOT)
+
+    def test_bind_volume_command_targets_the_device(self, monkeypatch, tmp_path):
+        from orchestrator import docker_ctl
+        seen = {}
+        monkeypatch.setattr(docker_ctl, "_run",
+                            lambda cmd, **kw: seen.setdefault("cmd", cmd))
+        device = str(tmp_path / "vol")
+        docker_ctl.create_volume("v1", device=device)
+        cmd = seen["cmd"]
+        assert f"device={device}" in cmd and "o=bind" in cmd
+        assert os.path.isdir(device)      # created before docker is asked for it
+
+    def test_plain_volume_has_no_device_options(self, monkeypatch):
+        from orchestrator import docker_ctl
+        seen = {}
+        monkeypatch.setattr(docker_ctl, "_run",
+                            lambda cmd, **kw: seen.setdefault("cmd", cmd))
+        docker_ctl.create_volume("v2")
+        assert "--opt" not in seen["cmd"]
+
+
+class TestDiskPreflightChecksBothFilesystems:
+    """The results tree and Docker's data-root are usually different mounts."""
+
+    def test_reports_the_tighter_of_the_two(self, tmp_path, monkeypatch, capsys):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "root_dir", lambda: "/var/lib/docker")
+
+        def usage(path):
+            free = 5 * cli.GB if path == "/var/lib/docker" else 900 * cli.GB
+            return type("U", (), {"free": free, "total": 1000 * cli.GB,
+                                  "used": 1000 * cli.GB - free})()
+        monkeypatch.setattr(cli.shutil, "disk_usage", usage)
+        paths = {"results": str(tmp_path), "datasets": str(tmp_path)}
+        blocked = cli._check_free_disk(
+            paths, ["pgvector"], ["dbpedia-openai-1000k-angular"], ["normalized"])
+        assert blocked is True, "a full docker root must block even when results has room"
+        assert "/var/lib/docker" in capsys.readouterr().out
+
+    def test_survives_a_daemon_that_will_not_answer(self, tmp_path, monkeypatch):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "root_dir", lambda: None)
+        monkeypatch.setattr(cli.shutil, "disk_usage",
+                            lambda _p: type("U", (), {"free": 900 * cli.GB,
+                                                      "total": 1000 * cli.GB,
+                                                      "used": 100 * cli.GB})())
+        paths = {"results": str(tmp_path), "datasets": str(tmp_path)}
+        assert cli._check_free_disk(
+            paths, ["mariadb"], ["glove-100-angular"], ["normalized"]) is False

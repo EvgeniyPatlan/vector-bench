@@ -3,6 +3,7 @@
 /work/
 /datasets/
 /results/
+/state/
 /.cache/
 
 # Python

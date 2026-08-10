@@ -52,6 +52,10 @@ def paths_for(run_id: str) -> Dict[str, str]:
         "datasets": os.path.join(VB_ROOT, "datasets"),
         "work_annb": os.path.join(VB_ROOT, "work", "ann-benchmarks"),
         "results": results,
+        # Engine data directories and ops volumes. Kept under VB_ROOT so they
+        # land on whatever filesystem the checkout is on, rather than on
+        # Docker's data-root, which is usually the root volume.
+        "engine_state": os.path.join(VB_ROOT, "state"),
         "run_dir": run_dir,
         # ann-benchmarks builds result filenames from the algorithm and its
         # parameters only — not from the resource pass. Sharing one tree across
@@ -476,10 +480,25 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     put the cluster, and nothing in the run said so — it looked like an engine
     failure for a while. Cheap to check, expensive to discover eight hours in.
     """
-    target = paths.get("results") or paths.get("run_dir") or "."
-    try:
-        usage = shutil.disk_usage(target)
-    except OSError:
+    # Two filesystems matter and they are frequently different. Engine data
+    # goes under VB_ROOT now, but images and any volume not created by this
+    # harness still live under Docker's data-root, which on a default install
+    # is the root volume. Checking only the results directory is how a run
+    # passed preflight and then died at "No space left on device".
+    targets = {paths.get("results") or paths.get("run_dir") or "."}
+    root = docker_ctl.root_dir()
+    if root:
+        targets.add(root)
+
+    usage, target = None, None
+    for candidate in sorted(targets):
+        try:
+            u = shutil.disk_usage(candidate)
+        except OSError:
+            continue
+        if usage is None or u.free < usage.free:
+            usage, target = u, candidate
+    if usage is None:
         return False
 
     corpus_bytes = 0
@@ -497,7 +516,8 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     need = corpus_bytes * _DISK_PER_ENGINE + _DISK_HEADROOM_GB * GB
     free = usage.free
 
-    print(f"disk: {free / GB:.0f} GB free at {target}, "
+    checked = " and ".join(sorted(targets))
+    print(f"disk: {free / GB:.0f} GB free (tightest of {checked}), "
           f"run needs about {need / GB:.0f} GB "
           f"({len(engines)} engine(s), largest corpus footprint plus headroom)")
     if free >= need:

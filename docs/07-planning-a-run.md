@@ -169,7 +169,30 @@ corpus producing a 7.7 GB table and a 3.9 GB index per engine.
 Engines run one at a time and their volumes are removed after each, so the peak
 is one engine's footprint rather than the sum of all three.
 
-The run checks this before starting and refuses if it looks too tight. It is
+### Which filesystem
+
+Two of them matter, and on a benchmark box they are usually different mounts.
+
+Engine data directories and ops volumes go under `$VB_ROOT/state`, so they land
+on whatever filesystem the checkout is on. Images, and anything else Docker
+stores, stay under the daemon's data-root (`docker info -f '{{.DockerRootDir}}'`,
+normally `/var/lib/docker`).
+
+This used to be worse. The ann containers ran the engine with no data mount at
+all, so the database wrote into the container's own writable layer — under
+Docker's data-root, on the root volume. A pgvector phase died at
+
+```
+initdb: error: could not create directory "/var/lib/postgresql/data/pg_wal": No space left on device
+```
+
+while the filesystem holding the checkout had over 100 GB free. If your root
+volume is small, that is now handled: both paths write under `$VB_ROOT`. If you
+would rather move Docker itself, set `data-root` in `/etc/docker/daemon.json`
+and restart the daemon.
+
+The run checks the tighter of the two filesystems before starting and refuses if
+it looks too tight. It is
 worth having: a pgvector phase once died two seconds in because the volume had
 nowhere to put the cluster, and it read as an engine failure for a while before
 anyone thought to check `df`.

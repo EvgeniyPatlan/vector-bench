@@ -93,9 +93,34 @@ def remove_network(name: str) -> None:
     _run(["docker", "network", "rm", name], check=False)
 
 
-def create_volume(name: str) -> str:
-    _run(["docker", "volume", "create", "--label", f"{LABEL}=1", name])
+def create_volume(name: str, device: Optional[str] = None) -> str:
+    """Create a named volume, optionally backed by a specific host directory.
+
+    Without `device`, Docker puts the volume under its own data-root, which on
+    a default install is /var/lib/docker on the root filesystem. That is rarely
+    where the space is: a benchmark box typically has a small root volume and a
+    large data mount, and a million-vector corpus lands on the wrong one. The
+    failure is not subtle but it is misleading — initdb reports "No space left
+    on device" from inside the container and it reads as an engine problem.
+    """
+    cmd = ["docker", "volume", "create", "--label", f"{LABEL}=1"]
+    if device:
+        os.makedirs(device, exist_ok=True)
+        cmd += ["--driver", "local",
+                "--opt", "type=none", "--opt", "o=bind", "--opt", f"device={device}"]
+    cmd.append(name)
+    _run(cmd)
     return name
+
+
+def root_dir() -> Optional[str]:
+    """Where the daemon stores images, containers and volumes."""
+    try:
+        proc = _run(["docker", "info", "-f", "{{.DockerRootDir}}"], check=False)
+    except Exception:
+        return None
+    out = (proc.stdout or "").strip()
+    return out or None
 
 
 def remove_volume(name: str) -> None:

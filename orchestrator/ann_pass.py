@@ -25,6 +25,14 @@ from .config import ResolvedResources, server_args
 # Constructor class names, as ann-benchmarks expects them in config.yml.
 CONSTRUCTORS = {"mariadb": "MariaDB", "alisql": "AliSQL", "pgvector": "PGVector"}
 
+# Where each engine's data directory lives inside its image. The ops path
+# mounts a volume here; the ann path binds a host directory for the same reason.
+DATA_MOUNT = {
+    "mariadb": "/var/lib/vbench",
+    "alisql": "/var/lib/vbench",
+    "pgvector": "/var/lib/postgresql",
+}
+
 # ann-benchmarks raises this when every configuration is already done.
 # See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
 NOTHING_TO_RUN = "Nothing to run"
@@ -239,6 +247,19 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     client_bytes = client_memory_bytes(paths["datasets"], dataset)
     container_memory_bytes = resolved.server_memory_bytes + client_bytes
 
+    # Without this the engine writes its data directory into the container's
+    # writable layer, which lives under Docker's data-root — usually the root
+    # filesystem, and usually not where the space is. A pgvector run died at
+    # `initdb: could not create directory ".../pg_wal": No space left on
+    # device` while the filesystem holding the checkout had 100+ GB free.
+    #
+    # Each configuration builds a fresh index, so the directory is cleared
+    # rather than reused; leaving it would also make the ingest measurement
+    # depend on whatever the previous run left behind.
+    state_dir = os.path.join(paths["engine_state"], "annb", f"{resource_pass}-{engine}")
+    shutil.rmtree(state_dir, ignore_errors=True)
+    os.makedirs(state_dir, exist_ok=True)
+
     command = [
         "run.py", "--local",
         "--algorithm", engine,
@@ -273,6 +294,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             f"{paths['work_annb']}:/home/app:rw",
             f"{paths['datasets']}:/home/app/data:rw",
             f"{annb_results_dir(paths, resource_pass, resolved)}:/home/app/results:rw",
+            f"{state_dir}:{DATA_MOUNT[engine]}:rw",
         ],
         command=command,
         detach=False,
