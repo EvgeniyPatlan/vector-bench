@@ -723,3 +723,56 @@ class TestDiskPreflightChecksBothFilesystems:
         paths = {"results": str(tmp_path), "datasets": str(tmp_path)}
         assert cli._check_free_disk(
             paths, ["mariadb"], ["glove-100-angular"], ["normalized"]) is False
+
+
+class TestCleanup:
+    """Cleanup must be label-scoped, refuse to kill a live run, and reclaim disk."""
+
+    def test_no_run_id_omits_the_name_filter(self, monkeypatch):
+        """An empty --filter name= filters on the empty string, not on everything."""
+        from orchestrator import docker_ctl
+        calls = []
+        monkeypatch.setattr(docker_ctl, "_run",
+                            lambda cmd, **kw: (calls.append(cmd),
+                                               type("P", (), {"stdout": ""})())[1])
+        docker_ctl.cleanup_run("")
+        for cmd in calls:
+            assert "name=" not in " ".join(cmd)
+            assert "label=vector-bench=1" in cmd
+
+    def test_run_id_narrows_the_filter(self, monkeypatch):
+        from orchestrator import docker_ctl
+        calls = []
+        monkeypatch.setattr(docker_ctl, "_run",
+                            lambda cmd, **kw: (calls.append(cmd),
+                                               type("P", (), {"stdout": ""})())[1])
+        docker_ctl.cleanup_run("main-123")
+        assert any("name=main-123" in " ".join(c) for c in calls)
+
+    def test_always_scoped_by_label(self, monkeypatch):
+        """Nothing on a shared machine should be at risk."""
+        from orchestrator import docker_ctl
+        calls = []
+        monkeypatch.setattr(docker_ctl, "_run",
+                            lambda cmd, **kw: (calls.append(cmd),
+                                               type("P", (), {"stdout": ""})())[1])
+        docker_ctl.cleanup_run("")
+        assert all("label=vector-bench=1" in c for c in calls if c[1] != "ps")
+
+    def test_refuses_while_a_run_is_live(self, monkeypatch):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "docker_available", lambda: True)
+        monkeypatch.setattr(cli.docker_ctl, "running_containers",
+                            lambda: ["main-1-mariadb-srv"])
+        args = type("A", (), {"run_id": None, "force": False})()
+        assert cli.cmd_clean(args) == 2
+
+    def test_force_overrides_the_guard(self, monkeypatch, tmp_path):
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "docker_available", lambda: True)
+        monkeypatch.setattr(cli.docker_ctl, "running_containers", lambda: ["x"])
+        monkeypatch.setattr(cli.docker_ctl, "cleanup_run", lambda _r: {"container": 0})
+        monkeypatch.setattr(cli, "paths_for",
+                            lambda _n: {"engine_state": str(tmp_path / "none")})
+        args = type("A", (), {"run_id": None, "force": True})()
+        assert cli.cmd_clean(args) == 0

@@ -140,9 +140,58 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
-    docker_ctl.cleanup_run(args.run_id or "")
-    print("cleaned up docker resources")
+    if not docker_ctl.docker_available():
+        print("cannot talk to the Docker daemon", file=sys.stderr)
+        return 1
+
+    live = docker_ctl.running_containers()
+    if live and not args.force:
+        print(f"{len(live)} vector-bench container(s) are still running:",
+              file=sys.stderr)
+        for name in live[:10]:
+            print(f"  {name}", file=sys.stderr)
+        print("Cleaning now would destroy a run in progress.\n"
+              "Wait for it to finish, or pass --force if you know it is dead.",
+              file=sys.stderr)
+        return 2
+
+    removed = docker_ctl.cleanup_run(args.run_id or "")
+    print("removed: " + ", ".join(f"{n} {kind}(s)" for kind, n in removed.items()))
+
+    # Bind-backed volumes leave their host directory behind when the volume is
+    # removed, and the ann path writes its data directory straight onto the
+    # host. Neither is reclaimed by docker, so a killed run leaves a full corpus
+    # and index on disk with nothing pointing at it.
+    paths = paths_for("clean")
+    state = paths["engine_state"]
+    freed = 0
+    if os.path.isdir(state):
+        for sub in ("annb", "ops"):
+            base = os.path.join(state, sub)
+            if not os.path.isdir(base):
+                continue
+            for name in sorted(os.listdir(base)):
+                if args.run_id and args.run_id not in name:
+                    continue
+                target = os.path.join(base, name)
+                size = _dir_size(target)
+                shutil.rmtree(target, ignore_errors=True)
+                freed += size
+                print(f"  removed state/{sub}/{name} ({size / GB:.1f} GB)")
+    if freed:
+        print(f"reclaimed {freed / GB:.1f} GB of engine data")
     return 0
 
 
@@ -714,7 +763,10 @@ def build_parser() -> argparse.ArgumentParser:
     rep.set_defaults(func=cmd_report)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
-    c.add_argument("--run-id", default=None)
+    c.add_argument("--run-id", default=None,
+                   help="limit cleanup to one run (default: everything)")
+    c.add_argument("--force", action="store_true",
+                   help="clean even while vector-bench containers are running")
     c.set_defaults(func=cmd_clean)
 
     return p

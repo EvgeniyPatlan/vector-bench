@@ -356,16 +356,32 @@ class MemorySampler(threading.Thread):
         self.join(timeout=10)
 
 
-def cleanup_run(run_id: str) -> None:
-    """Remove every container, network and volume belonging to a run."""
+def running_containers() -> List[str]:
+    """Names of vector-bench containers currently running."""
+    proc = _run(["docker", "ps", "--format", "{{.Names}}",
+                 "--filter", f"label={LABEL}=1"], check=False, timeout=60)
+    return [n for n in (proc.stdout or "").split() if n]
+
+
+def cleanup_run(run_id: str = "") -> Dict[str, int]:
+    """Remove every container, network and volume belonging to a run.
+
+    With no run_id this removes everything the harness has ever created. Always
+    scoped by the vector-bench label, so nothing else on a shared box is
+    touched. Returns counts per kind.
+    """
+    removed: Dict[str, int] = {}
     for kind in ("container", "network", "volume"):
-        proc = _run(
-            ["docker", kind, "ls", "-q", "--filter", f"label={LABEL}=1",
-             "--filter", f"name={run_id}"],
-            check=False, timeout=60,
-        )
+        filters = ["--filter", f"label={LABEL}=1"]
+        # An empty --filter name= is not "match everything", it is a filter on
+        # the empty string, and whether that matches is version-dependent.
+        if run_id:
+            filters += ["--filter", f"name={run_id}"]
+        proc = _run(["docker", kind, "ls", "-q", *filters], check=False, timeout=60)
         ids = [i for i in (proc.stdout or "").split() if i]
+        removed[kind] = len(ids)
         if not ids:
             continue
         force = ["-f"] if kind in ("container", "volume") else []
         _run(["docker", kind, "rm", *force, *ids], check=False, timeout=300)
+    return removed
