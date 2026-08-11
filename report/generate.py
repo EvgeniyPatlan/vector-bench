@@ -191,15 +191,20 @@ def _narrow_to_this_run(annb_dir: str, manifest: Dict[str, Any]) -> str:
     the staleness check below is the only guard.
     """
     cfg = manifest.get("config") or {}
-    resolved = cfg.get("resolved_resources") or {}
     pass_name = cfg.get("resource_pass")
-    if not (resolved and pass_name):
+    # Taken from the manifest, not recomputed. This module runs inside a bench
+    # image that mounts report/ and harness/ only, so importing the orchestrator
+    # to derive it is not an option.
+    fingerprint = cfg.get("ann_fingerprint")
+    if not (pass_name and fingerprint):
         return annb_dir
-    from orchestrator.ann_pass import ann_fingerprint
-    candidate = os.path.join(annb_dir, pass_name, ann_fingerprint(resolved))
+    candidate = os.path.join(annb_dir, pass_name, fingerprint)
     if os.path.isdir(candidate):
-        print(f"[report] ann-bench tree: {pass_name}/{os.path.basename(candidate)}")
+        print(f"[report] ann-bench tree: {pass_name}/{fingerprint}")
         return candidate
+    print(f"[report] no tree at {pass_name}/{fingerprint}; reading the whole "
+          f"ann-benchmarks directory. Results older than this run will be "
+          f"flagged in Validity.")
     return annb_dir
 
 

@@ -286,7 +286,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         for engine in engines:
             engine_cfg = load_engine(engine)
             resolved = resolve_resources(resources, engine, info)
-            manifest.set_config(profile, resource_pass, resolved)
+            # Recorded here, where orchestrator code is importable. The report
+            # generator runs inside a bench image that mounts only report/ and
+            # harness/, so it cannot compute this itself — an earlier version
+            # imported orchestrator.ann_pass from the report and crashed the
+            # whole run at the last step, after 20 hours of measurement.
+            manifest.set_config(
+                profile, resource_pass, resolved,
+                extra={"ann_fingerprint": ann_pass.ann_fingerprint(resolved)},
+            )
             manifest.set_engine(
                 engine, paths["sources"],
                 engine_cfg.get("image", {}).get("runtime", ""),
@@ -364,6 +372,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
+def _read_manifest_config(run_dir: str) -> Dict[str, Any]:
+    """The run's `config` block, or an empty dict if it cannot be read."""
+    try:
+        with open(os.path.join(run_dir, "run-manifest.json")) as fh:
+            return json.load(fh).get("config") or {}
+    except (OSError, ValueError):
+        return {}
+
+
 def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
     """Run the report generator inside a bench image.
 
@@ -383,6 +400,28 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
               "build one first: ./run-benchmark.sh build", file=sys.stderr)
         return 1
 
+    # Narrow the ann tree on the host, where the orchestrator is importable.
+    # The report container mounts report/ and harness/ only, so it cannot work
+    # this out for itself, and reading the whole tree would mix results from
+    # every resource configuration ever measured on this machine into one
+    # report. Older manifests predate the recorded fingerprint, so fall back to
+    # recomputing it from the resources they did record.
+    annb_mount = "/results/annb"
+    cfg = _read_manifest_config(paths["run_dir"])
+    pass_name = cfg.get("resource_pass")
+    fingerprint = cfg.get("ann_fingerprint")
+    if pass_name and not fingerprint and cfg.get("resolved_resources"):
+        fingerprint = ann_pass.ann_fingerprint(cfg["resolved_resources"])
+    if pass_name and fingerprint:
+        candidate = os.path.join(paths["annb_results"], pass_name, fingerprint)
+        if os.path.isdir(candidate):
+            annb_mount = f"/results/annb/{pass_name}/{fingerprint}"
+            print(f"report: ann results from {pass_name}/{fingerprint}")
+        else:
+            print(f"report: no ann tree at {pass_name}/{fingerprint}; "
+                  f"reading everything under results/annb. Anything older than "
+                  f"this run will be flagged in the report's Validity section.")
+
     spec = docker_ctl.ContainerSpec(
         name=f"vb-report-{os.getpid()}",
         image=image,
@@ -399,7 +438,7 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
         command=[
             "/vb/report/generate.py",
             "--run-dir", f"/results/{os.path.basename(paths['run_dir'])}",
-            "--annb-results", "/results/annb",
+            "--annb-results", annb_mount,
             "--datasets-dir", "/datasets",
         ],
         detach=False,

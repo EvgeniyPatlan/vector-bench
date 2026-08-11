@@ -8,6 +8,7 @@ perfectly credible.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -18,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.metrics import sysinfo  # noqa: E402
 from orchestrator import ann_pass  # noqa: E402
+from orchestrator.cli import VB_ROOT  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  merge_resource_overrides,
                                  load_profile, load_resources, resolve_resources,
@@ -776,3 +778,55 @@ class TestCleanup:
                             lambda _n: {"engine_state": str(tmp_path / "none")})
         args = type("A", (), {"run_id": None, "force": True})()
         assert cli.cmd_clean(args) == 0
+
+
+class TestReportNarrowing:
+    """The report container mounts report/ and harness/ only.
+
+    An earlier version imported orchestrator.ann_pass from inside it, which
+    crashed report generation with ModuleNotFoundError at the very end of a
+    20-hour run. The narrowing is decided on the host now, and the fingerprint
+    is recorded in the manifest so the container never has to derive it.
+    """
+
+    def test_report_package_does_not_import_the_orchestrator(self):
+        import glob
+        for path in glob.glob(os.path.join(VB_ROOT, "report", "*.py")):
+            src = open(path).read()
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                assert "import orchestrator" not in stripped, f"{path}: {stripped}"
+                assert "from orchestrator" not in stripped, f"{path}: {stripped}"
+
+    def test_manifest_records_the_fingerprint(self, tmp_path):
+        from orchestrator.ann_pass import ann_fingerprint
+        from orchestrator.manifest import Manifest
+        resolved = {"server_memory_bytes": 64 * 1024 ** 3, "buffer_bytes": 1,
+                    "graph_cache_bytes": 2, "maintenance_bytes": 3,
+                    "build_threads": 1, "server_cpu_count": 8}
+        m = Manifest(str(tmp_path / "run"), "run-1")
+        m.set_config({}, "normalized", resolved,
+                     extra={"ann_fingerprint": ann_fingerprint(resolved)})
+        assert m.data["config"]["ann_fingerprint"] == ann_fingerprint(resolved)
+
+    def test_old_manifests_still_resolve_a_fingerprint(self, tmp_path):
+        """Runs that predate the recorded field must still narrow correctly."""
+        from orchestrator.ann_pass import ann_fingerprint
+        from orchestrator.cli import _read_manifest_config
+        resolved = {"server_memory_bytes": 16 * 1024 ** 3, "buffer_bytes": 1,
+                    "graph_cache_bytes": 2, "maintenance_bytes": 3,
+                    "build_threads": 1, "server_cpu_count": 8}
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "run-manifest.json").write_text(json.dumps(
+            {"config": {"resource_pass": "normalized",
+                        "resolved_resources": resolved}}))
+        cfg = _read_manifest_config(str(run))
+        assert cfg.get("ann_fingerprint") is None
+        assert ann_fingerprint(cfg["resolved_resources"]) == ann_fingerprint(resolved)
+
+    def test_missing_manifest_is_survivable(self, tmp_path):
+        from orchestrator.cli import _read_manifest_config
+        assert _read_manifest_config(str(tmp_path)) == {}
