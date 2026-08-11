@@ -830,3 +830,57 @@ class TestReportNarrowing:
     def test_missing_manifest_is_survivable(self, tmp_path):
         from orchestrator.cli import _read_manifest_config
         assert _read_manifest_config(str(tmp_path)) == {}
+
+
+class TestFingerprintIsEngineInvariant:
+    """One results tree per configuration, not per engine.
+
+    The cache split differs by engine on purpose: pgvector has no separate
+    graph cache so its buffer absorbs that share. Hashing the split gave each
+    engine its own tree, the report could only narrow to one of them, and a
+    three-engine run produced a recall chart with a single engine on it.
+    """
+
+    class _CPU:
+        arch = "x86_64"; hybrid = False; efficiency_cpus = []
+        performance_cpus = list(range(40)); logical_cpus = 80
+        physical_cores = 40; threads_per_core = 2; model = "Xeon"
+
+    class _Info:
+        cpu = None; total_ram_bytes = 201365635072
+
+    def _info(self):
+        info = self._Info(); info.cpu = self._CPU(); return info
+
+    def _resolved(self, engine, gb=64, **over):
+        res = merge_resource_overrides(load_resources("normalized"),
+                                       load_profile("mariadb-blog"))
+        res["memory"]["server_limit_gb"] = gb
+        res["memory"].update(over)
+        return resolve_resources(res, engine, self._info())
+
+    def test_all_engines_share_one_tree(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        got = {e: ann_fingerprint(self._resolved(e))
+               for e in ("mariadb", "alisql", "pgvector")}
+        assert len(set(got.values())) == 1, got
+
+    def test_survives_the_one_byte_rounding_difference(self):
+        """int(x*0.30)*2 and int(x*0.60) differ by a byte; MiB quantising hides it."""
+        my = self._resolved("mariadb")
+        pg = self._resolved("pgvector")
+        raw_my = my.buffer_bytes + my.graph_cache_bytes + my.maintenance_bytes
+        raw_pg = pg.buffer_bytes + pg.graph_cache_bytes + pg.maintenance_bytes
+        assert raw_my != raw_pg, "the rounding quirk this guards against is gone"
+        from orchestrator.ann_pass import ann_fingerprint
+        assert ann_fingerprint(my) == ann_fingerprint(pg)
+
+    def test_budget_change_still_invalidates(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        assert (ann_fingerprint(self._resolved("mariadb", gb=64))
+                != ann_fingerprint(self._resolved("mariadb", gb=16)))
+
+    def test_fraction_change_still_invalidates(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        assert (ann_fingerprint(self._resolved("mariadb"))
+                != ann_fingerprint(self._resolved("mariadb", buffer_fraction=0.20)))

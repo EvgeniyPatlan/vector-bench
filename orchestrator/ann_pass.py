@@ -61,12 +61,25 @@ def ann_fingerprint(resolved: Any) -> str:
     # can recompute the fingerprint without rebuilding the resource objects.
     get = (resolved.get if isinstance(resolved, dict)
            else lambda k, d=None: getattr(resolved, k, d))
+
+    # Deliberately engine-invariant. The individual cache figures differ by
+    # engine by design -- pgvector has no separate graph cache, so its buffer
+    # absorbs that share -- and hashing them gave every engine its own results
+    # tree. The report can only narrow to one tree, so a three-engine run
+    # produced a recall chart containing a single engine.
+    #
+    # The *total* handed out is identical across engines, so it captures a
+    # change to the fractions without fragmenting by engine.
+    # Quantised to MiB. int(64GB * 0.30) * 2 and int(64GB * 0.60) differ by a
+    # single byte from float rounding, which was enough to split the engines
+    # into separate trees again.
+    allocated = sum(int(get(k) or 0) for k in
+                    ("buffer_bytes", "graph_cache_bytes", "maintenance_bytes"))
+    allocated //= 1024 * 1024
     fields = (
         ANN_MEASUREMENT_VERSION,
         get("server_memory_bytes"),
-        get("buffer_bytes"),
-        get("graph_cache_bytes"),
-        get("maintenance_bytes"),
+        allocated,
         get("build_threads"),
         get("server_cpu_count"),
     )
