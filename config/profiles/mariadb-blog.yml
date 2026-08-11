@@ -109,11 +109,13 @@ ops:
   # concurrency costs only its own query time (six minutes per engine) rather
   # than another 3-7 hour load.
   #
-  # Filtered and churn stay off. Filtered has to recompute exact ground truth by
-  # brute force over the qualifying subset, and churn rewrites 10% of a million
-  # rows at the engine's incremental insert rate, which is 20-40 minutes on its
-  # own. Enable them deliberately when that is the question being asked.
-  workloads: [build, concurrency]
+  # Filtered and churn are on too. They are the reason to keep vectors in a
+  # database rather than a dedicated store, and like concurrency they run
+  # against the corpus that has already been loaded. Filtered adds a brute-force
+  # ground-truth pass per selectivity; churn rewrites 10% of a million rows at
+  # the engine's incremental insert rate. Together roughly two hours across the
+  # three engines, against 21 hours of loading that is being paid anyway.
+  workloads: [build, concurrency, filtered, churn]
   m_values: [16]
   ef_search: 100
   subset_rows: null
@@ -129,5 +131,8 @@ ops:
   # 30s at these throughputs is a few thousand queries, which is thin for a p99.
   # Six points at 60s is six minutes per engine.
   concurrency_duration_s: 60
-  selectivities: [0.10]
+  # 1% is the hard case and the one worth having: on glove-100 MariaDB fell to
+  # 0.9 QPS there against 326 unfiltered, a 360x penalty that is itself a
+  # result. It is slow to measure for the same reason, so budget for it.
+  selectivities: [0.10, 0.01]
   churn_fractions: [0.10]
