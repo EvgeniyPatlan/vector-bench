@@ -94,7 +94,26 @@ def summarize(records: List[Dict[str, Any]],
         "failed_phases": [],
         "memory_pressure": [],
         "stale_ann": [],
+        "duplicate_ann": [],
     }
+
+    # Two results for one configuration means the report is reading more than
+    # one measurement tree. Timestamps can be lost by copying a run between
+    # machines, so this catches the same problem without depending on them: a
+    # 16 GB curve and a 64 GB curve were merged into one chart, and the charts
+    # silently showed whichever was faster at each point.
+    by_config: Dict[Any, List[Dict[str, Any]]] = {}
+    for r in recall_records:
+        by_config.setdefault(
+            (r.get("engine"), r.get("dataset"), r.get("m"), r.get("ef_search"),
+             r.get("build_mode")), []).append(r)
+    for key, group in sorted(by_config.items(), key=lambda kv: str(kv[0])):
+        if len(group) > 1:
+            summary["duplicate_ann"].append({
+                "engine": key[0], "dataset": key[1], "m": key[2],
+                "ef_search": key[3], "count": len(group),
+                "qps": sorted(round(g.get("qps") or 0, 1) for g in group),
+            })
 
     # ann-benchmarks skips configurations that already have result files, and
     # reports that as success. A re-run after a config change therefore returns
@@ -102,14 +121,16 @@ def summarize(records: List[Dict[str, Any]],
     started = _parse_ts((manifest or {}).get("started_at"))
     if started:
         for r in recall_records:
-            mtime = r.get("source_mtime")
+            # The loader stores this under `extra`, alongside source_file.
+            # Reading it from the top level meant the check never fired once.
+            mtime = (r.get("extra") or {}).get("source_mtime") or r.get("source_mtime")
             if mtime and mtime < started:
                 summary["stale_ann"].append({
                     "engine": r.get("engine"),
                     "dataset": r.get("dataset"),
                     "measured_at": mtime,
                     "run_started": started,
-                    "source_file": r.get("source_file"),
+                    "source_file": (r.get("extra") or {}).get("source_file"),
                 })
 
     # An engine that spent the phase against its cgroup limit was reclaiming

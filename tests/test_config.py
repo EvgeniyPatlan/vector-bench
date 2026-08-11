@@ -884,3 +884,46 @@ class TestFingerprintIsEngineInvariant:
         from orchestrator.ann_pass import ann_fingerprint
         assert (ann_fingerprint(self._resolved("mariadb"))
                 != ann_fingerprint(self._resolved("mariadb", buffer_fraction=0.20)))
+
+
+class TestDuplicateAnnDetection:
+    """Reading two measurement trees at once must be loud, not silent.
+
+    A report merged a 16 GB curve and a 64 GB curve for the same engines. The
+    charts take the best value at each point, so they showed a blend of two
+    configurations and the Validity section said "no problems detected".
+    """
+
+    MANIFEST = {"started_at": "2026-08-10T15:20:05Z",
+                "config": {"resource_pass": "normalized"}}
+
+    def _rec(self, engine, ef, qps, mtime=None):
+        r = {"phase": "recall_qps", "engine": engine, "dataset": "d", "m": 16,
+             "ef_search": ef, "recall_at_k": 0.95, "qps": qps,
+             "build_mode": None, "extra": {"source_file": "x.hdf5"}}
+        if mtime is not None:
+            r["extra"]["source_mtime"] = mtime
+        return r
+
+    def test_flags_one_configuration_measured_twice(self):
+        from report.generate import summarize
+        s = summarize([self._rec("mariadb", 10, 118.3),
+                       self._rec("mariadb", 10, 305.5)], self.MANIFEST)
+        assert len(s["duplicate_ann"]) == 1
+        assert s["duplicate_ann"][0]["qps"] == [118.3, 305.5]
+
+    def test_silent_on_a_clean_single_tree(self):
+        from report.generate import summarize
+        s = summarize([self._rec("mariadb", 10, 118.3),
+                       self._rec("mariadb", 20, 173.5),
+                       self._rec("alisql", 10, 144.8)], self.MANIFEST)
+        assert s["duplicate_ann"] == []
+
+    def test_staleness_reads_the_key_the_loader_writes(self):
+        """The loader puts source_mtime under `extra`; reading the top level
+        meant the check silently never fired."""
+        from report.generate import summarize, _parse_ts
+        old = _parse_ts("2026-08-05T22:00:00Z")
+        s = summarize([self._rec("mariadb", 10, 118.3, mtime=old)], self.MANIFEST)
+        assert len(s["stale_ann"]) == 1
+        assert s["stale_ann"][0]["source_file"] == "x.hdf5"

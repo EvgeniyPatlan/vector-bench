@@ -162,6 +162,26 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         if len(summary["plan_failures"]) > 40:
             parts.append(f"\n_…and {len(summary['plan_failures']) - 40} more._\n")
 
+    if summary.get("duplicate_ann"):
+        parts.append(
+            "\n### The same configuration was measured more than once\n\n"
+            "Every row below appeared twice or more in the results this report "
+            "read, which means it is reading **more than one measurement tree** "
+            "— typically results from an older resource budget sitting alongside "
+            "the current ones. The charts pick the best value at each point, so "
+            "they are a blend of two configurations rather than a measurement of "
+            "either. Point the report at a single tree with `--annb-results`, or "
+            "delete the stale one.\n"
+        )
+        rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+                 str(c.get("m", "—")), str(c.get("ef_search", "—")),
+                 str(c.get("count")), ", ".join(str(q) for q in c.get("qps", []))]
+                for c in summary["duplicate_ann"][:30]]
+        parts.append(_md_table(
+            ["Engine", "Dataset", "M", "ef_search", "Copies", "QPS seen"], rows))
+        if len(summary["duplicate_ann"]) > 30:
+            parts.append(f"\n_…and {len(summary['duplicate_ann']) - 30} more._\n")
+
     if summary.get("stale_ann"):
         parts.append(
             "\n### Recall results that predate this run\n\n"
