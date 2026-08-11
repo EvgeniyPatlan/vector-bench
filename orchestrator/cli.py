@@ -174,8 +174,21 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # removed, and the ann path writes its data directory straight onto the
     # host. Neither is reclaimed by docker, so a killed run leaves a full corpus
     # and index on disk with nothing pointing at it.
+    # Needs an image: the directories are root-owned and can only be removed
+    # from inside a container.
+    image = ""
+    for engine in ALL_ENGINES:
+        candidate = load_engine(engine).get("image", {}).get("runtime", "")
+        if candidate and docker_ctl.image_exists(candidate):
+            image = candidate
+            break
+
     paths = paths_for("clean")
     state = paths["engine_state"]
+    if not image and os.path.isdir(state) and os.listdir(state):
+        print("no engine image available to remove the root-owned state "
+              "directories; build one first, or remove them with sudo",
+              file=sys.stderr)
     freed = 0
     if os.path.isdir(state):
         for sub in ("annb", "ops"):
@@ -187,9 +200,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     continue
                 target = os.path.join(base, name)
                 size = _dir_size(target)
-                shutil.rmtree(target, ignore_errors=True)
-                freed += size
-                print(f"  removed state/{sub}/{name} ({size / GB:.1f} GB)")
+                if docker_ctl.remove_tree_as_root(target, image):
+                    freed += size
+                    print(f"  removed state/{sub}/{name} ({size / GB:.1f} GB)")
+                else:
+                    print(f"  could NOT remove state/{sub}/{name}", file=sys.stderr)
     if freed:
         print(f"reclaimed {freed / GB:.1f} GB of engine data")
     return 0

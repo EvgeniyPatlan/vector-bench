@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -258,8 +259,15 @@ class OpsRun:
         # Removing a bind-backed volume leaves the host directory behind, so
         # without this every configuration would leak a full copy of the corpus
         # and the index onto disk.
-        shutil.rmtree(os.path.join(self.paths["engine_state"], "ops", self.volume),
-                      ignore_errors=True)
+        # Root-owned: the engine wrote it from inside the container, so this
+        # has to go through a container too. shutil.rmtree cannot touch it and
+        # fails silently, leaving a full corpus and index on disk.
+        bind_dir = os.path.join(self.paths["engine_state"], "ops", self.volume)
+        image = self.engine_cfg.get("image", {}).get(
+            "runtime", f"vector-bench/{self.engine}-runtime")
+        if not docker_ctl.remove_tree_as_root(bind_dir, image):
+            print(f"[ops] WARNING: {bind_dir} survived teardown and is still "
+                  f"using disk", file=sys.stderr)
 
 
 def harness_args(profile: Dict[str, Any], m: int, engine: str,

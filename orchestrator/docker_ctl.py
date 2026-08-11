@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 import shlex
 import subprocess
 import threading
@@ -361,6 +363,39 @@ def running_containers() -> List[str]:
     proc = _run(["docker", "ps", "--format", "{{.Names}}",
                  "--filter", f"label={LABEL}=1"], check=False, timeout=60)
     return [n for n in (proc.stdout or "").split() if n]
+
+
+def remove_tree_as_root(path: str, image: str) -> bool:
+    """Delete a host directory that a container filled as root.
+
+    Engines run as root inside their containers, so everything they write to a
+    bind mount is root-owned. shutil.rmtree cannot remove it, and with
+    ignore_errors=True it fails silently, which is how a teardown that looked
+    like it worked left tens of GB behind.
+
+    Returns True if the path is gone afterwards.
+    """
+    if not os.path.exists(path):
+        return True
+    if os.getuid() == 0:
+        shutil.rmtree(path, ignore_errors=True)
+        return not os.path.exists(path)
+
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    spec = ContainerSpec(
+        name=f"vb-rm-{os.getpid()}",
+        image=image,
+        network="none",
+        entrypoint="rm",
+        command=["-rf", f"/target/{name}"],
+        volumes=[f"{parent}:/target:rw"],
+        detach=False,
+    )
+    try:
+        run_foreground(spec, timeout=600, stream=False)
+    except Exception as exc:  # pragma: no cover - depends on the daemon
+        print(f"[clean] could not remove {path}: {exc}", file=sys.stderr)
+    return not os.path.exists(path)
 
 
 def cleanup_run(run_id: str = "") -> Dict[str, int]:

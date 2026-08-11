@@ -927,3 +927,38 @@ class TestDuplicateAnnDetection:
         s = summarize([self._rec("mariadb", 10, 118.3, mtime=old)], self.MANIFEST)
         assert len(s["stale_ann"]) == 1
         assert s["stale_ann"][0]["source_file"] == "x.hdf5"
+
+
+class TestRootOwnedCleanup:
+    """Engine data is written by root inside a container.
+
+    shutil.rmtree cannot remove it, and with ignore_errors=True it fails
+    silently. A teardown that looked successful left the corpus and index on
+    disk; the only visible symptom was `du: Permission denied`.
+    """
+
+    def test_uses_a_container_when_not_root(self, tmp_path, monkeypatch):
+        from orchestrator import docker_ctl
+        target = tmp_path / "vol"
+        target.mkdir()
+        seen = {}
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(docker_ctl, "run_foreground",
+                            lambda spec, **kw: seen.setdefault("spec", spec))
+        docker_ctl.remove_tree_as_root(str(target), "vector-bench/mariadb-runtime")
+        spec = seen["spec"]
+        assert spec.entrypoint == "rm"
+        assert spec.command == ["-rf", "/target/vol"]
+        assert f"{tmp_path}:/target:rw" in spec.volumes
+
+    def test_reports_failure_when_the_path_survives(self, tmp_path, monkeypatch):
+        from orchestrator import docker_ctl
+        target = tmp_path / "vol"
+        target.mkdir()
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+        monkeypatch.setattr(docker_ctl, "run_foreground", lambda spec, **kw: 0)
+        assert docker_ctl.remove_tree_as_root(str(target), "img") is False
+
+    def test_missing_path_is_already_clean(self, tmp_path):
+        from orchestrator import docker_ctl
+        assert docker_ctl.remove_tree_as_root(str(tmp_path / "gone"), "img") is True
