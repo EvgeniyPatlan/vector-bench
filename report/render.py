@@ -337,6 +337,21 @@ def _build_table(summary: Dict[str, Any]) -> str:
     )
 
 
+def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
+    """Say a workload was not enabled, rather than printing an empty table.
+
+    A section with an empty table and a blank chart reads as a broken report.
+    It usually just means `ops.workloads` did not include this one.
+    """
+    enabled = ((profile.get("ops") or {}).get("workloads")) or []
+    return (
+        f"_Not measured in this run._ The `{profile.get('name', 'profile')}` "
+        f"profile ran `workloads: {list(enabled)}`, which does not include "
+        f"`{workload}`. Add it to the profile and re-run to populate this "
+        f"section; it reuses the corpus the build phase already loaded.\n"
+    )
+
+
 def _concurrency_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("concurrency", []),
@@ -464,7 +479,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "MHNSW graph per `TABLE_SHARE`; AliSQL keeps a shared cache plus a "
         "per-transaction cache; pgvector serves graph pages from `shared_buffers`. "
         "Scaling efficiency of 1.0 is linear scaling.\n\n",
-        _concurrency_table(summary),
+        (_concurrency_table(summary) if summary.get("concurrency")
+         else _not_measured("concurrency", profile)),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.startswith("concurrency-"):
@@ -476,7 +492,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "recomputed exactly over the qualifying rows. **Short results** counts "
         "queries that returned fewer than k rows — a real consequence of "
         "post-filtering, not a harness fault.\n\n",
-        _filtered_table(summary),
+        (_filtered_table(summary) if summary.get("filtered")
+         else _not_measured("filtered", profile)),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.startswith("filtered-"):
@@ -486,7 +503,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "\n---\n\n## 8. Churn\n\n",
         "Recall and throughput after deleting and re-inserting a fraction of rows. "
         "HNSW graphs degrade under deletion; how much differs by implementation.\n\n",
-        _churn_table(summary),
+        (_churn_table(summary) if summary.get("churn")
+         else _not_measured("churn", profile)),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.split("-")[0] in ("churn", "churnimpact", "passcompare") or stem == "memory-timeline":

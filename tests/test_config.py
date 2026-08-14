@@ -1013,3 +1013,77 @@ class TestShmSizedForParallelBuild:
         res["memory"]["maintenance_fraction"] = 0.9
         r = resolve_resources(res, "pgvector", self._info())
         assert float(r.shm_size.rstrip("gG")) <= 4.0
+
+
+class TestReportHandlesUnrunWorkloads:
+    """A profile picks its workloads; the report must not look broken for it.
+
+    mariadb-blog-repro runs `workloads: [build]` because the article it
+    reproduces measured nothing else. The report drew empty axes for
+    concurrency and churn anyway, which reads as a failure rather than a
+    choice, and got asked about three separate times.
+    """
+
+    MANIFEST = {"started_at": "2026-08-14T09:25:44Z",
+                "config": {"resource_pass": "tuned",
+                           "profile": {"name": "mariadb-blog-repro",
+                                       "ops": {"workloads": ["build"]}}}}
+
+    def _records(self):
+        return [{"phase": "ingest", "engine": "mariadb", "dataset": "d",
+                 "ingest_rows_per_s": 76.3, "ingest_wall_s": 1.0},
+                {"phase": "recall_qps", "engine": "mariadb", "dataset": "d",
+                 "m": 16, "ef_search": 10, "recall_at_k": 0.93, "qps": 261.7,
+                 "storage_engine": "InnoDB", "extra": {}}]
+
+    def test_unrun_workloads_summarise_as_empty(self):
+        from report.generate import summarize
+        s = summarize(self._records(), self.MANIFEST)
+        assert s["concurrency"] == [] and s["filtered"] == [] and s["churn"] == []
+
+    def test_not_measured_note_names_the_profile_and_workload(self):
+        from report.render import _not_measured
+        note = _not_measured("churn", {"name": "mariadb-blog-repro",
+                                       "ops": {"workloads": ["build"]}})
+        assert "Not measured" in note and "churn" in note
+        assert "mariadb-blog-repro" in note and "['build']" in note
+
+
+class TestDuplicateCheckRespectsSweptAxes:
+    """The tuned pass sweeps storage engine and ef_construction on purpose.
+
+    Keying duplicate detection on ef_search alone flagged 16 legitimate
+    measurements as accidental repeats: MariaDB's InnoDB and MyISAM curves,
+    and pgvector's three ef_construction curves.
+    """
+
+    MANIFEST = {"started_at": "2026-08-14T09:25:44Z",
+                "config": {"resource_pass": "tuned"}}
+
+    def _rec(self, **kw):
+        base = {"phase": "recall_qps", "engine": "mariadb", "dataset": "d",
+                "m": 16, "ef_search": 10, "recall_at_k": 0.93, "qps": 261.7,
+                "build_mode": None, "storage_engine": "InnoDB",
+                "ef_construction": None, "extra": {}}
+        base.update(kw)
+        return base
+
+    def test_storage_engine_curves_are_not_duplicates(self):
+        from report.generate import summarize
+        s = summarize([self._rec(storage_engine="InnoDB", qps=261.7),
+                       self._rec(storage_engine="MyISAM", qps=913.9)],
+                      self.MANIFEST)
+        assert s["duplicate_ann"] == []
+
+    def test_ef_construction_curves_are_not_duplicates(self):
+        from report.generate import summarize
+        s = summarize([self._rec(engine="pgvector", ef_construction=64),
+                       self._rec(engine="pgvector", ef_construction=200),
+                       self._rec(engine="pgvector", ef_construction=400)],
+                      self.MANIFEST)
+        assert s["duplicate_ann"] == []
+
+    def test_a_genuine_repeat_is_still_caught(self):
+        from report.generate import summarize
+        s = summarize([self._rec(qps=118.3), self._rec(qps=305.5)], self.MANIFEST)
+        assert len(s["duplicate_ann"]) == 1

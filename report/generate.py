@@ -104,14 +104,21 @@ def summarize(records: List[Dict[str, Any]],
     # silently showed whichever was faster at each point.
     by_config: Dict[Any, List[Dict[str, Any]]] = {}
     for r in recall_records:
+        # The key must name every axis a profile is allowed to sweep, or a
+        # legitimate curve looks like a duplicate. The tuned pass sweeps
+        # storage engine for MariaDB (InnoDB and MyISAM) and ef_construction
+        # for pgvector, and omitting those flagged 16 real measurements as
+        # accidental repeats.
         by_config.setdefault(
             (r.get("engine"), r.get("dataset"), r.get("m"), r.get("ef_search"),
-             r.get("build_mode")), []).append(r)
+             r.get("build_mode"), r.get("storage_engine"),
+             r.get("ef_construction")), []).append(r)
     for key, group in sorted(by_config.items(), key=lambda kv: str(kv[0])):
         if len(group) > 1:
             summary["duplicate_ann"].append({
                 "engine": key[0], "dataset": key[1], "m": key[2],
-                "ef_search": key[3], "count": len(group),
+                "ef_search": key[3], "storage_engine": key[5],
+                "ef_construction": key[6], "count": len(group),
                 "qps": sorted(round(g.get("qps") or 0, 1) for g in group),
             })
 
@@ -295,6 +302,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                   if r.get("dataset") == dataset and r.get("k")), 10)
 
         safe = dataset.replace(".", "_")
+
+        # A profile chooses which workloads to run. Drawing an empty axis for
+        # one that was never enabled has confused every reader of these
+        # reports so far -- an absent chart reads as a broken report, when it
+        # only means `workloads:` did not include it. Charts whose phase
+        # produced no records are skipped entirely, and the section says so.
+        phases_present = {r.get("phase") for r in records
+                          if r.get("dataset") == dataset}
+        needs = {
+            "latency": "concurrency",
+            "concurrency": "concurrency",
+            "filtered": "filtered",
+            "churn": "churn",
+            "churnimpact": "churn",
+        }
+
         for name, fn, payload in (
             ("pareto", charts.pareto, (dict(by_engine), dataset, k)),
             ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.85, **kw),
@@ -309,6 +332,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("churnimpact", charts.churn_impact, (records, dataset)),
             ("passcompare", charts.pass_comparison, (records, dataset)),
         ):
+            required = needs.get(name)
+            if required and required not in phases_present:
+                print(f"[report] skipping {name}: no {required} records "
+                      f"(not in this profile's workloads)")
+                continue
             stem = f"{name}-{safe}"
             try:
                 paths = fn(*payload, chart_dir, stem)
