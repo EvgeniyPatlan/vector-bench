@@ -962,3 +962,54 @@ class TestRootOwnedCleanup:
     def test_missing_path_is_already_clean(self, tmp_path):
         from orchestrator import docker_ctl
         assert docker_ctl.remove_tree_as_root(str(tmp_path / "gone"), "img") is True
+
+
+class TestShmSizedForParallelBuild:
+    """pgvector's parallel HNSW build lives in /dev/shm.
+
+    It allocates a dynamic shared memory segment the size of
+    maintenance_work_mem. With maintenance_work_mem at 11.25 GB and shm at 8g
+    the build died 27 minutes in with "could not resize shared memory segment
+    ... to 12078927552 bytes: No space left on device" -- 12078927552 being
+    exactly maintenance_work_mem. The old heuristic sized shm from the worker
+    count alone and never fired.
+    """
+
+    class _CPU:
+        arch = "x86_64"; hybrid = False; efficiency_cpus = []
+        performance_cpus = list(range(40)); logical_cpus = 80
+        physical_cores = 40; threads_per_core = 2; model = "Xeon"
+
+    def _info(self):
+        info = type("I", (), {})()
+        info.cpu = self._CPU()
+        info.total_ram_bytes = 201365635072
+        return info
+
+    def _shm_gb(self, profile, pass_name):
+        res = merge_resource_overrides(load_resources(pass_name), load_profile(profile))
+        r = resolve_resources(res, "pgvector", self._info())
+        return float(r.shm_size.rstrip("gG")), r
+
+    def test_covers_the_segment_that_failed(self):
+        shm, r = self._shm_gb("mariadb-blog-repro", "tuned")
+        assert r.maintenance_bytes / 1024 ** 3 > 11, "precondition: a large maintenance_work_mem"
+        assert shm >= 12078927552 / 1024 ** 3, f"shm {shm}g cannot hold the build segment"
+
+    def test_scales_with_maintenance_work_mem(self):
+        small, _ = self._shm_gb("mariadb-blog", "normalized")
+        large, _ = self._shm_gb("mariadb-blog-repro", "tuned")
+        assert large > small
+
+    def test_warns_when_it_raises_the_value(self):
+        _, r = self._shm_gb("mariadb-blog-repro", "tuned")
+        assert any("shm_size raised" in w for w in r.warnings)
+
+    def test_never_exceeds_half_the_container_budget(self):
+        """/dev/shm is tmpfs and counts against the cgroup it is carved from."""
+        res = merge_resource_overrides(load_resources("normalized"),
+                                       load_profile("mariadb-blog"))
+        res["memory"]["server_limit_gb"] = 8
+        res["memory"]["maintenance_fraction"] = 0.9
+        r = resolve_resources(res, "pgvector", self._info())
+        assert float(r.shm_size.rstrip("gG")) <= 4.0

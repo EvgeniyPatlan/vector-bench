@@ -233,11 +233,46 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     shm_size = str(docker_cfg.get("shm_size", "2g"))
     try:
         shm_gb = float(shm_size.rstrip("gG"))
-        needed_gb = 1.0 + 0.5 * build_threads
+
+        # Two independent demands on /dev/shm, and the larger one wins.
+        #
+        # Per-worker segments scale with the worker count. That was the only
+        # term here originally, and it is the smaller of the two by a wide
+        # margin once maintenance_work_mem is generous.
+        per_worker_gb = 1.0 + 0.5 * build_threads
+
+        # pgvector's parallel HNSW build puts the graph in a dynamic shared
+        # memory segment sized from maintenance_work_mem, so /dev/shm has to
+        # hold the whole thing. With maintenance_work_mem at 11.25 GB and
+        # shm at 8g the build died with
+        #   could not resize shared memory segment ... to 12078927552 bytes:
+        #   No space left on device
+        # after 27 minutes. 12078927552 is exactly maintenance_work_mem, which
+        # is what identifies the term that was missing.
+        build_segment_gb = (maintenance_bytes / GB) * 1.1 + 1.0
+
+        needed_gb = max(per_worker_gb, build_segment_gb)
+
+        # /dev/shm is tmpfs and counts against the container's memory limit, so
+        # it cannot be sized past the budget it is being carved out of.
+        ceiling_gb = (server_bytes / GB) * 0.5
+        if needed_gb > ceiling_gb:
+            warnings.append(
+                f"a parallel index build wants {needed_gb:.0f}g of /dev/shm but "
+                f"that is over half the {server_bytes / GB:.0f}g container "
+                f"budget; capping at {ceiling_gb:.0f}g. Lower "
+                f"memory.maintenance_fraction or build.max_threads if the build "
+                f"fails with 'No space left on device'."
+            )
+            needed_gb = ceiling_gb
+
         if shm_gb < needed_gb:
             warnings.append(
-                f"shm_size raised from {shm_size} to {needed_gb:.0f}g to cover "
-                f"{build_threads} parallel workers' shared memory segments"
+                f"shm_size raised from {shm_size} to {needed_gb:.0f}g: a "
+                f"parallel index build needs /dev/shm to hold a segment the "
+                f"size of maintenance_work_mem "
+                f"({maintenance_bytes / GB:.1f}g), plus room for "
+                f"{build_threads} worker(s)"
             )
             shm_size = f"{needed_gb:.0f}g"
     except ValueError:
