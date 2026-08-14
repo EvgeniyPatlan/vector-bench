@@ -1087,3 +1087,52 @@ class TestDuplicateCheckRespectsSweptAxes:
         from report.generate import summarize
         s = summarize([self._rec(qps=118.3), self._rec(qps=305.5)], self.MANIFEST)
         assert len(s["duplicate_ann"]) == 1
+
+
+class TestOpsStorageEngineSweep:
+    """Build cost was only ever measured on InnoDB.
+
+    MariaDB publishes an index build "under 15 minutes"; we measured 3.6 hours
+    on InnoDB, and the recall curves show MyISAM is almost certainly what the
+    article used. Measuring build cost on the engine nobody benchmarks is not
+    a reproduction.
+    """
+
+    def test_tuned_sweeps_both_for_mariadb(self):
+        from orchestrator.cli import _ops_storage_engines
+        got = _ops_storage_engines("mariadb", load_profile("mariadb-blog-repro"),
+                                   load_resources("tuned"), "tuned")
+        assert got == ["InnoDB", "MyISAM"]
+
+    def test_normalized_stays_on_innodb(self):
+        """The normalized pass must not hand MariaDB an axis the others lack."""
+        from orchestrator.cli import _ops_storage_engines
+        got = _ops_storage_engines("mariadb", load_profile("mariadb-blog"),
+                                   load_resources("normalized"), "normalized")
+        assert got == ["InnoDB"]
+
+    def test_other_engines_have_no_such_axis(self):
+        """VIDX is InnoDB-only and PostgreSQL has no equivalent."""
+        from orchestrator.cli import _ops_storage_engines
+        for engine in ("alisql", "pgvector"):
+            got = _ops_storage_engines(engine, load_profile("mariadb-blog-repro"),
+                                       load_resources("tuned"), "tuned")
+            assert got == ["InnoDB"], engine
+
+    def test_harness_args_carries_the_choice(self):
+        from orchestrator.config import resolve_resources
+        from orchestrator.ops_pass import harness_args
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = 201365635072
+        prof = load_profile("mariadb-blog-repro")
+        res = load_resources("tuned")
+        resolved = resolve_resources(res, "mariadb", info)
+        args = harness_args(prof, 16, "mariadb", resolved, "tuned", res,
+                            storage_engine="MyISAM")
+        assert "--storage-engine" in args
+        assert args[args.index("--storage-engine") + 1] == "MyISAM"

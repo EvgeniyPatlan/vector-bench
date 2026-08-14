@@ -387,6 +387,31 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
+def _ops_storage_engines(engine: str, profile: Dict[str, Any],
+                         resources: Dict[str, Any],
+                         resource_pass: str) -> List[str]:
+    """Storage engines the ops phase should measure build cost on.
+
+    The recall path has swept this since the tuned pass existed; the ops path
+    never did, so build cost was only ever measured on InnoDB. That mattered:
+    MariaDB's published benchmark reports an index build under 15 minutes, we
+    measured 3.6 hours on InnoDB, and the recall curves show MyISAM is almost
+    certainly what the article used. Build cost on the engine nobody benchmarks
+    is not a reproduction.
+
+    VIDX is InnoDB-only and PostgreSQL has no equivalent knob, so this is a
+    MariaDB-only axis.
+    """
+    if engine != "mariadb":
+        return ["InnoDB"]
+    extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
+    return list(
+        extras.get("mariadb_storage_engines")
+        or (profile.get("ops", {}) or {}).get("storage_engines")
+        or ["InnoDB"]
+    )
+
+
 def _read_manifest_config(run_dir: str) -> Dict[str, Any]:
     """The run's `config` block, or an empty dict if it cannot be read."""
     try:
@@ -706,35 +731,45 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
         m_values = list(ops_cfg.get("m_values", [16]))
         build_modes = (["post"] if engine != "pgvector"
                        else list(profile.get("ann", {}).get("pgvector_build_modes", ["post"])))
+        storage_engines = _ops_storage_engines(engine, profile, resources,
+                                               resource_pass)
         worst_rc = 0
         for m in m_values:
             for build_mode in build_modes:
-                tag = f"m{m}-{build_mode}"
-                # Checkpoint per (M, build_mode), not just per phase. A single
-                # ops phase can be a dozen hours spread over several M values,
-                # and each M is an independent unit of work: recording only the
-                # whole phase meant an interruption threw away every M that had
-                # already completed.
-                sub_key = f"{resource_pass}/{engine}/{dataset}/ops/{tag}"
-                if checkpoints is not None and sub_key in checkpoints:
-                    print(f"[skip] {sub_key} (already complete)")
-                    continue
-                output = os.path.join(paths["run_dir"],
-                                      f"ops-{engine}-{dataset}-{resource_pass}-{tag}.jsonl")
-                memory_ts = os.path.join(paths["run_dir"],
-                                         f"mem-{engine}-{dataset}-{resource_pass}-{tag}.jsonl")
-                harness_args = ops_pass.harness_args(
-                    profile, m, engine, resolved, resource_pass, resources,
-                    build_mode=build_mode,
-                )
-                with ops_pass.OpsRun(engine, engine_cfg, resolved, resource_pass,
-                                     paths, run_id, dataset, tag) as run:
-                    rc = run.run_harness(harness_args, output,
-                                         memory_timeseries=memory_ts)
-                if rc == 0 and checkpoints is not None:
-                    _save_checkpoint(paths["checkpoints"], sub_key)
-                    checkpoints.add(sub_key)
-                worst_rc = worst_rc or rc
+                for storage in storage_engines:
+                    # InnoDB stays unsuffixed so checkpoints written by earlier
+                    # runs are still honoured; only the extra curves get a new
+                    # tag.
+                    tag = f"m{m}-{build_mode}"
+                    if storage.lower() != "innodb":
+                        tag += f"-{storage.lower()}"
+
+                    # Checkpoint per unit, not per phase. One ops phase can be a
+                    # dozen hours spread over several M values and storage
+                    # engines, and each is independent work: recording only the
+                    # whole phase meant an interruption threw away everything
+                    # that had already completed.
+                    sub_key = f"{resource_pass}/{engine}/{dataset}/ops/{tag}"
+                    if checkpoints is not None and sub_key in checkpoints:
+                        print(f"[skip] {sub_key} (already complete)")
+                        continue
+
+                    stem = f"{engine}-{dataset}-{resource_pass}-{tag}"
+                    output = os.path.join(paths["run_dir"], f"ops-{stem}.jsonl")
+                    memory_ts = os.path.join(paths["run_dir"], f"mem-{stem}.jsonl")
+                    harness_args = ops_pass.harness_args(
+                        profile, m, engine, resolved, resource_pass, resources,
+                        build_mode=build_mode, storage_engine=storage,
+                    )
+                    with ops_pass.OpsRun(engine, engine_cfg, resolved,
+                                         resource_pass, paths, run_id,
+                                         dataset, tag) as run:
+                        rc = run.run_harness(harness_args, output,
+                                             memory_timeseries=memory_ts)
+                    if rc == 0 and checkpoints is not None:
+                        _save_checkpoint(paths["checkpoints"], sub_key)
+                        checkpoints.add(sub_key)
+                    worst_rc = worst_rc or rc
         return worst_rc
 
     raise ValueError(f"unknown phase: {phase}")
