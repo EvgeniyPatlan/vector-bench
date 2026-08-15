@@ -1214,3 +1214,56 @@ class TestSourcePrepIsEngineParameterised:
         script = open(os.path.join(VB_ROOT, "scripts", "build-images.sh")).read()
         for engine in KNOWN_ENGINES:
             assert engine in script, f"build-images cannot build {engine}"
+
+
+class TestBuildContextCompleteness:
+    """Every COPY source in a Dockerfile must be stageable for every engine.
+
+    mariadb123 compiled for an hour and then died on
+      COPY failed: stat entrypoint-mariadb.sh: file does not exist
+    because auxiliary files were looked up in docker/mariadb123/, which does
+    not exist and never needs to. This is a static check of the same thing.
+    """
+
+    @staticmethod
+    def _copy_sources(dockerfile):
+        """Local COPY sources, ignoring --from=stage copies and the target."""
+        out = []
+        for line in open(dockerfile):
+            line = line.strip()
+            if not line.startswith("COPY ") or "--from=" in line:
+                continue
+            out += line.split()[1:-1]
+        return out
+
+    def test_every_engine_can_stage_every_copy_source(self):
+        import yaml
+        docker_dir = os.path.join(VB_ROOT, "docker")
+        engines_dir = os.path.join(VB_ROOT, "config", "engines")
+        for cfg_name in sorted(os.listdir(engines_dir)):
+            if not cfg_name.endswith(".yml"):
+                continue
+            cfg = yaml.safe_load(open(os.path.join(engines_dir, cfg_name))) or {}
+            engine = cfg.get("name", cfg_name[:-4])
+            base = cfg.get("alias_of", engine)
+            dockerfile = os.path.join(docker_dir, base, "Dockerfile")
+            assert os.path.isfile(dockerfile), f"{engine}: no Dockerfile at {dockerfile}"
+            available = set(os.listdir(os.path.join(docker_dir, base)))
+            available |= set(os.listdir(os.path.join(docker_dir, "_shared")))
+            available.add("source.tar")          # produced by prepare-sources
+            for src in self._copy_sources(dockerfile):
+                assert src in available, (
+                    f"{engine}: Dockerfile COPYs {src!r}, which is in neither "
+                    f"docker/{base}/ nor docker/_shared/")
+
+    def test_aliased_engines_reuse_a_real_docker_directory(self):
+        import yaml
+        engines_dir = os.path.join(VB_ROOT, "config", "engines")
+        for cfg_name in sorted(os.listdir(engines_dir)):
+            if not cfg_name.endswith(".yml"):
+                continue
+            cfg = yaml.safe_load(open(os.path.join(engines_dir, cfg_name))) or {}
+            base = cfg.get("alias_of")
+            if base:
+                assert os.path.isdir(os.path.join(VB_ROOT, "docker", base)), \
+                    f"{cfg.get('name')}: alias_of={base} has no docker/ directory"

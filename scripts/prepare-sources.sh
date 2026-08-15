@@ -220,9 +220,18 @@ stage_context() {
   # engine's own auxiliary files (entrypoint, confs) which may override them.
   find "$VB_DOCKER/_shared" -maxdepth 1 -type f \
        -exec cp {} "$ctx/" \; 2>/dev/null || true
-  find "$VB_DOCKER/$engine" -maxdepth 1 -type f ! -name 'Dockerfile' \
+  # Auxiliary files (entrypoint, init.sql, confs) come from the engine's own
+  # docker/ directory, or from the engine it aliases. Without the alias lookup
+  # a second MariaDB version compiles for an hour and then dies on
+  #   COPY failed: stat entrypoint-mariadb.sh: file does not exist
+  # because docker/mariadb123/ does not exist and never needs to.
+  local base; base="$(yq_get "$VB_CONFIG/engines/$engine.yml" alias_of "$engine")"
+  find "$VB_DOCKER/$base" -maxdepth 1 -type f ! -name 'Dockerfile' \
        -exec cp {} "$ctx/" \; 2>/dev/null || true
-  ok "$engine: build context ready at $ctx"
+  if [[ ! -f "$ctx/source.tar" ]]; then
+    die "$engine: build context is missing source.tar at $ctx"
+  fi
+  ok "$engine: build context ready at $ctx (aux files from docker/$base)"
 }
 
 # ---------------------------------------------------------------------------
