@@ -1267,3 +1267,34 @@ class TestBuildContextCompleteness:
             if base:
                 assert os.path.isdir(os.path.join(VB_ROOT, "docker", base)), \
                     f"{cfg.get('name')}: alias_of={base} has no docker/ directory"
+
+
+class TestEngineSelectionAcceptsExtraVersions:
+    """--engines must accept anything with a config, not just the default three.
+
+    ALL_ENGINES is the default set a bare run uses. KNOWN_ENGINES is everything
+    that exists. Validating selection against the former rejected mariadb123
+    after it had been built, with "unknown engines: ['mariadb123']".
+    """
+
+    def test_known_engines_is_a_superset(self):
+        from orchestrator.cli import ALL_ENGINES, KNOWN_ENGINES
+        assert set(ALL_ENGINES) < set(KNOWN_ENGINES)
+
+    def test_every_known_engine_has_a_config(self):
+        from orchestrator.cli import KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            path = os.path.join(VB_ROOT, "config", "engines", f"{engine}.yml")
+            assert os.path.isfile(path), f"{engine} has no config at {path}"
+
+    def test_every_engine_config_is_selectable(self):
+        """A config on disk that --engines rejects is a trap."""
+        from orchestrator.cli import KNOWN_ENGINES
+        engines_dir = os.path.join(VB_ROOT, "config", "engines")
+        on_disk = {f[:-4] for f in os.listdir(engines_dir) if f.endswith(".yml")}
+        assert on_disk <= set(KNOWN_ENGINES), \
+            f"config exists but --engines would reject: {sorted(on_disk - set(KNOWN_ENGINES))}"
+
+    def test_selection_validation_uses_the_full_set(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        assert "unknown = set(engines) - set(KNOWN_ENGINES)" in source

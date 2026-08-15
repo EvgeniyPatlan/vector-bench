@@ -181,7 +181,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     # Needs an image: the directories are root-owned and can only be removed
     # from inside a container.
     image = ""
-    for engine in ALL_ENGINES:
+    for engine in KNOWN_ENGINES:
         candidate = load_engine(engine).get("image", {}).get("runtime", "")
         if candidate and docker_ctl.image_exists(candidate):
             image = candidate
@@ -237,7 +237,7 @@ def cmd_run(args: argparse.Namespace) -> int:
               f"'{requested}' pass only; override with --resource-pass both")
     phases = (["ann", "ops"] if args.phases == "both" else [args.phases])
 
-    unknown = set(engines) - set(ALL_ENGINES)
+    unknown = set(engines) - set(KNOWN_ENGINES)
     if unknown:
         print(f"unknown engines: {sorted(unknown)}", file=sys.stderr)
         return 2
@@ -434,7 +434,7 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
     stack onto the machine it is measuring.
     """
     image = ""
-    for engine in list(engines) + list(ALL_ENGINES):
+    for engine in list(engines) + list(KNOWN_ENGINES):
         candidate = load_engine(engine).get("image", {}).get("bench", "")
         if candidate and docker_ctl.image_exists(candidate):
             image = candidate
@@ -790,7 +790,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             return 1
     paths = paths_for(os.path.basename(run_dir))
     paths["run_dir"] = run_dir
-    return generate_report(paths, list(ALL_ENGINES))
+    return generate_report(paths, list(KNOWN_ENGINES))
 
 
 # ---------------------------------------------------------------------------
