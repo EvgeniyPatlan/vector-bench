@@ -7,7 +7,7 @@
 #   <engine>-bench    runtime + the ann-benchmarks Python stack
 #
 # Usage:
-#   scripts/build-images.sh [--engine mariadb|alisql|pgvector|all]
+#   scripts/build-images.sh [--engine mariadb|mariadb123|alisql|pgvector|all]
 #                           [--target runtime|bench|all]
 #                           [--march x86-64-v3|native|...]
 #                           [--jobs N] [--no-cache] [--pull]
@@ -97,10 +97,15 @@ build_engine() {
     --build-arg "JOBS=${JOBS}"
   )
   [[ -n "$optflags" ]] && bargs+=(--build-arg "OPTFLAGS=${optflags}")
-  case "$engine" in
+  # An engine may declare `alias_of` to reuse another engine's Dockerfile and
+  # tag build-arg. That is how a second MariaDB version costs one config file
+  # instead of a branch in every script.
+  local base; base="$(yq_get "$cfg" alias_of "$engine")"
+  case "$base" in
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
+    *) die "engine '$engine' has no known build-arg (alias_of=$base)" ;;
   esac
 
   local -a targets=()
@@ -122,7 +127,7 @@ build_engine() {
     docker build \
       --target "$t" \
       -t "${img}:${tag}" -t "${img}:latest" \
-      -f "$VB_DOCKER/$engine/Dockerfile" \
+      -f "$VB_DOCKER/$base/Dockerfile" \
       "${bargs[@]}" "${EXTRA_BUILD_ARGS[@]}" \
       "$ctx" \
       || die "build failed for $engine target $t"
@@ -142,7 +147,11 @@ PY
 }
 
 case "$ENGINE" in
-  all)      build_engine mariadb; build_engine alisql; build_engine pgvector ;;
+  # `all` stays the three baseline engines. Extra versions such as mariadb123
+  # are opt-in, because each is another hour of compiling that nobody asked for
+  # by typing "all".
+  all)        build_engine mariadb; build_engine alisql; build_engine pgvector ;;
+  mariadb123) build_engine mariadb123 ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

@@ -39,7 +39,11 @@ from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 
 GB = 1024 ** 3
 
+# mariadb123 is opt-in via --engines: it is a second MariaDB version, not
+# part of the default three-way comparison.
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
+EXTRA_ENGINES = ("mariadb123",)
+KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
 
 
 def paths_for(run_id: str) -> Dict[str, str]:
@@ -402,7 +406,7 @@ def _ops_storage_engines(engine: str, profile: Dict[str, Any],
     VIDX is InnoDB-only and PostgreSQL has no equivalent knob, so this is a
     MariaDB-only axis.
     """
-    if engine != "mariadb":
+    if engine not in ann_pass.MARIADB_ENGINES:
         return ["InnoDB"]
     extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
     return list(

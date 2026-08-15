@@ -107,7 +107,11 @@ prepare_alisql() {
 # ---------------------------------------------------------------------------
 
 prepare_mariadb() {
-  local cfg="$VB_CONFIG/engines/mariadb.yml"
+  # Takes the engine name so additional MariaDB versions (mariadb123, ...)
+  # reuse this routine. Tarball and checkout names carry the tag, so two
+  # versions never collide.
+  local engine="${1:-mariadb}"
+  local cfg="$VB_CONFIG/engines/$engine.yml"
   local tag; tag="$(yq_get "$cfg" source.tag mariadb-11.8.8)"
   local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/MariaDB/server.git)"
   local submods; submods="$(yq_get "$cfg" source.submodules libmariadb)"
@@ -120,9 +124,9 @@ prepare_mariadb() {
     want_sha="$(git -C "$VB_REPO_MARIADB" rev-parse "refs/tags/$tag^{commit}")"
   fi
 
-  if [[ -n "$want_sha" ]] && tarball_current mariadb "$want_sha" "$tar"; then
-    ok "mariadb: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
-    stage_context mariadb "$tar"; return
+  if [[ -n "$want_sha" ]] && tarball_current "$engine" "$want_sha" "$tar"; then
+    ok "$engine: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+    stage_context "$engine" "$tar"; return
   fi
 
   if [[ ! -d "$checkout/.git" ]]; then
@@ -132,10 +136,10 @@ prepare_mariadb() {
       # Reuse the local object store so the clone costs almost no network.
       # --dissociate makes the result independent of the reference afterwards,
       # so the vendor repo can be moved or deleted without breaking us.
-      info "mariadb: cloning $tag referencing local objects at $VB_REPO_MARIADB"
+      info "$engine: cloning $tag referencing local objects at $VB_REPO_MARIADB"
       ref_args=(--reference-if-able "$VB_REPO_MARIADB" --dissociate)
     else
-      info "mariadb: cloning $tag from $upstream (no local repo to reference)"
+      info "$engine: cloning $tag from $upstream (no local repo to reference)"
     fi
     git clone --quiet --branch "$tag" --single-branch "${ref_args[@]}" \
         "$upstream" "$checkout"
@@ -224,11 +228,12 @@ stage_context() {
 # ---------------------------------------------------------------------------
 
 case "$ENGINE" in
-  all)      prepare_mariadb; prepare_alisql; prepare_pgvector ;;
-  mariadb)  prepare_mariadb ;;
-  alisql)   prepare_alisql ;;
-  pgvector) prepare_pgvector ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|alisql|pgvector|all)" ;;
+  all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
+  mariadb)    prepare_mariadb mariadb ;;
+  mariadb123) prepare_mariadb mariadb123 ;;
+  alisql)     prepare_alisql ;;
+  pgvector)   prepare_pgvector ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|all)" ;;
 esac
 
 ok "sources prepared"

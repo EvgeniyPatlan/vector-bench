@@ -23,13 +23,19 @@ from . import docker_ctl
 from .config import ResolvedResources, server_args
 from .manifest import utcnow
 
-DEFAULT_PORTS = {"mariadb": 3306, "alisql": 3306, "pgvector": 5432}
+DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
+                 "alisql": 3306, "pgvector": 5432}
 
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
 # start would charge initialisation time to the first measurement.
 PROBES = {
     "mariadb": [
+        "sh", "-c",
+        "/opt/mariadb/bin/mariadb -ubench -pbench "
+        "--socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1",
+    ],
+    "mariadb123": [
         "sh", "-c",
         "/opt/mariadb/bin/mariadb -ubench -pbench "
         "--socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1",
@@ -52,6 +58,7 @@ PROBES = {
 # (--skip-grant-tables is unusable because on MySQL 8 it disables networking).
 DB_CREDENTIALS = {
     "mariadb": ("bench", "bench"),
+    "mariadb123": ("bench", "bench"),
     "alisql": ("bench", "bench"),
     "pgvector": ("postgres", ""),
 }
@@ -61,6 +68,7 @@ SERVER_DATA_MOUNT = {
     # index sizing. PostgreSQL reports its own index size through pg_relation_size,
     # so it needs no shared mount.
     "mariadb": "/server-data/data",
+    "mariadb123": "/server-data/data",
     "alisql": "/server-data/data",
     "pgvector": None,
 }

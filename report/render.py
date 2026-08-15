@@ -20,7 +20,8 @@ import os
 from typing import Any, Dict, List, Optional
 
 ENGINE_LABEL = {
-    "mariadb": "MariaDB (MHNSW)",
+    "mariadb": "MariaDB 11.8 (MHNSW)",
+    "mariadb123": "MariaDB 12.3 (MHNSW)",
     "alisql": "AliSQL (VIDX)",
     "pgvector": "PostgreSQL (pgvector)",
 }

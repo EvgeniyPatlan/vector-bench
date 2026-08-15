@@ -25,7 +25,10 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 
 # Engine identity is consistent across every chart in the report.
 STYLE: Dict[str, Dict[str, Any]] = {
-    "mariadb":  {"color": "#1f77b4", "marker": "o", "linestyle": "-",  "label": "MariaDB (MHNSW)"},
+    "mariadb":  {"color": "#1f77b4", "marker": "o", "linestyle": "-",  "label": "MariaDB 11.8 (MHNSW)"},
+    # Same hue family as 11.8 so the two versions read as related, dashed so
+    # they stay distinguishable in greyscale and for colour-blind readers.
+    "mariadb123": {"color": "#5fa8d3", "marker": "s", "linestyle": "--", "label": "MariaDB 12.3 (MHNSW)"},
     "alisql":   {"color": "#d62728", "marker": "s", "linestyle": "--", "label": "AliSQL (VIDX)"},
     "pgvector": {"color": "#2ca02c", "marker": "^", "linestyle": "-.", "label": "PostgreSQL (pgvector)"},
 }

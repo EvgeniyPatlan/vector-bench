@@ -667,10 +667,55 @@ class TestEngineDataPlacement:
     """
 
     def test_every_engine_has_a_declared_data_mount(self):
+        """Covers extra versions too, not just the baseline three."""
         from orchestrator.ann_pass import DATA_MOUNT
-        from orchestrator.cli import ALL_ENGINES
-        assert set(DATA_MOUNT) == set(ALL_ENGINES)
+        from orchestrator.cli import KNOWN_ENGINES
+        assert set(DATA_MOUNT) == set(KNOWN_ENGINES)
         assert all(p.startswith("/var/lib/") for p in DATA_MOUNT.values())
+
+    def test_every_registry_covers_every_known_engine(self):
+        """Adding an engine means touching five tables; this is the guard.
+
+        mariadb123 was added as a distinct engine because ann-benchmarks keys
+        results on the algorithm name, so a retagged `mariadb` would silently
+        return 11.8.8's numbers for a 12.3 build.
+        """
+        from orchestrator.ann_pass import CONSTRUCTORS, DATA_MOUNT
+        from orchestrator.ops_pass import (DB_CREDENTIALS, DEFAULT_PORTS,
+                                           PROBES, SERVER_DATA_MOUNT)
+        from orchestrator.cli import KNOWN_ENGINES
+        for name, table in (("CONSTRUCTORS", CONSTRUCTORS),
+                            ("DATA_MOUNT", DATA_MOUNT),
+                            ("DEFAULT_PORTS", DEFAULT_PORTS),
+                            ("PROBES", PROBES),
+                            ("DB_CREDENTIALS", DB_CREDENTIALS),
+                            ("SERVER_DATA_MOUNT", SERVER_DATA_MOUNT)):
+            missing = set(KNOWN_ENGINES) - set(table)
+            assert not missing, f"{name} is missing {sorted(missing)}"
+
+    def test_a_second_mariadb_version_is_a_distinct_engine(self):
+        from orchestrator.config import load_engine
+        base, alt = load_engine("mariadb"), load_engine("mariadb123")
+        assert alt["source"]["tag"] != base["source"]["tag"]
+        assert alt["image"]["runtime"] != base["image"]["runtime"]
+        assert alt.get("alias_of") == "mariadb"
+
+    def test_both_mariadb_versions_sweep_storage_engines(self):
+        from orchestrator.cli import _ops_storage_engines
+        prof, tuned = load_profile("mariadb-blog-repro"), load_resources("tuned")
+        for engine in ("mariadb", "mariadb123"):
+            assert _ops_storage_engines(engine, prof, tuned, "tuned") == \
+                ["InnoDB", "MyISAM"], engine
+
+    def test_the_two_versions_get_separate_ann_modules(self):
+        """Sharing a module name is exactly how a 12.3 run would reuse 11.8's
+        result files and report success without measuring anything."""
+        from orchestrator.ann_pass import render_config
+        prof, tuned = load_profile("mariadb-blog-repro"), load_resources("tuned")
+        a = render_config("mariadb", prof, tuned, "tuned")["float"]["any"][0]
+        b = render_config("mariadb123", prof, tuned, "tuned")["float"]["any"][0]
+        assert a["module"] != b["module"]
+        assert a["constructor"] != b["constructor"]
 
     def test_engine_state_lives_under_the_checkout(self):
         from orchestrator.cli import paths_for, VB_ROOT

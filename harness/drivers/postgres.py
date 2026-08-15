@@ -275,6 +275,8 @@ def get_driver(engine: str, spec: ConnectionSpec) -> EngineDriver:
 
     table = {
         "mariadb": MariaDBDriver,
+        # Same server software at a different tag; the driver is identical.
+        "mariadb123": MariaDBDriver,
         "alisql": AliSQLDriver,
         "pgvector": PostgresDriver,
     }

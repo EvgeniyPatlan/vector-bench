@@ -23,12 +23,14 @@ from . import docker_ctl
 from .config import ResolvedResources, server_args
 
 # Constructor class names, as ann-benchmarks expects them in config.yml.
-CONSTRUCTORS = {"mariadb": "MariaDB", "alisql": "AliSQL", "pgvector": "PGVector"}
+CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
+                "alisql": "AliSQL", "pgvector": "PGVector"}
 
 # Where each engine's data directory lives inside its image. The ops path
 # mounts a volume here; the ann path binds a host directory for the same reason.
 DATA_MOUNT = {
     "mariadb": "/var/lib/vbench",
+    "mariadb123": "/var/lib/vbench",
     "alisql": "/var/lib/vbench",
     "pgvector": "/var/lib/postgresql",
 }
@@ -36,6 +38,10 @@ DATA_MOUNT = {
 # ann-benchmarks raises this when every configuration is already done.
 # See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
 NOTHING_TO_RUN = "Nothing to run"
+
+# Engines that are MariaDB at a different tag. They share the driver, the SQL,
+# the Dockerfile and the storage-engine axis; only the source tag differs.
+MARIADB_ENGINES = ("mariadb", "mariadb123")
 
 
 # Bump when the measurement path itself changes in a way that makes older
@@ -126,8 +132,8 @@ def render_config(engine: str, profile: Dict[str, Any],
 
     run_groups: Dict[str, Any] = {}
 
-    if engine in ("mariadb", "alisql"):
-        if engine == "mariadb":
+    if engine in MARIADB_ENGINES + ("alisql",):
+        if engine in MARIADB_ENGINES:
             storage_engines = list(
                 extras.get("mariadb_storage_engines")
                 or ann.get("mariadb_storage_engines", ["InnoDB"])

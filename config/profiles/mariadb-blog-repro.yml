@@ -45,11 +45,15 @@
 #   longer measuring the machine we actually have. Worth doing as a separate
 #   axis; not folded into this profile.
 #
-#   Version. The article's headline is MariaDB 12.3, and says only that 11.8 is
-#   slower without quantifying it. We build 11.8.8, so our numbers cannot be
-#   set against their 850-1000 QPS figure. Comparing to the headline needs a
-#   12.3 build, which is a change of tag in config/engines/mariadb.yml and a
-#   rebuild.
+#   Version. Resolved: MariaDB 12.3 is now a first-class engine
+#   (config/engines/mariadb123.yml, tag mariadb-12.3.2), so a run can carry
+#   11.8.8 and 12.3 side by side and quantify the gap the article leaves as
+#   "slower". It is opt-in rather than default because it is another hour of
+#   compiling:
+#
+#     ./run-benchmark.sh build --engine mariadb123
+#     ./run-benchmark.sh run --profile mariadb-blog-repro \
+#         --engines mariadb,mariadb123,alisql,pgvector
 #
 #   Index parameters. Not published. The M and ef_search grids below are
 #   ann-benchmarks' conventional ranges, not a claim to match theirs.
