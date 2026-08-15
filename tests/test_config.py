@@ -1181,3 +1181,36 @@ class TestOpsStorageEngineSweep:
                             storage_engine="MyISAM")
         assert "--storage-engine" in args
         assert args[args.index("--storage-engine") + 1] == "MyISAM"
+
+
+class TestSourcePrepIsEngineParameterised:
+    """prepare_mariadb serves every MariaDB version, so it must not name one.
+
+    Adding mariadb123 left five literals behind. The visible symptom was that
+    12.3 sources were staged into buildctx/mariadb, clobbering 11.8's context,
+    and the build then failed with "build context missing for mariadb123".
+    """
+
+    def _body(self):
+        script = open(os.path.join(VB_ROOT, "scripts", "prepare-sources.sh")).read()
+        start = script.index("prepare_mariadb() {")
+        return script[start:script.index("\n}", start)]
+
+    def test_engine_scoped_helpers_take_the_argument(self):
+        body = self._body()
+        for call in ("stage_context", "record_meta", "tarball_current"):
+            for line in body.splitlines():
+                if call in line and not line.strip().startswith("#"):
+                    assert '"$engine"' in line, f"{call} is not engine-scoped: {line.strip()}"
+
+    def test_dispatch_covers_every_mariadb_engine(self):
+        from orchestrator.ann_pass import MARIADB_ENGINES
+        script = open(os.path.join(VB_ROOT, "scripts", "prepare-sources.sh")).read()
+        for engine in MARIADB_ENGINES:
+            assert f"{engine})" in script, f"prepare-sources cannot prepare {engine}"
+
+    def test_build_script_can_build_every_known_engine(self):
+        from orchestrator.cli import KNOWN_ENGINES
+        script = open(os.path.join(VB_ROOT, "scripts", "build-images.sh")).read()
+        for engine in KNOWN_ENGINES:
+            assert engine in script, f"build-images cannot build {engine}"

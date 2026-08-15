@@ -144,7 +144,7 @@ prepare_mariadb() {
     git clone --quiet --branch "$tag" --single-branch "${ref_args[@]}" \
         "$upstream" "$checkout"
   else
-    info "mariadb: reusing existing checkout at $checkout"
+    info "$engine: reusing existing checkout at $checkout"
   fi
 
   local sha; sha="$(git -C "$checkout" rev-parse HEAD)"
@@ -156,21 +156,21 @@ prepare_mariadb() {
   for sm in $submods; do
     [[ -n "$sm" ]] || continue
     if [[ -z "$(ls -A "$checkout/$sm" 2>/dev/null)" ]]; then
-      info "mariadb: initialising submodule $sm"
+      info "$engine: initialising submodule $sm"
       git -C "$checkout" submodule update --init --depth 1 -- "$sm" \
         || die "failed to initialise submodule $sm (network required once)"
     fi
   done
   unset IFS
 
-  info "mariadb: packing build context tarball"
+  info "$engine: packing build context tarball"
   tar --create --file "$tar.tmp" \
       --exclude-vcs --exclude='.git' \
       --transform='s,^\.,source,' \
       -C "$checkout" .
   mv "$tar.tmp" "$tar"
-  record_meta mariadb "$tag" "$sha" "$checkout"
-  stage_context mariadb "$tar"
+  record_meta "$engine" "$tag" "$sha" "$checkout"
+  stage_context "$engine" "$tar"
 }
 
 # ---------------------------------------------------------------------------
