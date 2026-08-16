@@ -25,7 +25,7 @@ if __package__ in (None, ""):  # pragma: no cover
 
 from .datasets import load as load_dataset  # noqa: E402
 from .drivers.base import ConnectionSpec, IndexSpec  # noqa: E402
-from .drivers.postgres import get_driver  # noqa: E402
+from .drivers.postgres import get_driver, known_engines  # noqa: E402
 from .metrics.records import Recorder  # noqa: E402
 from .workloads import build as build_workload  # noqa: E402
 from .workloads import churn as churn_workload  # noqa: E402
@@ -41,7 +41,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         prog="vb-harness",
         description="vector-bench ops harness (build cost, concurrency, filtered, churn)",
     )
-    p.add_argument("--engine", required=True, choices=("mariadb", "alisql", "pgvector"))
+    p.add_argument("--engine", required=True, choices=known_engines())
     p.add_argument("--host", required=True, help="server container hostname")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--user", default=os.environ.get("VB_DB_USER", "bench"))

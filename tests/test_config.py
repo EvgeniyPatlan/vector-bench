@@ -1298,3 +1298,30 @@ class TestEngineSelectionAcceptsExtraVersions:
     def test_selection_validation_uses_the_full_set(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
         assert "unknown = set(engines) - set(KNOWN_ENGINES)" in source
+
+
+class TestHarnessAcceptsEveryOrchestratedEngine:
+    """The harness runs in a container with its own argument parser.
+
+    A run reached the point of starting the 12.3 server, then died on
+    `argument --engine: invalid choice: 'mariadb123'` because the harness kept
+    its own hardcoded list. The orchestrator and the harness must agree.
+    """
+
+    def test_harness_and_orchestrator_agree(self):
+        from harness.drivers.postgres import known_engines
+        from orchestrator.cli import KNOWN_ENGINES
+        missing = set(KNOWN_ENGINES) - set(known_engines())
+        assert not missing, f"the harness cannot drive: {sorted(missing)}"
+
+    def test_choices_are_not_hardcoded_in_the_parser(self):
+        source = open(os.path.join(VB_ROOT, "harness", "main.py")).read()
+        assert 'choices=known_engines()' in source, \
+            "--engine choices must come from the driver table, not a literal"
+
+    def test_every_engine_resolves_to_a_driver_class(self):
+        from harness.drivers.postgres import _driver_table
+        from orchestrator.cli import KNOWN_ENGINES
+        table = _driver_table()
+        for engine in KNOWN_ENGINES:
+            assert engine in table and table[engine] is not None, engine

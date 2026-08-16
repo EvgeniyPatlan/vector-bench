@@ -269,17 +269,33 @@ class PostgresDriver(EngineDriver):
 DRIVERS = {}
 
 
-def get_driver(engine: str, spec: ConnectionSpec) -> EngineDriver:
-    """Resolve an engine name to a connected-capable driver instance."""
+def _driver_table() -> Dict[str, Any]:
+    """Engine name -> driver class.
+
+    The single source of truth for what this harness can drive. The argument
+    parser reads it too, so adding an engine here is enough: a mismatch between
+    the two lists is how a run got as far as starting the server and then died
+    on `argument --engine: invalid choice`.
+    """
     from .mysql_family import AliSQLDriver, MariaDBDriver
 
-    table = {
+    return {
         "mariadb": MariaDBDriver,
         # Same server software at a different tag; the driver is identical.
         "mariadb123": MariaDBDriver,
         "alisql": AliSQLDriver,
         "pgvector": PostgresDriver,
     }
+
+
+def known_engines() -> Tuple[str, ...]:
+    """Engine names this harness accepts, for argparse choices."""
+    return tuple(_driver_table())
+
+
+def get_driver(engine: str, spec: ConnectionSpec) -> EngineDriver:
+    """Resolve an engine name to a connected-capable driver instance."""
+    table = _driver_table()
     if engine not in table:
         raise ValueError(f"unknown engine: {engine} (expected one of {sorted(table)})")
     return table[engine](spec)
