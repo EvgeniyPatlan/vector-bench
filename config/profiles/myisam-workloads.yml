@@ -24,13 +24,32 @@
 # engines: about eighteen hours of loading to answer a question about one
 # configuration.
 #
-# This profile loads MariaDB on MyISAM only, once per version, and runs every
-# workload against it. Roughly two hours rather than eighteen.
+# WHY IT SWEEPS BOTH STORAGE ENGINES
+#
+# The InnoDB concurrency numbers we have were measured under the equal-budget
+# pass: 64 GB and eight cores. This profile runs tuned, with 113 GB and the
+# whole machine. Comparing MyISAM here against InnoDB there would confound the
+# storage engine with the resource budget, and the whole point is to attribute
+# the ceiling to one thing. So both storage engines run under the same pass, in
+# the same run, and the difference between them means something.
 #
 # Run it with:
-#   ./run-benchmark.sh run --profile myisam-workloads --engines mariadb,mariadb123
+#   ./run-benchmark.sh run --profile myisam-workloads \
+#       --engines mariadb,mariadb123,alisql,pgvector
+#
+# COST, from measured load rates on this corpus:
+#
+#   MariaDB 11.8   InnoDB 3.6 h  + MyISAM 0.9 h
+#   MariaDB 12.3   InnoDB 5.7 h  + MyISAM 0.9 h
+#   AliSQL         InnoDB 7.1 h
+#   pgvector       0.2 h
+#   workloads      about 25 min per configuration
+#
+# Roughly 21 hours all in, nearly all of it loading. Dropping MariaDB 12.3 on
+# InnoDB saves 5.7 h and still answers the MyISAM question on 11.8, which is
+# the version the earlier concurrency numbers came from.
 name: myisam-workloads
-description: MariaDB on MyISAM across all workloads — does the concurrency ceiling move? (~2 h)
+description: All engines, all workloads, tuned pass — does MyISAM move MariaDB's concurrency ceiling? (~21 h)
 
 datasets:
   - dbpedia-openai-1000k-angular
@@ -42,11 +61,8 @@ default_resource_pass: tuned
 resources:
   cpu:
     client_cpus: 16
-  extras:
-    # Overrides the tuned pass, which sweeps both. Measuring InnoDB again would
-    # add 3.6 h for MariaDB and 5.7 h for 12.3 to re-confirm numbers we already
-    # have.
-    mariadb_storage_engines: [MyISAM]
+  # No extras override: the tuned pass sweeps InnoDB and MyISAM, and both are
+  # wanted here so the comparison is within one run and one budget.
 
 ann:
   # The recall curves for these configurations are already measured in
@@ -55,7 +71,7 @@ ann:
   m_values: [16]
   ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
   insert_threads: 8
-  mariadb_storage_engines: [MyISAM]
+  mariadb_storage_engines: [InnoDB, MyISAM]
 
 ops:
   enabled: true
