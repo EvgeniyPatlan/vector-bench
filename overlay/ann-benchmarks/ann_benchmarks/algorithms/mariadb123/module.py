@@ -18,3 +18,4 @@ from ...vb_mysql import VBMySQLBase
 
 class MariaDB123(VBMySQLBase):
     dialect = MARIADB
+    vb_engine = "mariadb123"

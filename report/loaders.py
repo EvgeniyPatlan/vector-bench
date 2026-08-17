@@ -80,7 +80,15 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                     record: Dict[str, Any] = {
                         "run_id": run_id,
                         "phase": PHASE_RECALL,
-                        "engine": str(attrs.get("engine", attrs.get("algo", "unknown"))),
+                        # The directory ann-benchmarks wrote the file into is
+                        # named for the algorithm and is authoritative. The
+                        # `engine` attribute is written by the module, which
+                        # reported its dialect name -- shared between MariaDB
+                        # 11.8 and 12.3 -- so 12.3 results arrived labelled
+                        # "mariadb" despite sitting in a mariadb123 directory.
+                        "engine": (os.path.basename(os.path.dirname(path))
+                                   or str(attrs.get("engine",
+                                                    attrs.get("algo", "unknown")))),
                         "engine_version": _maybe_str(attrs.get("engine_version")),
                         "dataset": dataset_name,
                         "metric_space": str(attrs.get("distance", "")),
@@ -151,12 +159,41 @@ def load_ops_records(run_dir: str) -> List[Dict[str, Any]]:
     if not os.path.isdir(run_dir):
         return out
     for filename in sorted(os.listdir(run_dir)):
-        if filename.startswith("ops-") and filename.endswith(".jsonl"):
-            try:
-                out.extend(read_records(os.path.join(run_dir, filename)))
-            except Exception as exc:  # noqa: BLE001
-                print(f"[report] could not read {filename}: {exc}")
+        if not (filename.startswith("ops-") and filename.endswith(".jsonl")):
+            continue
+        try:
+            # Materialised: read_records is a generator, and the relabelling
+            # below walks it before out.extend does.
+            records = list(read_records(os.path.join(run_dir, filename)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[report] could not read {filename}: {exc}")
+            continue
+        # The orchestrator writes ops-<engine>-<dataset>-<pass>-<tag>.jsonl, so
+        # the filename is authoritative about which engine produced the file.
+        # The records themselves were not: the harness recorded the driver's
+        # own name, and mariadb123 shares MariaDBDriver, so every 12.3
+        # measurement arrived labelled "mariadb". Trusting the filename repairs
+        # runs recorded before that was fixed, without re-measuring them.
+        engine = _engine_from_ops_filename(filename)
+        if engine:
+            for r in records:
+                r["engine"] = engine
+        out.extend(records)
     return out
+
+
+def _engine_from_ops_filename(filename: str) -> Optional[str]:
+    """Engine name out of ops-<engine>-<dataset>-<pass>-<tag>.jsonl.
+
+    Datasets contain hyphens, so match the longest known engine prefix rather
+    than splitting on the separator.
+    """
+    stem = filename[len("ops-"):-len(".jsonl")]
+    known = ("mariadb123", "mariadb", "alisql", "pgvector")
+    for name in known:
+        if stem.startswith(name + "-"):
+            return name
+    return None
 
 
 def load_memory_series(run_dir: str) -> Dict[str, List[Dict[str, Any]]]:

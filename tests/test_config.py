@@ -1325,3 +1325,49 @@ class TestHarnessAcceptsEveryOrchestratedEngine:
         table = _driver_table()
         for engine in KNOWN_ENGINES:
             assert engine in table and table[engine] is not None, engine
+
+
+class TestEngineLabelling:
+    """A record must name the engine that produced it, not its driver class.
+
+    mariadb123 shares MariaDBDriver and MariaDB's dialect on purpose, so the
+    two versions cannot drift apart in configuration. Both label sources
+    reported "mariadb" for 12.3, so a 6.5-hour run vanished from the report and
+    11.8 appeared to have measured everything twice.
+    """
+
+    RUN = os.path.join(os.path.dirname(VB_ROOT), "SMOKE_RESULTS", "7",
+                       "mariadb-blog-repro-20260812-203028")
+
+    def test_ops_filename_parses_the_longer_name_first(self):
+        """mariadb123 must not be truncated to mariadb by a prefix match."""
+        from report.loaders import _engine_from_ops_filename
+        assert _engine_from_ops_filename(
+            "ops-mariadb123-dbpedia-openai-1000k-angular-tuned-m16-post.jsonl"
+        ) == "mariadb123"
+        assert _engine_from_ops_filename(
+            "ops-mariadb-dbpedia-openai-1000k-angular-tuned-m16-post.jsonl"
+        ) == "mariadb"
+
+    def test_unknown_prefix_leaves_the_record_alone(self):
+        from report.loaders import _engine_from_ops_filename
+        assert _engine_from_ops_filename("ops-something-else.jsonl") is None
+
+    def test_run_context_prefers_the_requested_engine(self):
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "context.py")).read()
+        assert '"engine": self.engine or driver.name' in source
+
+    def test_ann_modules_declare_their_engine(self):
+        base = os.path.join(VB_ROOT, "overlay", "ann-benchmarks",
+                            "ann_benchmarks", "algorithms")
+        for engine in ("mariadb", "mariadb123"):
+            src = open(os.path.join(base, engine, "module.py")).read()
+            assert f'vb_engine = "{engine}"' in src, engine
+
+    @pytest.mark.skipif(not os.path.isdir(RUN), reason="archived run not present")
+    def test_a_recorded_run_relabels_correctly(self):
+        from report.loaders import load_ops_records
+        engines = {r["engine"] for r in load_ops_records(self.RUN)}
+        assert "mariadb123" in engines
+        assert {"mariadb", "alisql", "pgvector"} <= engines

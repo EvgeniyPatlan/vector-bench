@@ -143,6 +143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_id=args.run_id,
         resource_pass=args.resource_pass,
         recorder=recorder,
+        engine=args.engine,
         engine_tag=args.engine_tag,
         march=args.march or _detect_march(),
         k=args.k,

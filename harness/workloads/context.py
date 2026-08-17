@@ -20,6 +20,12 @@ class RunContext:
     run_id: str
     resource_pass: str          # "normalized" | "tuned"
     recorder: Recorder
+    # The engine name the orchestrator asked for, which is not always the
+    # driver's own name: mariadb and mariadb123 are the same server at
+    # different tags and share MariaDBDriver. Recording driver.name labelled
+    # every 12.3 measurement as "mariadb", so 12.3 vanished from the report and
+    # 11.8 appeared to have measured everything twice.
+    engine: Optional[str] = None
     engine_tag: Optional[str] = None
     march: Optional[str] = None
     k: int = 10
@@ -34,7 +40,7 @@ class RunContext:
         """
         return {
             "run_id": self.run_id,
-            "engine": driver.name,
+            "engine": self.engine or driver.name,
             "engine_version": driver.server_version(),
             "engine_tag": self.engine_tag,
             "resource_pass": self.resource_pass,

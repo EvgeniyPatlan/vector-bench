@@ -43,3 +43,4 @@ MARIADB = Dialect(
 
 class MariaDB(VBMySQLBase):
     dialect = MARIADB
+    vb_engine = "mariadb"

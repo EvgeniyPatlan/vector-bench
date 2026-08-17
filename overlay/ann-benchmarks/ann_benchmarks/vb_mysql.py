@@ -142,6 +142,16 @@ class VBMySQLBase(BaseANN):
         self._cur = self._conn.cursor()
         self._apply_global_setup(self._cur)
 
+    @classmethod
+    def engine_name(cls) -> str:
+        """The engine this class represents, which is not always the dialect.
+
+        MariaDB123 reuses MariaDB's dialect so the two versions cannot drift
+        apart in configuration, but they are separate engines. Reporting
+        dialect.name labelled every 12.3 result as "mariadb".
+        """
+        return getattr(cls, "vb_engine", None) or cls.dialect.name
+
     def _default_socket(self) -> str:
         return f"/var/run/vbench/{self.dialect.name}.sock"
 
@@ -503,7 +513,7 @@ class VBMySQLBase(BaseANN):
 
     def get_additional(self) -> Dict[str, Any]:
         return {
-            "engine": self.dialect.name,
+            "engine": self.engine_name(),
             "resource_pass": os.environ.get("VB_RESOURCE_PASS", "unknown"),
             "engine_version": self._server_version(),
             "storage_engine": self._storage_engine,
