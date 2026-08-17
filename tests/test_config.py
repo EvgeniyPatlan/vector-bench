@@ -1402,3 +1402,30 @@ class TestReportShowsEverySweptAxis:
         for workload in ("concurrency", "filtered", "churn"):
             # once for the markdown body, once for the html section list
             assert source.count(f'_not_measured("{workload}", profile)') == 2, workload
+
+
+class TestPassComparisonNeedsTwoPasses:
+    """It puts normalized next to tuned. One pass draws bars against nothing.
+
+    With workloads: [build] two of its four panels were blank as well, so the
+    figure managed to be empty in two independent ways at once.
+    """
+
+    def test_summary_lists_the_passes_it_saw(self):
+        from report.generate import summarize
+        recs = [{"phase": "ingest", "engine": "mariadb", "dataset": "d",
+                 "resource_pass": "tuned"}]
+        assert summarize(recs, {})["passes"] == ["tuned"]
+
+    def test_note_appears_for_a_single_pass(self):
+        from report.render import _pass_note
+        note = _pass_note({"passes": ["tuned"]})
+        assert "not shown" in note and "--resource-pass both" in note
+
+    def test_note_is_silent_when_both_ran(self):
+        from report.render import _pass_note
+        assert _pass_note({"passes": ["normalized", "tuned"]}) == ""
+
+    def test_generator_skips_the_chart(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert 'name == "passcompare" and len(passes_present) < 2' in source

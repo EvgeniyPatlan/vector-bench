@@ -697,6 +697,21 @@ def _inline_md(text: str) -> str:
     return escaped
 
 
+def _pass_note(summary: Dict[str, Any]) -> str:
+    """Explain an absent normalized-vs-tuned comparison.
+
+    The chart hangs off section 8, so when it is skipped the section simply
+    loses a figure with nothing said about it.
+    """
+    passes = sorted({p for p in summary.get("passes", []) if p})
+    if len(passes) >= 2:
+        return ""
+    only = passes[0] if passes else "one"
+    return (f"<p><em>The normalized-vs-tuned comparison is not shown: this run "
+            f"measured the <code>{_html.escape(only)}</code> pass only. Run with "
+            f"<code>--resource-pass both</code> to populate it.</em></p>")
+
+
 def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
                 records: List[Dict[str, Any]],
                 chart_paths: Dict[str, Dict[str, str]], title: str) -> str:
@@ -768,7 +783,8 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
          figures("filtered-")),
         ("8. Churn",
          _md_tables_to_html(_churn_table(summary) if summary.get("churn")
-                            else _not_measured("churn", profile)),
+                            else _not_measured("churn", profile))
+         + _pass_note(summary),
          figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
     ]
 

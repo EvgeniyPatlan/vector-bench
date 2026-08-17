@@ -95,6 +95,8 @@ def summarize(records: List[Dict[str, Any]],
         "memory_pressure": [],
         "stale_ann": [],
         "duplicate_ann": [],
+        "passes": sorted({r.get("resource_pass") for r in records
+                          if r.get("resource_pass")}),
     }
 
     # Two results for one configuration means the report is reading more than
@@ -318,6 +320,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             "churnimpact": "churn",
         }
 
+        # The pass comparison exists to put normalized next to tuned. With one
+        # pass it draws pale bars against nothing, and its per-workload panels
+        # are blank for whatever the profile did not run -- four panels, two of
+        # them empty, on a chart that could not say anything either way.
+        passes_present = {r.get("resource_pass") for r in records
+                          if r.get("dataset") == dataset and r.get("resource_pass")}
+
         for name, fn, payload in (
             ("pareto", charts.pareto, (dict(by_engine), dataset, k)),
             ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.85, **kw),
@@ -332,6 +341,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("churnimpact", charts.churn_impact, (records, dataset)),
             ("passcompare", charts.pass_comparison, (records, dataset)),
         ):
+            if name == "passcompare" and len(passes_present) < 2:
+                print(f"[report] skipping passcompare: only the "
+                      f"{', '.join(sorted(passes_present)) or 'one'} pass ran "
+                      f"(needs normalized and tuned)")
+                continue
             required = needs.get(name)
             if required and required not in phases_present:
                 print(f"[report] skipping {name}: no {required} records "
