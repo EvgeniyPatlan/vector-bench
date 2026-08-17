@@ -624,7 +624,13 @@ def storage_breakdown(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     for r in sorted(rows, key=lambda r: (r["engine"], str(r.get("resource_pass")),
                                          str(r.get("build_mode")))):
         tag = style_for(r["engine"])["label"].split(" (")[0]
-        extra = [x for x in (r.get("resource_pass"), r.get("build_mode")) if x]
+        # Storage engine belongs here for the same reason it belongs in the
+        # build table: MariaDB gets an InnoDB bar and a MyISAM bar, and without
+        # it they carry identical captions.
+        storage = r.get("storage_engine")
+        extra = [x for x in (r.get("resource_pass"),
+                             storage if storage not in (None, "heap") else None,
+                             r.get("build_mode")) if x]
         labels.append(f"{tag}\n{' / '.join(extra)}")
         index_b.append((r.get("index_bytes") or 0))
         table_b.append((r.get("table_bytes") or 0))

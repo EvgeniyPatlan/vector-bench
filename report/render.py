@@ -324,6 +324,10 @@ def _build_table(summary: Dict[str, Any]) -> str:
             (r.get("engine"), r.get("dataset"), r.get("resource_pass"), r.get("build_mode")))
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"), str(r.get("m", "—")),
+            # MariaDB is measured on InnoDB and MyISAM under the tuned pass, and
+            # without this column those two rows are identical on the page while
+            # differing 6x in ingest rate.
+            r.get("storage_engine") or "—",
             r.get("build_mode") or "—",
             _fmt(r.get("build_wall_s"), 1, " s"),
             _fmt(ingest_rate, 0, " rows/s"),
@@ -332,8 +336,8 @@ def _build_table(summary: Dict[str, Any]) -> str:
             "yes" if (r.get("extra") or {}).get("separable_build") else "no",
         ])
     return _md_table(
-        ["Engine", "Dataset", "M", "Build mode", "Build time", "Ingest rate",
-         "Peak server RSS", "Index size", "Separable build"],
+        ["Engine", "Dataset", "M", "Storage", "Build mode", "Build time",
+         "Ingest rate", "Peak server RSS", "Index size", "Separable build"],
         rows,
     )
 
@@ -750,12 +754,21 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
          figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")),
         ("5. Index build cost",
          _md_tables_to_html(_build_table(summary)), figures("build-") + figures("storage-")),
+        # These three must use the same not-measured wording as the markdown.
+        # The HTML is built from its own section list, so fixing only the
+        # markdown left the page a reader actually opens still saying
+        # "No data." for a workload the profile never ran.
         ("6. Concurrency scaling",
-         _md_tables_to_html(_concurrency_table(summary)), figures("concurrency-")),
+         _md_tables_to_html(_concurrency_table(summary) if summary.get("concurrency")
+                            else _not_measured("concurrency", profile)),
+         figures("concurrency-")),
         ("7. Filtered (hybrid) search",
-         _md_tables_to_html(_filtered_table(summary)), figures("filtered-")),
+         _md_tables_to_html(_filtered_table(summary) if summary.get("filtered")
+                            else _not_measured("filtered", profile)),
+         figures("filtered-")),
         ("8. Churn",
-         _md_tables_to_html(_churn_table(summary)),
+         _md_tables_to_html(_churn_table(summary) if summary.get("churn")
+                            else _not_measured("churn", profile)),
          figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
     ]
 

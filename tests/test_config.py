@@ -1371,3 +1371,34 @@ class TestEngineLabelling:
         engines = {r["engine"] for r in load_ops_records(self.RUN)}
         assert "mariadb123" in engines
         assert {"mariadb", "alisql", "pgvector"} <= engines
+
+
+class TestReportShowsEverySweptAxis:
+    """A swept axis that is not shown makes two rows look like a duplicate.
+
+    MariaDB is measured on InnoDB and MyISAM under the tuned pass. Those two
+    differ 6x in ingest rate, but the build table and the footprint chart both
+    captioned them identically, so the extra bar read as a bug.
+    """
+
+    def test_build_table_names_the_storage_engine(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert '"Storage"' in source, "build table has no storage column"
+        assert 'r.get("storage_engine") or "—"' in source
+
+    def test_footprint_labels_include_storage(self):
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        assert 'storage if storage not in (None, "heap") else None' in source
+
+    def test_html_uses_the_same_not_measured_note(self):
+        """The HTML is built from its own section list and was left behind."""
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        html_block = source[source.index('sections = ['):]
+        for workload in ("concurrency", "filtered", "churn"):
+            assert f'_not_measured("{workload}", profile)' in html_block, workload
+
+    def test_both_renderers_reference_not_measured_equally(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        for workload in ("concurrency", "filtered", "churn"):
+            # once for the markdown body, once for the html section list
+            assert source.count(f'_not_measured("{workload}", profile)') == 2, workload
