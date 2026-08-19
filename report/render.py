@@ -287,11 +287,20 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
         parts.append(f"\n#### {dataset}\n\n")
         rows = []
         for engine, entry in sorted(per_engine.items()):
+            # The frontier spans every configuration the engine was swept over,
+            # so on the tuned pass MariaDB's headline figures are MyISAM ones.
+            # Naming the winner keeps the number from being read as the result
+            # of the default build.
+            multi = len(entry.get("storage_engines") or []) > 1
+
+            def cell(floor: int) -> str:
+                value = _fmt(entry.get(f"qps_at_recall_{floor}"), 0)
+                storage = entry.get(f"qps_at_recall_{floor}_storage")
+                return f"{value} ({storage})" if multi and storage and value != "—" else value
+
             rows.append([
                 _label(engine),
-                _fmt(entry.get("qps_at_recall_90"), 0),
-                _fmt(entry.get("qps_at_recall_95"), 0),
-                _fmt(entry.get("qps_at_recall_99"), 0),
+                cell(90), cell(95), cell(99),
                 f"{entry.get('max_recall', 0):.4f}",
                 str(entry.get("points", 0)),
             ])
@@ -308,26 +317,43 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
     return "".join(parts) or "_No recall/QPS data in this run._\n"
 
 
+# The ops harness stamps a storage engine on every unit and defaults to
+# InnoDB, which is meaningless for PostgreSQL. Its own ann records call the
+# same thing `heap`; this keeps the two paths from disagreeing on the page.
+_STORAGE_OVERRIDES = {"pgvector": "heap"}
+
+
+def _storage(record: Dict[str, Any]) -> str:
+    override = _STORAGE_OVERRIDES.get(record.get("engine"))
+    return override or record.get("storage_engine") or "—"
+
+
 def _build_table(summary: Dict[str, Any]) -> str:
     # Ingest rate lives on the `ingest` record, not on `index_build`; reading it
     # off the build record produced an em dash in every row.
+    # Keyed on the storage engine as well. Without it MariaDB's InnoDB and
+    # MyISAM builds collided and one rate was printed for both rows, which
+    # reported MyISAM's 210 rows/s as 80 on 11.8 and its 305 as 51 on 12.3.
     ingest_by_key = {
-        (i.get("engine"), i.get("dataset"), i.get("resource_pass"), i.get("build_mode")):
+        (i.get("engine"), i.get("dataset"), i.get("resource_pass"),
+         i.get("build_mode"), i.get("storage_engine")):
             i.get("ingest_rows_per_s")
         for i in summary.get("ingest", [])
     }
 
     rows = []
     for r in sorted(summary.get("build", []),
-                    key=lambda r: (r.get("dataset", ""), r.get("engine", ""), r.get("m") or 0)):
+                    key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("m") or 0, r.get("storage_engine") or "")):
         ingest_rate = ingest_by_key.get(
-            (r.get("engine"), r.get("dataset"), r.get("resource_pass"), r.get("build_mode")))
+            (r.get("engine"), r.get("dataset"), r.get("resource_pass"),
+             r.get("build_mode"), r.get("storage_engine")))
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"), str(r.get("m", "—")),
             # MariaDB is measured on InnoDB and MyISAM under the tuned pass, and
             # without this column those two rows are identical on the page while
             # differing 6x in ingest rate.
-            r.get("storage_engine") or "—",
+            _storage(r),
             r.get("build_mode") or "—",
             _fmt(r.get("build_wall_s"), 1, " s"),
             _fmt(ingest_rate, 0, " rows/s"),
@@ -357,14 +383,21 @@ def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
     )
 
 
+# The tuned pass measures MariaDB on both InnoDB and MyISAM, so an engine name
+# alone does not identify a row. Without this column the two appeared as
+# unexplained duplicates, and the largest result in the tuned-complete run --
+# that MariaDB loses 3-10% of its throughput to churn on MyISAM against 84-86%
+# on InnoDB -- was invisible on the page.
 def _concurrency_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("concurrency", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("storage_engine") or "",
                                    r.get("clients") or 0)):
         eff = (r.get("extra") or {}).get("scaling_efficiency")
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            _storage(r),
             str(r.get("clients", "—")),
             _fmt(r.get("qps"), 0),
             _fmt(r.get("latency_p50_ms"), 3),
@@ -373,8 +406,8 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _fmt(eff, 2) if eff is not None else "—",
         ])
     return _md_table(
-        ["Engine", "Dataset", "Clients", "QPS", "p50 (ms)", "p95 (ms)",
-         "p99 (ms)", "Scaling efficiency"],
+        ["Engine", "Dataset", "Storage", "Clients", "QPS", "p50 (ms)",
+         "p95 (ms)", "p99 (ms)", "Scaling efficiency"],
         rows,
     )
 
@@ -383,10 +416,12 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("filtered", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("storage_engine") or "",
                                    r.get("selectivity") or 0)):
         extra = r.get("extra") or {}
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            _storage(r),
             f"{(r.get('selectivity') or 0):.0%}",
             _fmt(r.get("recall_at_k"), 4),
             _fmt(r.get("qps"), 0),
@@ -396,8 +431,8 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
             extra.get("iterative_scan") or "—",
         ])
     return _md_table(
-        ["Engine", "Dataset", "Selectivity", "Recall@k", "QPS", "p99 (ms)",
-         "Index used", "Short results", "Iterative scan"],
+        ["Engine", "Dataset", "Storage", "Selectivity", "Recall@k", "QPS",
+         "p99 (ms)", "Index used", "Short results", "Iterative scan"],
         rows,
     )
 
@@ -406,10 +441,12 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("churn", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("storage_engine") or "",
                                    r.get("churn_fraction") or 0)):
         extra = r.get("extra") or {}
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            _storage(r),
             f"{(r.get('churn_fraction') or 0):.0%}",
             _fmt(r.get("recall_at_k"), 4),
             _fmt(extra.get("recall_drop_vs_baseline"), 4),
@@ -417,8 +454,8 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             _fmt_bytes(r.get("index_bytes")),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Churn", "Recall@k", "Recall drop vs baseline",
-         "QPS", "Index size"],
+        ["Engine", "Dataset", "Storage", "Churn", "Recall@k",
+         "Recall drop vs baseline", "QPS", "Index size"],
         rows,
     )
 

@@ -46,6 +46,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--output-dir", default=None,
                    help="where to write the report (default: <run-dir>/report)")
     p.add_argument("--title", default="Vector search benchmark")
+    p.add_argument("--from-records", default=None,
+                   help="regenerate from a previously merged records.jsonl "
+                        "instead of reading the ops and ann-benchmarks trees. "
+                        "Use when a run directory has been archived or copied "
+                        "away from the machine that produced it.")
     return p.parse_args(argv)
 
 
@@ -185,11 +190,18 @@ def summarize(records: List[Dict[str, Any]],
             # QPS at a recall floor is the comparison an operator actually
             # makes: "how fast is it, at accuracy I can accept?"
             entry: Dict[str, Any] = {"points": len(points)}
+            # Which storage engine reached each floor, not only how fast. The
+            # frontier spans every configuration swept, so on the tuned pass
+            # "MariaDB 12.3: 1,176 QPS" is a MyISAM result -- printing it
+            # unattributed credits it to the default build.
+            entry["storage_engines"] = sorted(
+                {p.get("storage_engine") for p in points if p.get("storage_engine")})
             for floor in (0.90, 0.95, 0.99):
                 qualifying = [p for p in frontier if (p.get("recall_at_k") or 0) >= floor]
-                entry[f"qps_at_recall_{int(floor * 100)}"] = (
-                    max(p["qps"] for p in qualifying) if qualifying else None
-                )
+                best = max(qualifying, key=lambda p: p["qps"]) if qualifying else None
+                entry[f"qps_at_recall_{int(floor * 100)}"] = best["qps"] if best else None
+                entry[f"qps_at_recall_{int(floor * 100)}_storage"] = (
+                    best.get("storage_engine") if best else None)
             entry["max_recall"] = max((p.get("recall_at_k") or 0) for p in frontier)
             per_engine[engine] = entry
         if per_engine:
@@ -209,6 +221,34 @@ def summarize(records: List[Dict[str, Any]],
             summary["failed_phases"].append(phase)
 
     return summary
+
+
+def attach_peak_rss(records: List[Dict[str, Any]],
+                    peaks: Dict[str, Optional[int]]) -> None:
+    """Fill in peak server memory from the sampled timeseries, in place.
+
+    Matched on the exact series name rather than a prefix. A prefix of
+    engine-dataset-pass matches both `...-m16-post` and `...-m16-post-myisam`,
+    so MariaDB's InnoDB and MyISAM builds were both given whichever series came
+    first: the InnoDB row was published at 13.9 GiB against a true 28.7.
+
+    A value derived here is tagged as such, so regenerating a report from a
+    merged records.jsonl recomputes it rather than trusting it. A value the
+    harness read from the kernel's high-water mark carries no tag and is left
+    alone: polling a timeseries can miss a peak that memory.peak recorded.
+    """
+    from report.loaders import memory_stem
+
+    for r in records:
+        if r.get("phase") != "index_build":
+            continue
+        derived = (r.get("extra") or {}).get("peak_rss_source") == "sampled"
+        if r.get("peak_rss_bytes") and not derived:
+            continue
+        peak = peaks.get(memory_stem(r))
+        if peak:
+            r["peak_rss_bytes"] = peak
+            r.setdefault("extra", {})["peak_rss_source"] = "sampled"
 
 
 def _narrow_to_this_run(annb_dir: str, manifest: Dict[str, Any]) -> str:
@@ -259,12 +299,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[report] output    : {out_dir}")
 
     records: List[Dict[str, Any]] = []
-    records += loaders.load_ops_records(run_dir)
-    print(f"[report] ops records: {len(records)}")
+    if args.from_records:
+        # A run directory is routinely copied off the machine that produced it,
+        # and the ann-benchmarks HDF5 tree is not copied with it. The merged
+        # records file is self-contained, so a report can be rebuilt from an
+        # archived run without re-running anything.
+        with open(args.from_records) as fh:
+            records = [json.loads(line) for line in fh if line.strip()]
+        print(f"[report] records from {args.from_records}: {len(records)}")
+    else:
+        records += loaders.load_ops_records(run_dir)
+        print(f"[report] ops records: {len(records)}")
 
-    annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
-    records += annb
-    print(f"[report] ann-benchmarks records: {len(annb)}")
+        annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
+        records += annb
+        print(f"[report] ann-benchmarks records: {len(annb)}")
 
     if not records:
         print("[report] no records found — nothing to report", file=sys.stderr)
@@ -275,13 +324,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Fill in peak memory from the timeseries where the harness could not read
     # a kernel high-water mark itself.
     peaks = {name: loaders.peak_from_series(rows) for name, rows in memory.items()}
-    for r in records:
-        if r.get("phase") == "index_build" and not r.get("peak_rss_bytes"):
-            prefix = f"{r.get('engine')}-{r.get('dataset')}-{r.get('resource_pass')}"
-            match = next((v for name, v in peaks.items()
-                          if name.startswith(prefix) and v), None)
-            if match:
-                r["peak_rss_bytes"] = match
+    attach_peak_rss(records, peaks)
 
     # Persisted AFTER the enrichment above, not before: writing it earlier left
     # records.jsonl missing the peak-RSS values the rendered report displayed,

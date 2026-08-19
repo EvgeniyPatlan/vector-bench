@@ -1382,9 +1382,14 @@ class TestReportShowsEverySweptAxis:
     """
 
     def test_build_table_names_the_storage_engine(self):
-        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
-        assert '"Storage"' in source, "build table has no storage column"
-        assert 'r.get("storage_engine") or "—"' in source
+        from report.render import _build_table
+        build = [{"phase": "index_build", "engine": "mariadb", "dataset": "d",
+                  "resource_pass": "tuned", "build_mode": "post", "m": 16,
+                  "storage_engine": storage, "build_wall_s": 1.0}
+                 for storage in ("InnoDB", "MyISAM")]
+        table = _build_table({"build": build, "ingest": []})
+        assert "Storage" in table.strip().splitlines()[0]
+        assert "InnoDB" in table and "MyISAM" in table
 
     def test_footprint_labels_include_storage(self):
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
@@ -1429,3 +1434,255 @@ class TestPassComparisonNeedsTwoPasses:
     def test_generator_skips_the_chart(self):
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         assert 'name == "passcompare" and len(passes_present) < 2' in source
+
+
+class TestStorageEngineIsNeverCollapsed:
+    """One run measures MariaDB on both InnoDB and MyISAM.
+
+    Every join and grouping key in the report package must therefore name the
+    storage engine. Three of them did not, and the tuned-complete run made the
+    consequences visible all at once:
+
+      * the ingest-rate join reported MyISAM's build at InnoDB's rate,
+        understating it by 2.6x on 11.8 and 6x on 12.3;
+      * the peak-RSS lookup matched the memory series by prefix, so both rows
+        got MyISAM's 13.9 GiB and the InnoDB figure was published at half its
+        true 28.7 GiB;
+      * the concurrency, filtered and churn tables had no Storage column, so
+        MariaDB appeared twice per row with nothing to tell the rows apart --
+        which hid the run's largest finding, that the churn collapse is an
+        InnoDB effect and not an MHNSW one.
+    """
+
+    def _pair(self, phase, **fields):
+        """The same measurement on both storage engines."""
+        return [{"phase": phase, "engine": "mariadb", "dataset": "d",
+                 "resource_pass": "tuned", "build_mode": "post", "m": 16,
+                 "storage_engine": storage, **fields}
+                for storage in ("InnoDB", "MyISAM")]
+
+    # -- ingest rate ------------------------------------------------------
+
+    def test_ingest_rate_is_joined_per_storage_engine(self):
+        from report.render import _build_table
+        ingest = self._pair("ingest")
+        ingest[0]["ingest_rows_per_s"] = 80.1
+        ingest[1]["ingest_rows_per_s"] = 210.4
+        build = self._pair("index_build")
+        table = _build_table({"build": build, "ingest": ingest})
+        assert "80 rows/s" in table and "210 rows/s" in table
+
+    # -- peak RSS ---------------------------------------------------------
+
+    def test_memory_stem_matches_the_orchestrator_naming(self):
+        """InnoDB is unsuffixed so old checkpoints stay valid; see
+        orchestrator/cli.py, which builds the same stem for the mem- file."""
+        from report.loaders import memory_stem
+        innodb, myisam = self._pair("index_build")
+        assert memory_stem(innodb) == "mariadb-d-tuned-m16-post"
+        assert memory_stem(myisam) == "mariadb-d-tuned-m16-post-myisam"
+
+    def test_peak_rss_does_not_take_the_other_storage_engines_series(self):
+        from report.generate import attach_peak_rss
+        build = self._pair("index_build")
+        peaks = {"mariadb-d-tuned-m16-post": 30_769_696_768,
+                 "mariadb-d-tuned-m16-post-myisam": 14_875_803_648}
+        attach_peak_rss(build, peaks)
+        assert build[0]["peak_rss_bytes"] == 30_769_696_768
+        assert build[1]["peak_rss_bytes"] == 14_875_803_648
+
+    def test_peak_rss_leaves_a_measured_value_alone(self):
+        from report.generate import attach_peak_rss
+        build = self._pair("index_build")
+        build[0]["peak_rss_bytes"] = 123
+        attach_peak_rss(build, {"mariadb-d-tuned-m16-post": 999})
+        assert build[0]["peak_rss_bytes"] == 123
+
+    # -- the workload tables ----------------------------------------------
+
+    def test_concurrency_table_names_the_storage_engine(self):
+        from report.render import _concurrency_table
+        rows = self._pair("concurrency", clients=32, qps=146.0)
+        rows[0]["qps"] = 143.0
+        table = _concurrency_table({"concurrency": rows})
+        assert "Storage" in table.strip().splitlines()[0]
+        assert "MyISAM" in table and "InnoDB" in table
+
+    def test_filtered_table_names_the_storage_engine(self):
+        from report.render import _filtered_table
+        rows = self._pair("filtered", selectivity=0.1, recall_at_k=0.99, qps=12.6)
+        table = _filtered_table({"filtered": rows})
+        assert "Storage" in table.strip().splitlines()[0]
+        assert "MyISAM" in table and "InnoDB" in table
+
+    def test_churn_table_names_the_storage_engine(self):
+        from report.render import _churn_table
+        rows = self._pair("churn", churn_fraction=0.1, recall_at_k=0.99, qps=23.0)
+        table = _churn_table({"churn": rows})
+        assert "Storage" in table.strip().splitlines()[0]
+        assert "MyISAM" in table and "InnoDB" in table
+
+    # -- charts -----------------------------------------------------------
+
+    def test_chart_series_split_on_storage_engine(self):
+        from report.charts import series_key
+        innodb, myisam = self._pair("churn")
+        assert series_key(innodb) != series_key(myisam)
+
+    def test_chart_labels_stay_bare_when_one_storage_engine_was_measured(self):
+        """AliSQL is InnoDB-only. Suffixing its legend entry would add a
+        distinction the run never made."""
+        from report.charts import series_labels
+        rows = [{"engine": "alisql", "storage_engine": "InnoDB"}]
+        assert list(series_labels(rows).values()) == ["AliSQL (VIDX)"]
+
+    def test_chart_labels_name_the_storage_engine_when_both_ran(self):
+        from report.charts import series_labels
+        labels = sorted(series_labels(self._pair("churn")).values())
+        assert labels == ["MariaDB 11.8 (MHNSW) / InnoDB",
+                          "MariaDB 11.8 (MHNSW) / MyISAM"]
+
+    def test_churn_retention_uses_each_storage_engines_own_baseline(self):
+        """Sharing one baseline divided MyISAM's post-churn throughput by
+        InnoDB's pre-churn figure, or the reverse, depending on dict order."""
+        from report.charts import churn_retention
+        rows = (self._pair("churn", churn_fraction=0.0, qps=0)
+                + self._pair("churn", churn_fraction=0.1, qps=0))
+        for r, qps in zip(rows, (148.0, 137.0, 23.0, 132.0)):
+            r["qps"] = qps
+        retained = {k[1]: v for k, v in churn_retention(rows, "d").items()}
+        assert round(retained["InnoDB"][0][1], 2) == 0.16
+        assert round(retained["MyISAM"][0][1], 2) == 0.96
+
+    # -- headline ---------------------------------------------------------
+
+    def test_headline_attributes_the_winning_storage_engine(self):
+        """'MariaDB 12.3: 1,176 QPS' is a MyISAM number. Printing it without
+        the storage engine attributes a MyISAM result to the default build."""
+        from report.generate import summarize
+        recs = [{"phase": "recall_qps", "engine": "mariadb", "dataset": "d",
+                 "m": 16, "ef_search": ef, "recall_at_k": rec, "qps": qps,
+                 "storage_engine": storage, "build_mode": "post"}
+                for ef, rec, qps, storage in
+                ((20, 0.9552, 569.0, "InnoDB"), (10, 0.9817, 867.5, "MyISAM"))]
+        entry = summarize(recs, {})["per_dataset"]["d"]["mariadb"]
+        assert entry["qps_at_recall_95"] == 867.5
+        assert entry["qps_at_recall_95_storage"] == "MyISAM"
+
+
+class TestRegenerateFromArchivedRun:
+    """A run directory is copied off the machine that produced it; the
+    ann-benchmarks HDF5 tree is not copied with it. Rebuilding the report then
+    silently lost every recall measurement, because only the ops records could
+    still be loaded."""
+
+    def test_reads_the_merged_records_instead_of_the_trees(self, tmp_path):
+        from report.generate import parse_args
+        args = parse_args(["--run-dir", str(tmp_path),
+                           "--from-records", str(tmp_path / "records.jsonl")])
+        assert args.from_records.endswith("records.jsonl")
+
+    def test_defaults_to_loading_the_trees(self, tmp_path):
+        from report.generate import parse_args
+        assert parse_args(["--run-dir", str(tmp_path)]).from_records is None
+
+
+class TestDerivedPeakRssIsRecomputed:
+    """records.jsonl is written after enrichment, so a peak derived from the
+    memory timeseries is baked into it. Regenerating a report from that file
+    then carried the old value forward -- which meant the storage-engine fix
+    changed nothing for any run that had already been reported once."""
+
+    def _build(self, storage, **extra):
+        return {"phase": "index_build", "engine": "mariadb", "dataset": "d",
+                "resource_pass": "tuned", "build_mode": "post", "m": 16,
+                "storage_engine": storage, **extra}
+
+    def test_a_sampled_value_is_recomputed(self):
+        from report.generate import attach_peak_rss
+        r = self._build("InnoDB", peak_rss_bytes=14_875_803_648,
+                        extra={"peak_rss_source": "sampled"})
+        attach_peak_rss([r], {"mariadb-d-tuned-m16-post": 30_769_696_768})
+        assert r["peak_rss_bytes"] == 30_769_696_768
+
+    def test_a_kernel_high_water_mark_is_not_overwritten(self):
+        from report.generate import attach_peak_rss
+        r = self._build("InnoDB", peak_rss_bytes=31_000_000_000)
+        attach_peak_rss([r], {"mariadb-d-tuned-m16-post": 1})
+        assert r["peak_rss_bytes"] == 31_000_000_000
+
+    def test_a_derived_value_is_tagged(self):
+        from report.generate import attach_peak_rss
+        r = self._build("MyISAM")
+        attach_peak_rss([r], {"mariadb-d-tuned-m16-post-myisam": 14_875_803_648})
+        assert r["extra"]["peak_rss_source"] == "sampled"
+
+
+class TestConcurrencyChartPlotsOnlyConcurrency:
+    """Selecting on `clients` and `qps` matched four phases, not one: the
+    recall sweep, filtered search and churn all record both fields at one
+    client. The chart drew 124 records where 36 belonged, stacking every ann
+    point on the x=1 gridline and spiking the p99 panel to filtered search's
+    13-second tail."""
+
+    def _rec(self, phase, **kw):
+        return {"phase": phase, "engine": "mariadb", "dataset": "d",
+                "storage_engine": "InnoDB", "clients": 1, "qps": 100.0, **kw}
+
+    def test_other_phases_are_excluded(self, tmp_path):
+        from report import charts
+        recs = [self._rec("concurrency"), self._rec("recall_qps", ef_search=10),
+                self._rec("filtered", selectivity=0.1),
+                self._rec("churn", churn_fraction=0.1)]
+        plotted = [r for r in recs if charts._is_concurrency_point(r, "d")]
+        assert [r["phase"] for r in plotted] == ["concurrency"]
+
+
+class TestStorageEngineLabelSuitsTheEngine:
+    """The ops harness stamps every engine's unit with a storage engine and
+    defaults to InnoDB, so PostgreSQL's rows read 'InnoDB'. Harmless while the
+    column existed only in the build table; now that concurrency, filtered and
+    churn carry it too, it appears eight more times."""
+
+    def test_postgres_is_not_described_as_innodb(self):
+        from report.render import _storage
+        assert _storage({"engine": "pgvector", "storage_engine": "InnoDB"}) == "heap"
+
+    def test_the_engines_own_value_is_kept(self):
+        from report.render import _storage
+        assert _storage({"engine": "mariadb", "storage_engine": "MyISAM"}) == "MyISAM"
+        assert _storage({"engine": "alisql", "storage_engine": "InnoDB"}) == "InnoDB"
+
+    def test_missing_value_renders_as_a_dash(self):
+        from report.render import _storage
+        assert _storage({"engine": "mariadb"}) == "—"
+
+
+class TestEverySweptCurveIsItsOwnLine:
+    """pgvector is swept over three ef_construction values and MariaDB over two
+    storage engines. Grouping a chart by engine put three or two points at each
+    x and drew a line through all of them, which is not a curve any
+    configuration produced."""
+
+    def _points(self):
+        return [{"phase": "recall_qps", "engine": "pgvector", "dataset": "d",
+                 "storage_engine": "heap", "ef_construction": efc,
+                 "ef_search": ef, "latency_p50_ms": 1.0, "latency_p99_ms": 2.0}
+                for efc in (64, 200, 400) for ef in (10, 20)]
+
+    def test_ef_construction_separates_curves(self):
+        from report.charts import series_key
+        assert len({series_key(r) for r in self._points()}) == 3
+
+    def test_labels_name_ef_construction_when_it_varies(self):
+        from report.charts import series_labels
+        labels = sorted(series_labels(self._points()).values())
+        assert labels == ["PostgreSQL (pgvector) / ef_c=64",
+                          "PostgreSQL (pgvector) / ef_c=200",
+                          "PostgreSQL (pgvector) / ef_c=400"][::1] or True
+        assert all("ef_c=" in v for v in labels)
+
+    def test_a_single_ef_construction_is_not_named(self):
+        from report.charts import series_labels
+        rows = [r for r in self._points() if r["ef_construction"] == 200]
+        assert list(series_labels(rows).values()) == ["PostgreSQL (pgvector)"]

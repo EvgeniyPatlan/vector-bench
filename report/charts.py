@@ -41,6 +41,76 @@ def style_for(engine: str) -> Dict[str, Any]:
     return STYLE.get(engine, {**FALLBACK, "label": engine})
 
 
+# Axes a single engine can be swept over within one run. Two measurements of
+# one engine that differ on either are different curves, not repeats of one:
+# grouping a chart by engine name alone put several points at every x and drew
+# a line through all of them that no configuration ever produced.
+SERIES_AXES = ("storage_engine", "ef_construction")
+
+# Colour stays with the engine so versions remain comparable at a glance; the
+# storage engine is carried by the linestyle instead.
+STORAGE_LINESTYLES = ("-", "--", ":", "-.")
+
+
+def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Identity of one plotted line."""
+    return (record.get("engine"),) + tuple(record.get(a) for a in SERIES_AXES)
+
+
+def series_labels(records: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
+    """Legend text per series, naming only the axes that actually vary.
+
+    An engine swept over one value keeps its bare label: AliSQL is InnoDB-only
+    and only pgvector exposes ef_construction, so naming either there would
+    imply a comparison the run did not make.
+    """
+    varying: Dict[str, List[set]] = {}
+    for r in records:
+        seen = varying.setdefault(r.get("engine"), [set() for _ in SERIES_AXES])
+        for i, axis in enumerate(SERIES_AXES):
+            seen[i].add(r.get(axis))
+
+    labels = {}
+    for r in records:
+        key = series_key(r)
+        label = style_for(key[0])["label"]
+        for i, axis in enumerate(SERIES_AXES):
+            value = key[i + 1]
+            if value is not None and len(varying[key[0]][i]) > 1:
+                label += (f" / {value}" if axis == "storage_engine"
+                          else f" / ef_c={value}")
+        labels[key] = label
+    return labels
+
+
+def series_style(record: Dict[str, Any],
+                 storages: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
+    """Engine colour and marker, with the linestyle carrying storage engine."""
+    style = dict(style_for(record.get("engine")))
+    if storages and len(storages) > 1:
+        idx = storages.index(record.get("storage_engine"))
+        style["linestyle"] = STORAGE_LINESTYLES[idx % len(STORAGE_LINESTYLES)]
+    return style
+
+
+def _grouped(records: List[Dict[str, Any]]
+             ) -> Tuple[Dict[Tuple[Any, ...], List[Dict[str, Any]]],
+                        Dict[Tuple[Any, ...], str],
+                        Dict[str, List[Optional[str]]]]:
+    """Split records into plotted series, with their labels and storage order."""
+    groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for r in records:
+        groups.setdefault(series_key(r), []).append(r)
+    per_engine: Dict[str, List[Optional[str]]] = {}
+    for key in groups:
+        storages = per_engine.setdefault(key[0], [])
+        if key[1] not in storages:
+            storages.append(key[1])
+    for v in per_engine.values():
+        v.sort(key=lambda x: (x is None, x))
+    return groups, series_labels(records), per_engine
+
+
 def _new_axes(title: str, xlabel: str, ylabel: str,
               figsize: Tuple[float, float] = (9, 5.5)):
     fig, ax = plt.subplots(figsize=figsize)
@@ -154,12 +224,11 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
 def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                stem: str) -> Optional[Dict[str, str]]:
     """Build time, peak memory and index size against M, side by side."""
-    by_engine: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        if r.get("dataset") == dataset and r.get("build_wall_s") is not None:
-            by_engine.setdefault(r["engine"], []).append(r)
-    if not by_engine:
+    plotted_records = [r for r in records if r.get("dataset") == dataset
+                       and r.get("build_wall_s") is not None]
+    if not plotted_records:
         return None
+    by_series, labels, storages = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     fig.patch.set_alpha(0.0)
@@ -180,8 +249,8 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         if formatter:
             ax.yaxis.set_major_formatter(FuncFormatter(formatter))
 
-        for engine, rows in sorted(by_engine.items()):
-            style = style_for(engine)
+        for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+            style = series_style(rows[0], storages.get(key[0]))
             points = sorted(
                 ((r.get("m"), r.get(field)) for r in rows
                  if r.get("m") is not None and r.get(field) is not None),
@@ -193,7 +262,7 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
             ax.plot([p[0] for p in points], [p[1] for p in points],
                     color=style["color"], marker=style["marker"],
                     linestyle=style["linestyle"], linewidth=1.8, markersize=6,
-                    label=style["label"])
+                    label=labels[key])
 
     if not any_data:
         plt.close(fig)
@@ -212,15 +281,26 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 # Concurrency
 # ---------------------------------------------------------------------------
 
+def _is_concurrency_point(record: Dict[str, Any], dataset: str) -> bool:
+    """Only the concurrency sweep belongs on the concurrency chart.
+
+    `clients` and `qps` are recorded by the recall sweep, filtered search and
+    churn as well, all at one client. Selecting on those two fields alone put
+    every one of them on the x=1 gridline and let filtered search's 13-second
+    p99 set the scale of the latency panel.
+    """
+    return (record.get("phase") == "concurrency"
+            and record.get("dataset") == dataset
+            and record.get("clients") and record.get("qps"))
+
+
 def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                 stem: str) -> Optional[Dict[str, str]]:
     """QPS, p99 latency and scaling efficiency against client count."""
-    by_engine: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        if r.get("dataset") == dataset and r.get("clients") and r.get("qps"):
-            by_engine.setdefault(r["engine"], []).append(r)
-    if not by_engine:
+    plotted_records = [r for r in records if _is_concurrency_point(r, dataset)]
+    if not plotted_records:
         return None
+    by_series, labels, storages = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     fig.patch.set_alpha(0.0)
@@ -237,14 +317,14 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_ylabel("p99 latency (ms)  (lower is better ↓)", fontsize=10)
     axes[2].set_ylabel("Scaling efficiency  (1.0 = linear)", fontsize=10)
 
-    for engine, rows in sorted(by_engine.items()):
-        style = style_for(engine)
+    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        style = series_style(rows[0], storages.get(key[0]))
         rows = sorted(rows, key=lambda r: r["clients"])
         clients = [r["clients"] for r in rows]
 
         axes[0].plot(clients, [r["qps"] for r in rows], color=style["color"],
                      marker=style["marker"], linestyle=style["linestyle"],
-                     linewidth=1.8, markersize=6, label=style["label"])
+                     linewidth=1.8, markersize=6, label=labels[key])
 
         p99 = [(c, r.get("latency_p99_ms")) for c, r in zip(clients, rows)
                if r.get("latency_p99_ms") is not None]
@@ -283,12 +363,11 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
              stem: str) -> Optional[Dict[str, str]]:
     """Filtered recall and QPS against selectivity."""
-    by_engine: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        if r.get("dataset") == dataset and r.get("selectivity") is not None:
-            by_engine.setdefault(r["engine"], []).append(r)
-    if not by_engine:
+    plotted_records = [r for r in records if r.get("dataset") == dataset
+                       and r.get("selectivity") is not None]
+    if not plotted_records:
         return None
+    by_series, labels, storages = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     fig.patch.set_alpha(0.0)
@@ -304,15 +383,15 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_ylabel("Queries per second  (higher is better ↑)", fontsize=10)
     axes[1].set_yscale("log")
 
-    for engine, rows in sorted(by_engine.items()):
-        style = style_for(engine)
+    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        style = series_style(rows[0], storages.get(key[0]))
         rows = sorted(rows, key=lambda r: r["selectivity"])
         sel = [r["selectivity"] for r in rows]
 
         axes[0].plot(sel, [r.get("recall_at_k") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6,
-                     label=style["label"])
+                     label=labels[key])
         axes[1].plot(sel, [r.get("qps") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
@@ -345,12 +424,11 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
           stem: str) -> Optional[Dict[str, str]]:
     """Recall and QPS after successive delete/re-insert cycles."""
-    by_engine: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        if r.get("dataset") == dataset and r.get("churn_fraction") is not None:
-            by_engine.setdefault(r["engine"], []).append(r)
-    if not by_engine:
+    plotted_records = [r for r in records if r.get("dataset") == dataset
+                       and r.get("churn_fraction") is not None]
+    if not plotted_records:
         return None
+    by_series, labels, storages = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     fig.patch.set_alpha(0.0)
@@ -364,14 +442,14 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[0].set_ylabel("Recall@k  (higher is better ↑)", fontsize=10)
     axes[1].set_ylabel("Queries per second  (higher is better ↑)", fontsize=10)
 
-    for engine, rows in sorted(by_engine.items()):
-        style = style_for(engine)
+    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        style = series_style(rows[0], storages.get(key[0]))
         rows = sorted(rows, key=lambda r: r["churn_fraction"])
         fractions = [r["churn_fraction"] for r in rows]
         axes[0].plot(fractions, [r.get("recall_at_k") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6,
-                     label=style["label"])
+                     label=labels[key])
         axes[1].plot(fractions, [r.get("qps") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
@@ -565,13 +643,12 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
     is written against. An engine with a good p50 and a bad p99 is a different
     proposition from one with both merely acceptable.
     """
-    by_engine: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        if (r.get("phase") == "recall_qps" and r.get("dataset") == dataset
-                and r.get("ef_search") and r.get("latency_p99_ms")):
-            by_engine.setdefault(r["engine"], []).append(r)
-    if not by_engine:
+    plotted_records = [r for r in records
+                       if r.get("phase") == "recall_qps" and r.get("dataset") == dataset
+                       and r.get("ef_search") and r.get("latency_p99_ms")]
+    if not plotted_records:
         return None
+    by_series, labels, storages = _grouped(plotted_records)
 
     fig, ax = _new_axes(
         f"Query latency distribution — {dataset}",
@@ -580,8 +657,8 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
     )
     ax.set_xscale("log", base=2)
 
-    for engine, rows in sorted(by_engine.items()):
-        style = style_for(engine)
+    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        style = series_style(rows[0], storages.get(key[0]))
         rows = sorted(rows, key=lambda r: r["ef_search"])
         ef = [r["ef_search"] for r in rows]
         p50 = [r.get("latency_p50_ms") for r in rows]
@@ -591,7 +668,7 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
         ax.fill_between(ef, p50, p99, color=style["color"], alpha=0.13, linewidth=0)
         ax.plot(ef, p50, color=style["color"], marker=style["marker"],
                 linestyle=style["linestyle"], linewidth=1.9, markersize=5,
-                label=f"{style['label']} p50")
+                label=f"{labels[key]} p50")
         ax.plot(ef, p99, color=style["color"], linestyle=":", linewidth=1.2,
                 alpha=0.85)
 
@@ -663,6 +740,31 @@ def storage_breakdown(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 # Churn impact
 # ---------------------------------------------------------------------------
 
+def churn_retention(records: List[Dict[str, Any]], dataset: str
+                    ) -> Dict[Tuple[Any, ...], List[Tuple[float, float]]]:
+    """Post-churn QPS as a fraction of each series' own pre-churn baseline.
+
+    The key names the storage engine. Without it MariaDB's InnoDB and MyISAM
+    runs shared one baseline slot, so whichever was recorded second overwrote
+    the first and both post-churn points were divided by it -- turning a real
+    3% MyISAM loss and an 84% InnoDB loss into two numbers that were each
+    wrong by the ratio between the two baselines.
+    """
+    baseline: Dict[Tuple[Any, ...], float] = {}
+    after: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
+    for r in records:
+        if r.get("phase") != "churn" or r.get("dataset") != dataset or not r.get("qps"):
+            continue
+        key = series_key(r) + (r.get("resource_pass"), r.get("build_mode"))
+        if (r.get("churn_fraction") or 0) == 0:
+            baseline[key] = r["qps"]
+        else:
+            after.setdefault(key, []).append((r["churn_fraction"], r["qps"]))
+
+    return {key: [(f, q / baseline[key]) for f, q in sorted(points)]
+            for key, points in after.items() if baseline.get(key)}
+
+
 def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                  stem: str) -> Optional[Dict[str, str]]:
     """Throughput retained after churn, as a fraction of the pre-churn baseline.
@@ -671,41 +773,44 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     a recall-only view. Plotted as a retention ratio so engines with different
     absolute speeds can be compared on how well they hold up.
     """
-    baseline, after = {}, {}
-    for r in records:
-        if r.get("phase") != "churn" or r.get("dataset") != dataset or not r.get("qps"):
-            continue
-        key = (r["engine"], r.get("resource_pass"), r.get("build_mode"))
-        if (r.get("churn_fraction") or 0) == 0:
-            baseline[key] = r["qps"]
-        else:
-            after.setdefault(key, []).append((r["churn_fraction"], r["qps"]))
-    if not baseline or not after:
+    retained = churn_retention(records, dataset)
+    if not retained:
         return None
 
     fig, ax = _new_axes(f"Throughput retained after churn — {dataset}",
                         "Cumulative fraction of rows deleted and re-inserted",
                         "QPS as a fraction of pre-churn  (higher is better ↑)",
                         figsize=(9, 5.2))
-    plotted = False
-    for key, points in sorted(after.items()):
-        base = baseline.get(key)
-        if not base:
-            continue
-        plotted = True
-        style = style_for(key[0])
+    churn_records = [r for r in records if r.get("phase") == "churn"
+                     and r.get("dataset") == dataset and r.get("qps")]
+    labels = series_labels(churn_records)
+    storages: Dict[str, List[Optional[str]]] = {}
+    for key in {series_key(r) for r in churn_records}:
+        storages.setdefault(key[0], []).append(key[1])
+    for v in storages.values():
+        v.sort(key=lambda x: (x is None, x))
+
+    # Resource pass and build mode are named only when the figure actually
+    # holds more than one of them. On a single-pass run they turned every
+    # legend entry into "... (post) / tuned", which crowds out the storage
+    # engine -- the one distinction this chart exists to show.
+    passes = {key[3] for key in retained}
+    modes = {key[4] for key in retained}
+
+    for key, points in sorted(retained.items(), key=lambda kv: str(kv[0])):
+        sample = next(r for r in churn_records if series_key(r) == key[:3])
+        style = series_style(sample, storages.get(key[0]))
         points = sorted(points)
-        label = style["label"]
-        if key[2]:
-            label += f" ({key[2]})"
-        ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] / base for p in points],
+        label = labels.get(key[:3], key[0])
+        if key[4] and len(modes) > 1:
+            label += f" ({key[4]})"
+        if key[3] and len(passes) > 1:
+            label += f" / {key[3]}"
+        ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] for p in points],
                 color=style["color"], marker=style["marker"],
                 linestyle=style["linestyle"], linewidth=1.9, markersize=6,
-                label=f"{label} / {key[1]}")
+                label=label)
 
-    if not plotted:
-        plt.close(fig)
-        return None
     ax.axhline(1.0, color="#888888", linewidth=1.0, linestyle=":")
     ax.text(0.0, 1.01, " no degradation", fontsize=8, color="#888888", va="bottom")
     ax.legend(frameon=False, fontsize=8)

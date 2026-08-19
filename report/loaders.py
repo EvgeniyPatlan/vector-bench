@@ -231,6 +231,28 @@ def peak_from_series(rows: List[Dict[str, Any]]) -> Optional[int]:
     return max(values) if values else None
 
 
+def memory_stem(record: Dict[str, Any]) -> str:
+    """Name of the memory series belonging to one ops unit.
+
+    Mirrors the stem `orchestrator/cli.py` gives the `mem-*.jsonl` file it
+    writes, including the rule that InnoDB stays unsuffixed so checkpoints from
+    runs that predate the storage-engine sweep are still honoured. Kept here
+    rather than imported from the orchestrator because this package runs inside
+    a bench image that mounts only report/ and harness/.
+
+    Matching on a prefix instead matched both storage engines and took
+    whichever the dict happened to yield first, which published MyISAM's peak
+    memory as InnoDB's.
+    """
+    stem = (f"{record.get('engine')}-{record.get('dataset')}"
+            f"-{record.get('resource_pass')}-m{record.get('m')}"
+            f"-{record.get('build_mode')}")
+    storage = (record.get("storage_engine") or "").lower()
+    if storage and storage != "innodb":
+        stem += f"-{storage}"
+    return stem
+
+
 # Within this of the container limit counts as "at the ceiling". cgroup peak
 # accounting cannot exceed memory.max, so an engine under sustained pressure
 # reports a value just below the limit rather than above it, and an exact
