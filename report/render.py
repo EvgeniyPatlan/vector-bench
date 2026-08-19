@@ -24,6 +24,7 @@ ENGINE_LABEL = {
     "mariadb123": "MariaDB 12.3 (MHNSW)",
     "alisql": "AliSQL (VIDX)",
     "pgvector": "PostgreSQL (pgvector)",
+    "mongodb": "Percona Search for MongoDB (mongot)",
 }
 
 
@@ -87,6 +88,21 @@ def _engine_rows(manifest: Dict[str, Any]) -> List[List[str]]:
     for engine, info in sorted((manifest.get("engines", {}) or {}).items()):
         source = info.get("source", {}) or {}
         build = info.get("build", {}) or {}
+        if source.get("kind") == "image":
+            # No tag, no commit, no -march, because nothing was compiled. The
+            # digest is the provenance. Printing "?" in those columns where
+            # every other engine shows a commit reads as data we failed to
+            # collect, and there is none to collect.
+            digest = (source.get("mongot_digest") or source.get("server_digest")
+                      or "")
+            rows.append([
+                _label(engine),
+                source.get("version", "image"),
+                digest.split("@")[-1][:19] if digest else "not pinned",
+                "n/a (JVM)",
+                "published image",
+            ])
+            continue
         rows.append([
             _label(engine),
             source.get("tag", "?"),
@@ -162,6 +178,17 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             ["Engine", "Dataset", "Phase", "M", "ef_search", "Selectivity"], rows))
         if len(summary["plan_failures"]) > 40:
             parts.append(f"\n_…and {len(summary['plan_failures']) - 40} more._\n")
+
+    if "mongodb" in set(summary.get("engines") or []):
+        parts.append(
+            "\n### One engine is a Technical Preview\n\n"
+            "**Percona Search for MongoDB is a Technical Preview and its own "
+            "documentation says it is not for production use.** It is measured "
+            "here beside four generally available engines. Treat a number for it "
+            "as an indication of where the implementation currently stands "
+            "rather than as a property of a shipped product, and expect it to "
+            "move between releases in ways the others will not.\n"
+        )
 
     if summary.get("recall_floor_gaps"):
         parts.append(
@@ -275,14 +302,15 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _known_asymmetries() -> str:
-    return (
-        "These are structural differences between the engines that no configuration "
-        "removes. They are why some comparisons below are presented in pairs rather "
-        "than as a single ranking.\n\n"
-        + _md_table(
-            ["Asymmetry", "Consequence for these results"],
-            [
+def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
+    """Structural differences no configuration removes.
+
+    Conditional on what actually ran. A row about a separate index process in a
+    report of four in-engine indexes describes nothing, and a reader has to
+    work out that it does not apply.
+    """
+    engines = set((summary or {}).get("engines") or [])
+    rows = [
                 ["`ef_construction` is exposed only by pgvector",
                  "Build quality can be tuned for pgvector but not for MHNSW or VIDX. "
                  "It is pinned to the default in the normalized pass so pgvector is "
@@ -301,8 +329,40 @@ def _known_asymmetries() -> str:
                  "Both MHNSW and VIDX document AVX-512 distance kernels. On a host "
                  "without AVX-512 both run narrower paths, and the ranking may differ "
                  "on AVX-512 hardware."],
-            ],
-        )
+    ]
+
+    if "mongodb" in engines:
+        rows += [
+            ["Percona Search keeps its index in a separate process",
+             "mongod holds the documents and mongot holds a Lucene index fed from "
+             "the change stream, where the other four keep the index inside the "
+             "query engine. What is being compared includes where the index lives, "
+             "not only how it is implemented."],
+            ["Percona Search is not built from source",
+             "It ships as packages and images only and runs on the JVM, so it "
+             "carries an image digest instead of a tag, a commit and a `-march`. "
+             "Its distance kernels come from the JVM's vector API, so the AVX-512 "
+             "row above does not describe it."],
+            ["Percona Search exposes no graph degree",
+             "M is pinned at one value for every other engine and cannot be set "
+             "here at all, so any row carrying an M for it is naming a sweep "
+             "rather than a setting, and those comparisons are not at matched M."],
+            ["Percona Search filters before the vector comparison",
+             "Its `filter` is a pre-filter; the other four apply the predicate "
+             "after the graph walk. That is why their filtered results either "
+             "collapse in throughput or return fewer than k rows, and why a "
+             "difference in the filtered section is a difference in kind."],
+            ["Percona Search builds its index asynchronously",
+             "createSearchIndex returns before the index exists and it is built "
+             "while writes are still arriving, so its build cost is wall clock to "
+             "a queryable index rather than the duration of a statement."],
+        ]
+
+    return (
+        "These are structural differences between the engines that no configuration "
+        "removes. They are why some comparisons below are presented in pairs rather "
+        "than as a single ranking.\n\n"
+        + _md_table(["Asymmetry", "Consequence for these results"], rows)
     )
 
 
@@ -389,13 +449,57 @@ def _build_table(summary: Dict[str, Any]) -> str:
             _fmt(ingest_rate, 0, " rows/s"),
             _fmt_bytes(r.get("peak_rss_bytes")),
             _fmt_bytes(r.get("index_bytes")),
-            "yes" if (r.get("extra") or {}).get("separable_build") else "no",
+            _index_build_kind(r),
         ])
-    return _md_table(
+    table = _md_table(
         ["Engine", "Dataset", "M", "Storage", "Build mode", "Build time",
-         "Ingest rate", "Peak server RSS", "Index size", "Separable build"],
+         "Ingest rate", "Peak server RSS", "Index size", "Index build"],
         rows,
     )
+    return table + _build_table_notes(summary)
+
+
+def _index_build_kind(record: Dict[str, Any]) -> str:
+    """How the index came to exist, in three kinds rather than two.
+
+    "no" was a fair answer while every engine either maintained its graph on
+    INSERT or built it with a blocking statement afterwards. An index built by
+    another process, asynchronously, while the writes are still arriving is
+    neither, and calling it "no" files it beside MHNSW's incremental build,
+    which is a different operation that also happens to lack a bulk step.
+    """
+    extra = record.get("extra") or {}
+    if extra.get("async_index_build") or record.get("build_mode") == "async":
+        ready = extra.get("index_ready_seconds")
+        if ready:
+            return f"async, ready {_fmt(ready / 60, 1)} min after load"
+        return "async (separate process)"
+    return "bulk after load" if extra.get("separable_build") else "incremental"
+
+
+def _build_table_notes(summary: Dict[str, Any]) -> str:
+    """Footnotes for values that are labels rather than settings."""
+    notes: List[str] = []
+    unapplied = sorted({
+        _label(r.get("engine", "?")) for r in summary.get("build", [])
+        if (r.get("extra") or {}).get("m_applied") is False
+    })
+    if unapplied:
+        notes.append(
+            f"**M is not a setting for {', '.join(unapplied)}.** It exposes no "
+            "graph degree, so the value says which sweep the row belongs to "
+            "rather than what the engine was told. Comparisons in this table "
+            "are not at matched M."
+        )
+    if any(_index_build_kind(r).startswith("async")
+           for r in summary.get("build", [])):
+        notes.append(
+            "**An async build overlaps the load.** Build time for those rows is "
+            "the wall clock from the first write to the index reporting ready, "
+            "because neither the load nor the wait alone is the cost of having "
+            "a queryable index."
+        )
+    return ("\n" + "\n\n".join(notes) + "\n") if notes else ""
 
 
 def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
@@ -520,7 +624,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "\n---\n\n## 2. Validity\n\n",
         _validity_section(manifest, summary),
         "\n---\n\n## 3. Known asymmetries\n\n",
-        _known_asymmetries(),
+        _known_asymmetries(summary),
         "\n---\n\n## 4. Recall vs throughput\n\n",
         "The headline comparison. Each engine's Pareto frontier is the best "
         "throughput it achieved at each recall level across the whole parameter "
@@ -830,7 +934,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
         ("2. Validity",
          _md_tables_to_html(_validity_section(manifest, summary)), ""),
         ("3. Known asymmetries",
-         _md_tables_to_html(_known_asymmetries()), ""),
+         _md_tables_to_html(_known_asymmetries(summary)), ""),
         ("4. Recall vs throughput",
          _md_tables_to_html(_headline_tables(summary)),
          figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")),

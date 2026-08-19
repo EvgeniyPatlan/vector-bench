@@ -2063,3 +2063,90 @@ class TestTwoProcessMemorySplit:
         assert r.maintenance_bytes == 0
         assert not any("shm_size raised" in w for w in r.warnings)
         assert self._resolve("pgvector").maintenance_bytes > 0
+
+
+class TestReportHandlesTheThirdArchitecture:
+    """Percona Search does not fit the shapes the report was written for.
+
+    Its index is built asynchronously by another process, so `separable_build`
+    has no true answer. It exposes no graph degree, so an M in its row is a
+    label rather than a setting. It has no source tag, commit or -march. And it
+    pre-filters where every other engine post-filters, which is the difference
+    that makes its filtered-search numbers mean something different rather than
+    just measure better.
+    """
+
+    def _records(self):
+        base = {"dataset": "d", "resource_pass": "tuned", "m": 16,
+                "storage_engine": "wiredTiger", "engine": "mongodb"}
+        return [
+            {**base, "phase": "ingest", "build_mode": "async",
+             "ingest_rows_per_s": 500.0},
+            {**base, "phase": "index_build", "build_mode": "async",
+             "build_wall_s": 900.0, "index_bytes": 6 * 1024 ** 3,
+             "extra": {"separable_build": False, "async_index_build": True,
+                       "index_ready_seconds": 400.0, "m_applied": False}},
+        ]
+
+    def _summary(self, records=None):
+        from report.generate import summarize
+        return summarize(records if records is not None else self._records(), {})
+
+    def test_build_table_names_the_async_mode_rather_than_saying_no(self):
+        """'no' would put it in the same column as MHNSW's incremental build,
+        which is a different operation that happens to also lack a bulk step."""
+        from report.render import _build_table
+        s = self._summary()
+        table = _build_table(s)
+        assert "async" in table.lower()
+        assert "yes" not in table.split("\n")[2].lower()
+
+    def test_build_table_flags_an_m_that_was_never_applied(self):
+        """mongot exposes no graph degree, so 16 in its row is which sweep the
+        point belongs to, not a setting the engine received."""
+        from report.render import _build_table
+        table = _build_table(self._summary())
+        assert "M is not a setting" in table
+        assert "not at matched M" in table
+
+    def test_time_to_ready_is_reported_where_it_exists(self):
+        from report.render import _build_table
+        assert "6.7 min" in _build_table(self._summary()) or "400" in _build_table(self._summary())
+
+    def test_asymmetries_name_the_prefilter_only_when_mongo_ran(self):
+        from report.render import _known_asymmetries
+        with_mongo = _known_asymmetries(self._summary())
+        assert "pre-filter" in with_mongo or "before" in with_mongo
+        from report.generate import summarize
+        without = _known_asymmetries(summarize(
+            [{"phase": "ingest", "engine": "mariadb", "dataset": "d"}], {}))
+        assert "mongot" not in without
+
+    def test_asymmetries_say_it_is_not_built_from_source(self):
+        from report.render import _known_asymmetries
+        text = _known_asymmetries(self._summary())
+        assert "JVM" in text
+
+    def test_validity_flags_the_technical_preview(self):
+        """Its own documentation says not for production. A reader comparing it
+        against four GA engines has to be told."""
+        from report.render import _validity_section
+        assert "preview" in _validity_section({}, self._summary()).lower()
+
+    def test_validity_is_silent_without_it(self):
+        from report.generate import summarize
+        from report.render import _validity_section
+        s = summarize([{"phase": "ingest", "engine": "mariadb", "dataset": "d"}], {})
+        assert "preview" not in _validity_section({}, s).lower()
+
+    def test_engines_table_does_not_invent_a_tag_or_a_march(self):
+        """Printing '?' where every other engine shows a commit reads as data
+        we failed to collect. There is none to collect."""
+        from report.render import _engine_rows
+        rows = _engine_rows({"engines": {"mongodb": {
+            "source": {"kind": "image", "version": "1.70.3-1",
+                       "mongot_digest": "percona/...@sha256:abc123"},
+            "build": {"march": "none"}}}})
+        row = " ".join(rows[0])
+        assert "?" not in row
+        assert "sha256:abc123" in row or "1.70.3-1" in row
