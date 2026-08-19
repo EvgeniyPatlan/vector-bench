@@ -1,48 +1,47 @@
 # Everything, in one run, under one configuration.
 #
-# Every engine, both MariaDB versions, both storage engines where the engine has
-# them, all five measurements: recall against throughput, index build cost,
-# concurrency, filtered search and churn.
+# Every engine, both MariaDB versions, all five measurements: recall against
+# throughput, index build cost, concurrency, filtered search and churn.
 #
 # WHY ONE RUN RATHER THAN SEVERAL
 #
-# The results we have are spread across two runs with different resource
-# splits, and every cross-run comparison carries a caveat. Concurrency,
-# filtered search and churn were measured only under the equal-budget pass on
-# InnoDB, before MyISAM turned out to be worth 84% on single-client throughput.
-# Recall and build cost came from the tuned pass with eight client cores, which
-# is too few to drive 32 concurrent clients without the client itself becoming
-# the bottleneck.
+# Results spread across runs with different resource splits carry a caveat on
+# every cross-run comparison. Measuring one thing here and another there
+# attributes to the engine a difference that is partly the budget. One run, one
+# split, and the differences mean something.
 #
-# So the open questions cannot be answered by adding to what exists:
+# WHY NO MyISAM
 #
-#   * Does MyISAM lift MariaDB's concurrency ceiling? It was flat at ~170 QPS
-#     from two clients through thirty-two, measured on InnoDB. MyISAM removes
-#     row locks, redo, doublewrite and buffer-pool latching, which are the
-#     obvious causes.
-#   * Does MyISAM change churn? MariaDB lost 83% of its throughput after 10%
-#     churn, and MyISAM handles deletes completely differently.
-#   * Does it change filtered search? That was InnoDB-only too.
+# It used to sweep InnoDB and MyISAM, and the run of 2026-08-17 answered what
+# that was for. MyISAM won on every axis measured: 84% more single-client
+# throughput at recall 0.99, a sixth of the build time, half the memory and
+# half the disk, and 10% throughput lost to churn where InnoDB lost 86%. It did
+# not lift the concurrency ceiling, which was the open question that justified
+# measuring it -- MariaDB is flat from one client to thirty-two on both.
 #
-# Measuring MyISAM here against InnoDB there would attribute to the storage
-# engine a difference that is partly the resource budget. One run, one split,
-# both storage engines, and the differences mean something.
+# None of which makes it deployable. MyISAM is not transactional, so it is not
+# a configuration vector search runs on in production, and measuring it costs
+# about eight hours a run to produce numbers nobody can act on.
 #
-# COST. Roughly 45 hours, about two days. Nearly all of it is loading: the ann
-# and ops phases each load the corpus independently, and six configurations
-# times two phases is twelve loads. There is no way around that -- an ops unit
-# builds its own volume, loads, measures and tears down, so nothing can be
-# shared with a phase that ran earlier.
+# The capability is still there. Set mariadb_storage_engines below, and
+# extras.mariadb_storage_engines in config/resources/tuned.yml, to
+# [InnoDB, MyISAM]. The report keeps its per-storage-engine handling either
+# way, so the 2026-08-17 results remain readable.
+#
+# COST. Roughly 40 hours. The 2026-08-17 run took 49.7 h with MyISAM in it.
+# Nearly all of that is loading: the ann and ops phases each load the corpus
+# independently, and there is no way around it, because an ops unit builds its
+# own volume, loads, measures and tears down. Nothing can be shared with a
+# phase that ran earlier.
 #
 # Run it with:
 #   ./run-benchmark.sh run --profile tuned-complete \
 #       --engines mariadb,mariadb123,alisql,pgvector
 #
-# If two days is too long, --engines mariadb,alisql,pgvector drops MariaDB 12.3
-# and saves about 13 h. It still answers every question above on 11.8, which is
-# the version the earlier concurrency numbers came from.
+# --engines mariadb,alisql,pgvector drops MariaDB 12.3 and saves about 11 h.
+# It still answers every question on 11.8.
 name: tuned-complete
-description: Every engine, both storage engines, all five measurements, one configuration (~45 h)
+description: Every engine, all five measurements, one configuration (~40 h)
 
 datasets:
   - dbpedia-openai-1000k-angular
@@ -54,8 +53,8 @@ default_resource_pass: tuned
 resources:
   cpu:
     client_cpus: 16
-  # No extras override: the tuned pass sweeps InnoDB and MyISAM, and both are
-  # wanted here so the comparison is within one run and one budget.
+  # No extras override: the tuned pass resolves memory from host_fraction and
+  # sweeps InnoDB only, which is what this profile wants.
 
 ann:
   # On, so recall lands in the same run and the same CPU split as everything
@@ -67,7 +66,7 @@ ann:
   m_values: [16]
   ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
   insert_threads: 8
-  mariadb_storage_engines: [InnoDB, MyISAM]
+  mariadb_storage_engines: [InnoDB]
 
 ops:
   enabled: true

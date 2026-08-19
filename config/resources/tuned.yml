@@ -56,9 +56,12 @@ docker:
 
 # Extra curves that only make sense once each engine is allowed its own idioms.
 extras:
-  # MariaDB supports MyISAM for vector tables and its own published benchmark
-  # uses it. AliSQL cannot, so this is a MariaDB-only curve, labelled as such.
-  mariadb_storage_engines: [InnoDB, MyISAM]
+  # MyISAM is no longer swept. It measured well (84% more throughput, a sixth
+  # of the build time, and it turned the churn cliff into a slope), but it is
+  # not transactional, so it is not a configuration anyone deploys vector
+  # search on. The tuned-complete run of 2026-08-17 has the numbers if they are
+  # ever wanted again; set this to [InnoDB, MyISAM] to measure it.
+  mariadb_storage_engines: [InnoDB]
   # The one build knob only pgvector exposes. Swept here, pinned in the
   # normalized pass so pgvector is not handed a tuning axis the others lack.
   pgvector_ef_construction: [64, 200, 400]

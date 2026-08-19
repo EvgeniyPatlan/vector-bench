@@ -700,12 +700,15 @@ class TestEngineDataPlacement:
         assert alt["image"]["runtime"] != base["image"]["runtime"]
         assert alt.get("alias_of") == "mariadb"
 
-    def test_both_mariadb_versions_sweep_storage_engines(self):
+    def test_both_mariadb_versions_resolve_the_same_storage_axis(self):
+        """Whatever the axis is set to, 12.3 must follow 11.8. Adding it left
+        seven hardcoded three-engine assumptions behind, each of which failed
+        one run at a time."""
         from orchestrator.cli import _ops_storage_engines
         prof, tuned = load_profile("mariadb-blog-repro"), load_resources("tuned")
-        for engine in ("mariadb", "mariadb123"):
-            assert _ops_storage_engines(engine, prof, tuned, "tuned") == \
-                ["InnoDB", "MyISAM"], engine
+        assert (_ops_storage_engines("mariadb", prof, tuned, "tuned")
+                == _ops_storage_engines("mariadb123", prof, tuned, "tuned")
+                == ["InnoDB"])
 
     def test_the_two_versions_get_separate_ann_modules(self):
         """Sharing a module name is exactly how a 12.3 run would reuse 11.8's
@@ -1135,18 +1138,32 @@ class TestDuplicateCheckRespectsSweptAxes:
 
 
 class TestOpsStorageEngineSweep:
-    """Build cost was only ever measured on InnoDB.
+    """MyISAM is no longer measured, but the axis still has to work.
 
-    MariaDB publishes an index build "under 15 minutes"; we measured 3.6 hours
-    on InnoDB, and the recall curves show MyISAM is almost certainly what the
-    article used. Measuring build cost on the engine nobody benchmarks is not
-    a reproduction.
+    The 2026-08-17 run settled what sweeping it was for: MyISAM won on every
+    axis measured and did not lift the concurrency ceiling, which was the open
+    question. It is not transactional, so it is not a configuration vector
+    search is deployed on, and it costs roughly eight hours a run. The
+    capability stays because turning it back on must not require rediscovering
+    how, and because existing results still contain MyISAM records.
     """
 
-    def test_tuned_sweeps_both_for_mariadb(self):
+    def test_shipped_configuration_measures_innodb_only(self):
         from orchestrator.cli import _ops_storage_engines
-        got = _ops_storage_engines("mariadb", load_profile("mariadb-blog-repro"),
-                                   load_resources("tuned"), "tuned")
+        for profile in ("tuned-complete", "mariadb-blog-repro"):
+            for engine in ("mariadb", "mariadb123"):
+                got = _ops_storage_engines(engine, load_profile(profile),
+                                           load_resources("tuned"), "tuned")
+                assert got == ["InnoDB"], f"{profile}/{engine}"
+
+    def test_the_axis_still_works_when_asked_for(self):
+        """Turning MyISAM back on is one list in the resource pass."""
+        from orchestrator.cli import _ops_storage_engines
+        resources = load_resources("tuned")
+        resources.setdefault("extras", {})["mariadb_storage_engines"] = \
+            ["InnoDB", "MyISAM"]
+        got = _ops_storage_engines("mariadb", load_profile("tuned-complete"),
+                                   resources, "tuned")
         assert got == ["InnoDB", "MyISAM"]
 
     def test_normalized_stays_on_innodb(self):

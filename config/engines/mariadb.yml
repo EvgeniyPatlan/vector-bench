@@ -95,11 +95,14 @@ server:
     - --innodb-flush-method=O_DIRECT
     - --skip-log-bin
 
-# Storage engines to test. InnoDB is the headline (AliSQL cannot do MyISAM);
-# MyISAM is an extra MariaDB-only curve, reported separately and labelled.
+# Storage engines to test. InnoDB only: MyISAM is faster on every axis we
+# measured but is not transactional, so it is not a configuration vector search
+# gets deployed on. The framework still supports sweeping it -- add MyISAM here
+# and in the tuned resource pass -- and the report keeps its per-storage
+# handling so existing results stay readable.
 storage_engines:
   normalized: [InnoDB]
-  tuned: [InnoDB, MyISAM]
+  tuned: [InnoDB]
 
 capabilities:
   ef_construction_tunable: false
