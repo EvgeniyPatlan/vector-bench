@@ -227,12 +227,10 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         # discovering it after an hour of writing.
         corpus_bytes = int((resources.get("memory", {}) or {}).get(
             "expected_corpus_bytes", 0) or 0)
-        if not corpus_bytes:
-            # 990k x 1536 float32 plus the HNSW graph and Valkey's per-key
-            # overhead. Deliberately generous: a false warning costs a sentence
-            # and a missed one costs the run.
-            corpus_bytes = int(16 * GB)
-        if maxmemory_bytes < corpus_bytes:
+        # No default. The caller knows the dataset and passes its size in; a
+        # warning derived from a number invented here would fire on every
+        # small run and stop being read.
+        if corpus_bytes and maxmemory_bytes < corpus_bytes:
             warnings.append(
                 f"the corpus does not fit: maxmemory resolves to "
                 f"{maxmemory_bytes / GB:.1f} GB and an in-memory engine needs "

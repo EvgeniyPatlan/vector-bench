@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, VB_ROOT)
 
+from harness import datasets as datasets_mod  # noqa: E402
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
 from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
@@ -302,9 +303,21 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     failures: List[str] = []
 
+    # What an in-memory engine has to hold, sized from the profile's own
+    # dataset rather than assumed. Without this the check fired on every small
+    # run: a 20k-row smoke profile was told its 14 GB budget could not hold a
+    # 60 MB corpus, which is exactly how a warning stops being read.
+    expected_corpus = max(
+        (datasets_mod.resident_bytes_estimate(
+            d, (profile.get("ops", {}) or {}).get("subset_rows"))
+         for d in profile.get("datasets", [])), default=0)
+
     for resource_pass in passes:
         resources = merge_resource_overrides(
             load_resources(resource_pass), profile)
+        if expected_corpus:
+            resources.setdefault("memory", {})["expected_corpus_bytes"] = \
+                expected_corpus
         for engine in engines:
             engine_cfg = load_engine(engine)
             resolved = resolve_resources(resources, engine, info)

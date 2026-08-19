@@ -2200,8 +2200,26 @@ class TestInMemoryResourceModel:
         """An in-memory engine given less memory than the dataset does not get
         slower, it fails. Saying so before the run beats discovering it after
         the load."""
+        from orchestrator.config import load_resources, resolve_resources
+        res = load_resources("tuned")
+        res.setdefault("memory", {})["expected_corpus_bytes"] = int(200 * 1024 ** 3)
+        r = resolve_resources(res, "valkey", self._sysinfo())
+        assert any("does not fit" in w for w in r.warnings)
+
+    def test_it_is_silent_when_the_corpus_comfortably_fits(self):
+        """The check fired on every small run while it invented the corpus
+        size, which is how a warning stops being read."""
+        from orchestrator.config import load_resources, resolve_resources
+        res = load_resources("normalized")
+        res.setdefault("memory", {})["expected_corpus_bytes"] = int(0.1 * 1024 ** 3)
+        r = resolve_resources(res, "valkey", self._sysinfo())
+        assert not any("does not fit" in w for w in r.warnings)
+
+    def test_it_says_nothing_when_the_corpus_size_is_unknown(self):
+        """A warning derived from a number we made up is worse than none."""
         r = self._resolve("valkey", ram_gb=8)
-        assert any("does not fit" in w or "corpus" in w for w in r.warnings)
+        assert not any("does not fit" in w for w in r.warnings)
+
 
     def test_the_limit_reaches_the_server(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
@@ -2284,3 +2302,29 @@ class TestReportHandlesTheInMemoryEngine:
     def test_footprint_chart_drops_in_memory_engines(self):
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
         assert 'in_memory_only' in source
+
+
+class TestCorpusSizeIsMeasuredNotAssumed:
+    """The in-memory fit check needs a real number.
+
+    It was a hardcoded 16 GB, so a 20k-row smoke profile was told its 14 GB
+    budget could not hold a 60 MB corpus.
+    """
+
+    def test_it_scales_with_the_subset_actually_loaded(self):
+        from harness.datasets import resident_bytes_estimate
+        full = resident_bytes_estimate("fashion-mnist-784-euclidean")
+        subset = resident_bytes_estimate("fashion-mnist-784-euclidean", 20_000)
+        assert subset < full
+        assert subset < 0.5 * 1024 ** 3          # 60k vectors of 784, not gigabytes
+
+    def test_the_real_corpus_is_sized_in_gigabytes(self):
+        from harness.datasets import resident_bytes_estimate
+        estimate = resident_bytes_estimate("dbpedia-openai-1000k-angular")
+        raw = 990_000 * 1536 * 4
+        assert estimate > raw                    # graph and per-key overhead included
+        assert estimate < 4 * raw                # but not wildly so
+
+    def test_an_unknown_dataset_returns_zero_rather_than_a_guess(self):
+        from harness.datasets import resident_bytes_estimate
+        assert resident_bytes_estimate("something-we-have-never-run") == 0

@@ -64,6 +64,34 @@ KNOWN_DATASETS: Dict[str, Dict[str, object]] = {
 }
 
 
+def resident_bytes_estimate(dataset: str, subset_rows: Optional[int] = None) -> int:
+    """Roughly what an in-memory engine needs to hold this corpus.
+
+    Vectors at four bytes a dimension, plus an allowance for the HNSW graph and
+    the store's per-key overhead. Only in-memory engines care: a disk-backed
+    engine given too little memory gets slower, while Valkey refuses writes
+    partway through the load, so it is worth saying before the run rather than
+    after.
+
+    Deliberately generous. A false warning costs a sentence; a missed one costs
+    the run. Returns 0 for an unknown dataset rather than guessing, because a
+    warning derived from a number we made up is worse than none.
+    """
+    facts = KNOWN_DATASETS.get(dataset)
+    if not facts:
+        return 0
+    rows = int(facts.get("train") or 0)
+    if subset_rows:
+        rows = min(rows, int(subset_rows))
+    dim = int(facts.get("dim") or 0)
+    if not rows or not dim:
+        return 0
+    vectors = rows * dim * 4
+    # The graph and per-key overhead together are the same order as the
+    # vectors at these dimensionalities, so doubling is the safe estimate.
+    return int(vectors * 2.2)
+
+
 @dataclass
 class Dataset:
     name: str

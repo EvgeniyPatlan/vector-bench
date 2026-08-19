@@ -448,7 +448,8 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
 # The ops harness stamps a storage engine on every unit and defaults to
 # InnoDB, which is meaningless for PostgreSQL. Its own ann records call the
 # same thing `heap`; this keeps the two paths from disagreeing on the page.
-_STORAGE_OVERRIDES = {"pgvector": "heap"}
+_STORAGE_OVERRIDES = {"pgvector": "heap", "mongodb": "wiredTiger",
+                      "valkey": "memory"}
 
 
 def _storage(record: Dict[str, Any]) -> str:
