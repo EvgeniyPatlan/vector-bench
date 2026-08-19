@@ -100,6 +100,7 @@ def summarize(records: List[Dict[str, Any]],
         "memory_pressure": [],
         "stale_ann": [],
         "duplicate_ann": [],
+        "recall_floor_gaps": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
     }
@@ -202,7 +203,27 @@ def summarize(records: List[Dict[str, Any]],
                 entry[f"qps_at_recall_{int(floor * 100)}"] = best["qps"] if best else None
                 entry[f"qps_at_recall_{int(floor * 100)}_storage"] = (
                     best.get("storage_engine") if best else None)
+                entry[f"qps_at_recall_{int(floor * 100)}_recall"] = (
+                    best.get("recall_at_k") if best else None)
             entry["max_recall"] = max((p.get("recall_at_k") or 0) for p in frontier)
+            # The floor columns compare engines at an accuracy the operator
+            # accepts, which is only a comparison if both engines have
+            # measurements near it. ef_search cannot go below k and MHNSW
+            # exposes no ef_construction, so with M pinned there is no MariaDB
+            # configuration returning recall below about 0.975: its 0.90 and
+            # 0.95 figures are one measurement printed twice. Recording the
+            # lowest recall reached is what lets the report say so.
+            entry["min_recall"] = min((p.get("recall_at_k") or 0) for p in points)
+            for floor in (0.90, 0.95, 0.99):
+                if entry[f"qps_at_recall_{int(floor * 100)}"] is None:
+                    continue
+                if entry["min_recall"] > floor:
+                    summary["recall_floor_gaps"].append({
+                        "engine": engine, "dataset": dataset, "floor": floor,
+                        "lowest_recall": entry["min_recall"],
+                        "measured_at": entry[f"qps_at_recall_{int(floor * 100)}_recall"],
+                        "qps": entry[f"qps_at_recall_{int(floor * 100)}"],
+                    })
             per_engine[engine] = entry
         if per_engine:
             summary["per_dataset"][dataset] = per_engine

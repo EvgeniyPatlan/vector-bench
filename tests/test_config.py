@@ -1686,3 +1686,62 @@ class TestEverySweptCurveIsItsOwnLine:
         from report.charts import series_labels
         rows = [r for r in self._points() if r["ef_construction"] == 200]
         assert list(series_labels(rows).values()) == ["PostgreSQL (pgvector)"]
+
+
+class TestRecallFloorsAnEngineNeverApproached:
+    """`QPS @ recall>=0.90` invites a comparison the sweep may not support.
+
+    ef_search cannot go below k and MHNSW exposes no ef_construction, so with M
+    pinned there is no MariaDB configuration that returns recall below about
+    0.975. Its 0.90 and 0.95 figures are therefore the same measurement, taken
+    at 0.9753, while pgvector's come from points at 0.929 and 0.971. The report
+    printed all of them in one row and said nothing, and the two identical
+    MariaDB cells read as a rendering artifact rather than as the fact that the
+    engine was never evaluated anywhere near those floors.
+    """
+
+    def _rec(self, engine, recall, qps, storage="InnoDB"):
+        return {"phase": "recall_qps", "engine": engine, "dataset": "d", "m": 16,
+                "ef_search": 10, "recall_at_k": recall, "qps": qps,
+                "storage_engine": storage, "build_mode": "post"}
+
+    def test_flags_a_floor_below_everything_the_engine_measured(self):
+        from report.generate import summarize
+        s = summarize([self._rec("mariadb", 0.9753, 1176.5),
+                       self._rec("mariadb", 0.9998, 31.2)], {})
+        gaps = {(g["engine"], g["floor"]) for g in s["recall_floor_gaps"]}
+        assert ("mariadb", 0.90) in gaps
+        assert ("mariadb", 0.95) in gaps
+        assert ("mariadb", 0.99) not in gaps
+
+    def test_silent_when_the_sweep_reaches_below_every_floor(self):
+        from report.generate import summarize
+        s = summarize([self._rec("pgvector", 0.8164, 1014.7),
+                       self._rec("pgvector", 0.9993, 43.7)], {})
+        assert s["recall_floor_gaps"] == []
+
+    def test_reports_the_recall_the_figure_actually_came_from(self):
+        from report.generate import summarize
+        s = summarize([self._rec("mariadb", 0.9753, 1176.5),
+                       self._rec("mariadb", 0.9998, 31.2)], {})
+        gap = next(g for g in s["recall_floor_gaps"] if g["floor"] == 0.90)
+        assert gap["lowest_recall"] == 0.9753
+        assert gap["measured_at"] == 0.9753
+
+    def test_headline_shows_the_range_not_only_the_best(self):
+        from report.generate import summarize
+        from report.render import _headline_tables
+        s = summarize([self._rec("mariadb", 0.9753, 1176.5),
+                       self._rec("mariadb", 0.9998, 31.2)], {})
+        table = _headline_tables(s)
+        assert "Recall range" in table
+        assert "0.9753" in table and "0.9998" in table
+
+    def test_validity_section_explains_the_identical_columns(self):
+        from report.generate import summarize
+        from report.render import _validity_section
+        s = summarize([self._rec("mariadb", 0.9753, 1176.5),
+                       self._rec("mariadb", 0.9998, 31.2)], {})
+        text = _validity_section({}, s)
+        assert "never approached" in text.lower()
+        assert "0.9753" in text

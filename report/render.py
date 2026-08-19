@@ -163,6 +163,31 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         if len(summary["plan_failures"]) > 40:
             parts.append(f"\n_…and {len(summary['plan_failures']) - 40} more._\n")
 
+    if summary.get("recall_floor_gaps"):
+        parts.append(
+            "\n### Recall floors an engine never approached\n\n"
+            "`QPS @ recall≥F` is a comparison only where both engines have "
+            "measurements near F. For each engine below, **every configuration "
+            "swept returned recall above the floor**, so the figure reported at "
+            "that floor is the same measurement as at every lower one, taken at "
+            "a materially higher accuracy than the column asks for. This is a "
+            "limit of the grid rather than a fault: `ef_search` cannot go below "
+            "k, and where an engine exposes no `ef_construction` there is no "
+            "setting that makes its index less accurate at a fixed M.\n"
+        )
+        rows = [[_label(g.get("engine", "?")), g.get("dataset", "?"),
+                 f"≥{g['floor']:.2f}",
+                 f"{g['lowest_recall']:.4f}",
+                 f"{g['measured_at']:.4f}" if g.get("measured_at") is not None else "—",
+                 _fmt(g.get("qps"), 0)]
+                for g in summary["recall_floor_gaps"][:30]]
+        parts.append(_md_table(
+            ["Engine", "Dataset", "Floor reported", "Lowest recall measured",
+             "Figure taken at recall", "QPS"], rows))
+        if len(summary["recall_floor_gaps"]) > 30:
+            parts.append(
+                f"\n_…and {len(summary['recall_floor_gaps']) - 30} more._\n")
+
     if summary.get("duplicate_ann"):
         parts.append(
             "\n### The same configuration was measured more than once\n\n"
@@ -298,15 +323,20 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
                 storage = entry.get(f"qps_at_recall_{floor}_storage")
                 return f"{value} ({storage})" if multi and storage and value != "—" else value
 
+            # The range, not only the best. Two identical floor columns mean
+            # the engine has no measurement between them, and the lowest recall
+            # it reached is the number that says so.
+            low, high = entry.get("min_recall"), entry.get("max_recall", 0)
+            span = f"{low:.4f} to {high:.4f}" if low is not None else f"{high:.4f}"
             rows.append([
                 _label(engine),
                 cell(90), cell(95), cell(99),
-                f"{entry.get('max_recall', 0):.4f}",
+                span,
                 str(entry.get("points", 0)),
             ])
         parts.append(_md_table(
             ["Engine", "QPS @ recall≥0.90", "QPS @ recall≥0.95",
-             "QPS @ recall≥0.99", "Best recall", "Points measured"],
+             "QPS @ recall≥0.99", "Recall range", "Points measured"],
             rows,
         ))
         parts.append(
