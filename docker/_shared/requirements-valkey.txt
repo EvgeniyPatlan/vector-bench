@@ -1,0 +1,7 @@
+# Client stack for the valkey-bench image.
+#
+# Kept out of requirements-bench.txt for the same reason every other client is:
+# no engine image should carry another engine's driver. valkey-py is the
+# official client and is protocol-compatible with redis-py, which the driver
+# falls back to if only that is present.
+valkey==6.1.0

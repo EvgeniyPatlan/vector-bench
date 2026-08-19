@@ -276,6 +276,30 @@ prepare_mongodb() {
 
 # ---------------------------------------------------------------------------
 
+prepare_valkey() {
+  # Nothing is fetched or compiled: Percona ships both the server and the
+  # search module as packages, and the build installs them from the repository
+  # named in the engine config. What this stages is the build context and the
+  # package list the Dockerfile checks before installing, so a name that does
+  # not resolve fails with the repository's actual contents rather than after
+  # the corpus is loaded.
+  local engine=valkey
+  local cfg="$VB_CONFIG/engines/$engine.yml"
+  local ctx="$VB_BUILDCTX/$engine"
+  local repo; repo="$(yq_get "$cfg" source.repository "")"
+  [[ -n "$repo" ]] || die "$engine: source.repository not set in $cfg"
+
+  mkdir -p "$ctx"
+  say "$engine: provenance is the $repo repository (nothing is compiled)"
+  printf '%s\n' "$repo" > "$ctx/percona-repository.txt"
+
+  find "$VB_DOCKER/_shared" -maxdepth 1 -type f -exec cp {} "$ctx/" \; 2>/dev/null || true
+  find "$VB_DOCKER/$engine" -maxdepth 1 -type f ! -name 'Dockerfile' \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  ok "$engine: build context ready at $ctx (no source.tar: installed from packages)"
+}
+
+
 case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
   mariadb)    prepare_mariadb mariadb ;;
@@ -283,7 +307,8 @@ case "$ENGINE" in
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
   mongodb)    prepare_mongodb ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|all)" ;;
+  valkey)     prepare_valkey ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|all)" ;;
 esac
 
 ok "sources prepared"

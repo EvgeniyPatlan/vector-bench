@@ -25,7 +25,7 @@ from .config import ResolvedResources, server_args
 # Constructor class names, as ann-benchmarks expects them in config.yml.
 CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
                 "alisql": "AliSQL", "pgvector": "PGVector",
-                "mongodb": "PerconaSearch"}
+                "mongodb": "PerconaSearch", "valkey": "ValkeySearch"}
 
 # Where each engine's data directory lives inside its image. The ops path
 # mounts a volume here; the ann path binds a host directory for the same reason.
@@ -38,6 +38,9 @@ DATA_MOUNT = {
     # segments. Sizing the index means reading mongot's directory, because
     # collStats cannot see another process's files.
     "mongodb": "/var/lib/vbench",
+    # Nothing durable is written, but the server still wants a working
+    # directory and the mount keeps the container's layout uniform.
+    "valkey": "/var/lib/vbench",
 }
 
 # ann-benchmarks raises this when every configuration is already done.

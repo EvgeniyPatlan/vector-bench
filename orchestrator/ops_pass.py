@@ -24,7 +24,8 @@ from .config import ResolvedResources, server_args
 from .manifest import utcnow
 
 DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
-                 "alisql": 3306, "pgvector": 5432, "mongodb": 27017}
+                 "alisql": 3306, "pgvector": 5432, "mongodb": 27017,
+                 "valkey": 6379}
 
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
@@ -47,6 +48,12 @@ PROBES = {
         "sh", "-c",
         "mongosh --quiet --port 27017 --eval "
         "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true",
+    ],
+    # PING alone would pass before the module finished loading, and a Valkey
+    # without valkey-search accepts writes and then fails every FT.SEARCH.
+    "valkey": [
+        "sh", "-c",
+        "valkey-cli MODULE LIST 2>/dev/null | grep -qi search",
     ],
     "alisql": [
         "sh", "-c",
@@ -72,6 +79,9 @@ DB_CREDENTIALS = {
     # No authentication: the container is on an isolated network and
     # skipAuthenticationToSearchIndexManagementServer is set for mongot anyway.
     "mongodb": ("", ""),
+    # No AUTH: the container is on an isolated network, and requirepass would
+    # add a round trip to every measured command.
+    "valkey": ("", ""),
 }
 
 SERVER_DATA_MOUNT = {
@@ -85,6 +95,9 @@ SERVER_DATA_MOUNT = {
     # mongot's Lucene segments are files belonging to another process, so the
     # client has to read them directly to size the index at all.
     "mongodb": "/server-data/mongot",
+    # In-memory: there is no index on disk for the client to measure, so index
+    # size is taken from used_memory instead.
+    "valkey": None,
 }
 
 

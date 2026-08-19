@@ -1,0 +1,140 @@
+# Valkey + valkey-search engine definition.
+#
+# The fourth architecture, and the only in-memory one. The MySQL family and
+# pgvector keep a disk-backed table with a cache in front; Percona Search keeps
+# the index in a separate process; Valkey keeps everything in RAM, always. There
+# is no buffer pool to size, no cache-hit ratio to reason about, and no on-disk
+# index: the container limit is not a cache budget, it is the dataset.
+#
+# WHAT IT ADDS TO THE COMPARISON
+#
+#   * It is the second engine to expose ef_construction, which pgvector was
+#     previously alone in having. The normalized pass still pins it, because
+#     MariaDB and AliSQL still lack it, but the reason is now "two of four" and
+#     the report says so.
+#
+#   * It documents a lock-free read path with a reader thread pool and linear
+#     scaling with cores. Our measured result is that MariaDB and AliSQL are
+#     flat from one client to thirty-two while pgvector reaches 21.7x, so this
+#     is the most directly testable claim in the set.
+#
+#   * Its query planner chooses between pre-filtering and inline filtering per
+#     query. That is a third filtering strategy: the SQL engines post-filter
+#     and Percona Search pre-filters.
+#
+# THE TRAP THIS CONFIG EXISTS TO AVOID
+#
+# If Valkey reaches maxmemory under any policy other than noeviction it evicts
+# keys. Vectors would disappear mid-run and recall would fall in a way that
+# looks exactly like a bad index. maxmemory-policy is pinned to noeviction and
+# the driver checks evicted_keys after the load, so this fails loudly instead
+# of being measured.
+name: valkey
+display_name: Valkey + valkey-search
+family: valkey
+
+source:
+  # Percona's Valkey repository, enabled through percona-release.
+  #
+  # This is the one engine whose provenance is a package rather than a git tag
+  # or an image digest. The repository is pinned by name and the installed
+  # package versions are read back from the image and recorded in the manifest,
+  # because "whatever valkey-91 held on the day we built" is not a
+  # reproducible statement and the report has to be able to say which build ran.
+  kind: percona_repo
+  repository: valkey-91
+  # Verified on the build host rather than assumed: build-images fails with the
+  # available package list if a name here does not resolve, which is cheaper
+  # than discovering it after the corpus is loaded.
+  packages:
+    - percona-valkey
+    - percona-valkey-search
+  # Where the module lands. The entrypoint loads it with --loadmodule and
+  # refuses to start the server without it, since a Valkey with no search
+  # module accepts writes and then fails every query.
+  module_path: /usr/lib/valkey/modules/libsearch.so
+  # Filled in at build time from the installed packages.
+  installed_versions: null
+
+image:
+  runtime: vector-bench/valkey-runtime
+  bench: vector-bench/valkey-bench
+  base: debian:bookworm-slim   # percona-release supports Debian 12
+
+build:
+  # Nothing is compiled by us. Percona's packages are prebuilt, so the -march
+  # every other engine records does not apply and claiming one would be false.
+  # This is the same provenance gap Percona Search has, for the same reason,
+  # and the report states it the same way.
+  march: none
+  optflags: ""
+
+valkey:
+  index_name: idx
+  key_prefix: "v:"
+  vector_field: embedding
+  tag_field: tag
+  # FLOAT32 little-endian, which is what the module expects in PARAMS and what
+  # every other engine here stores.
+  vector_type: FLOAT32
+  # DIALECT 2 is required for the =>[KNN ...] query form.
+  dialect: 2
+  metrics:
+    angular: COSINE
+    euclidean: L2
+  # HNSW only. FLAT is exact search, so it belongs to ground truth rather than
+  # to a comparison of approximate indexes.
+  algorithm: HNSW
+
+server:
+  common:
+    # Persistence off. Every other engine has its durability weakened for the
+    # same reason (fsync=off, doublewrite off): the measurement is of index
+    # behaviour, not of the write-ahead path, and leaving it on would measure
+    # different durability guarantees against each other.
+    - --save
+    - ""
+    - --appendonly
+    - "no"
+    # See the trap above. Not negotiable per pass.
+    - --maxmemory-policy
+    - noeviction
+  normalized:
+    - --maxmemory
+    - "{maxmemory_bytes}"
+    - --io-threads
+    - "{server_cpu_count}"
+  tuned:
+    - --maxmemory
+    - "{maxmemory_bytes}"
+    - --io-threads
+    - "{server_cpu_count}"
+
+resources:
+  # No buffer pool and no graph cache: the dataset is resident by definition.
+  # What the container budget has to hold is the vectors, the HNSW graph and
+  # Valkey's per-key overhead, so it is handed to maxmemory rather than split.
+  in_memory: true
+  # Headroom below the container limit for replication buffers, client output
+  # buffers and fragmentation. Hitting the container limit gets the process
+  # OOM-killed; hitting maxmemory with noeviction returns an error, which is
+  # recoverable and diagnosable.
+  maxmemory_fraction: 0.9
+
+storage_engines:
+  normalized: [memory]
+  tuned: [memory]
+
+capabilities:
+  # No longer unique to pgvector. The normalized pass still pins it, because
+  # MariaDB and AliSQL still do not have it, but the asymmetry is now two
+  # engines against two rather than one against three.
+  ef_construction_tunable: true
+  ef_construction_normalized: 200
+  # Documented lock-free read path with a reader thread pool.
+  reader_thread_pool: true
+  # The query planner chooses per query rather than committing to one strategy.
+  hybrid_filter_planner: true
+  # Nothing is written to disk, so the on-disk footprint comparison does not
+  # include it and index size is measured as resident bytes.
+  in_memory_only: true

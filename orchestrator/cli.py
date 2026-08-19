@@ -45,7 +45,7 @@ ALL_ENGINES = ("mariadb", "alisql", "pgvector")
 # Opt-in rather than default. mariadb123 is another hour of compiling; mongodb
 # is a second server process, a replica set and a JVM, and is a Technical
 # Preview besides.
-EXTRA_ENGINES = ("mariadb123", "mongodb")
+EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
 KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
 
 

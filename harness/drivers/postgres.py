@@ -279,6 +279,7 @@ def _driver_table() -> Dict[str, Any]:
     """
     from .mongo import MongoDriver
     from .mysql_family import AliSQLDriver, MariaDBDriver
+    from .valkey import ValkeyDriver
 
     return {
         "mariadb": MariaDBDriver,
@@ -287,6 +288,7 @@ def _driver_table() -> Dict[str, Any]:
         "alisql": AliSQLDriver,
         "pgvector": PostgresDriver,
         "mongodb": MongoDriver,
+        "valkey": ValkeyDriver,
     }
 
 

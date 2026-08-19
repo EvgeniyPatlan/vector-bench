@@ -155,6 +155,8 @@ case "$ENGINE" in
   # Nothing is compiled: the runtime image is the published PSMDB image plus
   # mongot copied out of its own image, both pinned by digest.
   mongodb)    build_engine mongodb ;;
+  # Installed from Percona's valkey repository; nothing is compiled.
+  valkey)     build_engine valkey ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac
