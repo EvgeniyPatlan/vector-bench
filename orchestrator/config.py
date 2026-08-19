@@ -96,6 +96,8 @@ class ResolvedResources:
     maintenance_bytes: int
     #: JVM heap for mongot. Zero for every engine that is a single process.
     mongot_heap_bytes: int
+    #: Valkey's maxmemory. Zero for every engine that is not in-memory.
+    maxmemory_bytes: int
     build_threads: int
     shm_size: str
     transaction_isolation: str
@@ -115,6 +117,7 @@ class ResolvedResources:
             "graph_cache_bytes": self.graph_cache_bytes,
             "maintenance_bytes": self.maintenance_bytes,
             "mongot_heap_bytes": self.mongot_heap_bytes,
+            "maxmemory_bytes": self.maxmemory_bytes,
             "build_threads": self.build_threads,
             "shm_size": self.shm_size,
             "transaction_isolation": self.transaction_isolation,
@@ -199,6 +202,44 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         # container limit, which would not be a fair normalization.
         buffer_fraction = buffer_fraction + graph_fraction
         graph_fraction = 0.0
+
+    maxmemory_bytes = 0
+    if engine == "valkey":
+        # Nothing here lives on disk, so there is no share of a larger thing to
+        # reserve. buffer_fraction and graph_cache_fraction both describe memory
+        # set aside to hold part of something bigger; carving them out of an
+        # in-memory store would leave the data less room than the container was
+        # given, for no benefit.
+        buffer_fraction = 0.0
+        graph_fraction = 0.0
+        maint_fraction = 0.0
+
+        # maxmemory sits below the container limit on purpose. Reaching
+        # maxmemory under noeviction returns an error the driver can report;
+        # reaching the container limit gets the process OOM-killed, which
+        # arrives as a crash with no cause attached to it.
+        headroom = float((resources.get("memory", {}) or {}).get(
+            "valkey_maxmemory_fraction", 0.9))
+        maxmemory_bytes = int(server_bytes * headroom)
+
+        # An in-memory engine given less memory than the dataset does not get
+        # slower, it fails partway through the load. Saying so now beats
+        # discovering it after an hour of writing.
+        corpus_bytes = int((resources.get("memory", {}) or {}).get(
+            "expected_corpus_bytes", 0) or 0)
+        if not corpus_bytes:
+            # 990k x 1536 float32 plus the HNSW graph and Valkey's per-key
+            # overhead. Deliberately generous: a false warning costs a sentence
+            # and a missed one costs the run.
+            corpus_bytes = int(16 * GB)
+        if maxmemory_bytes < corpus_bytes:
+            warnings.append(
+                f"the corpus does not fit: maxmemory resolves to "
+                f"{maxmemory_bytes / GB:.1f} GB and an in-memory engine needs "
+                f"roughly {corpus_bytes / GB:.0f} GB for 990k x 1536 vectors "
+                f"plus the graph. Valkey will refuse writes partway through the "
+                f"load rather than running slowly."
+            )
 
     mongot_heap_bytes = 0
     if engine == "mongodb":
@@ -345,6 +386,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         graph_cache_bytes=graph_cache_bytes,
         maintenance_bytes=maintenance_bytes,
         mongot_heap_bytes=mongot_heap_bytes,
+        maxmemory_bytes=maxmemory_bytes,
         build_threads=build_threads,
         shm_size=shm_size,
         transaction_isolation=str(iso_cfg.get("transaction_isolation", "engine_default")),

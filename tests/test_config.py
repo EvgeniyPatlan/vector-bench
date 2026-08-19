@@ -2150,3 +2150,64 @@ class TestReportHandlesTheThirdArchitecture:
         row = " ".join(rows[0])
         assert "?" not in row
         assert "sha256:abc123" in row or "1.70.3-1" in row
+
+
+class TestInMemoryResourceModel:
+    """Valkey has no cache to size; the container limit is the dataset.
+
+    buffer_fraction and graph_cache_fraction both describe memory set aside to
+    hold part of something larger that lives on disk. Nothing here lives on
+    disk, so reserving either would carve the budget into shares of a thing
+    that is already wholly resident, and would leave less room for the data
+    than the container was given.
+    """
+
+    def _sysinfo(self, ram_gb=192, cores=40):
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(cores)),
+                                  "efficiency_cpus": [], "logical_cpus": cores * 2,
+                                  "physical_cores": cores, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(ram_gb * 1024 ** 3)
+        return info
+
+    def _resolve(self, engine, ram_gb=192):
+        from orchestrator.config import load_resources, resolve_resources
+        return resolve_resources(load_resources("tuned"), engine,
+                                 self._sysinfo(ram_gb))
+
+    def test_no_cache_shares_are_carved_out(self):
+        r = self._resolve("valkey")
+        assert r.buffer_bytes == 0
+        assert r.graph_cache_bytes == 0
+        assert r.maintenance_bytes == 0
+
+    def test_maxmemory_leaves_headroom_below_the_container_limit(self):
+        """Reaching maxmemory with noeviction returns an error, which is
+        diagnosable. Reaching the container limit gets the process OOM-killed,
+        which looks like a crash with no cause."""
+        r = self._resolve("valkey")
+        assert 0 < r.maxmemory_bytes < r.server_memory_bytes
+        assert r.maxmemory_bytes >= r.server_memory_bytes * 0.8
+
+    def test_disk_backed_engines_are_untouched(self):
+        for engine in ("mariadb", "alisql", "pgvector", "mongodb"):
+            assert self._resolve(engine).maxmemory_bytes == 0, engine
+            assert self._resolve(engine).buffer_bytes > 0, engine
+
+    def test_it_warns_when_the_corpus_will_not_fit(self):
+        """An in-memory engine given less memory than the dataset does not get
+        slower, it fails. Saying so before the run beats discovering it after
+        the load."""
+        r = self._resolve("valkey", ram_gb=8)
+        assert any("does not fit" in w or "corpus" in w for w in r.warnings)
+
+    def test_the_limit_reaches_the_server(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert "maxmemory_bytes" in source
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        assert "maxmemory_bytes" in source
+
+    def test_the_split_is_recorded_in_the_manifest(self):
+        assert "maxmemory_bytes" in self._resolve("valkey").as_dict()

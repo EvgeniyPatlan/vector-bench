@@ -187,6 +187,7 @@ class OpsRun:
                 # the single-process engines, which never read it.
                 "VB_MONGOT_HEAP_GB": str(
                     max(1, self.resolved.mongot_heap_bytes // (1024 ** 3))),
+                "VB_MAXMEMORY_BYTES": str(self.resolved.maxmemory_bytes),
             },
             volumes=[f"{self.volume}:{data_mount}:rw"],
             command=["server"],

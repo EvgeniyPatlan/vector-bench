@@ -72,3 +72,7 @@ extras:
   # size rather than a thumb on the scale. Pinned to none in the normalized
   # pass, where no engine gets an axis the others lack.
   mongodb_quantization: [scalar]
+  # valkey-search exposes ef_construction as pgvector does, so the tuned pass
+  # sweeps it for both. The normalized pass pins both, because MariaDB and
+  # AliSQL still have no equivalent.
+  valkey_ef_construction: [64, 200, 400]

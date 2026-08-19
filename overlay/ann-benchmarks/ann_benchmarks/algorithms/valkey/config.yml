@@ -1,0 +1,29 @@
+# Default (full-profile) Valkey + valkey-search sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according
+# to the selected profile.
+#
+# efConstruction is pinned to 200 here. valkey-search is the second engine to
+# expose it, after pgvector, but MariaDB and AliSQL still do not, so varying it
+# in the headline comparison would hand two engines a tuning axis the other two
+# lack. The tuned profile sweeps it for both, reported separately.
+#
+# build_mode carries the same meaning it does for pgvector: creating the index
+# before the load indexes on write, which is what MHNSW and VIDX are forced
+# into, and creating it afterwards triggers a backfill, which is the bulk build.
+#
+# query_args are EF_RUNTIME, the ef_search analogue, on the grid every other
+# engine sweeps.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: ValkeySearch
+    disabled: false
+    docker_tag: vector-bench/valkey-bench
+    module: ann_benchmarks.algorithms.valkey
+    name: valkey
+    run_groups:
+      post_build:
+        arg_groups: [{M: [16], efConstruction: 200, build_mode: 'post'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]

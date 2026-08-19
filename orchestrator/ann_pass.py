@@ -176,6 +176,26 @@ def render_config(engine: str, profile: Dict[str, Any],
                 "args": {},
                 "query_args": query_args,
             }
+    elif engine == "valkey":
+        # The same two knobs pgvector has, so the same rule: pinned in the
+        # normalized pass because MariaDB and AliSQL still lack ef_construction,
+        # swept in the tuned pass where each engine gets its own idioms.
+        if resource_pass == "tuned" and extras.get("valkey_ef_construction"):
+            ef_constructions = list(extras["valkey_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("valkey_ef_construction", 200))]
+
+        for build_mode in ann.get("valkey_build_modes", ["post"]):
+            run_groups[f"{build_mode}_build"] = {
+                "arg_groups": [{
+                    "M": m_values,
+                    "efConstruction": ef_constructions,
+                    "build_mode": build_mode,
+                }],
+                "args": {},
+                "query_args": query_args,
+            }
+
     elif engine == "mongodb":
         # Quantization is the one axis no other engine has, so it follows the
         # ef_construction precedent exactly: pinned in the normalized pass, set
@@ -341,6 +361,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             # mongot the same heap, and the single-process engines ignore it.
             "VB_MONGOT_HEAP_GB": str(
                 max(1, resolved.mongot_heap_bytes // (1024 ** 3))),
+            "VB_MAXMEMORY_BYTES": str(resolved.maxmemory_bytes),
             "PYTHONUNBUFFERED": "1",
         },
         volumes=[
