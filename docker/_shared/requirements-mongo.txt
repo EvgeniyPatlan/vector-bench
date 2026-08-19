@@ -1,0 +1,11 @@
+# Client stack for the mongodb-bench image.
+#
+# Kept out of requirements-bench.txt for the same reason the MySQL and
+# PostgreSQL clients are: the pgvector image should not carry a Mongo driver,
+# and the Mongo image should not carry libmariadb. Pinned so two engine images
+# cannot drift apart and silently change what is being compared.
+#
+# 4.9 is the first release with BSON binary vector (subtype 9) support, which
+# is what keeps 990k x 1536 vectors at 5.7 GB in mongod instead of 12.2 GB as
+# an array of doubles.
+pymongo==4.10.1

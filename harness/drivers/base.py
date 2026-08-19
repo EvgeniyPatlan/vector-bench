@@ -44,6 +44,11 @@ class IndexSpec:
     ef_construction: Optional[int] = None
     storage_engine: str = "InnoDB"
     build_mode: str = "post"          # "post" | "incremental"
+    # Percona Search is the only engine here that compresses indexed vectors.
+    # "none" | "scalar" | "binary"; pinned off in the normalized pass so it is
+    # not an axis the others lack, and set to the vendor's recommendation in
+    # the tuned pass, where following each vendor's own advice is the point.
+    quantization: Optional[str] = None
 
 
 @dataclass
@@ -64,6 +69,10 @@ class EngineDriver(abc.ABC):
     #: True when the engine maintains its graph during INSERT and therefore has
     #: no separable bulk build step. Drives how build cost is attributed.
     incremental_index: bool = True
+    #: True when the index is built by another process after the statement
+    #: returns, so build cost is load time plus time-to-ready and the two
+    #: overlap. Neither value of incremental_index describes that.
+    async_index_build: bool = False
 
     def __init__(self, spec: ConnectionSpec):
         self.spec = spec
@@ -149,6 +158,7 @@ class EngineDriver(abc.ABC):
     def capabilities(self) -> Dict[str, Any]:
         return {
             "incremental_index": self.incremental_index,
+            "async_index_build": self.async_index_build,
             "ef_construction_tunable": False,
         }
 

@@ -152,6 +152,9 @@ case "$ENGINE" in
   # by typing "all".
   all)        build_engine mariadb; build_engine alisql; build_engine pgvector ;;
   mariadb123) build_engine mariadb123 ;;
+  # Nothing is compiled: the runtime image is the published PSMDB image plus
+  # mongot copied out of its own image, both pinned by digest.
+  mongodb)    build_engine mongodb ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

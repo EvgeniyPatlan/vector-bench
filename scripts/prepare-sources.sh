@@ -236,13 +236,54 @@ stage_context() {
 
 # ---------------------------------------------------------------------------
 
+prepare_mongodb() {
+  # The one engine with nothing to compile.
+  #
+  # Percona Search ships as tarballs, packages and images only, so there is no
+  # pinned tag and commit to record and no source.tar to stage. What replaces
+  # them is the image digest: a tag floats, and a run built from a floating tag
+  # is unreproducible in exactly the dimension this script exists to guarantee.
+  # Both digests are resolved here and written into the build context, where
+  # the build reads them and the manifest records them.
+  local engine=mongodb
+  local cfg="$VB_CONFIG/engines/$engine.yml"
+  local ctx="$VB_BUILDCTX/$engine"
+  local mongot server
+  mongot="$(yq_get "$cfg" source.mongot_image "")"
+  server="$(yq_get "$cfg" source.server_image "")"
+  [[ -n "$mongot" && -n "$server" ]] || die "$engine: source.mongot_image / source.server_image not set in $cfg"
+
+  mkdir -p "$ctx"
+  say "$engine: resolving image digests (nothing is compiled for this engine)"
+
+  local digests="$ctx/image-digests.txt"
+  : > "$digests"
+  local ref name digest
+  for ref in "$server" "$mongot"; do
+    docker pull --quiet "$ref" >/dev/null || die "$engine: cannot pull $ref"
+    digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$ref" 2>/dev/null || true)"
+    [[ -n "$digest" ]] || die "$engine: $ref has no repo digest; push it to a registry or pin it by hand"
+    name="$([[ "$ref" == "$server" ]] && echo server || echo mongot)"
+    printf '%s=%s\n' "$name" "$digest" >> "$digests"
+    ok "$engine: $name pinned to $digest"
+  done
+
+  find "$VB_DOCKER/_shared" -maxdepth 1 -type f -exec cp {} "$ctx/" \; 2>/dev/null || true
+  find "$VB_DOCKER/$engine" -maxdepth 1 -type f ! -name 'Dockerfile' \
+       -exec cp {} "$ctx/" \; 2>/dev/null || true
+  ok "$engine: build context ready at $ctx (no source.tar: nothing is built from source)"
+}
+
+# ---------------------------------------------------------------------------
+
 case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
   mariadb)    prepare_mariadb mariadb ;;
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|all)" ;;
+  mongodb)    prepare_mongodb ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|all)" ;;
 esac
 
 ok "sources prepared"

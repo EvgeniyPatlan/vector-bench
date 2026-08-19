@@ -42,7 +42,10 @@ GB = 1024 ** 3
 # mariadb123 is opt-in via --engines: it is a second MariaDB version, not
 # part of the default three-way comparison.
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
-EXTRA_ENGINES = ("mariadb123",)
+# Opt-in rather than default. mariadb123 is another hour of compiling; mongodb
+# is a second server process, a replica set and a JVM, and is a Technical
+# Preview besides.
+EXTRA_ENGINES = ("mariadb123", "mongodb")
 KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
 
 

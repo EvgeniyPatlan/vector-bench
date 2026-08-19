@@ -1,0 +1,119 @@
+# Percona Server for MongoDB + Percona Search (mongot) engine definition.
+#
+# The third architecture in the set, and the reason it is worth measuring. The
+# other four put a vector index inside the query engine. This puts a separate
+# Lucene process, `mongot`, alongside `mongod` and replicates into it. What is
+# being compared is not four implementations of one idea but two different
+# answers to where the index should live.
+#
+# THREE THINGS HERE ARE UNLIKE EVERY OTHER ENGINE
+#
+#   1. No source build. mongot ships as tarballs, packages and images only, so
+#      the pinned-tag-and-commit provenance every other engine carries is
+#      replaced by a pinned image digest plus the JVM version. Its distance
+#      kernels come from the JVM's vector API, not from our -march, so the
+#      AVX-512 asymmetry the other engines share does not apply in the same way.
+#
+#   2. Two processes, one budget. Vectors live in mongot's memory-mapped Lucene
+#      segments, served from the OS filesystem cache; documents live in mongod's
+#      WiredTiger cache. See `resources` below for how the split is set and why.
+#
+#   3. Asynchronous index build. createSearchIndex returns immediately and the
+#      index becomes queryable at some later point, polled until READY. That is
+#      neither of the two build modes the framework had: not incremental on
+#      INSERT like MHNSW and VIDX, and not a separable bulk build like pgvector.
+#      Build cost is load time plus time-to-READY, and those overlap.
+#
+# STATUS. Percona Search is a Technical Preview and its own documentation says
+# not for production. Any result here is labelled accordingly.
+name: mongodb
+display_name: Percona Search for MongoDB (mongot)
+family: mongo
+
+source:
+  # No upstream source build is offered. The digest is the provenance, and the
+  # orchestrator pulls rather than builds. Pin by digest, never by tag alone:
+  # a floating tag makes a run unreproducible in the one dimension this file
+  # exists to guarantee.
+  kind: image
+  version: 1.70.3-1
+  mongot_image: percona/percona-server-mongodb-mongot:1.70.3-1
+  server_image: percona/percona-server-mongodb:8.3
+  # Filled in by `run-benchmark.sh sources` and recorded in the manifest.
+  mongot_digest: null
+  server_digest: null
+
+image:
+  runtime: vector-bench/mongodb-runtime
+  bench: vector-bench/mongodb-bench
+  base: percona/percona-server-mongodb:8.3
+
+build:
+  # Recorded for shape only. Nothing here is compiled by us: mongod arrives as
+  # a published binary and mongot runs on the JVM.
+  march: none
+  optflags: ""
+
+mongo:
+  database: ann
+  collection: t1
+  index_name: vector_index
+  # Percona Search requires an initiated replica set; standalone is explicitly
+  # unsupported. Single node, so the oplog write amplification the other engines
+  # do not pay is kept to its minimum.
+  replica_set: rs0
+  # A BSON array of doubles costs 8 bytes per dimension, so 990k x 1536 would be
+  # 12.2 GB in mongod against 5.7 GB in Lucene. BinData float32 halves the
+  # working set and is what MongoDB recommends for vector search.
+  vector_encoding: binData_float32
+  metrics:
+    angular: cosine
+    euclidean: euclidean
+  # numCandidates is the ef_search analogue. Percona's guidance is at least
+  # 20x limit, so 200 at k=10 -- near the top of the grid the other engines
+  # sweep rather than the middle. The grid is not changed for it; the guidance
+  # is recorded so the curve can be read against the vendor's own advice.
+  num_candidates_guidance_multiplier: 20
+
+server:
+  common:
+    - --setParameter
+    - "searchIndexManagementHostAndPort=localhost:27028"
+    - --setParameter
+    - "mongotHost=localhost:27028"
+    - --setParameter
+    - "skipAuthenticationToSearchIndexManagementServer=true"
+    - --setParameter
+    - "useGrpcForSearch=true"
+
+resources:
+  # Heap scales with the number of indexed fields, not with the number of
+  # vectors: the vectors themselves are served from memory-mapped segments in
+  # the filesystem cache. This index has one vector field and one filter field,
+  # so a large heap would take memory away from the cache that actually answers
+  # queries, which MongoDB's own guidance warns against above 50%.
+  mongot_heap_gb: 8
+  # The rest of the container is left to WiredTiger and the filesystem cache.
+  # mongod takes the same fraction the other engines give their buffer pool so
+  # the split is not invented here.
+  wiredtiger_cache_fraction: 0.6
+
+storage_engines:
+  normalized: [wiredTiger]
+  tuned: [wiredTiger]
+
+capabilities:
+  ef_construction_tunable: false
+  # The axis no other engine has. MongoDB advises quantizing above a 3 GB
+  # vector index; at 990k x 1536 float32 ours is 5.7 GB, so the tuned pass
+  # follows that advice and the normalized pass does not, exactly as
+  # ef_construction is pinned there so nobody gets an axis the others lack.
+  quantization_tunable: true
+  quantization_normalized: none
+  quantization_tuned: scalar
+  # Its filter is applied before vector comparison, where every other engine
+  # here post-filters. This is the one workload where a different answer is
+  # expected rather than a different speed.
+  prefilter: true
+  # createSearchIndex returns before the index exists.
+  async_index_build: true

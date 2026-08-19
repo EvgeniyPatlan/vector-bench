@@ -1762,3 +1762,116 @@ class TestRecallFloorsAnEngineNeverApproached:
         text = _validity_section({}, s)
         assert "never approached" in text.lower()
         assert "0.9753" in text
+
+
+class TestMongoDriverShape:
+    """Percona Search is the third architecture in the set.
+
+    mongod holds the documents, a separate Lucene process (mongot) holds the
+    index and is fed by a change stream. Three things follow that no other
+    driver has to deal with, and each has bitten a benchmark somewhere: the
+    build is asynchronous, the filter runs before the vector comparison rather
+    than after, and the search width is a per-query argument instead of a
+    session variable.
+    """
+
+    def test_the_ops_harness_accepts_it(self):
+        """A driver missing from this table is how a run got as far as starting
+        the server and then died on `argument --engine: invalid choice`."""
+        from harness.drivers.postgres import known_engines
+        assert "mongodb" in known_engines()
+
+    def test_it_is_neither_of_the_two_build_modes(self):
+        from harness.drivers.mongo import MongoDriver
+        assert MongoDriver.incremental_index is False
+        assert MongoDriver.async_index_build is True
+
+    def test_other_engines_are_not_async(self):
+        from harness.drivers.mysql_family import MariaDBDriver
+        from harness.drivers.postgres import PostgresDriver
+        assert MariaDBDriver.async_index_build is False
+        assert PostgresDriver.async_index_build is False
+
+    def test_vectors_are_encoded_as_binata_float32(self):
+        """A BSON array of doubles spends 8 bytes a dimension, so 990k x 1536
+        would cost 12.2 GB in mongod against 5.7 GB in Lucene."""
+        import numpy
+        from harness.drivers import mongo
+        if mongo.Binary is None:
+            import pytest
+            pytest.skip("pymongo not installed outside the bench image")
+        packed = mongo.encode_vector(numpy.arange(4, dtype=numpy.float32))
+        assert packed.subtype == 9
+        assert len(packed) == 2 + 4 * 4          # header + float32 per dimension
+
+    @staticmethod
+    def _driver(monkeypatch):
+        """A driver whose vector encoding does not need pymongo installed.
+
+        The stage shape is worth testing on the host, where CI runs and the
+        Mongo client is not present; only the BSON packing needs the real
+        library, and that has its own test.
+        """
+        from harness.drivers import mongo
+        from harness.drivers.base import ConnectionSpec
+        monkeypatch.setattr(mongo, "Binary", lambda payload, subtype: payload)
+        return mongo.MongoDriver(ConnectionSpec(host="h", port=1))
+
+    def test_num_candidates_never_drops_below_k(self, monkeypatch):
+        """numCandidates < limit cannot return limit rows, and the shared grid
+        starts at ef_search 10, which reaches there at k=10."""
+        d = self._driver(monkeypatch)
+        d.set_ef_search(10)
+        stage = d._pipeline([0.0], 10)[0]["$vectorSearch"]
+        assert stage["numCandidates"] == 10 and stage["limit"] == 10
+        d.set_ef_search(2)
+        assert d._pipeline([0.0], 10)[0]["$vectorSearch"]["numCandidates"] == 10
+
+    def test_filtered_queries_carry_the_predicate_into_the_stage(self, monkeypatch):
+        """Its filter is a pre-filter. Every other engine here post-filters,
+        which is why their filtered results collapse or come back short."""
+        d = self._driver(monkeypatch)
+        stage = d._pipeline([0.0], 10, tag_threshold=100)[0]["$vectorSearch"]
+        assert stage["filter"] == {"tag": {"$lt": 100}}
+        assert "filter" not in d._pipeline([0.0], 10)[0]["$vectorSearch"]
+
+    def test_quantization_is_only_declared_when_asked_for(self):
+        from harness.drivers.base import IndexSpec
+        spec = IndexSpec(dim=1536, m=16, metric="angular")
+        assert spec.quantization is None
+
+
+class TestMongoEngineConfig:
+    """The one engine with no source build.
+
+    Provenance is an image digest and a JVM rather than a tag, a commit and our
+    compiler flags, and the report has to say so rather than leave a reader to
+    assume it was built like the other four.
+    """
+
+    def test_it_loads_and_declares_its_family(self):
+        cfg = load_engine("mongodb")
+        assert cfg["family"] == "mongo"
+        assert cfg["source"]["kind"] == "image"
+
+    def test_images_are_pinned_to_a_version(self):
+        cfg = load_engine("mongodb")
+        for key in ("mongot_image", "server_image"):
+            assert ":" in cfg["source"][key], key
+
+    def test_quantization_follows_the_ef_construction_precedent(self):
+        """Pinned off where no other engine has the axis, set to the vendor's
+        recommendation where each engine is allowed its own idioms."""
+        caps = load_engine("mongodb")["capabilities"]
+        assert caps["quantization_normalized"] == "none"
+        assert caps["quantization_tuned"] == "scalar"
+
+    def test_it_declares_what_makes_it_structurally_different(self):
+        caps = load_engine("mongodb")["capabilities"]
+        assert caps["async_index_build"] is True
+        assert caps["prefilter"] is True
+
+    def test_no_other_engine_claims_to_prefilter(self):
+        for engine in ("mariadb", "mariadb123", "alisql", "pgvector"):
+            caps = load_engine(engine).get("capabilities", {})
+            assert not caps.get("prefilter"), engine

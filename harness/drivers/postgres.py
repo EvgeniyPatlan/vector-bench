@@ -277,6 +277,7 @@ def _driver_table() -> Dict[str, Any]:
     the two lists is how a run got as far as starting the server and then died
     on `argument --engine: invalid choice`.
     """
+    from .mongo import MongoDriver
     from .mysql_family import AliSQLDriver, MariaDBDriver
 
     return {
@@ -285,6 +286,7 @@ def _driver_table() -> Dict[str, Any]:
         "mariadb123": MariaDBDriver,
         "alisql": AliSQLDriver,
         "pgvector": PostgresDriver,
+        "mongodb": MongoDriver,
     }
 
 

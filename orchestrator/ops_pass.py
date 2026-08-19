@@ -24,7 +24,7 @@ from .config import ResolvedResources, server_args
 from .manifest import utcnow
 
 DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
-                 "alisql": 3306, "pgvector": 5432}
+                 "alisql": 3306, "pgvector": 5432, "mongodb": 27017}
 
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
@@ -39,6 +39,14 @@ PROBES = {
         "sh", "-c",
         "/opt/mariadb/bin/mariadb -ubench -pbench "
         "--socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1",
+    ],
+    # Not a ping: mongod answers one while still SECONDARY, and a load that
+    # starts before the election completes fails on its first write. mongot
+    # readiness is checked separately, when the index is created.
+    "mongodb": [
+        "sh", "-c",
+        "mongosh --quiet --port 27017 --eval "
+        "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true",
     ],
     "alisql": [
         "sh", "-c",
@@ -61,6 +69,9 @@ DB_CREDENTIALS = {
     "mariadb123": ("bench", "bench"),
     "alisql": ("bench", "bench"),
     "pgvector": ("postgres", ""),
+    # No authentication: the container is on an isolated network and
+    # skipAuthenticationToSearchIndexManagementServer is set for mongot anyway.
+    "mongodb": ("", ""),
 }
 
 SERVER_DATA_MOUNT = {
@@ -71,6 +82,9 @@ SERVER_DATA_MOUNT = {
     "mariadb123": "/server-data/data",
     "alisql": "/server-data/data",
     "pgvector": None,
+    # mongot's Lucene segments are files belonging to another process, so the
+    # client has to read them directly to size the index at all.
+    "mongodb": "/server-data/mongot",
 }
 
 
