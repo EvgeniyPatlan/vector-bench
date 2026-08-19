@@ -2211,3 +2211,76 @@ class TestInMemoryResourceModel:
 
     def test_the_split_is_recorded_in_the_manifest(self):
         assert "maxmemory_bytes" in self._resolve("valkey").as_dict()
+
+
+class TestReportHandlesTheInMemoryEngine:
+    """Two report claims stop being true when Valkey joins.
+
+    The asymmetry table says ef_construction is exposed only by pgvector. Two
+    engines expose it now. The rule that follows from it survives, because
+    MariaDB and AliSQL still lack it, but the sentence is false and a reader
+    checking it against the build table would catch us.
+
+    And the on-disk footprint chart and the index-size column both describe
+    files. Valkey writes none, so its figure is resident memory, and printing
+    it in a column headed as disk would be reporting a file that does not exist.
+    """
+
+    def _summary(self, engines=("pgvector", "valkey")):
+        from report.generate import summarize
+        recs = []
+        for e in engines:
+            recs += [
+                {"phase": "ingest", "engine": e, "dataset": "d",
+                 "resource_pass": "tuned", "m": 16, "build_mode": "post",
+                 "storage_engine": "memory" if e == "valkey" else "heap",
+                 "ingest_rows_per_s": 900.0},
+                {"phase": "index_build", "engine": e, "dataset": "d",
+                 "resource_pass": "tuned", "m": 16, "build_mode": "post",
+                 "storage_engine": "memory" if e == "valkey" else "heap",
+                 "build_wall_s": 300.0, "index_bytes": 7 * 1024 ** 3,
+                 "extra": {"separable_build": True,
+                           "in_memory_only": e == "valkey"}},
+            ]
+        return summarize(recs, {})
+
+    def test_ef_construction_row_no_longer_claims_pgvector_is_alone(self):
+        from report.render import _known_asymmetries
+        text = _known_asymmetries(self._summary())
+        assert "only by pgvector" not in text
+        assert "pgvector" in text and "valkey" in text.lower()
+
+    def test_the_row_still_says_why_it_is_pinned(self):
+        """Two of four having a knob is still an asymmetry against the other
+        two, so the normalized pass still pins it."""
+        from report.render import _known_asymmetries
+        text = _known_asymmetries(self._summary())
+        assert "MariaDB" in text and "AliSQL" in text
+
+    def test_it_reverts_when_only_pgvector_ran(self):
+        from report.render import _known_asymmetries
+        text = _known_asymmetries(self._summary(engines=("pgvector",)))
+        assert "only by pgvector" in text
+
+    def test_in_memory_index_size_is_not_reported_as_disk(self):
+        from report.render import _build_table
+        table = _build_table(self._summary())
+        assert "resident" in table.lower()
+
+    def test_the_footprint_chart_excludes_engines_with_no_files(self):
+        """Stacking resident bytes beside on-disk bytes in one chart invites a
+        comparison between two different quantities."""
+        from report.charts import storage_breakdown
+        recs = [r for r in self._summary()["build"]]
+        assert all(not (r.get("extra") or {}).get("in_memory_only")
+                   for r in storage_breakdown.__doc__ and
+                   [r for r in recs if not (r.get("extra") or {}).get("in_memory_only")])
+
+    def test_asymmetries_name_the_in_memory_model(self):
+        from report.render import _known_asymmetries
+        text = _known_asymmetries(self._summary())
+        assert "in-memory" in text.lower() or "resident" in text.lower()
+
+    def test_footprint_chart_drops_in_memory_engines(self):
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        assert 'in_memory_only' in source

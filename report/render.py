@@ -25,6 +25,7 @@ ENGINE_LABEL = {
     "alisql": "AliSQL (VIDX)",
     "pgvector": "PostgreSQL (pgvector)",
     "mongodb": "Percona Search for MongoDB (mongot)",
+    "valkey": "Valkey (valkey-search)",
 }
 
 
@@ -310,11 +311,30 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
     work out that it does not apply.
     """
     engines = set((summary or {}).get("engines") or [])
+    # Which engines expose the build-quality knob is a property of the run, not
+    # a constant. It was pgvector alone until valkey-search joined; the rule it
+    # justifies is unchanged, but stating the old reason would be false and a
+    # reader checking it against the build table would catch it.
+    tunable = sorted(engines & {"pgvector", "valkey"})
+    if len(tunable) > 1:
+        ef_row = [
+            "`ef_construction` is exposed by " + " and ".join(
+                _label(e) for e in tunable),
+            "Build quality can be tuned for those two and not for MHNSW or VIDX, "
+            "so it is pinned to the default in the normalized pass and swept only "
+            "in the tuned pass. Two engines of four having the knob is still an "
+            "asymmetry against MariaDB and AliSQL, which have no equivalent.",
+        ]
+    else:
+        ef_row = [
+            "`ef_construction` is exposed only by pgvector",
+            "Build quality can be tuned for pgvector but not for MHNSW or VIDX. "
+            "It is pinned to the default in the normalized pass so pgvector is "
+            "not given an axis the others lack.",
+        ]
+
     rows = [
-                ["`ef_construction` is exposed only by pgvector",
-                 "Build quality can be tuned for pgvector but not for MHNSW or VIDX. "
-                 "It is pinned to the default in the normalized pass so pgvector is "
-                 "not given an axis the others lack."],
+                ef_row,
                 ["pgvector bulk-builds after load; MHNSW and VIDX build incrementally",
                  "Build cost is reported separately for both modes. A single "
                  "'build time' comparison would compare different operations."],
@@ -330,6 +350,24 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
                  "without AVX-512 both run narrower paths, and the ranking may differ "
                  "on AVX-512 hardware."],
     ]
+
+    if "valkey" in engines:
+        rows += [
+            ["Valkey holds the whole dataset in memory",
+             "The other engines keep a disk-backed table with a cache in front of "
+             "it, so their container limit is a cache budget. Valkey's is the "
+             "dataset. It has no buffer pool to size and no index on disk, and "
+             "its index size below is resident memory rather than a file."],
+            ["Valkey's planner chooses its filtering strategy per query",
+             "It picks between pre-filtering and filtering inline during the "
+             "search. The MySQL family and pgvector post-filter and Percona "
+             "Search pre-filters, so the filtered section compares three "
+             "strategies rather than one implemented three ways."],
+            ["Valkey is installed from packages, not built from source",
+             "Percona ships prebuilt packages, so it carries installed package "
+             "versions instead of a tag, a commit and a `-march`, and the "
+             "AVX-512 row above does not describe it."],
+        ]
 
     if "mongodb" in engines:
         rows += [
@@ -448,7 +486,7 @@ def _build_table(summary: Dict[str, Any]) -> str:
             _fmt(r.get("build_wall_s"), 1, " s"),
             _fmt(ingest_rate, 0, " rows/s"),
             _fmt_bytes(r.get("peak_rss_bytes")),
-            _fmt_bytes(r.get("index_bytes")),
+            _index_size(r),
             _index_build_kind(r),
         ])
     table = _md_table(
@@ -457,6 +495,19 @@ def _build_table(summary: Dict[str, Any]) -> str:
         rows,
     )
     return table + _build_table_notes(summary)
+
+
+def _index_size(record: Dict[str, Any]) -> str:
+    """Index size, labelled when it is not a file.
+
+    Valkey writes nothing to disk, so its figure is resident memory. Printing
+    it bare in a column every other row fills with a file size invites a
+    comparison between two different quantities.
+    """
+    size = _fmt_bytes(record.get("index_bytes"))
+    if (record.get("extra") or {}).get("in_memory_only"):
+        return f"{size} resident"
+    return size
 
 
 def _index_build_kind(record: Dict[str, Any]) -> str:

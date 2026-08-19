@@ -34,6 +34,9 @@ STYLE: Dict[str, Dict[str, Any]] = {
     # Distinct hue: it is the only engine whose index lives in a separate
     # process, so it should not read as a variant of anything above it.
     "mongodb":  {"color": "#9467bd", "marker": "v", "linestyle": "-",  "label": "Percona Search (mongot)"},
+    # Its own hue as well: it is the only in-memory engine, so it should not
+    # read as a variant of any disk-backed one.
+    "valkey":   {"color": "#e377c2", "marker": "D", "linestyle": "-",  "label": "Valkey (valkey-search)"},
 }
 FALLBACK = {"color": "#7f7f7f", "marker": "D", "linestyle": ":", "label": "unknown"}
 
@@ -696,7 +699,12 @@ def storage_breakdown(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     """
     rows = [r for r in records
             if r.get("phase") == "index_build" and r.get("dataset") == dataset
-            and (r.get("index_bytes") or r.get("table_bytes"))]
+            and (r.get("index_bytes") or r.get("table_bytes"))
+            # An in-memory engine writes no files. Stacking its resident bytes
+            # beside the others' on-disk bytes in a chart titled "on-disk
+            # footprint" invites a comparison between two different quantities;
+            # its memory cost is in the build table, labelled as resident.
+            and not (r.get("extra") or {}).get("in_memory_only")]
     if not rows:
         return None
 
