@@ -1977,3 +1977,89 @@ class TestMongoQuantizationFollowsPrecedent:
             for group in entry["run_groups"].values():
                 grids.add(tuple(group["query_args"][0]))
         assert len(grids) == 1, f"engines swept different grids: {grids}"
+
+
+class TestTwoProcessMemorySplit:
+    """Percona Search is the only engine here that is two processes.
+
+    Vectors live in mongot's memory-mapped Lucene segments, served from the OS
+    filesystem cache; documents live in mongod's WiredTiger cache. That inverts
+    the pgvector rule rather than repeating it. PostgreSQL keeps graph pages in
+    shared_buffers, so its graph-cache share is *absorbed* into the buffer.
+    mongot keeps them in the page cache, which is unallocated memory, so the
+    same share has to be left deliberately free: handing it to either process
+    starves the cache that actually answers queries, which is what MongoDB's
+    own guidance warns about above 50%.
+    """
+
+    def _sysinfo(self, ram_gb=192, cores=40):
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(cores)),
+                                  "efficiency_cpus": [], "logical_cpus": cores * 2,
+                                  "physical_cores": cores, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(ram_gb * 1024 ** 3)
+        return info
+
+    def _resolve(self, engine, overrides=None):
+        from orchestrator.config import load_resources, resolve_resources
+        res = load_resources("tuned")
+        if overrides:
+            res.setdefault("memory", {}).update(overrides)
+        return resolve_resources(res, engine, self._sysinfo())
+
+    def test_mongot_gets_a_heap_and_nothing_else_does(self):
+        assert self._resolve("mongodb").mongot_heap_bytes > 0
+        for engine in ("mariadb", "alisql", "pgvector"):
+            assert self._resolve(engine).mongot_heap_bytes == 0, engine
+
+    def test_the_graph_share_is_left_free_rather_than_absorbed(self):
+        """The opposite of pgvector. Allocating it would starve the filesystem
+        cache that serves the Lucene segments."""
+        mongo = self._resolve("mongodb")
+        assert mongo.graph_cache_bytes == 0
+        allocated = (mongo.buffer_bytes + mongo.graph_cache_bytes
+                     + mongo.maintenance_bytes + mongo.mongot_heap_bytes)
+        assert allocated < mongo.server_memory_bytes * 0.75
+
+    def test_pgvector_still_absorbs_its_graph_share(self):
+        pg = self._resolve("pgvector")
+        assert pg.graph_cache_bytes == 0
+        assert pg.buffer_bytes > self._resolve("mariadb").buffer_bytes
+
+    def test_heap_is_capped_below_the_compressed_pointer_boundary(self):
+        """Past ~30 GB the JVM loses compressed object pointers, and MongoDB's
+        guidance is to stay below or jump straight to 48 GB."""
+        r = self._resolve("mongodb", {"mongot_heap_gb": 40})
+        assert r.mongot_heap_bytes <= 31 * 1024 ** 3
+        assert any("compressed" in w for w in r.warnings)
+
+    def test_heap_never_takes_more_than_half_the_container(self):
+        from orchestrator.config import load_resources, resolve_resources
+        res = load_resources("tuned")
+        res.setdefault("memory", {}).update(
+            {"server_limit_gb": 16, "mongot_heap_gb": 12})
+        r = resolve_resources(res, "mongodb", self._sysinfo())
+        assert r.mongot_heap_bytes <= r.server_memory_bytes // 2
+        assert any("filesystem cache" in w for w in r.warnings)
+
+    def test_the_heap_reaches_the_container(self):
+        """Sized here and never passed through is how a tuned run would
+        silently use the image default instead."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert "VB_MONGOT_HEAP_GB" in source
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        assert "VB_MONGOT_HEAP_GB" in source
+
+    def test_the_split_is_recorded_in_the_manifest(self):
+        assert "mongot_heap_bytes" in self._resolve("mongodb").as_dict()
+
+    def test_no_maintenance_share_is_reserved(self):
+        """WiredTiger has no maintenance_work_mem and mongot's build is heap
+        work. Reserving a share would also size /dev/shm from it, and that term
+        exists for pgvector's parallel HNSW build, which has no counterpart."""
+        r = self._resolve("mongodb")
+        assert r.maintenance_bytes == 0
+        assert not any("shm_size raised" in w for w in r.warnings)
+        assert self._resolve("pgvector").maintenance_bytes > 0

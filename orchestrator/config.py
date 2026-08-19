@@ -94,6 +94,8 @@ class ResolvedResources:
     buffer_bytes: int
     graph_cache_bytes: int
     maintenance_bytes: int
+    #: JVM heap for mongot. Zero for every engine that is a single process.
+    mongot_heap_bytes: int
     build_threads: int
     shm_size: str
     transaction_isolation: str
@@ -112,6 +114,7 @@ class ResolvedResources:
             "buffer_bytes": self.buffer_bytes,
             "graph_cache_bytes": self.graph_cache_bytes,
             "maintenance_bytes": self.maintenance_bytes,
+            "mongot_heap_bytes": self.mongot_heap_bytes,
             "build_threads": self.build_threads,
             "shm_size": self.shm_size,
             "transaction_isolation": self.transaction_isolation,
@@ -197,11 +200,64 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         buffer_fraction = buffer_fraction + graph_fraction
         graph_fraction = 0.0
 
+    mongot_heap_bytes = 0
+    if engine == "mongodb":
+        # The opposite of the pgvector rule above, for the opposite reason.
+        #
+        # Percona Search is two processes: mongod holds the documents in its
+        # WiredTiger cache, and mongot holds the index as memory-mapped Lucene
+        # segments served from the OS filesystem cache. The filesystem cache is
+        # unallocated memory by definition, so the graph share cannot be
+        # absorbed into anything -- it has to be left free. Giving it to either
+        # process starves the cache that actually answers queries, which is
+        # what MongoDB's guidance means by warning against a heap above 50%.
+        graph_fraction = 0.0
+
+        # There is no maintenance_work_mem equivalent either. WiredTiger has no
+        # such knob, and mongot's index build is heap work, already accounted
+        # above. Reserving a maintenance share would take memory from the page
+        # cache and, worse, size /dev/shm from it: that term exists for
+        # pgvector's parallel HNSW build, which has no counterpart here.
+        maint_fraction = 0.0
+
+        # Heap scales with the number of indexed fields, not with the number of
+        # vectors. This index has one vector field and one filter field, so a
+        # large heap buys nothing and costs page cache.
+        heap_gb = float(mem_cfg.get("mongot_heap_gb", 8) or 8)
+        mongot_heap_bytes = int(heap_gb * GB)
+
+        # Past roughly 30 GB the JVM drops compressed object pointers and every
+        # reference doubles in width. MongoDB's advice is to stay below the
+        # boundary or jump straight to 48 GB; nothing here needs 48.
+        compressed_oops_ceiling = int(30 * GB)
+        if mongot_heap_bytes > compressed_oops_ceiling:
+            warnings.append(
+                f"mongot heap of {heap_gb:.0f} GB is above the ~30 GB "
+                f"compressed object pointer boundary, where every reference "
+                f"doubles in width; capping at 30 GB. Heap scales with indexed "
+                f"field count, not vector count, so this is very unlikely to "
+                f"be the limit that matters."
+            )
+            mongot_heap_bytes = compressed_oops_ceiling
+
+        # And never more than half the container, or there is nothing left for
+        # the segments themselves.
+        half = server_bytes // 2
+        if mongot_heap_bytes > half:
+            warnings.append(
+                f"mongot heap of {mongot_heap_bytes / GB:.1f} GB is over half "
+                f"the {server_bytes / GB:.1f} GB container budget, leaving "
+                f"insufficient filesystem cache for the memory-mapped index "
+                f"segments that serve queries; capping at {half / GB:.1f} GB"
+            )
+            mongot_heap_bytes = half
+
     buffer_bytes = int(server_bytes * buffer_fraction)
     graph_cache_bytes = int(server_bytes * graph_fraction)
     maintenance_bytes = int(server_bytes * maint_fraction)
 
-    total_allocated = buffer_bytes + graph_cache_bytes + maintenance_bytes
+    total_allocated = (buffer_bytes + graph_cache_bytes + maintenance_bytes
+                       + mongot_heap_bytes)
     if total_allocated > server_bytes * 0.9:
         warnings.append(
             "buffer + graph cache + maintenance exceeds 90% of the container "
@@ -288,6 +344,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         buffer_bytes=buffer_bytes,
         graph_cache_bytes=graph_cache_bytes,
         maintenance_bytes=maintenance_bytes,
+        mongot_heap_bytes=mongot_heap_bytes,
         build_threads=build_threads,
         shm_size=shm_size,
         transaction_isolation=str(iso_cfg.get("transaction_isolation", "engine_default")),

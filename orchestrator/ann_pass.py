@@ -334,6 +334,10 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             "VB_INSERT_THREADS": str(profile.get("ann", {}).get("insert_threads", 0)),
             "VB_RUN_ID": run_id,
             "VB_RESOURCE_PASS": resource_pass,
+            # See ops_pass: sized centrally so both measurement paths give
+            # mongot the same heap, and the single-process engines ignore it.
+            "VB_MONGOT_HEAP_GB": str(
+                max(1, resolved.mongot_heap_bytes // (1024 ** 3))),
             "PYTHONUNBUFFERED": "1",
         },
         volumes=[

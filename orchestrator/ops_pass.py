@@ -169,6 +169,11 @@ class OpsRun:
             env={
                 "VB_SERVER_ARGS": " ".join(flags),
                 "VB_RUN_ID": self.run_id,
+                # Sized by resolve_resources and passed through, so a tuned run
+                # cannot silently fall back to the image default. Harmless for
+                # the single-process engines, which never read it.
+                "VB_MONGOT_HEAP_GB": str(
+                    max(1, self.resolved.mongot_heap_bytes // (1024 ** 3))),
             },
             volumes=[f"{self.volume}:{data_mount}:rw"],
             command=["server"],
