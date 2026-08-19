@@ -66,3 +66,9 @@ extras:
   # normalized pass so pgvector is not handed a tuning axis the others lack.
   pgvector_ef_construction: [64, 200, 400]
   pgvector_iterative_scan: [off, relaxed_order]
+  # Percona Search compresses indexed vectors; nothing else here can. MongoDB
+  # advises quantizing above a 3 GB vector index and 990k x 1536 float32 is
+  # 5.7 GB, so scalar is the vendor-recommended configuration at this corpus
+  # size rather than a thumb on the scale. Pinned to none in the normalized
+  # pass, where no engine gets an axis the others lack.
+  mongodb_quantization: [scalar]

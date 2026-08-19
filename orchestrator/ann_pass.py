@@ -173,6 +173,28 @@ def render_config(engine: str, profile: Dict[str, Any],
                 "args": {},
                 "query_args": query_args,
             }
+    elif engine == "mongodb":
+        # Quantization is the one axis no other engine has, so it follows the
+        # ef_construction precedent exactly: pinned in the normalized pass, set
+        # from the vendor's own guidance in the tuned pass. MongoDB advises
+        # quantizing above a 3 GB vector index and 990k x 1536 float32 is
+        # 5.7 GB, so `scalar` there is the vendor-recommended configuration
+        # rather than a thumb on the scale.
+        if resource_pass == "tuned" and extras.get("mongodb_quantization"):
+            quantizations = list(extras["mongodb_quantization"])
+        else:
+            quantizations = [str(ann.get("mongodb_quantization", "none"))]
+
+        for quantization in quantizations:
+            # M is carried, not applied: mongot exposes no graph degree. One
+            # value only, because sweeping it would produce identical curves
+            # under different labels.
+            run_groups[f"{quantization}_quantization"] = {
+                "arg_groups": [{"M": m_values[:1], "quantization": quantization}],
+                "args": {},
+                "query_args": query_args,
+            }
+
     else:
         raise ValueError(f"unknown engine: {engine}")
 

@@ -1875,3 +1875,105 @@ class TestMongoEngineConfig:
         for engine in ("mariadb", "mariadb123", "alisql", "pgvector"):
             caps = load_engine(engine).get("capabilities", {})
             assert not caps.get("prefilter"), engine
+
+
+class TestMongoAnnModule:
+    """The recall sweep for an engine whose index is built by another process.
+
+    ann-benchmarks assumes fit() returns with a queryable index. mongot's
+    createSearchIndex returns in milliseconds and the index is unqueryable
+    until the change stream has been consumed, so a module written like the
+    others would measure an empty index and report it as fast.
+    """
+
+    MODULE = os.path.join(VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+                          "algorithms", "mongodb", "module.py")
+
+    def test_the_module_exists_where_the_config_says_it_does(self):
+        from orchestrator.ann_pass import render_config
+        entry = render_config("mongodb", load_profile("tuned-complete"),
+                              load_resources("tuned"), "tuned")["float"]["any"][0]
+        assert entry["module"] == "ann_benchmarks.algorithms.mongodb"
+        assert os.path.isfile(self.MODULE)
+
+    def test_the_constructor_the_config_names_is_defined(self):
+        """A config naming a class the module does not define fails only once
+        the image is built and the corpus is loaded."""
+        import ast
+        from orchestrator.ann_pass import CONSTRUCTORS
+        tree = ast.parse(open(self.MODULE).read())
+        classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+        assert CONSTRUCTORS["mongodb"] in classes
+
+    def test_fit_waits_for_the_index_rather_than_timing_the_call(self):
+        source = open(self.MODULE).read()
+        assert "_wait_until_ready" in source
+        assert "READY" in source
+
+    def test_build_seconds_covers_load_plus_the_wait(self):
+        """Load and indexing overlap, so neither alone is the cost of having a
+        queryable index."""
+        source = open(self.MODULE).read()
+        assert "self._load_seconds + self._ready_seconds" in source
+
+    def test_it_reports_a_third_build_mode(self):
+        """Not incremental on INSERT and not a separable bulk build. Recording
+        it as either would put it in a column it does not belong in."""
+        source = open(self.MODULE).read()
+        assert '"build_mode": "async"' in source
+
+    def test_m_is_carried_but_not_claimed_as_applied(self):
+        """mongot exposes no graph degree. Reporting M as applied would claim a
+        comparison at matched M that is not being made."""
+        source = open(self.MODULE).read()
+        assert '"m_applied": False' in source
+
+    def test_it_does_not_claim_a_march_it_never_had(self):
+        source = open(self.MODULE).read()
+        assert '"march": "none"' in source
+        assert "jvm_version" in source
+
+
+class TestMongoQuantizationFollowsPrecedent:
+    """The one axis no other engine has, handled the way ef_construction is.
+
+    Pinned where the comparison must not hand one engine a knob the others
+    lack; set from the vendor's own guidance where each engine is allowed its
+    idioms. MongoDB advises quantizing above a 3 GB vector index and this
+    corpus is 5.7 GB, so scalar in the tuned pass is the recommended
+    configuration rather than a thumb on the scale.
+    """
+
+    def _groups(self, resource_pass):
+        from orchestrator.ann_pass import render_config
+        return render_config("mongodb", load_profile("tuned-complete"),
+                             load_resources(resource_pass),
+                             resource_pass)["float"]["any"][0]["run_groups"]
+
+    def test_normalized_pins_it_off(self):
+        groups = self._groups("normalized")
+        assert list(groups) == ["none_quantization"]
+        assert groups["none_quantization"]["arg_groups"][0]["quantization"] == "none"
+
+    def test_tuned_takes_the_vendor_recommendation(self):
+        groups = self._groups("tuned")
+        assert groups["scalar_quantization"]["arg_groups"][0]["quantization"] == "scalar"
+
+    def test_only_one_m_is_swept(self):
+        """Sweeping a value the engine ignores produces identical curves under
+        different labels."""
+        for rp in ("normalized", "tuned"):
+            for group in self._groups(rp).values():
+                assert len(group["arg_groups"][0]["M"]) == 1, rp
+
+    def test_the_ef_search_grid_is_shared_with_every_other_engine(self):
+        """numCandidates is the ef_search analogue. A grid chosen for this
+        engine alone would make the curves incomparable."""
+        from orchestrator.ann_pass import render_config
+        profile, resources = load_profile("tuned-complete"), load_resources("tuned")
+        grids = set()
+        for engine in ("mariadb", "alisql", "pgvector", "mongodb"):
+            entry = render_config(engine, profile, resources, "tuned")["float"]["any"][0]
+            for group in entry["run_groups"].values():
+                grids.add(tuple(group["query_args"][0]))
+        assert len(grids) == 1, f"engines swept different grids: {grids}"

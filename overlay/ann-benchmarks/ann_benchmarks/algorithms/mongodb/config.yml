@@ -1,0 +1,35 @@
+# Default (full-profile) Percona Search for MongoDB sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according
+# to the selected profile.
+#
+# Two things differ from every other config in this overlay.
+#
+# M is listed but never applied. mongot exposes no graph degree, so the value
+# is carried into the results to say which sweep a point belongs to and is not
+# sent to the server. A single value is listed because sweeping one would
+# produce identical curves under different labels.
+#
+# quantization is the axis no other engine has. It is pinned to none here, the
+# same way pgvector's efConstruction is pinned in the headline comparison, so
+# Percona Search is not handed a knob MariaDB and AliSQL do not have. The tuned
+# profile sets it to scalar, which is what MongoDB advises above a 3 GB vector
+# index, and reports it separately.
+#
+# query_args are numCandidates, the ef_search analogue. The grid is shared with
+# the other engines rather than chosen for this one; Percona's own guidance is
+# at least 20x the limit, so the low end sits further outside its intended
+# range than it does for the others, and the curve should be read knowing that.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: PerconaSearch
+    disabled: false
+    docker_tag: vector-bench/mongodb-bench
+    module: ann_benchmarks.algorithms.mongodb
+    name: mongodb
+    run_groups:
+      unquantized:
+        arg_groups: [{M: [16], quantization: 'none'}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
