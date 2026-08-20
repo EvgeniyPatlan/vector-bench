@@ -97,6 +97,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements-bench.txt /tmp/requirements-bench.txt
 COPY requirements-valkey.txt /tmp/requirements-valkey.txt
-RUN pip3 install --no-cache-dir --break-system-packages \
+# pip's --break-system-packages does not exist before pip 23. This image is
+# el9-based and ships an older one, where the flag is a hard error rather than
+# a no-op. Detected instead of assumed, so the same Dockerfile works whichever
+# base it is built on.
+RUN set -eux; \
+    flags=""; \
+    if pip3 install --help 2>&1 | grep -q -- --break-system-packages; then \
+      flags="--break-system-packages"; \
+    fi; \
+    pip3 install --no-cache-dir $flags \
         -r /tmp/requirements-bench.txt -r /tmp/requirements-valkey.txt \
     && rm -f /tmp/requirements-bench.txt /tmp/requirements-valkey.txt

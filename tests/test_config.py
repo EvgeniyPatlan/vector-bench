@@ -2500,3 +2500,41 @@ class TestMongotForcesAuthentication:
         assert "/usr/lib/percona-search-mongodb" in dockerfile
         assert "/opt/mongot" not in dockerfile
         assert "/usr/lib/jvm" not in dockerfile
+
+
+class TestPipFlagsSuitTheBaseImage:
+    """--break-system-packages does not exist before pip 23.
+
+    On Debian and Ubuntu bases it is required; on the el9 base Percona Server
+    for MongoDB is built from, the same flag is a hard error. The four
+    Debian-based images pass it unconditionally and work, so they are left
+    alone; anything on another base has to detect it.
+    """
+
+    DEBIAN_BASES = ("debian", "ubuntu", "postgres:")
+
+    def _base(self, engine):
+        import yaml
+        with open(os.path.join(VB_ROOT, "config", "engines",
+                               f"{engine}.yml")) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        return str((cfg.get("image") or {}).get("base", ""))
+
+    def test_non_debian_images_detect_the_flag(self):
+        import yaml
+        from orchestrator.cli import KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            with open(os.path.join(VB_ROOT, "config", "engines",
+                                   f"{engine}.yml")) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            dockerfile = os.path.join(
+                VB_ROOT, "docker", cfg.get("alias_of", engine), "Dockerfile")
+            source = open(dockerfile).read()
+            if "--break-system-packages" not in source:
+                continue
+            base = self._base(engine).lower()
+            if any(base.startswith(d) or d in base for d in self.DEBIAN_BASES):
+                continue
+            assert "pip3 install --help" in source, (
+                f"{engine} builds on {base!r}, which may ship a pip without "
+                f"--break-system-packages; the flag must be detected there")
