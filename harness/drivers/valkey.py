@@ -383,6 +383,41 @@ class ValkeyDriver(EngineDriver):
 
     # -- sizing / metadata ----------------------------------------------
 
+    def _indexed_memory(self) -> int:
+        """What the module says its own attributes cost, from FT.INFO.
+
+        The used_memory delta across index creation is the obvious measure and
+        it is not reliable: on the upstream build the index shows up there, and
+        on Percona's it does not, which reported a 66 KB index beside an 82 MB
+        table. FT.INFO carries user_indexed_memory per attribute, and it needs
+        a nested walk because attributes is a list of lists.
+        """
+        total = 0
+
+        def walk(node):
+            nonlocal total
+            if not isinstance(node, (list, tuple)):
+                return
+            for i in range(0, len(node) - 1, 2):
+                key = node[i]
+                key = key.decode() if isinstance(key, bytes) else key
+                value = node[i + 1]
+                if key == "user_indexed_memory":
+                    try:
+                        total += int(value)
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(value, (list, tuple)):
+                    walk(value)
+                    for sub in value:
+                        walk(sub)
+
+        try:
+            walk(self._conn.execute_command("FT.INFO", INDEX))
+        except Exception:
+            return 0
+        return total
+
     def _used_memory(self) -> int:
         try:
             return int(self._conn.info("memory").get("used_memory", 0))
@@ -392,12 +427,17 @@ class ValkeyDriver(EngineDriver):
     def index_bytes(self) -> int:
         """Resident cost of the index, not a file size.
 
-        Nothing is written to disk, so the honest measure is how much more
-        memory is resident once the index exists. Taken across index creation
-        rather than from a catalog, because the module reports no size field.
+        Two measurements, and the larger wins. The used_memory delta across
+        index creation covers the graph as well as the vectors but only where
+        the build accounts index allocations to the main allocator, which
+        Percona's does not: it reported 66 KB beside an 82 MB table. FT.INFO's
+        user_indexed_memory is always reported but counts the indexed vectors
+        rather than the graph built over them. Taking the larger reports the
+        more complete of the two rather than whichever the build happens to
+        support.
         """
-        delta = self._bytes_after_index - self._bytes_before_index
-        return max(0, delta)
+        delta = max(0, self._bytes_after_index - self._bytes_before_index)
+        return max(delta, self._indexed_memory())
 
     def table_bytes(self) -> int:
         """What the hashes themselves cost, index excluded."""

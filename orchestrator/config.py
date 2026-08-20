@@ -103,6 +103,11 @@ class ResolvedResources:
     transaction_isolation: str
     hybrid_cpu: bool
     core_class_used: str
+    #: The pass's declared knobs, before any engine-specific adjustment.
+    #: Identical for every engine under one pass by construction, which is what
+    #: lets the ann fingerprint notice a changed pass without fragmenting the
+    #: results tree by engine.
+    pass_signature: str = ""
     warnings: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -118,6 +123,7 @@ class ResolvedResources:
             "maintenance_bytes": self.maintenance_bytes,
             "mongot_heap_bytes": self.mongot_heap_bytes,
             "maxmemory_bytes": self.maxmemory_bytes,
+            "pass_signature": self.pass_signature,
             "build_threads": self.build_threads,
             "shm_size": self.shm_size,
             "transaction_isolation": self.transaction_isolation,
@@ -202,6 +208,19 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         # container limit, which would not be a fair normalization.
         buffer_fraction = buffer_fraction + graph_fraction
         graph_fraction = 0.0
+
+    # Taken here, before any engine-specific adjustment below. Every engine
+    # under one pass sees the same declared knobs; what each does with them
+    # differs by design, so hashing the resolved split fragments the results
+    # tree by engine and hashing this does not.
+    pass_signature = "|".join(str(x) for x in (
+        resources.get("name", ""),
+        mem_cfg.get("server_limit_gb", ""), mem_cfg.get("host_fraction", ""),
+        mem_cfg.get("buffer_fraction", ""), mem_cfg.get("graph_cache_fraction", ""),
+        mem_cfg.get("maintenance_fraction", ""),
+        cpu_cfg.get("server_cpus", ""), cpu_cfg.get("client_cpus", ""),
+        build_cfg.get("threads", ""), build_cfg.get("max_threads", ""),
+    ))
 
     maxmemory_bytes = 0
     if engine == "valkey":
@@ -385,6 +404,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         maintenance_bytes=maintenance_bytes,
         mongot_heap_bytes=mongot_heap_bytes,
         maxmemory_bytes=maxmemory_bytes,
+        pass_signature=pass_signature,
         build_threads=build_threads,
         shm_size=shm_size,
         transaction_isolation=str(iso_cfg.get("transaction_isolation", "engine_default")),

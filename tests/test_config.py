@@ -2729,3 +2729,72 @@ class TestShortResultRowsAreDistinguishable:
         text = _validity_section({}, summarize(recs, {}))
         assert "Build mode" in text and "Pass" in text
         assert "incremental" in text and "normalized" in text
+
+
+class TestAnnFingerprintStaysEngineInvariant:
+    """One results tree per resource pass, not one per engine.
+
+    ann-benchmarks caches by algorithm and index parameters and knows nothing
+    about budgets, so results are keyed by a fingerprint of the configuration.
+    The report can narrow to exactly one tree, so the moment two engines under
+    one pass disagree on the fingerprint, the recall chart silently contains a
+    subset of the engines that ran.
+
+    It has broken twice. First by hashing each engine's cache split, which
+    differs by design. Then by hashing the sum of those splits, which held only
+    while every engine allocated the same total: Percona Search takes a JVM
+    heap and leaves the rest to the page cache, and Valkey allocates nothing
+    because the container budget is the dataset. A six-engine smoke run
+    produced a recall chart with one engine in it.
+    """
+
+    ENGINES = ("mariadb", "mariadb123", "alisql", "pgvector", "mongodb", "valkey")
+
+    def _resolve(self, engine, resource_pass):
+        from orchestrator.config import load_resources, resolve_resources
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        return resolve_resources(load_resources(resource_pass), engine, info)
+
+    def test_every_engine_under_a_pass_shares_one_fingerprint(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        for resource_pass in ("normalized", "tuned"):
+            prints = {e: ann_fingerprint(self._resolve(e, resource_pass))
+                      for e in self.ENGINES}
+            assert len(set(prints.values())) == 1, (
+                f"{resource_pass} fragments the results tree: {prints}")
+
+    def test_the_two_passes_do_not_collide(self):
+        from orchestrator.ann_pass import ann_fingerprint
+        assert (ann_fingerprint(self._resolve("mariadb", "normalized"))
+                != ann_fingerprint(self._resolve("mariadb", "tuned")))
+
+    def test_changing_a_pass_knob_changes_the_fingerprint(self):
+        """The whole point: a 16 GB curve must not be reused under 64 GB."""
+        from orchestrator.config import load_resources, resolve_resources
+        from orchestrator.ann_pass import ann_fingerprint
+        info = self._resolve("mariadb", "tuned")
+        res = load_resources("tuned")
+        res.setdefault("memory", {})["buffer_fraction"] = 0.11
+        sysinfo = type("I", (), {})()
+        sysinfo.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                     "performance_cpus": list(range(40)),
+                                     "efficiency_cpus": [], "logical_cpus": 80,
+                                     "physical_cores": 40, "threads_per_core": 2,
+                                     "model": "Xeon"})()
+        sysinfo.total_ram_bytes = int(192 * 1024 ** 3)
+        altered = resolve_resources(res, "mariadb", sysinfo)
+        assert ann_fingerprint(info) != ann_fingerprint(altered)
+
+    def test_it_survives_the_manifest_round_trip(self):
+        """The report recomputes this from the manifest dict, not from the
+        dataclass, so the field has to be recorded."""
+        from orchestrator.ann_pass import ann_fingerprint
+        resolved = self._resolve("valkey", "tuned")
+        assert "pass_signature" in resolved.as_dict()
+        assert ann_fingerprint(resolved.as_dict()) == ann_fingerprint(resolved)

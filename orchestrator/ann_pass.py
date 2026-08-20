@@ -82,14 +82,16 @@ def ann_fingerprint(resolved: Any) -> str:
     # tree. The report can only narrow to one tree, so a three-engine run
     # produced a recall chart containing a single engine.
     #
-    # The *total* handed out is identical across engines, so it captures a
-    # change to the fractions without fragmenting by engine.
-    # Quantised to MiB. int(64GB * 0.30) * 2 and int(64GB * 0.60) differ by a
-    # single byte from float rounding, which was enough to split the engines
-    # into separate trees again.
-    allocated = sum(int(get(k) or 0) for k in
-                    ("buffer_bytes", "graph_cache_bytes", "maintenance_bytes"))
-    allocated //= 1024 * 1024
+    # Summing the allocations fixed that only while every engine allocated the
+    # same total. Percona Search takes a JVM heap and leaves the rest to the
+    # page cache, and Valkey allocates nothing at all because the container
+    # budget is the dataset, so the sum fragmented the tree into three and a
+    # six-engine smoke run again produced a recall chart with one engine in it.
+    #
+    # The pass signature is the pass's declared knobs, taken before any
+    # engine-specific adjustment. It is identical across engines by
+    # construction, and it still changes when the fractions do.
+    allocated = str(get("pass_signature") or "")
     fields = (
         ANN_MEASUREMENT_VERSION,
         get("server_memory_bytes"),
