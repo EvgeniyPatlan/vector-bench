@@ -24,7 +24,8 @@ consequences run through this file.
   Creating it first indexes on write, which is what MHNSW and VIDX are forced
   into; creating it after triggers a backfill, which is pgvector's bulk build.
   `build_mode` selects which comparison is being made, exactly as it does for
-  pgvector, and the backfill is waited out through FT.INFO's percent_indexed.
+  pgvector, and the backfill is waited out through FT.INFO's own
+  backfill_complete_percent rather than assumed complete.
 """
 
 from __future__ import annotations
@@ -200,14 +201,26 @@ class ValkeyDriver(EngineDriver):
             time.sleep(BACKFILL_POLL_S)
 
     def _backfill_progress(self):
+        """Read valkey-search's own field names.
+
+        Guessing these cost a whole smoke run. FT.INFO reports
+        `backfill_complete_percent`, `backfill_in_progress` and `state`; there
+        is no `percent_indexed` and no `indexing`. Looking for the names that
+        do not exist made every default fire at once, so the wait returned
+        immediately and the build, the row count, the index size and every
+        query afterwards measured an index that was still empty.
+        """
         info = self._ft_info()
-        done = info.get("percent_indexed")
-        indexing = str(info.get("indexing", "0")) not in ("0", "false", "False")
+        if not info:
+            # No index yet, or FT.INFO failed. Not "finished".
+            return 0.0, True
         try:
-            done = float(done)
+            done = float(info.get("backfill_complete_percent", 0.0))
         except (TypeError, ValueError):
-            done = 1.0
-        return done, indexing
+            done = 0.0
+        in_progress = str(info.get("backfill_in_progress", "1")) not in ("0", "false", "False")
+        ready = str(info.get("state", "")).lower() in ("", "ready")
+        return done, (in_progress or not ready)
 
     def _ft_info(self) -> Dict[str, Any]:
         try:
@@ -220,6 +233,27 @@ class ValkeyDriver(EngineDriver):
             value = raw[i + 1]
             out[key] = value.decode() if isinstance(value, bytes) else value
         return out
+
+    def _assert_nothing_failed_to_index(self) -> None:
+        """A hash that fails to index is not an error anywhere else.
+
+        The document still counts toward num_docs, the write returned OK and
+        the query returns fewer neighbours than it should. It reads as poor
+        recall rather than as a broken configuration, which is the failure this
+        framework exists to catch rather than average into a curve.
+        """
+        info = self._ft_info()
+        try:
+            failures = int(info.get("hash_indexing_failures", 0))
+        except (TypeError, ValueError):
+            return
+        if failures:
+            raise RuntimeError(
+                f"valkey-search failed to index {failures:,} hashes. The most "
+                f"likely cause is a vector whose byte length does not match "
+                f"DIM x 4. Recall computed against this index would be wrong "
+                f"rather than merely low."
+            )
 
     # -- data -----------------------------------------------------------
 

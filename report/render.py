@@ -283,11 +283,16 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             "fault, but it means the recall figure for these points is computed over "
             "short result sets and should be read alongside the count.\n"
         )
+        # Build mode and pass are what tell these apart. pgvector is measured
+        # in two build modes across two passes, so four real measurements
+        # rendered as the same row four times and read as a rendering fault.
         rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+                 c.get("resource_pass") or "—", c.get("build_mode") or "—",
                  f"{(c.get('selectivity') or 0):.0%}", str(c.get("queries", "—"))]
                 for c in summary["short_result_cases"][:30]]
         parts.append(_md_table(
-            ["Engine", "Dataset", "Selectivity", "Queries short of k"], rows))
+            ["Engine", "Dataset", "Pass", "Build mode", "Selectivity",
+             "Queries short of k"], rows))
 
     if warnings:
         parts.append("\n### Environment warnings\n\n")

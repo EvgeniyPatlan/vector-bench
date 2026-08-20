@@ -2656,3 +2656,76 @@ class TestBuildRecordCarriesDriverCapabilities:
         kind = _index_build_kind(record)
         assert kind.startswith("async")
         assert "bulk" not in kind
+
+
+class TestValkeyReadsItsOwnFieldNames:
+    """FT.INFO has no percent_indexed and no indexing.
+
+    It reports backfill_complete_percent, backfill_in_progress and state.
+    Waiting on names that do not exist made every default fire at once, so the
+    wait returned in six milliseconds and the build time, the row count, the
+    index size and every query afterwards measured an index that was still
+    empty. Nothing errored: the run reported a successful build of nothing.
+    """
+
+    def _driver(self, info):
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.valkey import ValkeyDriver
+        d = ValkeyDriver(ConnectionSpec(host="h", port=1))
+        d._ft_info = lambda: info
+        return d
+
+    def test_an_unfinished_backfill_is_not_reported_as_done(self):
+        d = self._driver({"backfill_complete_percent": "0.421000",
+                          "backfill_in_progress": "1", "state": "backfill"})
+        done, indexing = d._backfill_progress()
+        assert done < 1.0 and indexing
+
+    def test_a_finished_backfill_is_recognised(self):
+        d = self._driver({"backfill_complete_percent": "1.000000",
+                          "backfill_in_progress": "0", "state": "ready"})
+        done, indexing = d._backfill_progress()
+        assert done >= 1.0 and not indexing
+
+    def test_a_missing_index_is_not_finished(self):
+        """An empty FT.INFO means no index yet, which is the opposite of done.
+        Defaulting the other way is exactly what made this silent."""
+        done, indexing = self._driver({})._backfill_progress()
+        assert done == 0.0 and indexing
+
+    def test_the_old_field_names_are_not_looked_up(self):
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        for dead in ('get("percent_indexed"', 'get("indexing"'):
+            assert dead not in source, f"still reading {dead}"
+        assert 'get("backfill_complete_percent"' in source
+
+    def test_indexing_failures_are_refused_rather_than_averaged(self):
+        """A hash that fails to index still counts in num_docs and the write
+        returned OK, so it reads as poor recall rather than as a broken
+        configuration."""
+        import pytest
+        d = self._driver({"hash_indexing_failures": "17"})
+        with pytest.raises(RuntimeError, match="failed to index"):
+            d._assert_nothing_failed_to_index()
+        self._driver({"hash_indexing_failures": "0"})._assert_nothing_failed_to_index()
+
+
+class TestShortResultRowsAreDistinguishable:
+    """pgvector is measured in two build modes across two passes.
+
+    All four landed in the short-results table as the same row repeated, which
+    reads as a rendering fault rather than as four measurements.
+    """
+
+    def test_the_table_names_the_pass_and_the_build_mode(self):
+        from report.generate import summarize
+        from report.render import _validity_section
+        recs = [{"phase": "filtered", "engine": "pgvector", "dataset": "d",
+                 "selectivity": 0.1, "resource_pass": rp, "build_mode": bm,
+                 "extra": {"returned_fewer_than_k": True,
+                           "short_result_queries": 81}}
+                for rp in ("normalized", "tuned") for bm in ("post", "incremental")]
+        text = _validity_section({}, summarize(recs, {}))
+        assert "Build mode" in text and "Pass" in text
+        assert "incremental" in text and "normalized" in text

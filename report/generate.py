@@ -177,6 +177,10 @@ def summarize(records: List[Dict[str, Any]],
             summary["short_result_cases"].append({
                 "engine": r.get("engine"), "dataset": r.get("dataset"),
                 "selectivity": r.get("selectivity"),
+                # Without these, four measurements of one engine are one row
+                # printed four times and the table reads as broken.
+                "resource_pass": r.get("resource_pass"),
+                "build_mode": r.get("build_mode"),
                 "queries": (r.get("extra") or {}).get("short_result_queries"),
             })
 
