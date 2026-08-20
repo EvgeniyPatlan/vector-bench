@@ -46,9 +46,12 @@ PROBES = {
     # readiness is checked separately, when the index is created.
     "mongodb": [
         "sh", "-c",
+        # Both processes. mongod answers well before mongot's JVM does, and an
+        # index created in that window never gets an initial sync queued.
         "mongosh --quiet --port 27017 -u bench -p bench "
         "--authenticationDatabase admin --eval "
-        "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true",
+        "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true "
+        "&& (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null",
     ],
     # PING alone would pass before the module finished loading, and a Valkey
     # without valkey-search accepts writes and then fails every FT.SEARCH.

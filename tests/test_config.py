@@ -2839,3 +2839,42 @@ class TestMongotIndexesAfterTheLoad:
         assert "create_search_index" not in create_schema, (
             "create_schema must not build the index; the ops workload loads "
             "first and calls create_index afterwards")
+
+
+class TestBothProcessesAreWaitedFor:
+    """mongod answers long before mongot does.
+
+    The JVM needs fifteen to twenty seconds to reach its health check, and a
+    createSearchIndexes issued inside that window is accepted, creates a Lucene
+    index, and then sits in PENDING with no initial sync ever queued for it.
+    Observed three seconds after mongot's process started, from an ann module
+    that waited only for mongod to become primary. The ops path never hit it
+    because the orchestrator spends that long starting a separate client
+    container, which is a difference in timing rather than in correctness.
+    """
+
+    def test_the_entrypoint_waits_for_the_health_check(self):
+        script = open(os.path.join(VB_ROOT, "docker", "mongodb",
+                                   "entrypoint-mongodb.sh")).read()
+        assert "wait_for_mongot" in script
+        # Anchored on the line that records the pid rather than on a closing
+        # brace: the function body is full of ${VAR} expansions.
+        after_launch = script.split("echo $! > /tmp/mongot.pid")[1]
+        assert after_launch.split("start_server()")[0].count("wait_for_mongot"), (
+            "mongot is started without waiting for it to answer")
+
+    def test_the_ann_module_waits_for_it_too(self):
+        source = open(os.path.join(
+            VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+            "algorithms", "mongodb", "module.py")).read()
+        assert "_wait_for_mongot" in source
+        started = source.split("def _start_server")[1].split("def ")[0]
+        assert "_wait_for_mongot" in started
+
+    def test_the_readiness_probe_checks_both(self):
+        """A probe that passes on mongod alone reports the server ready while
+        the process that answers every search query is still booting."""
+        from orchestrator.ops_pass import PROBES
+        probe = " ".join(PROBES["mongodb"])
+        assert "isWritablePrimary" in probe
+        assert "8080" in probe, "the probe does not check mongot at all"

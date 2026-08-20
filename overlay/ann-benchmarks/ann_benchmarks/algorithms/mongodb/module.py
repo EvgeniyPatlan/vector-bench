@@ -153,6 +153,7 @@ class PerconaSearch(BaseANN):
                 if client.admin.command("hello").get("isWritablePrimary"):
                     client.close()
                     print("[vb] mongod is primary", file=sys.stderr)
+                    self._wait_for_mongot()
                     return
                 client.close()
             except Exception as exc:
@@ -161,6 +162,30 @@ class PerconaSearch(BaseANN):
         raise TimeoutError(
             f"mongod did not become primary within {SERVER_START_TIMEOUT_S}s: {last_error}"
         )
+
+    def _wait_for_mongot(self) -> None:
+        """mongod is ready long before mongot is.
+
+        The JVM needs fifteen to twenty seconds to reach its health check, and a
+        createSearchIndexes issued inside that window is accepted, creates a
+        Lucene index and then sits in PENDING with no initial sync queued. The
+        ops path never saw it because the orchestrator spends that long starting
+        a separate client container; this one runs in-process and reached the
+        index three seconds after mongot's process started.
+        """
+        import socket
+
+        port = int(os.environ.get("VB_MONGOT_HEALTH_PORT", "8080"))
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=2):
+                    print("[vb] mongot health check is answering", file=sys.stderr)
+                    return
+            except OSError:
+                time.sleep(1)
+        print("[vb] WARNING: mongot did not answer its health check; "
+              "index creation may hang in PENDING", file=sys.stderr)
 
     def _connect(self):
         return pymongo.MongoClient(_uri(), serverSelectionTimeoutMS=60000)

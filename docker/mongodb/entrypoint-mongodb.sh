@@ -148,6 +148,28 @@ start_mongot() {
   mongot --config="$MONGOT_CONF" --jvm-flags "-Xms${HEAP_GB}g -Xmx${HEAP_GB}g" \
       >"${MONGOT_DATA}/mongot.log" 2>&1 &
   echo $! > /tmp/mongot.pid
+  wait_for_mongot
+}
+
+wait_for_mongot() {
+  # mongod answers long before mongot does: the JVM takes fifteen to twenty
+  # seconds to reach its health check. A createSearchIndexes issued in that
+  # window is accepted, creates a Lucene index, and then sits in PENDING with
+  # no initial sync ever queued for it. The ops path never hit this because the
+  # orchestrator spends that long starting a separate client container; the ann
+  # path runs in-process and got there in three seconds.
+  local health="${VB_MONGOT_HEALTH_PORT:-8080}"
+  for _ in $(seq 1 120); do
+    if (exec 3<>/dev/tcp/127.0.0.1/"$health") 2>/dev/null; then
+      exec 3<&- 2>/dev/null || true
+      log "mongot health check is answering on ${health}"
+      return 0
+    fi
+    sleep 1
+  done
+  log "WARNING: mongot did not answer its health check within 120s; "
+  log "         search index creation may fail or hang in PENDING"
+  return 0
 }
 
 start_server() {
