@@ -6,13 +6,14 @@ Lucene process, `mongot`, holds the index and is fed from mongod's change
 stream. Four things follow, and each is a place where a benchmark written for
 the other engines would silently measure the wrong thing.
 
-  Build is asynchronous and overlapping. createSearchIndex returns in
-  milliseconds and the index is unqueryable until mongot has consumed the
-  change stream. Timing the call would report a build of nearly zero, so `fit`
-  polls until the index reports READY and counts the wait. That wait overlaps
-  the load rather than following it, which is why `build_seconds` here is
-  reported as load-plus-wait and flagged as a third build mode: not incremental
-  on INSERT like MHNSW and VIDX, and not a separable bulk build like pgvector.
+  Build is asynchronous. createSearchIndex returns in milliseconds and the
+  index is unqueryable until mongot has finished its initial sync, so `fit`
+  polls until the index reports READY and counts the wait. The index is created
+  after the load, not before: created first, mongot queues an initial sync over
+  an empty collection and the index stays PENDING while the writes stream past.
+  `build_seconds` is therefore load plus wait, and the mode is a third kind --
+  not incremental on INSERT like MHNSW and VIDX, and not a blocking bulk build
+  like pgvector.
 
   Search width is a per-query argument. numCandidates goes inside the
   $vectorSearch stage rather than into a session variable, and it is clamped to
@@ -176,17 +177,24 @@ class PerconaSearch(BaseANN):
         db.drop_collection(COLLECTION)
         db.create_collection(COLLECTION)
 
-        # The index is declared before the load so mongot indexes from the
-        # change stream as rows arrive. Declaring it afterwards would make it
-        # read the whole collection back, which measures a different operation
-        # and is not how the product is meant to be used.
-        self._create_index(dim)
+        # The index is declared AFTER the load, which is the order that works.
+        #
+        # Declaring it first looks better on paper: mongot would index from the
+        # change stream as rows arrive, overlapping the two. What it actually
+        # does is queue an initial sync over an empty collection, and the index
+        # then sits in PENDING indefinitely while the documents stream past --
+        # observed for six minutes on 2,000 rows, with mongot logging
+        # "Queued initial syncs, numQueued: 0" and never revisiting it. The ops
+        # driver has always created the index after the load and reaches READY
+        # in thirty seconds on the same data.
         self._load_seconds = self._insert_rows(X)
 
-        print("[vb] waiting for mongot to finish indexing", file=sys.stderr)
+        print("[vb] creating search index and waiting for mongot", file=sys.stderr)
+        self._create_index(dim)
         self._ready_seconds = self._wait_until_ready()
-        # Load and indexing overlap, so neither alone is the cost of having a
-        # queryable index. Wall time from the start of the load to READY is.
+        # Sequential now rather than overlapping, but still two costs: the
+        # write and the indexing of what was written. Neither alone is the cost
+        # of having a queryable index.
         self._build_seconds = self._load_seconds + self._ready_seconds
 
         self._index_bytes = self._measure_index_bytes()

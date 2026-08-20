@@ -2798,3 +2798,44 @@ class TestAnnFingerprintStaysEngineInvariant:
         resolved = self._resolve("valkey", "tuned")
         assert "pass_signature" in resolved.as_dict()
         assert ann_fingerprint(resolved.as_dict()) == ann_fingerprint(resolved)
+
+
+class TestMongotIndexesAfterTheLoad:
+    """Creating the search index before the load leaves it PENDING forever.
+
+    It reads better: mongot would index from the change stream as rows arrive
+    and the two would overlap. What it does is queue an initial sync over an
+    empty collection, log "Queued initial syncs, numQueued: 0", and never
+    revisit it. Observed stuck for six minutes on 2,000 rows while the ops
+    driver, which has always created the index after the load, reached READY in
+    thirty seconds on twenty thousand.
+
+    ann-benchmarks catches a per-algorithm exception and exits zero, so the
+    phase reported completed and wrote no results at all: a recall chart with
+    five of six engines on it and nothing saying why.
+    """
+
+    MODULE = os.path.join(VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+                          "algorithms", "mongodb", "module.py")
+
+    def test_the_load_happens_before_the_index_is_created(self):
+        source = open(self.MODULE).read()
+        body = source.split("def fit(")[1].split("def ")[0]
+        assert body.index("_insert_rows") < body.index("_create_index"), (
+            "the index is created before the load again; mongot will queue an "
+            "initial sync over an empty collection and stay PENDING")
+
+    def test_it_still_waits_for_ready(self):
+        source = open(self.MODULE).read()
+        body = source.split("def fit(")[1].split("def ")[0]
+        assert body.index("_create_index") < body.index("_wait_until_ready")
+
+    def test_the_ops_driver_orders_it_the_same_way(self):
+        """The two paths must agree, or the ann curve and the ops build cost
+        describe different operations."""
+        from harness.drivers.mongo import MongoDriver
+        import inspect
+        create_schema = inspect.getsource(MongoDriver.create_schema)
+        assert "create_search_index" not in create_schema, (
+            "create_schema must not build the index; the ops workload loads "
+            "first and calls create_index afterwards")
