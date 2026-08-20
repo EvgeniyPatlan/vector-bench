@@ -40,6 +40,14 @@ start_server() {
     --bind "0.0.0.0"
     --dir "$DATADIR"
     --protected-mode no
+    # Persistence off, set here rather than in the engine config because
+    # `--save ""` needs an empty argument and the config's flags are passed
+    # through an environment variable that word-splitting would discard it
+    # from. Every other engine has its durability weakened the same way
+    # (fsync=off, doublewrite off): what is measured is index behaviour, not
+    # the write-ahead path.
+    --save ""
+    --appendonly no
     --loadmodule "$MODULE"
   )
   # shellcheck disable=SC2206

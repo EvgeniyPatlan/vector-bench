@@ -394,6 +394,15 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     )
 
 
+#: Placeholders an engine's server args may use. Anything else is rendered
+#: literally and reaches the server as a nonsense value.
+SERVER_ARG_KEYS = (
+    "buffer_bytes", "graph_cache_bytes", "maintenance_bytes", "build_threads",
+    "server_cpu_count", "maxmemory_bytes", "mongot_heap_bytes",
+    "server_memory_bytes",
+)
+
+
 def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
                 resolved: ResolvedResources) -> List[str]:
     """Render an engine's server flags with the resolved values substituted."""
@@ -407,6 +416,13 @@ def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
         "maintenance_bytes": resolved.maintenance_bytes,
         "build_threads": resolved.build_threads,
         "server_cpu_count": resolved.server_cpu_count,
+        # Added with the in-memory and two-process engines. A placeholder with
+        # no entry here is passed through literally, and the server rejects it
+        # and exits in under a second, which is how every valkey phase of the
+        # first smoke run failed. See the test that scans for unknown keys.
+        "maxmemory_bytes": resolved.maxmemory_bytes,
+        "mongot_heap_bytes": resolved.mongot_heap_bytes,
+        "server_memory_bytes": resolved.server_memory_bytes,
     }
 
     rendered: List[str] = []
@@ -417,6 +433,13 @@ def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
         # A graph cache of zero is meaningless; drop the flag entirely rather
         # than passing 0 and having the engine reject it or disable caching.
         if resolved.graph_cache_bytes == 0 and "cache-size=0" in text.replace("_", "-"):
+            continue
+        # An empty argument cannot survive the trip: flags are joined into
+        # VB_SERVER_ARGS and word-split back apart in the entrypoint, which
+        # discards it and silently shifts the meaning of the flag before it.
+        # Anything needing an empty value belongs in the entrypoint, where the
+        # quoting holds.
+        if text == "":
             continue
         rendered.append(text)
     return rendered

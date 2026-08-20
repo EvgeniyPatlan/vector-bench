@@ -106,5 +106,24 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         table_bytes=table_bytes,
         notes=("incremental: build cost is the load cost" if incremental
                else "bulk build after load"),
-        extra={"separable_build": not incremental},
+        # The driver's own capabilities go in first. Without them an engine
+        # whose index is built asynchronously by another process reported only
+        # separable_build=True and was filed beside pgvector's bulk build,
+        # which is a different operation, and its time-to-ready was dropped
+        # entirely. separable_build is set last because it is a property of
+        # how this workload ran, not of the driver.
+        extra={**_driver_capabilities(driver),
+               "separable_build": not incremental},
     ))
+
+
+def _driver_capabilities(driver) -> dict:
+    """Whatever the driver knows about itself that the record should carry.
+
+    Defensive: a driver whose capabilities() raises should not lose the
+    measurement that has already been taken.
+    """
+    try:
+        return dict(driver.capabilities() or {})
+    except Exception:
+        return {}

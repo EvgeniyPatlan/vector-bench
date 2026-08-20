@@ -2538,3 +2538,121 @@ class TestPipFlagsSuitTheBaseImage:
             assert "pip3 install --help" in source, (
                 f"{engine} builds on {base!r}, which may ship a pip without "
                 f"--break-system-packages; the flag must be detected there")
+
+
+class TestServerArgsRenderCompletely:
+    """An unknown placeholder reaches the server verbatim.
+
+    valkey's config asked for {maxmemory_bytes}, which server_args did not
+    substitute, so valkey-server was launched with the literal string
+    "{maxmemory_bytes}" as a memory limit. It rejected it and exited, and all
+    four valkey phases of the first smoke run failed in under two seconds with
+    nothing written. Nothing checked the placeholders against the keys.
+    """
+
+    def _resolved(self, engine, resource_pass):
+        from orchestrator.config import load_resources, resolve_resources
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        return resolve_resources(load_resources(resource_pass), engine, info)
+
+    def test_every_placeholder_in_every_config_is_known(self):
+        import re
+        import yaml
+        from orchestrator.config import SERVER_ARG_KEYS
+        from orchestrator.cli import KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            with open(os.path.join(VB_ROOT, "config", "engines",
+                                   f"{engine}.yml")) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            for section, args in (cfg.get("server") or {}).items():
+                for arg in args or []:
+                    for key in re.findall(r"\{(\w+)\}", str(arg)):
+                        assert key in SERVER_ARG_KEYS, (
+                            f"{engine}/{section} uses {{{key}}}, which "
+                            f"server_args does not substitute; the server "
+                            f"would receive it literally")
+
+    def test_nothing_unsubstituted_survives_rendering(self):
+        from orchestrator.config import load_engine, server_args
+        from orchestrator.cli import KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            for resource_pass in ("normalized", "tuned"):
+                rendered = server_args(load_engine(engine), resource_pass,
+                                       self._resolved(engine, resource_pass))
+                for arg in rendered:
+                    assert "{" not in arg, f"{engine}/{resource_pass}: {arg!r}"
+
+    def test_empty_arguments_are_dropped(self):
+        """Flags are joined into VB_SERVER_ARGS and word-split back apart, so
+        an empty argument disappears and shifts the meaning of the flag before
+        it. Anything needing one belongs in the entrypoint."""
+        from orchestrator.config import server_args
+        cfg = {"server": {"common": ["--save", "", "--appendonly", "no"]}}
+        rendered = server_args(cfg, "normalized", self._resolved("valkey", "normalized"))
+        assert "" not in rendered
+        assert rendered == ["--save", "--appendonly", "no"]
+
+    def test_valkey_gets_a_real_memory_limit(self):
+        from orchestrator.config import load_engine, server_args
+        rendered = server_args(load_engine("valkey"), "tuned",
+                               self._resolved("valkey", "tuned"))
+        limit = rendered[rendered.index("--maxmemory") + 1]
+        assert limit.isdigit() and int(limit) > 0
+
+
+class TestBuildRecordCarriesDriverCapabilities:
+    """The build workload wrote one extra and dropped everything else.
+
+    In the first smoke run mongodb's index_build record contained only
+    separable_build=True, so an index built asynchronously by another process
+    was filed beside pgvector's bulk build, and index_ready_seconds -- the
+    whole point of measuring an async build -- was never recorded. The report
+    work that renders a third build kind had nothing to render from.
+    """
+
+    class FakeDriver:
+        name = "fake"
+        incremental_index = False
+        async_index_build = True
+
+        def capabilities(self):
+            return {"async_index_build": True, "index_ready_seconds": 41.5,
+                    "separable_build": "should be overridden"}
+
+    class AngryDriver(FakeDriver):
+        def capabilities(self):
+            raise RuntimeError("no")
+
+    def test_capabilities_reach_the_record(self):
+        from harness.workloads.build import _driver_capabilities
+        caps = _driver_capabilities(self.FakeDriver())
+        assert caps["async_index_build"] is True
+        assert caps["index_ready_seconds"] == 41.5
+
+    def test_a_failing_driver_does_not_lose_the_measurement(self):
+        from harness.workloads.build import _driver_capabilities
+        assert _driver_capabilities(self.AngryDriver()) == {}
+
+    def test_separable_build_wins_over_the_driver(self):
+        """It is a property of how this workload ran, not of the driver."""
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "build.py")).read()
+        merged = source.split("extra={**_driver_capabilities(driver),")[1]
+        assert '"separable_build": not incremental' in merged.split("}")[0]
+
+    def test_the_async_kind_renders_once_the_extras_arrive(self):
+        """End to end: with capabilities merged, the build table stops calling
+        an async build a bulk one."""
+        from report.render import _index_build_kind
+        record = {"engine": "mongodb", "build_mode": "post",
+                  "extra": {"separable_build": True, "async_index_build": True,
+                            "index_ready_seconds": 41.5}}
+        kind = _index_build_kind(record)
+        assert kind.startswith("async")
+        assert "bulk" not in kind

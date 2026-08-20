@@ -96,14 +96,10 @@ valkey:
 
 server:
   common:
-    # Persistence off. Every other engine has its durability weakened for the
-    # same reason (fsync=off, doublewrite off): the measurement is of index
-    # behaviour, not of the write-ahead path, and leaving it on would measure
-    # different durability guarantees against each other.
-    - --save
-    - ""
-    - --appendonly
-    - "no"
+    # Persistence is turned off in the entrypoint instead: `--save ""` needs an
+    # empty argument, and these flags are joined into an environment variable
+    # and word-split back apart, which drops it.
+    #
     # See the trap above. Not negotiable per pass.
     - --maxmemory-policy
     - noeviction
