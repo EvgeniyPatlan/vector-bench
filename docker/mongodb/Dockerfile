@@ -24,7 +24,7 @@
 # floating on a tag.
 
 ARG BASE_IMAGE=percona/percona-server-mongodb:8.3
-ARG MONGOT_IMAGE=percona/percona-server-mongodb-mongot:1.70.3-1
+ARG MONGOT_IMAGE=percona/percona-search-mongodb:1.70.3-1
 
 # ---------------------------------------------------------------------------
 FROM ${MONGOT_IMAGE} AS mongot

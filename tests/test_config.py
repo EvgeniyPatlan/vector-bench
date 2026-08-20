@@ -2359,3 +2359,56 @@ class TestShellScriptsOnlyCallHelpersThatExist:
                     assert name in defined, (
                         f"{os.path.basename(script)} calls '{name}', which is "
                         f"defined neither there nor in lib.sh")
+
+
+class TestBuildScriptHandlesEveryEngineItAccepts:
+    """build-images.sh accepted mongodb and valkey and then could not build them.
+
+    Three separate gates assumed a compiled engine, and each failed only when
+    reached, on the user's machine, one per attempt: a required source.tar that
+    engines with no source never produce, an image tag read from source.tag
+    which they do not have, and a build-arg case statement with no branch for
+    them. Every one of those is decidable from the config.
+    """
+
+    SCRIPT = os.path.join(VB_ROOT, "scripts", "build-images.sh")
+
+    def _source(self, engine):
+        import yaml
+        with open(os.path.join(VB_ROOT, "config", "engines", f"{engine}.yml")) as fh:
+            return (yaml.safe_load(fh) or {}).get("source", {}) or {}
+
+    def test_every_engine_resolves_an_image_tag(self):
+        """Without this they are all tagged ':unknown' and overwrite each
+        other in the local image store."""
+        from orchestrator.cli import KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            src = self._source(engine)
+            assert src.get("tag") or src.get("version"), engine
+
+    def test_every_engine_has_a_build_arg_branch(self):
+        from orchestrator.cli import KNOWN_ENGINES
+        import yaml
+        script = open(self.SCRIPT).read()
+        branches = script.split("case \"$base\" in")[1].split("esac")[0]
+        for engine in KNOWN_ENGINES:
+            with open(os.path.join(VB_ROOT, "config", "engines",
+                                   f"{engine}.yml")) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            base = cfg.get("alias_of", engine)
+            assert f"{base})" in branches, (
+                f"{engine} (alias_of={base}) has no build-arg branch in "
+                f"build-images.sh and would die at build time")
+
+    def test_source_tar_is_required_only_of_compiled_engines(self):
+        script = open(self.SCRIPT).read()
+        assert 'kind" == "source"' in script, (
+            "the source.tar gate is unconditional again; engines installed "
+            "from images or packages have no tarball to check for")
+
+    def test_the_dispatch_accepts_every_known_engine(self):
+        from orchestrator.cli import KNOWN_ENGINES
+        script = open(self.SCRIPT).read()
+        dispatch = script.rsplit('case "$ENGINE" in', 1)[1]
+        for engine in KNOWN_ENGINES:
+            assert engine in dispatch, f"build-images.sh cannot build {engine}"

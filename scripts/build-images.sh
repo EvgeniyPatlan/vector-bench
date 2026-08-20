@@ -69,16 +69,40 @@ print(" ".join(cfg.get("build", {}).get("cmake_flags", []) or []))
 PY
 }
 
+# Read a space-separated list out of an engine config (yq_get cannot do lists).
+list_for() {
+  python3 - "$VB_CONFIG/engines/$1.yml" "$2" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+node = cfg
+for part in sys.argv[2].split("."):
+    node = (node or {}).get(part)
+print(" ".join(node or []))
+PY
+}
+
 build_engine() {
   local engine="$1"
   local cfg="$VB_CONFIG/engines/$engine.yml"
   [[ -f "$cfg" ]] || die "no config for engine '$engine'"
 
   local ctx="$VB_BUILDCTX/$engine"
-  [[ -f "$ctx/source.tar" ]] \
+  [[ -d "$ctx" ]] \
     || die "build context missing for $engine — run: scripts/prepare-sources.sh --engine $engine"
+  # Only engines we compile have a source tarball. Percona Search arrives as
+  # published images and Valkey as packages, so requiring source.tar of them
+  # failed a build whose context prepare-sources had just reported ready.
+  local kind; kind="$(yq_get "$cfg" source.kind "source")"
+  if [[ "$kind" == "source" ]]; then
+    [[ -f "$ctx/source.tar" ]] \
+      || die "build context for $engine has no source.tar — run: scripts/prepare-sources.sh --engine $engine"
+  fi
 
-  local tag;      tag="$(yq_get "$cfg" source.tag unknown)"
+  # Engines we compile carry a git tag. Percona Search is a published image and
+  # Valkey is a package set, so they carry a version instead and their images
+  # would otherwise all be tagged ":unknown".
+  local tag;      tag="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$tag" ]] || tag="$(yq_get "$cfg" source.version unknown)"
   local base;     base="$(yq_get "$cfg" image.base ubuntu:24.04)"
   local rt_image; rt_image="$(yq_get "$cfg" image.runtime "vector-bench/${engine}-runtime")"
   local bn_image; bn_image="$(yq_get "$cfg" image.bench   "vector-bench/${engine}-bench")"
@@ -105,6 +129,15 @@ build_engine() {
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
+    # Nothing compiled: the module is copied out of its own published image.
+    mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
+    # Nothing compiled: installed from a Percona repository. The package list
+    # comes from the config, so a name that does not resolve is one edit away
+    # rather than a code change.
+    valkey)   bargs+=(
+                --build-arg "VALKEY_REPO=$(yq_get "$cfg" source.repository "")"
+                --build-arg "VALKEY_PACKAGES=$(list_for "$engine" source.packages)"
+              ) ;;
     *) die "engine '$engine' has no known build-arg (alias_of=$base)" ;;
   esac
 

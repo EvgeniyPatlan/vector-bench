@@ -43,6 +43,8 @@ source:
   # reproducible statement and the report has to be able to say which build ran.
   kind: percona_repo
   repository: valkey-91
+  # Used as the image tag: there is no git tag to name this build by.
+  version: "9.1"
   # Verified on the build host rather than assumed: build-images fails with the
   # available package list if a name here does not resolve, which is cheaper
   # than discovering it after the corpus is loaded.

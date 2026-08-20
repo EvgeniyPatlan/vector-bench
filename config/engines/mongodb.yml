@@ -37,7 +37,7 @@ source:
   # exists to guarantee.
   kind: image
   version: 1.70.3-1
-  mongot_image: percona/percona-server-mongodb-mongot:1.70.3-1
+  mongot_image: percona/percona-search-mongodb:1.70.3-1
   server_image: percona/percona-server-mongodb:8.3
   # Filled in by `run-benchmark.sh sources` and recorded in the manifest.
   mongot_digest: null
