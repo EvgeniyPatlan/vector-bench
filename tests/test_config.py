@@ -2820,14 +2820,14 @@ class TestMongotIndexesAfterTheLoad:
 
     def test_the_load_happens_before_the_index_is_created(self):
         source = open(self.MODULE).read()
-        body = source.split("def fit(")[1].split("def ")[0]
+        body = source.split("def _fit(")[1].split("\n    def ")[0]
         assert body.index("_insert_rows") < body.index("_create_index"), (
             "the index is created before the load again; mongot will queue an "
             "initial sync over an empty collection and stay PENDING")
 
     def test_it_still_waits_for_ready(self):
         source = open(self.MODULE).read()
-        body = source.split("def fit(")[1].split("def ")[0]
+        body = source.split("def _fit(")[1].split("\n    def ")[0]
         assert body.index("_create_index") < body.index("_wait_until_ready")
 
     def test_the_ops_driver_orders_it_the_same_way(self):
@@ -2878,3 +2878,49 @@ class TestBothProcessesAreWaitedFor:
         probe = " ".join(PROBES["mongodb"])
         assert "isWritablePrimary" in probe
         assert "8080" in probe, "the probe does not check mongot at all"
+
+
+class TestSilentAnnFailuresAreReported:
+    """A recall phase can complete and measure nothing.
+
+    ann-benchmarks catches a per-algorithm exception and exits zero, so a
+    module that raises leaves the phase marked completed and the engine simply
+    absent from the recall comparison. Percona Search failed that way three
+    runs in a row while its other workloads succeeded, which is exactly what
+    makes it easy to miss: the engine is present everywhere except the one
+    table, and nothing says why.
+    """
+
+    MANIFEST = {"phases": [
+        {"engine": "mongodb", "phase": "ann", "status": "completed",
+         "dataset": "d", "resource_pass": "tuned", "duration_s": 85.2},
+        {"engine": "mariadb", "phase": "ann", "status": "completed",
+         "dataset": "d", "resource_pass": "tuned", "duration_s": 160.0},
+    ]}
+
+    def _summary(self, engines_with_results=("mariadb",)):
+        from report.generate import summarize
+        recs = [{"phase": "recall_qps", "engine": e, "dataset": "d", "m": 16,
+                 "ef_search": 10, "recall_at_k": 0.99, "qps": 100.0,
+                 "resource_pass": "tuned", "build_mode": "post"}
+                for e in engines_with_results]
+        return summarize(recs, self.MANIFEST)
+
+    def test_an_engine_that_measured_nothing_is_named(self):
+        s = self._summary()
+        assert [f["engine"] for f in s["silent_ann_failures"]] == ["mongodb"]
+
+    def test_an_engine_that_measured_something_is_not(self):
+        s = self._summary(engines_with_results=("mariadb", "mongodb"))
+        assert s["silent_ann_failures"] == []
+
+    def test_the_validity_section_calls_it_a_failure(self):
+        from report.render import _validity_section
+        text = _validity_section({}, self._summary())
+        assert "measured nothing" in text
+        assert "failure, not a finding" in text
+
+    def test_it_is_silent_on_a_clean_run(self):
+        from report.render import _validity_section
+        s = self._summary(engines_with_results=("mariadb", "mongodb"))
+        assert "measured nothing" not in _validity_section({}, s)

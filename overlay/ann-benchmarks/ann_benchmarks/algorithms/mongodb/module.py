@@ -71,6 +71,9 @@ def _uri() -> str:
 
 READY_POLL_S = float(os.environ.get("VB_MONGOT_POLL_INTERVAL", "2"))
 READY_TIMEOUT_S = float(os.environ.get("VB_MONGOT_READY_TIMEOUT", "43200"))
+# createSearchIndex returns before the index is listable, so an index that is
+# not there yet is normal for the first seconds and a fault only if it lasts.
+MISSING_INDEX_GRACE_S = float(os.environ.get("VB_MONGOT_MISSING_GRACE", "60"))
 INSERT_BATCH = int(os.environ.get("VB_MONGO_INSERT_BATCH", "1000"))
 
 SIMILARITY = {"angular": "cosine", "euclidean": "euclidean"}
@@ -195,6 +198,15 @@ class PerconaSearch(BaseANN):
     # ------------------------------------------------------------------
 
     def fit(self, X: numpy.ndarray) -> None:
+        try:
+            self._fit(X)
+        except Exception:
+            # Anything that goes wrong here is otherwise invisible: the phase
+            # is reported completed and no result file is written.
+            self._dump_mongot_log()
+            raise
+
+    def _fit(self, X: numpy.ndarray) -> None:
         dim = int(X.shape[1])
         self._dim = dim
         db = self._client[DATABASE]
@@ -278,12 +290,24 @@ class PerconaSearch(BaseANN):
             status = self._index_status()
             if status == "READY":
                 return time.time() - started
-            if status in ("FAILED", "DOES_NOT_EXIST"):
+            # DOES_NOT_EXIST is not fatal on its own: createSearchIndex returns
+            # before the index is listable, so the first polls legitimately see
+            # nothing. It is fatal only if it persists, which means mongod
+            # accepted the index and mongot never took it.
+            fatal = status == "FAILED" or (
+                status == "DOES_NOT_EXIST"
+                and time.time() - started > MISSING_INDEX_GRACE_S)
+            if fatal:
+                self._dump_mongot_log()
                 raise RuntimeError(
-                    f"mongot index build reported {status}; "
-                    "check the mongot log in the container's data directory")
+                    f"mongot index reported {status} after "
+                    f"{time.time() - started:.0f}s. The mongot log tail is "
+                    f"above; the usual causes are mongot not being reachable "
+                    f"from mongod and the index never being queued for an "
+                    f"initial sync.")
             waited = time.time() - started
             if waited > READY_TIMEOUT_S:
+                self._dump_mongot_log()
                 raise TimeoutError(
                     f"mongot index still {status} after {waited / 3600:.1f} h")
             if time.time() - last_report >= 30:
@@ -291,6 +315,28 @@ class PerconaSearch(BaseANN):
                       file=sys.stderr)
                 last_report = time.time()
             time.sleep(READY_POLL_S)
+
+    def _dump_mongot_log(self, lines: int = 40) -> None:
+        """Put mongot's own log where the failure is visible.
+
+        ann-benchmarks catches a per-algorithm exception and exits zero, so a
+        module that raises leaves a phase marked completed with no results and
+        no explanation anywhere. mongot logs to a file inside the container that
+        nothing collects, which is why three runs failed identically with
+        nothing to diagnose from.
+        """
+        path = os.path.join(os.environ.get("VB_MONGOT_DATA",
+                                           "/var/lib/vbench/mongot"),
+                            "mongot.log")
+        print(f"[vb] --- mongot log tail ({path}) ---", file=sys.stderr)
+        try:
+            with open(path) as fh:
+                tail = fh.readlines()[-lines:]
+            for line in tail:
+                print(f"[mongot] {line.rstrip()}", file=sys.stderr)
+        except OSError as exc:
+            print(f"[vb] could not read the mongot log: {exc}", file=sys.stderr)
+        print("[vb] --- end mongot log ---", file=sys.stderr)
 
     def _index_status(self) -> str:
         try:

@@ -101,6 +101,7 @@ def summarize(records: List[Dict[str, Any]],
         "stale_ann": [],
         "duplicate_ann": [],
         "recall_floor_gaps": [],
+        "silent_ann_failures": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
     }
@@ -237,6 +238,26 @@ def summarize(records: List[Dict[str, Any]],
                        ("filtered", "filtered"), ("churn", "churn"),
                        ("ingest", "ingest")):
         summary[key] = [r for r in records if r.get("phase") == phase]
+
+    # An engine whose ann phase ran and wrote nothing.
+    #
+    # ann-benchmarks catches a per-algorithm exception and exits zero, so a
+    # module that raises leaves the phase marked completed and the engine
+    # simply absent from the recall comparison. Three runs of Percona Search
+    # failed that way before anyone noticed the engine was missing rather than
+    # slow, because nothing distinguished "did not run" from "ran and produced
+    # no measurement".
+    measured = {r.get("engine") for r in recall_records}
+    for phase in (manifest or {}).get("phases", []):
+        engine = phase.get("engine")
+        if (phase.get("phase") == "ann" and phase.get("status") == "completed"
+                and engine and engine not in measured):
+            summary["silent_ann_failures"].append({
+                "engine": engine,
+                "dataset": phase.get("dataset"),
+                "resource_pass": phase.get("resource_pass"),
+                "duration_s": phase.get("duration_s"),
+            })
 
     # A phase that failed leaves a hole in the results. Without this the report
     # simply omits that engine/pass and a reader cannot distinguish "not

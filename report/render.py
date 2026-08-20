@@ -158,6 +158,25 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         parts.append(_md_table(
             ["Engine", "Phase", "Pass", "Dataset", "Exit code", "Ran for"], rows))
 
+    if summary.get("silent_ann_failures"):
+        parts.append(
+            "\n### Recall phases that ran and measured nothing\n\n"
+            "The engines below completed their recall phase and wrote **no "
+            "measurements at all**. ann-benchmarks catches a per-algorithm "
+            "exception and exits successfully, so a module that raises leaves "
+            "the phase marked completed and the engine simply absent from the "
+            "comparison below. That absence is a failure, not a finding, and "
+            "the engine's other workloads may still have succeeded, which "
+            "makes it easy to miss. The reason is in the run log for that "
+            "phase, not in this report.\n"
+        )
+        rows = [[_label(f.get("engine", "?")), f.get("dataset") or "—",
+                 f.get("resource_pass") or "—",
+                 f"{(f.get('duration_s') or 0) / 60:.1f} min"]
+                for f in summary["silent_ann_failures"][:20]]
+        parts.append(_md_table(
+            ["Engine", "Dataset", "Pass", "Ran for"], rows))
+
     if summary.get("plan_failures"):
         parts.append(
             "### Measurements that did not use the vector index\n\n"
