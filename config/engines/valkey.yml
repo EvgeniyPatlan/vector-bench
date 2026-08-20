@@ -49,11 +49,17 @@ source:
   # available package list if a name here does not resolve, which is cheaper
   # than discovering it after the corpus is loaded.
   packages:
-    - percona-valkey
+    # The server, the client (valkey-cli, which the entrypoint and the
+    # readiness probe both use) and the search module. Not
+    # percona-valkey-bundle: that pulls audit, bloom, json and ldap as well,
+    # which is more surface in the measured process for no benefit here.
+    - percona-valkey-server
+    - percona-valkey-tools
     - percona-valkey-search
-  # Where the module lands. The entrypoint loads it with --loadmodule and
-  # refuses to start the server without it, since a Valkey with no search
-  # module accepts writes and then fails every query.
+  # Where the module lands is asked of dpkg at build time rather than guessed,
+  # and written into the image. This value is only the fallback hint. The
+  # entrypoint refuses to start without the module, since a Valkey lacking it
+  # accepts every write and then fails every query.
   module_path: /usr/lib/valkey/modules/libsearch.so
   # Filled in at build time from the installed packages.
   installed_versions: null

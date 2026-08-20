@@ -87,13 +87,26 @@ class MongoDriver(EngineDriver):
     def connect(self) -> None:
         if pymongo is None:
             raise RuntimeError("pymongo is not installed in this image")
-        uri = (f"mongodb://{self.spec.host}:{self.spec.port}/"
-               f"?directConnection=true")
+        uri = self._uri()
         self._conn = pymongo.MongoClient(uri, serverSelectionTimeoutMS=60000)
         # Fail here rather than inside the first measured operation.
         self._conn.admin.command("ping")
         self._db = self._conn[self.spec.database or DATABASE]
         self._coll = self._db[TABLE]
+
+    def _uri(self) -> str:
+        """Authenticated, unlike every other driver here.
+
+        mongot will not parse a config without SCRAM or x509, so mongod runs
+        with auth on and the benchmark client has to authenticate as well. The
+        credentials are fixed and local to an isolated container network; they
+        are not a secret, they are a requirement mongot imposes.
+        """
+        user, password = self.spec.user, self.spec.password
+        if not user:
+            return f"mongodb://{self.spec.host}:{self.spec.port}/?directConnection=true"
+        return (f"mongodb://{user}:{password}@{self.spec.host}:{self.spec.port}/"
+                f"?directConnection=true&authSource=admin")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -202,8 +215,7 @@ class MongoDriver(EngineDriver):
         # Each worker opens its own client: MongoClient is thread safe but
         # shares one connection pool, and sharing it would make the thread count
         # a setting on the pool rather than a real measure of write concurrency.
-        client = pymongo.MongoClient(
-            f"mongodb://{self.spec.host}:{self.spec.port}/?directConnection=true")
+        client = pymongo.MongoClient(self._uri())
         try:
             coll = client[self.spec.database or DATABASE][TABLE]
             for chunk_start in range(begin, end, batch):

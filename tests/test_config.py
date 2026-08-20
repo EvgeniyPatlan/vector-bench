@@ -2412,3 +2412,91 @@ class TestBuildScriptHandlesEveryEngineItAccepts:
         dispatch = script.rsplit('case "$ENGINE" in', 1)[1]
         for engine in KNOWN_ENGINES:
             assert engine in dispatch, f"build-images.sh cannot build {engine}"
+
+    def test_valkey_installs_a_server_a_client_and_the_module(self):
+        """valkey-cli comes from percona-valkey-tools, and both the entrypoint
+        and the readiness probe shell out to it. Installing only the server and
+        the module leaves the probe failing against a healthy server."""
+        packages = self._source("valkey").get("packages") or []
+        assert "percona-valkey-server" in packages
+        assert "percona-valkey-search" in packages
+        assert "percona-valkey-tools" in packages, (
+            "valkey-cli is missing; the readiness probe runs "
+            "`valkey-cli MODULE LIST`")
+
+    def test_valkey_does_not_pull_the_whole_bundle(self):
+        """percona-valkey-bundle carries audit, bloom, json and ldap too, which
+        is more surface in the measured process for no benefit."""
+        assert "percona-valkey-bundle" not in (
+            self._source("valkey").get("packages") or [])
+
+    def test_the_module_path_is_resolved_rather_than_assumed(self):
+        dockerfile = open(os.path.join(VB_ROOT, "docker", "valkey",
+                                       "Dockerfile")).read()
+        assert "dpkg -L percona-valkey-search" in dockerfile
+        assert ".module_path" in dockerfile
+
+
+class TestMongotForcesAuthentication:
+    """mongot will not parse a config without SCRAM or x509.
+
+      BsonParseException: "syncSource" Exactly one authentication mechanism
+      must be used (x509 or scram)
+
+    Every other engine here runs with auth off, because credentials add a round
+    trip to nothing being measured. This one cannot, so mongod runs
+    authenticated with a keyfile, and every client authenticates: the driver,
+    the ann module and the readiness probe. A probe that does not is the worst
+    of the three, because it reports a healthy server as unreachable.
+    """
+
+    def test_the_credentials_registry_is_not_empty_for_mongodb(self):
+        from orchestrator.ops_pass import DB_CREDENTIALS
+        user, password = DB_CREDENTIALS["mongodb"]
+        assert user and password
+
+    def test_the_readiness_probe_authenticates(self):
+        from orchestrator.ops_pass import PROBES
+        probe = " ".join(PROBES["mongodb"])
+        assert "-u" in probe and "authenticationDatabase" in probe
+
+    def test_the_driver_builds_an_authenticated_uri(self):
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.mongo import MongoDriver
+        d = MongoDriver(ConnectionSpec(host="h", port=27017,
+                                       user="bench", password="bench"))
+        uri = d._uri()
+        assert uri.startswith("mongodb://bench:bench@")
+        assert "authSource=admin" in uri
+
+    def test_the_ann_module_authenticates_too(self):
+        source = open(os.path.join(
+            VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+            "algorithms", "mongodb", "module.py")).read()
+        assert "authSource=admin" in source
+
+    def test_the_entrypoint_runs_mongod_with_auth_and_a_keyfile(self):
+        """A replica set with auth needs internal member authentication too,
+        and mongod refuses a keyfile that is group or world readable."""
+        script = open(os.path.join(VB_ROOT, "docker", "mongodb",
+                                   "entrypoint-mongodb.sh")).read()
+        assert "--keyFile" in script and "--auth" in script
+        assert "chmod 400" in script
+
+    def test_the_entrypoint_writes_a_config_rather_than_passing_flags(self):
+        """--config is mongot's only option; the flags an earlier version
+        passed do not exist."""
+        script = open(os.path.join(VB_ROOT, "docker", "mongodb",
+                                   "entrypoint-mongodb.sh")).read()
+        assert "--config=" in script and "scramAuth" in script
+        for invented in ("--dataDir", "--mongodHostAndPort"):
+            assert invented not in script, f"{invented} is not a mongot option"
+
+    def test_the_dockerfile_copies_the_bundle_that_exists(self):
+        """The search image has no /opt/mongot and no system JVM: the launcher,
+        the jars and the JDK are all under /usr/lib/percona-search-mongodb."""
+        dockerfile = open(os.path.join(VB_ROOT, "docker", "mongodb",
+                                       "Dockerfile")).read()
+        assert "/usr/lib/percona-search-mongodb" in dockerfile
+        assert "/opt/mongot" not in dockerfile
+        assert "/usr/lib/jvm" not in dockerfile

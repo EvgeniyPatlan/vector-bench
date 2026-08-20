@@ -41,13 +41,17 @@ ENV VB_ENGINE=mongodb \
     VB_ENGINE_FAMILY=mongo \
     VB_MONGOT_IMAGE=${MONGOT_IMAGE}
 
-# mongot and the JRE it runs on. Copied rather than installed so the runtime
-# image carries exactly the build the digest names.
-COPY --from=mongot /opt/mongot /opt/mongot
-COPY --from=mongot /usr/lib/jvm /usr/lib/jvm
+# The mongot bundle: launcher, jars, and its own JDK. There is no system JVM in
+# the search image and none is needed -- /usr/lib/percona-search-mongodb/bin/jdk
+# is what the launcher execs, and it is the JVM whose vector API provides the
+# distance kernels. /usr/bin/mongot is a wrapper that must keep its own name
+# because the real launcher resolves its siblings relative to itself.
+COPY --from=mongot /usr/lib/percona-search-mongodb /usr/lib/percona-search-mongodb
+COPY --from=mongot /usr/bin/mongot /usr/bin/mongot
+COPY --from=mongot /etc/mongot /etc/mongot
 
-ENV PATH="/opt/mongot/bin:${PATH}" \
-    JAVA_HOME=/usr/lib/jvm/default-jvm
+ENV VB_MONGOT_HOME=/usr/lib/percona-search-mongodb \
+    VB_MONGOT_JAVA=/usr/lib/percona-search-mongodb/bin/jdk/bin/java
 
 COPY entrypoint-mongodb.sh /usr/local/bin/vb-entrypoint
 RUN chmod +x /usr/local/bin/vb-entrypoint

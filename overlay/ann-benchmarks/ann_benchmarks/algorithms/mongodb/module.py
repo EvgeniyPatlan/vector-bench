@@ -55,6 +55,18 @@ DATABASE = os.environ.get("VB_DATABASE", "ann")
 COLLECTION = "t1"
 INDEX_NAME = "vector_index"
 PORT = int(os.environ.get("VB_MONGOD_PORT", "27017"))
+# mongot refuses to parse a config without SCRAM or x509, so mongod runs with
+# auth on and this client authenticates too. Fixed credentials on an isolated
+# container network: not a secret, a requirement mongot imposes.
+USER = os.environ.get("VB_MONGO_USER", "bench")
+PASSWORD = os.environ.get("VB_MONGO_PASSWORD", "bench")
+
+
+def _uri() -> str:
+    if not USER:
+        return f"mongodb://localhost:{PORT}/?directConnection=true"
+    return (f"mongodb://{USER}:{PASSWORD}@localhost:{PORT}/"
+            f"?directConnection=true&authSource=admin")
 
 READY_POLL_S = float(os.environ.get("VB_MONGOT_POLL_INTERVAL", "2"))
 READY_TIMEOUT_S = float(os.environ.get("VB_MONGOT_READY_TIMEOUT", "43200"))
@@ -133,9 +145,7 @@ class PerconaSearch(BaseANN):
                 )
             try:
                 client = pymongo.MongoClient(
-                    f"mongodb://localhost:{PORT}/?directConnection=true",
-                    serverSelectionTimeoutMS=2000,
-                )
+                    _uri(), serverSelectionTimeoutMS=2000)
                 # Writable primary, not merely reachable: mongod answers a ping
                 # while still SECONDARY, and a load that starts before the
                 # election completes fails on its first insert.
@@ -152,10 +162,7 @@ class PerconaSearch(BaseANN):
         )
 
     def _connect(self):
-        return pymongo.MongoClient(
-            f"mongodb://localhost:{PORT}/?directConnection=true",
-            serverSelectionTimeoutMS=60000,
-        )
+        return pymongo.MongoClient(_uri(), serverSelectionTimeoutMS=60000)
 
     # ------------------------------------------------------------------
     # Fit

@@ -46,7 +46,8 @@ PROBES = {
     # readiness is checked separately, when the index is created.
     "mongodb": [
         "sh", "-c",
-        "mongosh --quiet --port 27017 --eval "
+        "mongosh --quiet --port 27017 -u bench -p bench "
+        "--authenticationDatabase admin --eval "
         "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true",
     ],
     # PING alone would pass before the module finished loading, and a Valkey
@@ -76,9 +77,10 @@ DB_CREDENTIALS = {
     "mariadb123": ("bench", "bench"),
     "alisql": ("bench", "bench"),
     "pgvector": ("postgres", ""),
-    # No authentication: the container is on an isolated network and
-    # skipAuthenticationToSearchIndexManagementServer is set for mongot anyway.
-    "mongodb": ("", ""),
+    # The only engine here that must run with auth on. mongot refuses to parse
+    # a config without SCRAM or x509, so mongod runs authenticated and every
+    # client authenticates with it.
+    "mongodb": ("bench", "bench"),
     # No AUTH: the container is on an isolated network, and requirepass would
     # add a round trip to every measured command.
     "valkey": ("", ""),

@@ -42,7 +42,7 @@ RUN set -eux; \
 # and a name that does not resolve fails with the list of what the repository
 # actually offers. Discovering that after the corpus is loaded costs hours;
 # discovering it here costs a rebuild.
-ARG VALKEY_PACKAGES="percona-valkey percona-valkey-search"
+ARG VALKEY_PACKAGES="percona-valkey-server percona-valkey-tools percona-valkey-search"
 RUN set -eux; \
     for pkg in ${VALKEY_PACKAGES}; do \
       if ! apt-cache show "$pkg" >/dev/null 2>&1; then \
@@ -63,6 +63,20 @@ RUN set -eux; \
       printf '%s=%s\n' "$pkg" "$(dpkg-query -W -f='${Version}' "$pkg")"; \
     done > /opt/valkey-artifacts/.packages; \
     cat /opt/valkey-artifacts/.packages
+
+# Ask dpkg where the module actually is rather than hardcoding a path. Guessing
+# it costs a full build to find out, and the answer is already in the package
+# manifest. Recorded in the image so the entrypoint does not have to search.
+RUN set -eux; \
+    module="$(dpkg -L percona-valkey-search | grep -E '\.so$' | head -1)"; \
+    if [ -z "$module" ]; then \
+      echo "ERROR: percona-valkey-search installed no shared object." >&2; \
+      echo "Files it did install:" >&2; \
+      dpkg -L percona-valkey-search >&2; \
+      exit 1; \
+    fi; \
+    echo "$module" > /opt/valkey-artifacts/.module_path; \
+    echo "search module: $module"
 
 COPY entrypoint-valkey.sh /usr/local/bin/vb-entrypoint
 RUN chmod +x /usr/local/bin/vb-entrypoint

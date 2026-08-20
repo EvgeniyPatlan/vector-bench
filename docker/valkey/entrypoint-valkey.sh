@@ -13,7 +13,13 @@
 set -euo pipefail
 
 PORT="${VB_VALKEY_PORT:-6379}"
-MODULE="${VB_MODULE_PATH:-/usr/lib/valkey/modules/libsearch.so}"
+# Resolved by dpkg at build time and recorded in the image; the environment
+# variable is only an override for running the image by hand.
+MODULE="${VB_MODULE_PATH:-}"
+if [[ -z "$MODULE" && -r /opt/valkey-artifacts/.module_path ]]; then
+  MODULE="$(cat /opt/valkey-artifacts/.module_path)"
+fi
+MODULE="${MODULE:-/usr/lib/valkey/modules/libsearch.so}"
 DATADIR="${VB_DATADIR:-/var/lib/vbench}"
 
 log() { printf '[vb-valkey] %s\n' "$*" >&2; }
@@ -22,8 +28,8 @@ start_server() {
   if [[ ! -f "$MODULE" ]]; then
     log "ERROR: search module not found at $MODULE"
     log "modules present under /usr/lib/valkey:"
-    find /usr/lib/valkey /usr/lib/valkey-search -name '*.so' 2>/dev/null >&2 || \
-      log "  (none)"
+    dpkg -L percona-valkey-search 2>/dev/null | grep -E '\.so$' >&2 || \
+      log "  (percona-valkey-search installed no shared object)"
     exit 1
   fi
   mkdir -p "$DATADIR"
