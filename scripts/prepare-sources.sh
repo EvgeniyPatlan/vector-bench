@@ -254,7 +254,7 @@ prepare_mongodb() {
   [[ -n "$mongot" && -n "$server" ]] || die "$engine: source.mongot_image / source.server_image not set in $cfg"
 
   mkdir -p "$ctx"
-  say "$engine: resolving image digests (nothing is compiled for this engine)"
+  info "$engine: resolving image digests (nothing is compiled for this engine)"
 
   local digests="$ctx/image-digests.txt"
   : > "$digests"
@@ -290,7 +290,7 @@ prepare_valkey() {
   [[ -n "$repo" ]] || die "$engine: source.repository not set in $cfg"
 
   mkdir -p "$ctx"
-  say "$engine: provenance is the $repo repository (nothing is compiled)"
+  info "$engine: provenance is the $repo repository (nothing is compiled)"
   printf '%s\n' "$repo" > "$ctx/percona-repository.txt"
 
   find "$VB_DOCKER/_shared" -maxdepth 1 -type f -exec cp {} "$ctx/" \; 2>/dev/null || true

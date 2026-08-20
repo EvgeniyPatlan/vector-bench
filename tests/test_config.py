@@ -2328,3 +2328,34 @@ class TestCorpusSizeIsMeasuredNotAssumed:
     def test_an_unknown_dataset_returns_zero_rather_than_a_guess(self):
         from harness.datasets import resident_bytes_estimate
         assert resident_bytes_estimate("something-we-have-never-run") == 0
+
+
+class TestShellScriptsOnlyCallHelpersThatExist:
+    """`say` was never a helper in lib.sh.
+
+    Two prepare functions called it and both died on the first line that
+    logged, after the user had already run the build. bash resolves function
+    names at call time, so nothing catches this until that line executes.
+    """
+
+    HELPERS = {"log", "info", "warn", "ok", "die", "need_cmd", "need_docker",
+               "assert_not_vendor_repo", "yq_get", "vb_hash", "human_bytes"}
+
+    def _defined_in(self, path):
+        import re
+        source = open(path).read()
+        return set(re.findall(r"^([a-z_][a-z0-9_]*)\s*\(\)", source, re.M))
+
+    def test_every_logging_call_resolves(self):
+        import glob
+        import re
+        lib = os.path.join(VB_ROOT, "scripts", "lib.sh")
+        available = self._defined_in(lib) | self.HELPERS
+        suspects = {"say", "note", "echo_info", "msg", "print"}
+        for script in glob.glob(os.path.join(VB_ROOT, "scripts", "*.sh")):
+            defined = available | self._defined_in(script)
+            for name in suspects:
+                if re.search(rf"^\s*{name}\s+[\"']", open(script).read(), re.M):
+                    assert name in defined, (
+                        f"{os.path.basename(script)} calls '{name}', which is "
+                        f"defined neither there nor in lib.sh")
