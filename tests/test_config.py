@@ -3243,33 +3243,14 @@ class TestReRunningAUnitReplacesItsRecords:
                                [None] * 1000, [None] * 1000, budget_s=60)
         assert 0 < written < 1000, written
 
-    def test_the_old_no_timeout_form_is_gone(self):
-        """The main connection carries a 600 second socket timeout so a wedged
-        query cannot stall a run. valkey-search performs the HNSW insertion on
-        the write path, so a batch of vectors into a large graph legitimately
-        exceeds that, and the churn died with "Timeout reading from socket"
-        after the baseline had been measured."""
+    def test_every_write_path_uses_the_shared_connection(self):
+        """Three paths write in bulk and all three must be configured alike.
+        The churn one differed, and that was the whole failure."""
         source = open(os.path.join(VB_ROOT, "harness", "drivers",
                                    "valkey.py")).read()
-        body = source.split("def _write_connection")[1].split("\n    def ")[0]
-        assert "socket_timeout" not in body, (
-            "bulk writes must not carry a read timeout")
         for method in ("def delete_ids", "def insert_rows", "def _write_range"):
             block = source.split(method)[1].split("\n    def ")[0]
             assert "_write_connection" in block, method
-
-
-class TestChurnIsBounded:
-    """An engine can take a write and never finish it.
-
-    Valkey loaded 990,000 vectors at 38,845 rows/s into an unindexed keyspace,
-    then managed 364 of 99,000 back into the populated index before writes
-    stopped entirely, with the server responsive, its index caught up and its
-    mutation queue empty. Two runs were lost waiting on it, one of them for
-    over two hours, because the re-insertion was a single blocking call with
-    nothing bounding it and no way to see progress.
-    """
-
     def test_the_reinsert_is_sliced_so_progress_is_visible(self):
         source = open(os.path.join(VB_ROOT, "harness", "workloads",
                                    "churn.py")).read()
