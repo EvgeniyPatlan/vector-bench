@@ -3316,3 +3316,62 @@ class TestChurnIsBounded:
                  "recall_at_k": 0.98,
                  "extra": {"reinsert_completed": True}}]
         assert "did not complete" not in _churn_table(summarize(recs, {}))
+
+
+class TestIoThreadsAreClamped:
+    """IO threads are not the cpuset.
+
+    Valkey's guidance is that more than a handful contend rather than help, and
+    the framework already clamps build threads for exactly that reason. Nothing
+    clamped this, so a 64-core server was started with --io-threads 64 and its
+    writes into a populated search index stopped after three rows while reads
+    stayed healthy. Every smoke run passed because a small cpuset produced a
+    small, legal value.
+    """
+
+    def _resolve(self, cores, resource_pass="tuned", overrides=None):
+        from orchestrator.config import load_resources, resolve_resources
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(cores)),
+                                  "efficiency_cpus": [],
+                                  "logical_cpus": cores * 2,
+                                  "physical_cores": cores,
+                                  "threads_per_core": 2, "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        res = load_resources(resource_pass)
+        if overrides:
+            res.setdefault("cpu", {}).update(overrides)
+        return resolve_resources(res, "valkey", info)
+
+    def test_a_large_cpuset_does_not_become_a_large_thread_count(self):
+        r = self._resolve(64)
+        assert r.io_threads <= 8, r.io_threads
+
+    def test_a_small_cpuset_is_left_alone(self):
+        r = self._resolve(4)
+        assert r.io_threads == min(r.server_cpu_count, 8)
+
+    def test_it_is_never_zero(self):
+        assert self._resolve(1).io_threads >= 1
+
+    def test_the_cap_is_overridable(self):
+        """Asserted as the rule rather than a number: the cpuset comes from the
+        host this runs on, so the value differs between machines."""
+        r = self._resolve(64, overrides={"max_io_threads": 16})
+        assert r.io_threads == min(r.server_cpu_count, 16)
+        assert r.io_threads >= self._resolve(64).io_threads
+
+    def test_the_server_flag_uses_the_clamped_value(self):
+        """The config asked for {server_cpu_count} directly, which is the bug."""
+        from orchestrator.config import load_engine, server_args
+        source = open(os.path.join(VB_ROOT, "config", "engines",
+                                   "valkey.yml")).read()
+        assert "{io_threads}" in source
+        assert "--io-threads\n    - \"{server_cpu_count}\"" not in source
+        args = server_args(load_engine("valkey"), "tuned", self._resolve(64))
+        assert args[args.index("--io-threads") + 1] == "8"
+
+    def test_clamping_is_announced(self):
+        r = self._resolve(64)
+        assert any("io threads clamped" in w for w in r.warnings) or r.server_cpu_count <= 8

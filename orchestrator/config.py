@@ -98,6 +98,8 @@ class ResolvedResources:
     mongot_heap_bytes: int
     #: Valkey's maxmemory. Zero for every engine that is not in-memory.
     maxmemory_bytes: int
+    #: Network IO threads, clamped. Not the same as the server's cpuset.
+    io_threads: int
     build_threads: int
     shm_size: str
     transaction_isolation: str
@@ -123,6 +125,7 @@ class ResolvedResources:
             "maintenance_bytes": self.maintenance_bytes,
             "mongot_heap_bytes": self.mongot_heap_bytes,
             "maxmemory_bytes": self.maxmemory_bytes,
+            "io_threads": self.io_threads,
             "pass_signature": self.pass_signature,
             "build_threads": self.build_threads,
             "shm_size": self.shm_size,
@@ -221,6 +224,23 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         cpu_cfg.get("server_cpus", ""), cpu_cfg.get("client_cpus", ""),
         build_cfg.get("threads", ""), build_cfg.get("max_threads", ""),
     ))
+
+    # Network IO threads are not the cpuset. Valkey's own guidance is that
+    # more than a handful is counterproductive, and the framework already
+    # clamps build threads for the same reason. Handing it the whole cpuset
+    # gave a 64-core server 64 IO threads, and its writes into a populated
+    # search index stopped after three rows while reads stayed healthy. The
+    # same engine on a small cpuset, which is what every smoke run used,
+    # completed the identical workload.
+    io_cap = int(cpu_cfg.get("max_io_threads", 8) or 8)
+    io_threads = max(1, min(len(server_cpus), io_cap))
+    if len(server_cpus) > io_cap:
+        warnings.append(
+            f"io threads clamped from {len(server_cpus)} to {io_threads}; "
+            f"more than a handful contend rather than help, and a large value "
+            f"stalled writes into a populated index entirely (raise "
+            f"cpu.max_io_threads to override)"
+        )
 
     maxmemory_bytes = 0
     if engine == "valkey":
@@ -404,6 +424,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         maintenance_bytes=maintenance_bytes,
         mongot_heap_bytes=mongot_heap_bytes,
         maxmemory_bytes=maxmemory_bytes,
+        io_threads=io_threads,
         pass_signature=pass_signature,
         build_threads=build_threads,
         shm_size=shm_size,
@@ -419,7 +440,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
 SERVER_ARG_KEYS = (
     "buffer_bytes", "graph_cache_bytes", "maintenance_bytes", "build_threads",
     "server_cpu_count", "maxmemory_bytes", "mongot_heap_bytes",
-    "server_memory_bytes",
+    "server_memory_bytes", "io_threads",
 )
 
 
@@ -441,6 +462,7 @@ def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
         # and exits in under a second, which is how every valkey phase of the
         # first smoke run failed. See the test that scans for unknown keys.
         "maxmemory_bytes": resolved.maxmemory_bytes,
+        "io_threads": resolved.io_threads,
         "mongot_heap_bytes": resolved.mongot_heap_bytes,
         "server_memory_bytes": resolved.server_memory_bytes,
     }
