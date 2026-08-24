@@ -316,6 +316,24 @@ class OpsRun:
                   f"using disk", file=sys.stderr)
 
 
+def _quantization(profile: Dict[str, Any], resources: Dict[str, Any],
+                  resource_pass: str) -> str:
+    """Which quantization the ops build should use.
+
+    The same rule render_config applies to the recall path: pinned off in the
+    normalized pass so no engine gets an axis the others lack, and the vendor's
+    recommendation in the tuned pass. Reading it in only one of the two paths
+    meant a tuned run measured a quantized index for recall and an unquantized
+    one for build cost and every ops workload, then reported them side by side
+    as one configuration.
+    """
+    if resource_pass == "tuned":
+        values = (resources.get("extras", {}) or {}).get("mongodb_quantization")
+        if values:
+            return str(list(values)[0])
+    return str((profile.get("ann", {}) or {}).get("mongodb_quantization", "none"))
+
+
 def harness_args(profile: Dict[str, Any], m: int, engine: str,
                  resolved: ResolvedResources,
                  resource_pass: str, resources: Dict[str, Any],
@@ -332,6 +350,11 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--ef-search", str(ops.get("ef_search", 100)),
         "--storage-engine", storage_engine,
         "--build-mode", build_mode,
+        # Read from the same extras render_config uses for the recall path, so
+        # both measurement paths in one run build the same index. Only Percona
+        # Search has the knob; the flag is omitted for everything else.
+        *(["--quantization", _quantization(profile, resources, resource_pass)]
+          if engine == "mongodb" else []),
         "--load-threads", str(ops.get("load_threads", 1)),
         "--max-queries", str(ops.get("max_queries", 1000)),
         "--workloads", ",".join(ops.get("workloads", ["build"])),

@@ -65,6 +65,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--storage-engine", default="InnoDB")
     p.add_argument("--build-mode", default="post", choices=("post", "incremental"))
+    # Percona Search is the only engine that compresses indexed vectors. Without
+    # this the ops path always built unquantized while the recall path built
+    # whatever the profile asked for, so one run measured two different indexes.
+    p.add_argument("--quantization", default=None,
+                   choices=(None, "none", "scalar", "binary"))
     p.add_argument("--load-threads", type=int, default=1)
 
     p.add_argument("--workloads", default=",".join(ALL_WORKLOADS),
@@ -124,6 +129,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ef_construction=args.ef_construction,
         storage_engine=args.storage_engine,
         build_mode=args.build_mode,
+        quantization=args.quantization,
     )
 
     print(f"[vb-harness] loading dataset {args.dataset} from {args.datasets_dir}")

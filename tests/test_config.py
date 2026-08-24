@@ -2981,3 +2981,90 @@ class TestValkeyChurnIsBatched:
                                    "valkey.py")).read()
         assert "CHURN_BATCH" in source
         assert source.count("CHURN_BATCH") >= 3
+
+
+class TestPlanProbesUseARealVector:
+    """A zero vector has no direction, so cosine distance over it is undefined.
+
+    Both new modules probed with numpy.zeros to confirm the index answers. On
+    the smoke corpus, which is euclidean, that is a legal query. On the real
+    corpus, which is angular, the server is entitled to reject it -- and the
+    Percona Search recall phase failed at full scale after the index had
+    already reached READY, having worked on every euclidean smoke run.
+    """
+
+    MODULES = ("mongodb", "valkey")
+
+    def _source(self, engine):
+        return open(os.path.join(
+            VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+            "algorithms", engine, "module.py")).read()
+
+    def test_no_module_probes_with_zeros(self):
+        for engine in self.MODULES:
+            assert "numpy.zeros" not in self._source(engine), engine
+
+    def test_a_corpus_vector_is_kept_for_the_probe(self):
+        for engine in self.MODULES:
+            source = self._source(engine)
+            assert "self._probe = X[0]" in source, engine
+
+
+class TestQuantizationReachesBothPaths:
+    """Only the recall path read it, so one run built two different indexes.
+
+    render_config gave the ann phase the vendor-recommended scalar quantization
+    in the tuned pass. Nothing gave it to the ops phase, which builds the index
+    the build-cost, concurrency, filtered and churn numbers are measured
+    against. The 44-hour run reported a 15 GB unquantized index beside a recall
+    curve measured on a quantized one, as though they were one configuration.
+    """
+
+    def _args(self, engine, resource_pass):
+        from orchestrator.config import (load_profile, load_resources,
+                                         resolve_resources)
+        from orchestrator.ops_pass import harness_args
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        res = load_resources(resource_pass)
+        return harness_args(load_profile("tuned-complete"), 16, engine,
+                            resolve_resources(res, engine, info),
+                            resource_pass, res, storage_engine="InnoDB")
+
+    def test_tuned_ops_gets_the_vendor_recommendation(self):
+        args = self._args("mongodb", "tuned")
+        assert args[args.index("--quantization") + 1] == "scalar"
+
+    def test_normalized_ops_pins_it_off(self):
+        args = self._args("mongodb", "normalized")
+        assert args[args.index("--quantization") + 1] == "none"
+
+    def test_the_two_paths_agree(self):
+        """Whatever render_config gives the recall phase, the ops phase gets."""
+        from orchestrator.ann_pass import render_config
+        from orchestrator.config import load_profile, load_resources
+        for resource_pass in ("normalized", "tuned"):
+            res = load_resources(resource_pass)
+            groups = render_config("mongodb", load_profile("tuned-complete"),
+                                   res, resource_pass)["float"]["any"][0]["run_groups"]
+            ann_value = list(groups.values())[0]["arg_groups"][0]["quantization"]
+            args = self._args("mongodb", resource_pass)
+            assert args[args.index("--quantization") + 1] == ann_value, resource_pass
+
+    def test_engines_without_the_knob_do_not_get_the_flag(self):
+        for engine in ("mariadb", "alisql", "pgvector", "valkey"):
+            assert "--quantization" not in self._args(engine, "tuned"), engine
+
+    def test_the_harness_accepts_it(self):
+        from harness.main import parse_args
+        args = parse_args(["--engine", "mongodb", "--dataset", "d",
+                           "--m", "16", "--run-id", "r",
+                           "--host", "h", "--port", "27017",
+                           "--output", "/tmp/out.jsonl",
+                           "--quantization", "scalar"])
+        assert args.quantization == "scalar"

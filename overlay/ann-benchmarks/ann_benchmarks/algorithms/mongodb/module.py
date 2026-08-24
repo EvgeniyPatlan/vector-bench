@@ -120,6 +120,10 @@ class PerconaSearch(BaseANN):
         self._ready_seconds = 0.0
         self._query_verified: Optional[bool] = None
         self._dim: Optional[int] = None
+        # A real vector from the corpus, kept for the plan check. A zero vector
+        # has no direction, so cosine similarity over it is undefined and the
+        # server is entitled to reject the query.
+        self._probe: Optional[Any] = None
         self._batch_results: List[List[int]] = []
 
         self._server = None
@@ -209,6 +213,7 @@ class PerconaSearch(BaseANN):
     def _fit(self, X: numpy.ndarray) -> None:
         dim = int(X.shape[1])
         self._dim = dim
+        self._probe = X[0]
         db = self._client[DATABASE]
 
         db.drop_collection(COLLECTION)
@@ -395,7 +400,13 @@ class PerconaSearch(BaseANN):
         merely slow.
         """
         try:
-            probe = numpy.zeros(self._dim or 1, dtype=numpy.float32)
+            # A real vector, not zeros. Under cosine similarity a zero vector
+            # has no direction and the distance is undefined; the smoke dataset
+            # is euclidean, where zeros are legal, so this only failed at full
+            # scale on an angular corpus.
+            probe = (self._probe if self._probe is not None
+                     else numpy.random.RandomState(0).normal(
+                         size=self._dim or 1).astype(numpy.float32))
             list(self._coll.aggregate(self._pipeline(probe, k)))
         except Exception as exc:
             print(f"[vb] WARNING: $vectorSearch failed: {exc}", file=sys.stderr)

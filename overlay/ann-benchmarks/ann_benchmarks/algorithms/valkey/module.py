@@ -100,6 +100,10 @@ class ValkeySearch(BaseANN):
         self._backfill_seconds = 0.0
         self._query_verified: Optional[bool] = None
         self._dim: Optional[int] = None
+        # A real vector from the corpus. valkey-search tolerates a zero vector
+        # under COSINE where Percona Search does not, but a probe with no
+        # direction is wrong on an angular corpus either way.
+        self._probe: Optional[Any] = None
         self._batch_results: List[List[int]] = []
 
         self._server = None
@@ -171,6 +175,7 @@ class ValkeySearch(BaseANN):
     def fit(self, X: numpy.ndarray) -> None:
         dim = int(X.shape[1])
         self._dim = dim
+        self._probe = X[0]
         self._conn.flushall()
 
         if self._build_mode == "incremental":
@@ -415,7 +420,10 @@ class ValkeySearch(BaseANN):
         one, so the two are not both recorded as low throughput.
         """
         try:
-            self._search(self._conn, numpy.zeros(self._dim or 1, dtype=numpy.float32), k)
+            probe = (self._probe if self._probe is not None
+                     else numpy.random.RandomState(0).normal(
+                         size=self._dim or 1).astype(numpy.float32))
+            self._search(self._conn, probe, k)
         except Exception as exc:
             print(f"[vb] WARNING: FT.SEARCH failed: {exc}", file=sys.stderr)
             return False
