@@ -3114,3 +3114,60 @@ class TestResumeContinuesTheRightRun:
         """Every run without --run-id would otherwise continue the last one."""
         source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
         assert "if not run_id and args.resume:" in source
+
+
+class TestReRunContinuesAManifest:
+    """Re-running one engine into an existing run directory must not erase it.
+
+    Manifest built a fresh dict and saved it in __init__, so continuing a
+    44-hour six-engine run to fix one failed unit would have overwritten the
+    environment, the engine versions and the phase record of the five engines
+    that succeeded. The report reads all of that, so the fix would have cost
+    more than the failure.
+    """
+
+    def _manifest(self, tmp_path, run_id="tuned-complete-20260820-134424"):
+        from orchestrator.manifest import Manifest
+        return Manifest(str(tmp_path), run_id)
+
+    def test_a_second_manifest_keeps_the_first_ones_record(self, tmp_path):
+        first = self._manifest(tmp_path)
+        first.data["engines"]["mariadb"] = {"source": {"tag": "11.8.8"}}
+        first.add_phase("ops", "mariadb", "d", "completed", "t0", "t1",
+                        {"resource_pass": "tuned"})
+        second = self._manifest(tmp_path)
+        assert second.data["engines"]["mariadb"]["source"]["tag"] == "11.8.8"
+        assert any(p["engine"] == "mariadb" for p in second.data["phases"])
+
+    def test_a_different_run_id_starts_clean(self):
+        """Two runs sharing a directory would otherwise merge into nonsense."""
+        import tempfile
+        from orchestrator.manifest import Manifest
+        with tempfile.TemporaryDirectory() as d:
+            a = Manifest(d, "run-a")
+            a.add_phase("ops", "mariadb", "d", "completed", "t0", "t1", {})
+            b = Manifest(d, "run-b")
+            assert b.data["phases"] == []
+
+    def test_a_repeated_unit_replaces_its_earlier_attempt(self, tmp_path):
+        """A re-run that fixes a failure must not leave the failure behind for
+        the report to keep reporting."""
+        m = self._manifest(tmp_path)
+        m.add_phase("ops", "valkey", "d", "failed", "t0", "t1",
+                    {"resource_pass": "tuned", "exit_code": 1})
+        m.add_phase("ops", "valkey", "d", "completed", "t2", "t3",
+                    {"resource_pass": "tuned"})
+        valkey = [p for p in m.data["phases"] if p["engine"] == "valkey"]
+        assert len(valkey) == 1
+        assert valkey[0]["status"] == "completed"
+
+    def test_the_same_unit_in_another_pass_is_kept(self):
+        import tempfile
+        from orchestrator.manifest import Manifest
+        with tempfile.TemporaryDirectory() as d:
+            m = Manifest(d, "r")
+            m.add_phase("ops", "valkey", "d", "completed", "t0", "t1",
+                        {"resource_pass": "normalized"})
+            m.add_phase("ops", "valkey", "d", "completed", "t2", "t3",
+                        {"resource_pass": "tuned"})
+            assert len(m.data["phases"]) == 2

@@ -39,6 +39,19 @@ class Manifest:
         self.run_dir = run_dir
         self.path = os.path.join(run_dir, MANIFEST_NAME)
         os.makedirs(run_dir, exist_ok=True)
+        # A re-run into an existing run directory continues that run rather
+        # than replacing it. Building a fresh manifest here overwrote the
+        # environment, the engine versions and every other engine's phase
+        # record, so resuming one failed unit of a six-engine run destroyed the
+        # provenance of the five that had succeeded.
+        existing = self._load_existing(run_id)
+        if existing is not None:
+            self.data = existing
+            self.data["status"] = "running"
+            self.data["finished_at"] = None
+            self.save()
+            return
+
         self.data: Dict[str, Any] = {
             "run_id": run_id,
             "started_at": utcnow(),
@@ -112,9 +125,27 @@ class Manifest:
         if annb:
             self.data["ann_benchmarks"] = annb
 
+    def _load_existing(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The manifest already in this directory, if it is the same run."""
+        try:
+            with open(self.path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if data.get("run_id") == run_id else None
+
     def add_phase(self, name: str, engine: str, dataset: str,
                   status: str, started_at: str, finished_at: str,
                   detail: Optional[Dict[str, Any]] = None) -> None:
+        # A repeated unit replaces its earlier attempt rather than sitting
+        # beside it. Otherwise a re-run that fixes a failure leaves the failure
+        # in the manifest, and the report keeps reporting it.
+        self.data["phases"] = [
+            p for p in self.data["phases"]
+            if not (p.get("phase") == name and p.get("engine") == engine
+                    and p.get("dataset") == dataset
+                    and p.get("resource_pass") == (detail or {}).get("resource_pass"))
+        ]
         self.data["phases"].append({
             "phase": name,
             "engine": engine,
