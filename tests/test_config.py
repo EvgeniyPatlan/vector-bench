@@ -2953,8 +2953,12 @@ class TestValkeyChurnIsBatched:
         class FakeConn:
             def pipeline(self, transaction=False): return FakePipe()
             def delete(self, *keys): calls.setdefault("delete", []).append(len(keys))
+            def close(self): pass
 
         d._conn = FakeConn()
+        # Bulk writes deliberately open their own connection, with no read
+        # timeout; the fake stands in for it.
+        d._write_connection = lambda: FakeConn()
         return d
 
     def test_deletes_are_chunked(self, monkeypatch):
@@ -3171,3 +3175,50 @@ class TestReRunContinuesAManifest:
             m.add_phase("ops", "valkey", "d", "completed", "t2", "t3",
                         {"resource_pass": "tuned"})
             assert len(m.data["phases"]) == 2
+
+
+class TestReRunningAUnitReplacesItsRecords:
+    """The records writer appends, which is right within a unit.
+
+    Across attempts it is wrong: re-running a failed unit left the previous
+    attempt's records in the file, and the report read both as separate
+    measurements. The six-engine re-run produced two ingest records, two index
+    sizes and twelve concurrency points for each engine it touched, and the
+    charts drew lines through all of them.
+    """
+
+    def test_the_orchestrator_clears_the_unit_output_first(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        block = source.split('output = os.path.join(paths["run_dir"], f"ops-{stem}.jsonl")')[1]
+        block = block.split("harness_args")[0]
+        assert "os.remove" in block, (
+            "a re-run appends to the previous attempt's records")
+
+    def test_the_memory_series_is_cleared_too(self):
+        """Otherwise peak RSS is taken across two attempts at once."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        block = source.split('memory_ts = os.path.join(paths["run_dir"], f"mem-{stem}.jsonl")')[1]
+        block = block.split("harness_args")[0]
+        assert "memory_ts" in block and "os.remove" in block
+
+    def test_the_recorder_itself_still_appends(self):
+        """Within one unit it must: several workloads and threads write to the
+        same file, and a crash should not lose what came before it."""
+        source = open(os.path.join(VB_ROOT, "harness", "metrics",
+                                   "records.py")).read()
+        assert 'open(path, "a"' in source
+
+    def test_bulk_writes_do_not_inherit_the_query_read_timeout(self):
+        """The main connection carries a 600 second socket timeout so a wedged
+        query cannot stall a run. valkey-search performs the HNSW insertion on
+        the write path, so a batch of vectors into a large graph legitimately
+        exceeds that, and the churn died with "Timeout reading from socket"
+        after the baseline had been measured."""
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        body = source.split("def _write_connection")[1].split("\n    def ")[0]
+        assert "socket_timeout" not in body, (
+            "bulk writes must not carry a read timeout")
+        for method in ("def delete_ids", "def insert_rows", "def _write_range"):
+            block = source.split(method)[1].split("\n    def ")[0]
+            assert "_write_connection" in block, method

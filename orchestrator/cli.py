@@ -813,6 +813,15 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                     stem = f"{engine}-{dataset}-{resource_pass}-{tag}"
                     output = os.path.join(paths["run_dir"], f"ops-{stem}.jsonl")
                     memory_ts = os.path.join(paths["run_dir"], f"mem-{stem}.jsonl")
+                    # The recorder appends, which is right within a unit and
+                    # wrong across attempts: re-running a failed unit left the
+                    # previous attempt's records in the file and the report
+                    # read both as separate measurements. A six-engine re-run
+                    # produced twelve concurrency points per engine and two
+                    # index sizes. A unit is atomic, so its output starts empty.
+                    for stale in (output, memory_ts):
+                        if os.path.exists(stale):
+                            os.remove(stale)
                     harness_args = ops_pass.harness_args(
                         profile, m, engine, resolved, resource_pass, resources,
                         build_mode=build_mode, storage_engine=storage,

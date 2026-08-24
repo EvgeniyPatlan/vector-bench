@@ -287,9 +287,7 @@ class ValkeyDriver(EngineDriver):
         # One connection per worker: a shared client would make the thread
         # count a property of the connection pool rather than a measure of
         # write concurrency.
-        conn = valkey_client.Valkey(host=self.spec.host, port=self.spec.port) \
-            if hasattr(valkey_client, "Valkey") else \
-            valkey_client.Redis(host=self.spec.host, port=self.spec.port)
+        conn = self._write_connection()
         try:
             pipe = conn.pipeline(transaction=False)
             for i in range(begin, end):
@@ -316,6 +314,22 @@ class ValkeyDriver(EngineDriver):
                 f"Raise the container memory limit or lower maxmemory."
             )
 
+    def _write_connection(self):
+        """A connection for bulk writes, with no read timeout.
+
+        Deliberately different from the driver's main connection, which carries
+        a 600 second socket timeout so a wedged query cannot stall a run
+        forever. Writes are not queries: valkey-search performs the HNSW graph
+        insertion on the write path, so a batch of a thousand vectors into a
+        graph of a million nodes can legitimately take longer than any timeout
+        worth setting on a query. The load path has always opened its own
+        connection this way; the churn path used the main one and died with
+        "Timeout reading from socket" after the churn baseline had been
+        measured, at a million rows but never at smoke scale.
+        """
+        factory = getattr(valkey_client, "Valkey", None) or valkey_client.Redis
+        return factory(host=self.spec.host, port=self.spec.port)
+
     def delete_ids(self, ids: Sequence[int]) -> None:
         """Batched, because a churn deletes a tenth of the corpus at once.
 
@@ -324,8 +338,12 @@ class ValkeyDriver(EngineDriver):
         worked at smoke scale and failed at a million rows.
         """
         keys = [f"{PREFIX}{int(i)}" for i in ids]
-        for start in range(0, len(keys), CHURN_BATCH):
-            self._conn.delete(*keys[start:start + CHURN_BATCH])
+        conn = self._write_connection()
+        try:
+            for start in range(0, len(keys), CHURN_BATCH):
+                conn.delete(*keys[start:start + CHURN_BATCH])
+        finally:
+            conn.close()
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     tags: Sequence[int]) -> None:
@@ -336,15 +354,19 @@ class ValkeyDriver(EngineDriver):
         execute. That is what failed the tuned churn 25 minutes in, after the
         baseline had already been measured.
         """
-        pipe = self._conn.pipeline(transaction=False)
-        for i, key_id in enumerate(ids):
-            pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
-                TAG_FIELD: int(tags[i]),
-                VECTOR_FIELD: encode_vector(vectors[i]),
-            })
-            if (i + 1) % CHURN_BATCH == 0:
-                pipe.execute()
-        pipe.execute()
+        conn = self._write_connection()
+        try:
+            pipe = conn.pipeline(transaction=False)
+            for i, key_id in enumerate(ids):
+                pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
+                    TAG_FIELD: int(tags[i]),
+                    VECTOR_FIELD: encode_vector(vectors[i]),
+                })
+                if (i + 1) % CHURN_BATCH == 0:
+                    pipe.execute()
+            pipe.execute()
+        finally:
+            conn.close()
 
     def count_rows(self) -> int:
         info = self._ft_info()
