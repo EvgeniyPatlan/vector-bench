@@ -413,6 +413,13 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     after = _count_results(results_dir, engine, dataset)
     text = "\n".join(output)
 
+    # Kept beside the measurements. A phase that writes no results explains
+    # itself here and nowhere else, and a terminal is not an archive.
+    saved = docker_ctl.save_phase_log(
+        paths["run_dir"], engine, "ann", resource_pass, output)
+    if saved:
+        print(f"[ann] log -> {os.path.relpath(saved, paths['run_dir'])}")
+
     # ann-benchmarks treats "every configuration already has results" as an
     # error: main() raises Exception("Nothing to run") and the process exits
     # non-zero. For us that is successful resumption, not failure — the whole

@@ -191,6 +191,30 @@ def start(spec: ContainerSpec) -> str:
     return proc.stdout.strip()
 
 
+def save_phase_log(run_dir: str, engine: str, phase: str, resource_pass: str,
+                   lines: List[str]) -> Optional[str]:
+    """Keep a phase's console output next to its measurements.
+
+    The output of a phase is where a failure explains itself, and until now it
+    existed only on the operator's terminal. A run that wrote no recall results
+    and a churn that stopped after nothing both had their reason printed and
+    then lost, and by the time anyone asked, the terminal was gone. The
+    measurements are archived and copied between machines; their explanation
+    should travel with them.
+    """
+    if not lines:
+        return None
+    directory = os.path.join(run_dir, "logs")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{engine}-{phase}-{resource_pass}.log")
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+    except OSError:
+        return None
+
+
 def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
                    stream: bool = True,
                    sink: Optional[List[str]] = None,

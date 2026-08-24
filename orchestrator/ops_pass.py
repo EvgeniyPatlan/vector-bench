@@ -285,7 +285,16 @@ class OpsRun:
             sampler = docker_ctl.MemorySampler(self.server_name, memory_timeseries)
             sampler.start()
         try:
-            return docker_ctl.run_foreground(spec, timeout=timeout_s)
+            captured: List[str] = []
+            rc = docker_ctl.run_foreground(spec, timeout=timeout_s,
+                                           sink=captured)
+            saved = docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, f"ops-{self.tag}",
+                self.resource_pass, captured)
+            if saved:
+                print(f"[ops] log -> "
+                      f"{os.path.relpath(saved, self.paths['run_dir'])}")
+            return rc
         finally:
             if sampler is not None:
                 sampler.stop()

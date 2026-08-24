@@ -3391,3 +3391,48 @@ class TestIoThreadsAreClamped:
     def test_clamping_is_announced(self):
         r = self._resolve(64)
         assert any("io threads clamped" in w for w in r.warnings) or r.server_cpu_count <= 8
+
+
+class TestPhaseLogsAreArchived:
+    """A phase explains its failure in its console output and nowhere else.
+
+    A recall phase that wrote no results and a churn that stopped after nothing
+    both printed their reason and then lost it: the measurements were archived
+    and copied between machines, the terminal was not. By the time anyone
+    asked, the answer was gone and the only way back to it was another run.
+    """
+
+    def test_a_phase_log_is_written_beside_the_measurements(self, tmp_path):
+        from orchestrator.docker_ctl import save_phase_log
+        path = save_phase_log(str(tmp_path), "valkey", "ops-m16-post", "tuned",
+                              ["[churn] re-insert stopped after 0 rows",
+                               "TimeoutError: Timeout reading from socket"])
+        assert path and os.path.isfile(path)
+        assert "logs" in path
+        assert "Timeout reading from socket" in open(path).read()
+
+    def test_nothing_is_written_for_a_silent_phase(self, tmp_path):
+        from orchestrator.docker_ctl import save_phase_log
+        assert save_phase_log(str(tmp_path), "e", "ann", "tuned", []) is None
+
+    def test_the_name_identifies_the_unit(self, tmp_path):
+        """Six engines times two phases in one directory; a shared name would
+        overwrite the one you came looking for."""
+        from orchestrator.docker_ctl import save_phase_log
+        a = save_phase_log(str(tmp_path), "valkey", "ann", "tuned", ["a"])
+        b = save_phase_log(str(tmp_path), "mongodb", "ann", "tuned", ["b"])
+        c = save_phase_log(str(tmp_path), "valkey", "ann", "normalized", ["c"])
+        assert len({a, b, c}) == 3
+
+    def test_both_measurement_paths_save_theirs(self):
+        for module in ("ann_pass", "ops_pass"):
+            source = open(os.path.join(VB_ROOT, "orchestrator",
+                                       f"{module}.py")).read()
+            assert "save_phase_log" in source, module
+
+    def test_an_unwritable_run_directory_does_not_fail_the_run(self, tmp_path):
+        """Losing the log is bad; losing the measurement because the log could
+        not be written would be worse."""
+        from orchestrator.docker_ctl import save_phase_log
+        assert save_phase_log("/proc/nonexistent/nope", "e", "ann", "t",
+                              ["x"]) is None
