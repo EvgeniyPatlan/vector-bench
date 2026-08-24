@@ -3208,7 +3208,42 @@ class TestReRunningAUnitReplacesItsRecords:
                                    "records.py")).read()
         assert 'open(path, "a"' in source
 
-    def test_bulk_writes_do_not_inherit_the_query_read_timeout(self):
+    def test_bulk_writes_have_a_finite_timeout_and_keepalive(self):
+        """Wrong in both directions before this.
+
+        First the driver's 600 second query timeout, which a slow write
+        legitimately exceeds. Then no timeout at all, which is worse: the
+        client sat at 0% CPU waiting on a reply that never came while the
+        server answered an identical write from another connection in 104 ms.
+        """
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        body = source.split("def _write_connection")[1].split("\n    def ")[0]
+        assert "socket_timeout=WRITE_TIMEOUT_S" in body, "no read timeout"
+        assert "socket_keepalive=True" in body, "a dead peer is waited on"
+        assert "health_check_interval" in body
+
+    def test_the_write_timeout_is_longer_than_a_query_timeout(self):
+        from harness.drivers.valkey import WRITE_TIMEOUT_S
+        assert 60 <= WRITE_TIMEOUT_S <= 3600
+
+    def test_a_failed_chunk_ends_the_reinsert_not_the_run(self):
+        from harness.workloads.churn import _reinsert
+
+        class Flaky:
+            name = "flaky"
+            calls = 0
+
+            def insert_rows(self, ids, vectors, tags):
+                self.calls += 1
+                if self.calls > 2:
+                    raise TimeoutError("Timeout reading from socket")
+
+        written, _ = _reinsert(Flaky(), list(range(1000)),
+                               [None] * 1000, [None] * 1000, budget_s=60)
+        assert 0 < written < 1000, written
+
+    def test_the_old_no_timeout_form_is_gone(self):
         """The main connection carries a 600 second socket timeout so a wedged
         query cannot stall a run. valkey-search performs the HNSW insertion on
         the write path, so a batch of vectors into a large graph legitimately

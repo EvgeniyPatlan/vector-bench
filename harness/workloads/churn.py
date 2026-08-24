@@ -219,7 +219,15 @@ def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, tags,
             if time.time() - started > budget_s:
                 break
             end = min(begin + chunk, total)
-            driver.insert_rows(ids[begin:end], vectors[begin:end],
-                               tags[begin:end])
+            try:
+                driver.insert_rows(ids[begin:end], vectors[begin:end],
+                                   tags[begin:end])
+            except Exception as exc:
+                # A write that times out or a connection that dies ends the
+                # re-insertion; it does not end the run. What was written is
+                # still a measurement, and the caller records it.
+                print(f"[churn] {driver.name}: re-insert stopped after "
+                      f"{written:,} rows: {type(exc).__name__}: {exc}")
+                break
             written = end
     return written, time.time() - started

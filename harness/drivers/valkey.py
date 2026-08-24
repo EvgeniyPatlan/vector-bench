@@ -65,6 +65,11 @@ METRIC = {"angular": "COSINE", "euclidean": "L2"}
 # million rows is one DEL of 99,000 keys and one pipeline holding 600 MB.
 CHURN_BATCH = int(os.environ.get("VB_VALKEY_CHURN_BATCH", "1000"))
 
+# Long enough that no honest write hits it, short enough that a reply which is
+# never coming does not hold the machine until someone notices. Never None:
+# that is what turned a stalled churn into a run that hung overnight.
+WRITE_TIMEOUT_S = float(os.environ.get("VB_VALKEY_WRITE_TIMEOUT", "300"))
+
 
 def encode_vector(vector) -> bytes:
     """FLOAT32 little-endian, which is what the module expects in PARAMS."""
@@ -315,20 +320,28 @@ class ValkeyDriver(EngineDriver):
             )
 
     def _write_connection(self):
-        """A connection for bulk writes, with no read timeout.
+        """A connection for bulk writes: generous timeout, keepalive, not none.
 
-        Deliberately different from the driver's main connection, which carries
-        a 600 second socket timeout so a wedged query cannot stall a run
-        forever. Writes are not queries: valkey-search performs the HNSW graph
-        insertion on the write path, so a batch of a thousand vectors into a
-        graph of a million nodes can legitimately take longer than any timeout
-        worth setting on a query. The load path has always opened its own
-        connection this way; the churn path used the main one and died with
-        "Timeout reading from socket" after the churn baseline had been
-        measured, at a million rows but never at smoke scale.
+        This has been wrong in both directions. It first carried the driver's
+        600 second query timeout, which a slow write legitimately exceeds. It
+        then carried no timeout at all, which is worse: a reply that never
+        arrives blocks forever, and that is exactly what happened. The client
+        sat at 0% CPU, 6.4 GB of a 10.6 GB limit, every cgroup memory counter
+        at zero, waiting on a socket, while the server answered a fresh HSET
+        into the same indexed prefix in 104 milliseconds.
+
+        A timeout that a real write cannot hit, plus keepalive so a dead peer
+        is noticed rather than waited on, plus a health check so a connection
+        that has gone stale is replaced instead of trusted.
         """
         factory = getattr(valkey_client, "Valkey", None) or valkey_client.Redis
-        return factory(host=self.spec.host, port=self.spec.port)
+        return factory(
+            host=self.spec.host, port=self.spec.port,
+            socket_timeout=WRITE_TIMEOUT_S,
+            socket_connect_timeout=30,
+            socket_keepalive=True,
+            health_check_interval=30,
+        )
 
     def delete_ids(self, ids: Sequence[int]) -> None:
         """Batched, because a churn deletes a tenth of the corpus at once.
