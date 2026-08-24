@@ -28,6 +28,11 @@ from ..metrics.records import PHASE_CHURN, Record
 from ..progress import Heartbeat, Progress
 from .context import RunContext
 
+# Wall clock allowed for one re-insertion. An engine that cannot write its rows
+# back in half an hour is not going to, and holding the machine to find out
+# costs a night. Overridable per profile.
+DEFAULT_CHURN_BUDGET_S = 1800.0
+
 DEFAULT_FRACTIONS = (0.10, 0.25)
 
 
@@ -68,7 +73,8 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         index: IndexSpec, ef_search: int,
         fractions: Sequence[float] = DEFAULT_FRACTIONS,
         max_queries: int = 1_000, seed: int = 20260803,
-        indexed_rows: Optional[int] = None) -> None:
+        indexed_rows: Optional[int] = None,
+        budget_s: float = DEFAULT_CHURN_BUDGET_S) -> None:
     """Measure recall/QPS before churn and after each churn step."""
     queries = dataset.test[:max_queries]
     # Recomputed when only part of the training set was loaded; the shipped
@@ -125,9 +131,45 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
 
         new_ids = list(range(next_id, next_id + len(original_ids)))
         next_id += len(original_ids)
-        with Heartbeat(f"re-inserting {len(new_ids):,} rows", prefix=driver.name):
-            with Timer() as insert_timer:
-                driver.insert_rows(new_ids, vectors, tags)
+        inserted, insert_seconds = _reinsert(
+            driver, new_ids, vectors, tags, budget_s)
+
+        if inserted < len(new_ids):
+            # Bounded rather than open-ended, because an engine can take the
+            # write and never finish it. Valkey loaded this corpus at 38,845
+            # rows/s into an unindexed keyspace and then managed 364 of 99,000
+            # back into the populated index before writes stopped entirely,
+            # with the server responsive and its mutation queue empty. Two runs
+            # were lost waiting on it.
+            #
+            # What it achieved is recorded as the measurement. Recall and
+            # throughput are not: the corpus is missing rows, so any figure
+            # taken now describes a state that is neither the baseline nor a
+            # churned corpus, and it would be read as though it were.
+            rate = inserted / insert_seconds if insert_seconds else 0.0
+            print(f"[churn] {driver.name}: re-insert did not complete — "
+                  f"{inserted:,} of {len(new_ids):,} rows in "
+                  f"{insert_seconds:.0f}s ({rate:,.1f} rows/s); "
+                  f"budget was {budget_s:.0f}s")
+            ctx.recorder.write(Record(
+                **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
+                churn_fraction=fraction, rows=driver.count_rows(),
+                index_bytes=driver.index_bytes(),
+                notes="re-insert did not complete within the churn budget",
+                extra={
+                    "rows_churned": count,
+                    "delete_seconds": round(delete_timer.elapsed, 3),
+                    "insert_seconds": round(insert_seconds, 3),
+                    "reinsert_completed": False,
+                    "rows_reinserted": inserted,
+                    "rows_expected": len(new_ids),
+                    "reinsert_rows_per_s": round(rate, 3),
+                    "churn_budget_s": budget_s,
+                },
+            ))
+            # Every later fraction builds on this one, so there is nothing
+            # meaningful left to measure.
+            break
 
         for original, new in zip(original_ids, new_ids):
             id_map[original] = new
@@ -148,7 +190,36 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             extra={
                 "rows_churned": count,
                 "delete_seconds": round(delete_timer.elapsed, 3),
-                "insert_seconds": round(insert_timer.elapsed, 3),
+                "insert_seconds": round(insert_seconds, 3),
+                "reinsert_completed": True,
                 "recall_drop_vs_baseline": round(drop, 6),
             },
         ))
+
+
+def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, tags,
+              budget_s: float):
+    """Re-insert in slices, stopping if the budget runs out.
+
+    One blocking call cannot tell a slow write path from a stalled one, and
+    cannot be abandoned. Slicing gives both: progress is visible, and a path
+    that is not going to finish releases the machine instead of holding it
+    until someone notices.
+
+    Returns (rows actually written, seconds spent).
+    """
+    total = len(ids)
+    # Fifty slices: enough that the budget is honoured to within 2% of itself,
+    # few enough that the slicing costs nothing against the write.
+    chunk = max(1, total // 50)
+    started = time.time()
+    written = 0
+    with Heartbeat(f"re-inserting {total:,} rows", prefix=driver.name):
+        for begin in range(0, total, chunk):
+            if time.time() - started > budget_s:
+                break
+            end = min(begin + chunk, total)
+            driver.insert_rows(ids[begin:end], vectors[begin:end],
+                               tags[begin:end])
+            written = end
+    return written, time.time() - started

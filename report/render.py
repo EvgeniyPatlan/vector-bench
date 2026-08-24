@@ -667,7 +667,39 @@ def _churn_table(summary: Dict[str, Any]) -> str:
         ["Engine", "Dataset", "Storage", "Churn", "Recall@k",
          "Recall drop vs baseline", "QPS", "Index size"],
         rows,
-    )
+    ) + _churn_notes(summary)
+
+
+def _churn_notes(summary: Dict[str, Any]) -> str:
+    """An engine that could not write its rows back.
+
+    Blank cells read as a measurement that was not taken. This one was: the
+    engine took the writes and did not finish them, and how far it got is the
+    result. Reported here rather than left to be inferred from an empty row.
+    """
+    stalled = [r for r in summary.get("churn", [])
+               if (r.get("extra") or {}).get("reinsert_completed") is False]
+    if not stalled:
+        return ""
+    lines = ["\n**Re-insertion did not complete for every engine.** Recall and "
+             "throughput are omitted for these rows on purpose: the corpus is "
+             "missing rows, so a figure taken then describes neither the "
+             "baseline nor a churned corpus. What the engine managed is the "
+             "measurement.\n"]
+    rows = []
+    for r in stalled:
+        extra = r.get("extra") or {}
+        rows.append([
+            _label(r.get("engine", "?")),
+            f"{extra.get('rows_reinserted', 0):,} of "
+            f"{extra.get('rows_expected', 0):,}",
+            _fmt(extra.get("insert_seconds"), 0, " s"),
+            _fmt(extra.get("reinsert_rows_per_s"), 1, " rows/s"),
+            _fmt(extra.get("churn_budget_s"), 0, " s"),
+        ])
+    lines.append(_md_table(
+        ["Engine", "Rows re-inserted", "Spent", "Rate", "Budget"], rows))
+    return "".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--concurrency-duration", type=float, default=20.0)
     p.add_argument("--selectivities", default="0.01,0.10,0.50")
     p.add_argument("--churn-fractions", default="0.10,0.25")
+    # An engine that stalls re-inserting must release the machine and record
+    # what it managed, rather than holding the run until someone notices.
+    p.add_argument("--churn-budget", type=float, default=1800.0)
     p.add_argument("--iterative-scan", default=None,
                    help="pgvector only: off | relaxed_order | strict_order")
 
@@ -223,6 +226,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 fractions=_floats(args.churn_fractions),
                 max_queries=args.max_queries,
                 indexed_rows=indexed_rows,
+                budget_s=args.churn_budget,
             )
 
     except Exception:

@@ -350,6 +350,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--ef-search", str(ops.get("ef_search", 100)),
         "--storage-engine", storage_engine,
         "--build-mode", build_mode,
+        "--churn-budget", str(ops.get("churn_budget_s", 1800)),
         # Read from the same extras render_config uses for the recall path, so
         # both measurement paths in one run build the same index. Only Percona
         # Search has the knob; the flag is omitted for everything else.

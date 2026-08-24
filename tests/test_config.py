@@ -3222,3 +3222,97 @@ class TestReRunningAUnitReplacesItsRecords:
         for method in ("def delete_ids", "def insert_rows", "def _write_range"):
             block = source.split(method)[1].split("\n    def ")[0]
             assert "_write_connection" in block, method
+
+
+class TestChurnIsBounded:
+    """An engine can take a write and never finish it.
+
+    Valkey loaded 990,000 vectors at 38,845 rows/s into an unindexed keyspace,
+    then managed 364 of 99,000 back into the populated index before writes
+    stopped entirely, with the server responsive, its index caught up and its
+    mutation queue empty. Two runs were lost waiting on it, one of them for
+    over two hours, because the re-insertion was a single blocking call with
+    nothing bounding it and no way to see progress.
+    """
+
+    def test_the_reinsert_is_sliced_so_progress_is_visible(self):
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "churn.py")).read()
+        body = source.split("def _reinsert")[1]
+        assert "budget_s" in body and "break" in body
+
+    def test_it_stops_at_the_budget_and_reports_what_it_wrote(self):
+        import time
+        from harness.workloads.churn import _reinsert
+
+        class SlowDriver:
+            name = "slow"
+            written = 0
+
+            def insert_rows(self, ids, vectors, tags):
+                time.sleep(0.05)
+                self.written += len(ids)
+
+        d = SlowDriver()
+        ids = list(range(1000))
+        written, elapsed = _reinsert(d, ids, [None] * 1000, [None] * 1000,
+                                     budget_s=0.12)
+        assert 0 < written < 1000, written
+        assert elapsed < 2.0
+
+    def test_a_fast_driver_finishes_everything(self):
+        from harness.workloads.churn import _reinsert
+
+        class FastDriver:
+            name = "fast"
+            def insert_rows(self, ids, vectors, tags): pass
+
+        written, _ = _reinsert(FastDriver(), list(range(500)),
+                               [None] * 500, [None] * 500, budget_s=60)
+        assert written == 500
+
+    def test_the_budget_reaches_the_harness(self):
+        from harness.main import parse_args
+        args = parse_args(["--engine", "valkey", "--dataset", "d", "--m", "16",
+                           "--run-id", "r", "--host", "h", "--port", "6379",
+                           "--output", "/tmp/o.jsonl", "--churn-budget", "900"])
+        assert args.churn_budget == 900.0
+
+    def test_the_orchestrator_passes_it(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert "--churn-budget" in source and "churn_budget_s" in source
+
+    def test_an_incomplete_reinsert_records_no_recall_number(self):
+        """The corpus is missing rows, so recall taken then describes neither
+        the baseline nor a churned corpus, and would be read as though it did."""
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "churn.py")).read()
+        block = source.split("reinsert_completed\": False")[0]
+        block = block[block.index("if inserted < len(new_ids):"):]
+        assert "**after" not in block, (
+            "an incomplete churn must not publish a recall/QPS measurement")
+
+    def test_the_report_states_what_a_stalled_engine_achieved(self):
+        from report.generate import summarize
+        from report.render import _churn_table
+        recs = [{"phase": "churn", "engine": "valkey", "dataset": "d",
+                 "resource_pass": "tuned", "storage_engine": "memory",
+                 "churn_fraction": 0.1, "m": 16,
+                 "notes": "re-insert did not complete within the churn budget",
+                 "extra": {"reinsert_completed": False, "rows_reinserted": 364,
+                           "rows_expected": 99000, "insert_seconds": 1800.0,
+                           "reinsert_rows_per_s": 0.2,
+                           "churn_budget_s": 1800.0}}]
+        table = _churn_table(summarize(recs, {}))
+        assert "did not complete" in table
+        assert "364 of 99,000" in table
+
+    def test_a_complete_churn_adds_no_note(self):
+        from report.generate import summarize
+        from report.render import _churn_table
+        recs = [{"phase": "churn", "engine": "pgvector", "dataset": "d",
+                 "resource_pass": "tuned", "storage_engine": "heap",
+                 "churn_fraction": 0.1, "m": 16, "qps": 229.0,
+                 "recall_at_k": 0.98,
+                 "extra": {"reinsert_completed": True}}]
+        assert "did not complete" not in _churn_table(summarize(recs, {}))
