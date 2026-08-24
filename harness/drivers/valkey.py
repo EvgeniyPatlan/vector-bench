@@ -60,6 +60,11 @@ BACKFILL_TIMEOUT_S = float(os.environ.get("VB_VALKEY_BACKFILL_TIMEOUT", "43200")
 
 METRIC = {"angular": "COSINE", "euclidean": "L2"}
 
+# Churn touches a fraction of the whole corpus in one call, so the same
+# batching the load path uses applies here. Unbatched, a 10% churn of a
+# million rows is one DEL of 99,000 keys and one pipeline holding 600 MB.
+CHURN_BATCH = int(os.environ.get("VB_VALKEY_CHURN_BATCH", "1000"))
+
 
 def encode_vector(vector) -> bytes:
     """FLOAT32 little-endian, which is what the module expects in PARAMS."""
@@ -312,16 +317,33 @@ class ValkeyDriver(EngineDriver):
             )
 
     def delete_ids(self, ids: Sequence[int]) -> None:
-        self._conn.delete(*[f"{PREFIX}{i}" for i in ids])
+        """Batched, because a churn deletes a tenth of the corpus at once.
+
+        One DEL carrying 99,000 key names is a single multi-bulk command of a
+        megabyte or so. The load path has always batched; this did not, and it
+        worked at smoke scale and failed at a million rows.
+        """
+        keys = [f"{PREFIX}{int(i)}" for i in ids]
+        for start in range(0, len(keys), CHURN_BATCH):
+            self._conn.delete(*keys[start:start + CHURN_BATCH])
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     tags: Sequence[int]) -> None:
+        """Batched for the same reason, and it matters more here.
+
+        Each vector is dim x 4 bytes, so 99,000 of them queued into one
+        pipeline is roughly 600 MB buffered in the client before a single
+        execute. That is what failed the tuned churn 25 minutes in, after the
+        baseline had already been measured.
+        """
         pipe = self._conn.pipeline(transaction=False)
         for i, key_id in enumerate(ids):
             pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
                 TAG_FIELD: int(tags[i]),
                 VECTOR_FIELD: encode_vector(vectors[i]),
             })
+            if (i + 1) % CHURN_BATCH == 0:
+                pipe.execute()
         pipe.execute()
 
     def count_rows(self) -> int:

@@ -2924,3 +2924,60 @@ class TestSilentAnnFailuresAreReported:
         from report.render import _validity_section
         s = self._summary(engines_with_results=("mariadb", "mongodb"))
         assert "measured nothing" not in _validity_section({}, s)
+
+
+class TestValkeyChurnIsBatched:
+    """Churn touches a tenth of the corpus in a single call.
+
+    The load path has always batched every thousand rows; the churn path did
+    not. At smoke scale that is 2,000 rows and it works. At a million rows it
+    is 99,000: one DEL carrying 99,000 key names, and one pipeline holding
+    99,000 HSETs of a 6 KB vector each, roughly 600 MB buffered in the client
+    before a single execute. The tuned pass failed there 25 minutes in, after
+    the churn baseline had already been measured, which is why five engines
+    have a churn result and one has half of one.
+    """
+
+    def _driver(self, monkeypatch, calls):
+        from harness.drivers import valkey as mod
+        from harness.drivers.base import ConnectionSpec
+        monkeypatch.setattr(mod, "Binary", lambda payload, subtype: payload,
+                            raising=False)
+        d = mod.ValkeyDriver(ConnectionSpec(host="h", port=1))
+
+        class FakePipe:
+            def hset(self, *a, **kw): calls.setdefault("hset", []).append(1)
+            def execute(self): calls.setdefault("execute", []).append(
+                len(calls.get("hset", [])))
+
+        class FakeConn:
+            def pipeline(self, transaction=False): return FakePipe()
+            def delete(self, *keys): calls.setdefault("delete", []).append(len(keys))
+
+        d._conn = FakeConn()
+        return d
+
+    def test_deletes_are_chunked(self, monkeypatch):
+        from harness.drivers.valkey import CHURN_BATCH
+        calls = {}
+        self._driver(monkeypatch, calls).delete_ids(list(range(99_000)))
+        assert max(calls["delete"]) <= CHURN_BATCH
+        assert sum(calls["delete"]) == 99_000
+
+    def test_inserts_are_flushed_along_the_way(self, monkeypatch):
+        """One execute at the end means the whole corpus fraction is buffered
+        in the client first."""
+        import numpy
+        from harness.drivers.valkey import CHURN_BATCH
+        calls = {}
+        n = 5_000
+        self._driver(monkeypatch, calls).insert_rows(
+            list(range(n)), numpy.zeros((n, 4), dtype=numpy.float32),
+            list(range(n)))
+        assert len(calls["execute"]) >= n // CHURN_BATCH
+
+    def test_the_load_path_and_the_churn_path_use_the_same_batch(self):
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        assert "CHURN_BATCH" in source
+        assert source.count("CHURN_BATCH") >= 3
