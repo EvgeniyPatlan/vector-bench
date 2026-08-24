@@ -3068,3 +3068,49 @@ class TestQuantizationReachesBothPaths:
                            "--output", "/tmp/out.jsonl",
                            "--quantization", "scalar"])
         assert args.quantization == "scalar"
+
+
+class TestResumeContinuesTheRightRun:
+    """Checkpoints live inside the run directory.
+
+    So --resume with a freshly minted run id resumes nothing: it re-runs every
+    unit into an empty directory and produces a report containing only the
+    engines named on that command line, while the run being continued stays
+    where it was. Two directories, neither complete, and a manual merge to get
+    one report.
+    """
+
+    def _profile(self):
+        return {"name": "tuned-complete"}
+
+    def _results(self, tmp_path, monkeypatch, names):
+        from orchestrator import cli
+        for name in names:
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "run-manifest.json").write_text("{}")
+        monkeypatch.setattr(cli, "paths_for",
+                            lambda rid: {"run_dir": str(tmp_path / rid)})
+        return cli
+
+    def test_it_picks_the_most_recent_run_for_the_profile(self, tmp_path, monkeypatch):
+        cli = self._results(tmp_path, monkeypatch,
+                            ["tuned-complete-20260820-134424",
+                             "tuned-complete-20260822-101500",
+                             "smoke-20260821-090000"])
+        assert cli._resume_target(self._profile()) == "tuned-complete-20260822-101500"
+
+    def test_it_ignores_other_profiles(self, tmp_path, monkeypatch):
+        cli = self._results(tmp_path, monkeypatch, ["smoke-20260899-000000"])
+        assert cli._resume_target(self._profile()) is None
+
+    def test_a_directory_without_a_manifest_is_not_a_run(self, tmp_path, monkeypatch):
+        from orchestrator import cli
+        (tmp_path / "tuned-complete-20260820-134424").mkdir()
+        monkeypatch.setattr(cli, "paths_for",
+                            lambda rid: {"run_dir": str(tmp_path / rid)})
+        assert cli._resume_target(self._profile()) is None
+
+    def test_it_is_only_consulted_when_resume_was_asked_for(self):
+        """Every run without --run-id would otherwise continue the last one."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        assert "if not run_id and args.resume:" in source

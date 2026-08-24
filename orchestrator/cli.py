@@ -222,6 +222,39 @@ def cmd_clean(args: argparse.Namespace) -> int:
 # run
 # ---------------------------------------------------------------------------
 
+def _resume_target(profile: Dict[str, Any]) -> Optional[str]:
+    """The run --resume should continue, when no --run-id was given.
+
+    Checkpoints live inside the run directory, so --resume with a fresh
+    timestamped run id resumes nothing: it silently re-runs every unit into an
+    empty directory and produces a report containing only the engines named on
+    that command line. The results of the run being continued stay where they
+    were, and the two have to be merged by hand afterwards.
+
+    Picking the most recent directory for the same profile is what --resume
+    plainly means. It is announced rather than assumed, because continuing the
+    wrong run is worse than starting a new one.
+    """
+    name = profile.get("name", "run")
+    results = paths_for("x")["run_dir"].rsplit(os.sep, 1)[0]
+    try:
+        candidates = sorted(
+            d for d in os.listdir(results)
+            if d.startswith(f"{name}-")
+            and os.path.isfile(os.path.join(results, d, "run-manifest.json"))
+        )
+    except OSError:
+        return None
+    if not candidates:
+        print("--resume: no previous run found for profile "
+              f"{name!r}; starting a new one")
+        return None
+    latest = candidates[-1]
+    print(f"--resume: continuing {latest} "
+          f"(pass --run-id to continue a different one)")
+    return latest
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not docker_ctl.docker_available():
         print("cannot talk to the Docker daemon", file=sys.stderr)
@@ -246,7 +279,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"unknown engines: {sorted(unknown)}", file=sys.stderr)
         return 2
 
-    run_id = args.run_id or new_run_id(profile.get("name", "run"))
+    run_id = args.run_id
+    if not run_id and args.resume:
+        run_id = _resume_target(profile)
+    run_id = run_id or new_run_id(profile.get("name", "run"))
     paths = paths_for(run_id)
     os.makedirs(paths["run_dir"], exist_ok=True)
     os.makedirs(paths["annb_results"], exist_ok=True)
