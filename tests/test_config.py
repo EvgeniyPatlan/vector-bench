@@ -3947,3 +3947,75 @@ class TestTheWriteShapeTravelsWithTheChurnNumber:
                                    "churn.py")).read()
         assert source.count('"reinsert_rows_per_s"') == 2
 
+
+class TestTheMSweepProfileIsolatesGraphDegree:
+    """tuned-complete pins M=16 because sweeping it costs a full index build
+    per value, and MHNSW and VIDX build incrementally. The result is a headline
+    run where pgvector and Valkey contributed 24 measured points and the three
+    InnoDB engines 8 -- an affordability artifact that reads as an engine
+    difference. This profile answers the M question at a tenth of the corpus,
+    and it is only worth running if M is genuinely the only thing moving."""
+
+    def _rendered(self, engine):
+        from orchestrator.ann_pass import render_config
+        from orchestrator.config import (load_profile, load_resources,
+                                         merge_resource_overrides)
+        profile = load_profile("m-sweep")
+        resources = merge_resource_overrides(load_resources("tuned"), profile)
+        return render_config(engine, profile, resources, "tuned"), profile
+
+    def _arg_groups(self, engine):
+        body, _ = self._rendered(engine)
+        groups = body["float"]["any"][0]["run_groups"]
+        return [ag for g in groups.values() for ag in g["arg_groups"]]
+
+    def test_every_engine_that_has_m_sweeps_the_same_five(self):
+        for engine in ("mariadb", "mariadb123", "alisql", "pgvector", "valkey"):
+            values = {tuple(ag["M"]) for ag in self._arg_groups(engine)}
+            assert values == {(6, 8, 16, 24, 32)}, engine
+
+    def test_no_other_build_axis_moves(self):
+        """The tuned pass sweeps ef_construction for two engines and
+        quantization for a third. Leaving those on would multiply fifteen
+        InnoDB builds by axes the InnoDB engines do not have -- widening the
+        asymmetry the profile exists to remove."""
+        for engine, key in (("pgvector", "efConstruction"),
+                            ("valkey", "efConstruction"),
+                            ("mongodb", "quantization")):
+            for ag in self._arg_groups(engine):
+                value = ag.get(key)
+                if isinstance(value, list):
+                    assert len(value) == 1, (engine, key, value)
+
+    def test_one_build_mode_each(self):
+        for engine in ("pgvector", "valkey"):
+            body, _ = self._rendered(engine)
+            assert len(body["float"]["any"][0]["run_groups"]) == 1, engine
+
+    def test_the_query_grid_matches_the_headline_run(self):
+        """The point is comparing shapes against tuned-complete. A different
+        ef_search grid would make that comparison an interpolation."""
+        from orchestrator.config import load_profile
+        assert (load_profile("m-sweep")["ann"]["ef_search"]
+                == load_profile("tuned-complete")["ann"]["ef_search"])
+
+    def test_it_runs_on_a_tenth_of_the_corpus(self):
+        """At 990,000 rows an InnoDB index build is hours, per M value."""
+        from orchestrator.config import load_profile
+        assert load_profile("m-sweep")["datasets"] == [
+            "dbpedia-openai-100k-angular"]
+
+    def test_ops_is_off(self):
+        """Build cost, concurrency, filtered and churn are answered at full
+        scale by tuned-complete. A second set at 90,000 rows would invite
+        exactly the cross-run comparison the profile warns against."""
+        from orchestrator.config import load_profile
+        assert load_profile("m-sweep")["ops"]["enabled"] is False
+
+    def test_the_estimate_covers_every_engine(self):
+        """An estimate missing an engine silently falls back to a default that
+        was wrong by 3x the last time it mattered."""
+        from orchestrator.cli import _INGEST_ROWS_PER_S, KNOWN_ENGINES
+        for engine in KNOWN_ENGINES:
+            assert engine in _INGEST_ROWS_PER_S, engine
+

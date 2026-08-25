@@ -1,0 +1,91 @@
+# Graph degree as the axis, on the corpus family the headline run used.
+#
+# WHY THIS EXISTS
+#
+# tuned-complete pins M=16 for every engine, because sweeping it there costs a
+# full index build per value and MHNSW and VIDX build incrementally: at 990,000
+# rows by 1536 dimensions that is three to six hours each, per M. The result is
+# a headline run where pgvector and Valkey contributed 24 measured points, mongot
+# 16, and the three InnoDB engines 8 — and the reason is affordability, not the
+# engines. A reader comparing the Pareto frontiers is entitled to ask whether
+# MariaDB at M=32 would have changed the picture, and tuned-complete cannot
+# answer.
+#
+# This profile answers it at a tenth of the corpus. Same generator, same
+# embedding model, same 1536 dimensions, same query grid — only 90,000 rows
+# instead of 990,000, which brings an InnoDB index build down from hours to
+# tens of minutes and makes five values of M affordable on every engine that
+# exposes one.
+#
+# WHAT IT DOES NOT DO
+#
+# It does not replace the headline numbers. HNSW insert cost and search cost
+# both rise with the number of indexed nodes, so absolute throughput here will
+# be better than at 990,000 rows for everyone. What transfers is the *shape*:
+# which direction each engine moves as M rises, and whether the ordering
+# between engines changes with it. Read a row against the other rows in this
+# run, never against tuned-complete.
+#
+# It also re-measures AliSQL's query grid on a second corpus. The
+# tuned-complete run recorded 19.6, 5.2 and 2.6 QPS at ef_search 120, 200 and
+# 400, sitting between 133 at ef=80 and 23.3 at ef=800 — non-monotonic, and
+# inconsistent with its own trend either side. If that reproduces here it is
+# the engine; if it does not, it was the machine, and those three points should
+# be struck rather than published.
+#
+# COST. Roughly nine hours, almost all of it the three InnoDB engines building
+# fifteen indexes between them. The other three finish in minutes. `run` prints
+# a per-engine estimate before it starts.
+#
+#   ./scripts/generate-dataset.sh dbpedia-openai-100k-angular
+#   ./run-benchmark.sh run --profile m-sweep
+name: m-sweep
+description: Graph degree swept across every engine that exposes it (~9 h)
+
+datasets:
+  - dbpedia-openai-100k-angular
+
+k: 10
+runs: 1
+default_resource_pass: tuned
+
+resources:
+  cpu:
+    client_cpus: 16
+  # The tuned pass sweeps ef_construction for pgvector and Valkey and
+  # quantization for Percona Search. Those are real axes and they belong in
+  # tuned-complete, but here they would multiply fifteen InnoDB index builds by
+  # axes the InnoDB engines do not have -- widening exactly the asymmetry this
+  # profile exists to remove. Pinned to one value each so M is the only build
+  # knob that moves. A profile's `resources:` block deep-merges over the pass,
+  # so this replaces the lists rather than adding to them.
+  extras:
+    mariadb_storage_engines: [InnoDB]
+    pgvector_ef_construction: [200]
+    valkey_ef_construction: [200]
+    mongodb_quantization: [none]
+
+ann:
+  enabled: true
+  # The axis. Six through thirty-two spans the useful range: below six the
+  # graph is too sparse to reach high recall at any ef_search, and above
+  # thirty-two the build cost stops being worth the recall on every engine
+  # measured so far.
+  m_values: [6, 8, 16, 24, 32]
+  ef_search: [10, 20, 40, 80, 120, 200, 400, 800]
+  insert_threads: 8
+  mariadb_storage_engines: [InnoDB]
+  # Fallbacks for a normalized-pass run of this profile; the tuned pass takes
+  # the pinned values from resources.extras above.
+  pgvector_ef_construction: 200
+  valkey_ef_construction: 200
+  mongodb_quantization: none
+  pgvector_build_modes: [post]
+  valkey_build_modes: [post]
+
+ops:
+  # Off. Build cost, concurrency, filtered and churn are all answered by
+  # tuned-complete at full scale, and repeating them at 90,000 rows would add
+  # a second set of numbers for the same questions that nobody should compare
+  # with the first.
+  enabled: false

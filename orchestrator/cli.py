@@ -596,7 +596,8 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
 # because HNSW insert cost rises as the graph grows and rises again with M
 # (glove-100: ~320 rows/s at M=8, ~70 at M=32). An estimate that is optimistic
 # by 3x is worse than none, so these are the observed mid-grid numbers.
-_INGEST_ROWS_PER_S = {"mariadb": 150, "alisql": 55, "pgvector": 3000}
+_INGEST_ROWS_PER_S = {"mariadb": 150, "mariadb123": 110, "alisql": 55,
+                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000}
 _DATASET_ROWS = {
     "fashion-mnist-784-euclidean": 60_000,
     "glove-100-angular": 1_183_514,
@@ -644,8 +645,16 @@ _MEASURED_ROWS_PER_S = {
     # of 3.3 h and 6.6 h, so it was 6-8x pessimistic at this dimensionality:
     # _dim_penalty overcharges for width once the per-row cost is dominated by
     # graph traversal rather than by the distance computation itself.
-    ("mariadb", "dbpedia-openai-1000k-angular"): 84,
-    ("alisql", "dbpedia-openai-1000k-angular"): 41,
+    ("mariadb", "dbpedia-openai-1000k-angular"): 74,
+    ("mariadb123", "dbpedia-openai-1000k-angular"): 51,
+    ("alisql", "dbpedia-openai-1000k-angular"): 43,
+    # The three that do not maintain the graph on the write path. Their rates
+    # are the load alone; the index build is separate and is not what this
+    # estimate is for. Two to three orders of magnitude above the InnoDB
+    # engines, which is the point.
+    ("pgvector", "dbpedia-openai-1000k-angular"): 617,
+    ("valkey", "dbpedia-openai-1000k-angular"): 30122,
+    ("mongodb", "dbpedia-openai-1000k-angular"): 71182,
 }
 
 
