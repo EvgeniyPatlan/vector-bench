@@ -662,19 +662,27 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
                                    r.get("storage_engine") or "",
                                    r.get("clients") or 0)):
-        eff = (r.get("extra") or {}).get("scaling_efficiency")
+        extra = r.get("extra") or {}
+        eff = extra.get("scaling_efficiency")
+        # A point measured once carries no spread, and the difference between
+        # "measured once" and "repeated and stable" is the difference between
+        # a number and a result.
+        repeats = extra.get("repeats") or 1
+        spread = ("—" if repeats < 2
+                  else f"±{extra.get('qps_spread_pct', 0):.1f}% (n={repeats})")
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
             _storage(r),
             str(r.get("clients", "—")),
             _fmt(r.get("qps"), 0),
+            spread,
             _fmt(r.get("latency_p50_ms"), 3),
             _fmt(r.get("latency_p95_ms"), 3),
             _fmt(r.get("latency_p99_ms"), 3),
             _fmt(eff, 2) if eff is not None else "—",
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Clients", "QPS", "p50 (ms)",
+        ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread", "p50 (ms)",
          "p95 (ms)", "p99 (ms)", "Scaling efficiency"],
         rows,
     )
@@ -820,7 +828,9 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "Where a database should differ from an ANN library. MariaDB caches the "
         "MHNSW graph per `TABLE_SHARE`; AliSQL keeps a shared cache plus a "
         "per-transaction cache; pgvector serves graph pages from `shared_buffers`. "
-        "Scaling efficiency of 1.0 is linear scaling.\n\n",
+        "Scaling efficiency of 1.0 is linear scaling. **Spread** is the range "
+        "across repeated measurement windows at that point; a dash means the "
+        "point was measured once and carries no error bar.\n\n",
         (_concurrency_table(summary) if summary.get("concurrency")
          else _not_measured("concurrency", profile)),
     ]

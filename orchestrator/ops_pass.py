@@ -401,6 +401,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--workloads", ",".join(ops.get("workloads", ["build"])),
         "--client-counts", ",".join(str(c) for c in ops.get("client_counts", [1])),
         "--concurrency-duration", str(ops.get("concurrency_duration_s", 20)),
+        "--concurrency-repeats", str(ops.get("concurrency_repeats", 1)),
         "--selectivities", ",".join(str(s) for s in ops.get("selectivities", [0.1])),
         "--churn-fractions", ",".join(str(c) for c in ops.get("churn_fractions", [0.1])),
     ]

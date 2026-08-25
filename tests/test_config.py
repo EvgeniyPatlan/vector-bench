@@ -4201,3 +4201,67 @@ class TestACurveIsIdentifiedByItsBuildNotItsColumns:
                     ef_search=ef, storage_engine="wiredTiger"))
         assert summarize(records)["duplicate_ann"] == []
 
+
+class TestConcurrencyCarriesAnErrorBar:
+    """Every figure in this framework was a single sample until a Valkey point
+    was re-measured by accident, five hours later on the same build and
+    configuration, and came back 21% higher at sixteen and thirty-two clients.
+    Nothing else had ever been repeated, so nothing else had an error bar, and
+    two engines whose results differ by less than that were being presented as
+    ordered."""
+
+    def _source(self):
+        return open(os.path.join(VB_ROOT, "harness", "workloads",
+                                 "concurrency.py")).read()
+
+    def test_the_workload_takes_repeats(self):
+        assert "repeats: int = 1" in self._source()
+
+    def test_a_window_is_a_function_now(self):
+        """Repeating meant the measured window had to stop being the body of
+        a loop."""
+        assert "def _one_window(" in self._source()
+
+    def test_the_median_window_is_reported_not_an_average(self):
+        """Latency percentiles from one measured window mean something; the
+        mean of several windows' percentiles means nothing."""
+        source = self._source()
+        assert "samples[len(samples) // 2]" in source
+        assert "samples.sort(" in source
+
+    def test_every_sample_is_recorded(self):
+        """A summary of the spread is not the spread."""
+        assert '"qps_samples"' in self._source()
+
+    def test_the_flag_reaches_the_harness(self):
+        source = open(os.path.join(VB_ROOT, "harness", "main.py")).read()
+        assert "--concurrency-repeats" in source
+        assert "repeats=args.concurrency_repeats" in source
+
+    def test_the_orchestrator_passes_it(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert "--concurrency-repeats" in source
+
+    def test_the_headline_profile_repeats(self):
+        from orchestrator.config import load_profile
+        assert load_profile("tuned-complete")["ops"]["concurrency_repeats"] >= 3
+
+    def test_a_single_sample_is_shown_as_having_no_error_bar(self):
+        """A point measured once must not be dressed as +/-0.0%."""
+        from report.render import _concurrency_table
+        once = _concurrency_table({"concurrency": [
+            {"engine": "valkey", "dataset": "d", "clients": 32, "qps": 5820.0,
+             "extra": {"scaling_efficiency": 0.43}}]})
+        assert "—" in once
+        assert "n=" not in once
+
+    def test_a_repeated_point_shows_its_spread(self):
+        from report.render import _concurrency_table
+        thrice = _concurrency_table({"concurrency": [
+            {"engine": "valkey", "dataset": "d", "clients": 32, "qps": 5820.0,
+             "extra": {"scaling_efficiency": 0.43, "repeats": 3,
+                       "qps_spread_pct": 21.3,
+                       "qps_samples": [4800.0, 5820.0, 5100.0]}}]})
+        assert "21.3%" in thrice
+        assert "n=3" in thrice
+

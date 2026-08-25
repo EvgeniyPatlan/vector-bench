@@ -81,5 +81,13 @@ ops:
   # present.
   client_counts: [1, 2, 4, 8, 16, 32]
   concurrency_duration_s: 60
+  # Three windows per client count, median reported with the spread beside it.
+  # Every figure in the 2026-08 run was a single sample, and the one point that
+  # happened to be re-measured came back 21% higher at sixteen and thirty-two
+  # clients -- enough to cover the gap between two engines that were being
+  # presented as ordered. Concurrency is the headline finding and the cheapest
+  # thing here to repeat: about fifteen extra minutes per engine on a run that
+  # takes days.
+  concurrency_repeats: 3
   selectivities: [0.10, 0.01]
   churn_fractions: [0.10]

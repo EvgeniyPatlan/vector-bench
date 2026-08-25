@@ -76,6 +76,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help=f"comma-separated subset of: {','.join(ALL_WORKLOADS)}")
     p.add_argument("--client-counts", default="1,2,4,8,16,32")
     p.add_argument("--concurrency-duration", type=float, default=20.0)
+    # Every figure here was a single sample until a Valkey point was
+    # re-measured by accident and came back 21% higher. Concurrency is the
+    # headline finding, the noisiest measurement, and the cheapest to repeat.
+    p.add_argument("--concurrency-repeats", type=int, default=1,
+                   help="measure each client count N times and record the "
+                        "median window with the spread beside it")
     p.add_argument("--selectivities", default="0.01,0.10,0.50")
     p.add_argument("--churn-fractions", default="0.10,0.25")
     # An engine that stalls re-inserting must release the machine and record
@@ -205,6 +211,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 client_counts=_ints(args.client_counts),
                 duration_s=args.concurrency_duration,
                 max_queries=args.max_queries,
+                repeats=args.concurrency_repeats,
             )
 
         if "filtered" in workloads:
