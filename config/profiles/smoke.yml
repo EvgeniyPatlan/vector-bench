@@ -1,6 +1,6 @@
 # Smoke profile — the gate every long run must pass first.
 #
-# Proves the whole pipeline end to end for all three engines: images build,
+# Proves the whole pipeline end to end for every engine: images build,
 # servers start, vector DDL is accepted, the index is actually used, records
 # are written, charts render and the report generates. It is not a
 # measurement — the grids are far too sparse to draw a Pareto curve from.
@@ -9,7 +9,7 @@
 # both. AliSQL dominates it at ~55 rows/s ingest. An earlier version of this
 # file claimed 15 minutes, which was wrong.
 name: smoke
-description: End-to-end pipeline validation, all engines, all charts (~30 min/pass)
+description: End-to-end pipeline validation, all six engines, all charts (~45 min/pass)
 
 datasets:
   - fashion-mnist-784-euclidean

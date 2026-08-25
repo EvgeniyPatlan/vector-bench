@@ -41,13 +41,21 @@ from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 
 GB = 1024 ** 3
 
-# mariadb123 is opt-in via --engines: it is a second MariaDB version, not
-# part of the default three-way comparison.
+# The original three-way comparison. Kept as a name because the docs and the
+# profiles still refer to it, but it is no longer what a run defaults to --
+# see KNOWN_ENGINES.
 ALL_ENGINES = ("mariadb", "alisql", "pgvector")
-# Opt-in rather than default. mariadb123 is another hour of compiling; mongodb
-# is a second server process, a replica set and a JVM, and is a Technical
-# Preview besides.
+# These arrived after the first three and were opt-in while they were being
+# brought up: a second MariaDB version is another hour of compiling, and
+# Percona Search is two processes, a replica set and a JVM.
 EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
+# What `run` measures when nobody says otherwise. This defaulted to the
+# original three long after the other three had become part of the study, so
+# `run --profile smoke` proved three engines and `run --profile tuned-complete`
+# would have measured three over forty hours -- both reporting success, because
+# an engine nobody asked for cannot fail. A default that silently drops half
+# the comparison is worse than one that fails on a missing image, which is what
+# this now does if the extras were never built.
 KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
 
 
@@ -180,7 +188,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         print(f"ann-benchmarks working copy missing at {work}; "
               f"run: scripts/prepare-harness.sh", file=sys.stderr)
         return 1
-    for engine in (args.engines.split(",") if args.engines else ALL_ENGINES):
+    for engine in (args.engines.split(",") if args.engines else KNOWN_ENGINES):
         body = ann_pass.render_config(engine, profile, resources, args.resource_pass)
         path = ann_pass.write_config(work, engine, body)
         print(f"rendered {path}")
@@ -300,7 +308,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     profile = load_profile(args.profile)
-    engines = [e.strip() for e in (args.engines or ",".join(ALL_ENGINES)).split(",") if e.strip()]
+    engines = [e.strip() for e in
+               (args.engines or ",".join(KNOWN_ENGINES)).split(",") if e.strip()]
     datasets = ([d.strip() for d in args.datasets.split(",") if d.strip()]
                 if args.datasets else list(profile.get("datasets", [])))
     # A profile may declare its own default pass. `mariadb-blog` does, because

@@ -4392,3 +4392,44 @@ class TestAFloorFigureSaysWhereItWasActuallyTaken:
         entry = self._entry(qps_at_recall_99=None, qps_at_recall_99_recall=None)
         assert "—" in self._table(entry)
 
+
+class TestARunMeasuresEveryEngineByDefault:
+    """`run` defaulted to the original three engines long after the other
+    three had become part of the study. So `run --profile smoke` proved three
+    engines and reported success, and `run --profile tuned-complete` would have
+    spent forty hours measuring three of six and reported success too -- an
+    engine nobody asked for cannot fail, so nothing anywhere said half the
+    comparison was missing."""
+
+    def test_the_default_is_every_known_engine(self):
+        from orchestrator.cli import KNOWN_ENGINES
+        assert set(KNOWN_ENGINES) == {"mariadb", "mariadb123", "alisql",
+                                      "pgvector", "valkey", "mongodb"}
+
+    def test_run_defaults_to_all_of_them(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        body = source.split("def cmd_run")[1].split("\ndef ")[0]
+        line = next(l for l in body.splitlines() if "engines = [" in l)
+        assert "ALL_ENGINES" not in line + body.split(line)[1].split("\n")[0]
+
+    def test_no_command_still_defaults_to_the_original_three(self):
+        """ALL_ENGINES survives as a name for the original comparison, but
+        nothing may quietly resolve a default through it."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        for line in source.splitlines():
+            if "args.engines" in line and "ALL_ENGINES" in line:
+                assert False, f"a default still resolves to three: {line.strip()}"
+
+    def test_the_smoke_profile_no_longer_claims_three(self):
+        """The gate before every long run has to gate the whole run."""
+        text = open(os.path.join(VB_ROOT, "config", "profiles",
+                                 "smoke.yml")).read()
+        assert "all three engines" not in text
+
+    def test_an_unbuilt_engine_fails_loudly(self):
+        """Defaulting to six means someone with three images gets an error.
+        That is the point: a missing image is recoverable, a silently absent
+        engine is forty hours."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        assert "not found. Build it first" in source
+
