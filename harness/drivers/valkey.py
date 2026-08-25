@@ -34,6 +34,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy
@@ -76,6 +77,32 @@ WRITE_TIMEOUT_S = float(os.environ.get("VB_VALKEY_WRITE_TIMEOUT", "300"))
 # "not coming".
 CANARY_TIMEOUT_S = float(os.environ.get("VB_VALKEY_CANARY_TIMEOUT", "30"))
 
+# The churn write gets a much shorter leash than the load. A healthy batch
+# of a thousand took a quarter of a second during the load, so a minute is
+# already two orders of magnitude of headroom -- and the batch size is
+# halved on each stall, so this is paid once per halving rather than once.
+CHURN_WRITE_TIMEOUT_S = float(
+    os.environ.get("VB_VALKEY_CHURN_WRITE_TIMEOUT", "60"))
+
+# Where the diagnosis looks for the turnover. One row is known to work and
+# a thousand is known not to; the point of the ladder is to say where
+# between them the write stops coming back, because that is the difference
+# between a batching limit and something that is not about size at all.
+_PROBE_SIZES = (1, 10, 100, 1000)
+
+# How long a write may be outstanding before the server is asked about it,
+# rather than after. A healthy batch of a thousand took a quarter of a
+# second during the load, so anything still running at twenty is already
+# two orders of magnitude out and worth a look.
+STALL_OBSERVE_S = float(os.environ.get("VB_VALKEY_STALL_OBSERVE", "20"))
+
+
+class _WriteStalled(RuntimeError):
+    """A batch that did not come back. Carries no diagnosis of its own:
+    the caller decides whether this is one to retry smaller or the last
+    one, and only the last one is worth a full report."""
+
+
 
 def _optional_int(value) -> Optional[int]:
     """int(value), or None for a field FT.INFO did not report.
@@ -108,6 +135,9 @@ class ValkeyDriver(EngineDriver):
         self._bytes_before_index = 0
         self._bytes_after_index = 0
         self._backfill_seconds = 0.0
+        # Not a constant: see insert_rows. Starts where the load writes
+        # and shrinks only if the engine will not take that size.
+        self._write_batch = CHURN_BATCH
 
     # -- lifecycle ------------------------------------------------------
 
@@ -450,14 +480,58 @@ class ValkeyDriver(EngineDriver):
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     tags: Sequence[int]) -> None:
-        """Batched for the same reason, and it matters more here.
+        """Write back in batches, shrinking the batch if one does not return.
 
-        Each vector is dim x 4 bytes, so 99,000 of them queued into one
-        pipeline is roughly 600 MB buffered in the client before a single
-        execute. That is what failed the tuned churn 25 minutes in, after the
-        baseline had already been measured.
+        Two facts fix the shape of this. A pipeline of a thousand HSETs is what
+        the load uses and it moves 30,000 rows a second into an unindexed
+        keyspace. The same pipeline into the populated index does not come back
+        at all -- 302 seconds, zero rows -- while a single HSET into that same
+        index, on a connection opened at the moment of the stall, returns in
+        one millisecond.
+
+        So the batch is not a constant any more. A write that does not return
+        halves it and tries again on a fresh connection, down to one row at a
+        time, and the size that worked is reported: at a millisecond a row even
+        the floor finishes 99,000 rows inside the budget. That is a slower
+        measurement than the load, which is the honest result -- writing into a
+        live HNSW graph is slower than writing into a hash table -- but it is a
+        measurement, where a timeout is not.
         """
-        conn = self._write_connection()
+        cursor = 0
+        while cursor < len(ids):
+            size = min(self._write_batch, len(ids) - cursor)
+            stop = cursor + size
+            try:
+                self._write_batch_once(ids[cursor:stop], vectors[cursor:stop],
+                                       tags[cursor:stop])
+            except _WriteStalled:
+                if self._write_batch <= 1:
+                    raise RuntimeError(
+                        f"a single-row write did not return either.\n"
+                        f"{self._diagnose_stalled_write(ids[cursor:stop], vectors[cursor:stop], tags[cursor:stop])}"
+                    )
+                if self._write_batch == CHURN_BATCH:
+                    # Printed once, from the first stall, while the server is
+                    # still in the state that produced it.
+                    print(self._diagnose_stalled_write(
+                        ids[cursor:stop], vectors[cursor:stop],
+                        tags[cursor:stop]), flush=True)
+                self._write_batch = max(1, self._write_batch // 2)
+                print(f"[valkey] batched write of {size:,} rows did not "
+                      f"return; retrying at {self._write_batch:,}",
+                      flush=True)
+                continue
+            cursor = stop
+
+    def _write_batch_once(self, ids, vectors, tags) -> None:
+        """One pipeline, one connection, a timeout a healthy write cannot hit.
+
+        Fresh each time: redis-py disconnects a connection whose read timed
+        out, and reusing one that has already failed would confuse a wedged
+        socket with a wedged server -- which is the distinction this whole path
+        exists to make.
+        """
+        conn = self._write_connection(timeout_s=CHURN_WRITE_TIMEOUT_S)
         try:
             pipe = conn.pipeline(transaction=False)
             for i, key_id in enumerate(ids):
@@ -465,33 +539,96 @@ class ValkeyDriver(EngineDriver):
                     TAG_FIELD: int(tags[i]),
                     VECTOR_FIELD: encode_vector(vectors[i]),
                 })
-                if (i + 1) % CHURN_BATCH == 0:
-                    self._execute_writes(pipe, ids, vectors, tags)
-            self._execute_writes(pipe, ids, vectors, tags)
+            try:
+                self._execute_watched(pipe, len(ids))
+            except Exception as exc:
+                raise _WriteStalled(str(exc)) from exc
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    def _execute_writes(self, pipe, ids, vectors, tags) -> None:
-        """Run one batch, and if it stalls, find out which side stalled.
+    def _execute_watched(self, pipe, rows: int) -> None:
+        """Run the batch, and look at the server while it is still hanging.
 
-        A churn re-insert has now failed the same way twice: the client blocked
-        on a socket read until its timeout, while the server sat at exactly its
-        idle CPU baseline and answered a hand-typed HSET into the same indexed
-        prefix in 104 ms. Both ends idle is not slow work, and six explanations
-        were proposed for it from the outside without one of them being tested
-        against the machine while it was in that state.
+        Every diagnosis so far has run after the fact, and that is why five of
+        them were wrong. redis-py disconnects a connection whose read timed
+        out, so by the time an exception is caught the socket the server would
+        have had an opinion about is already gone: CLIENT LIST shows nothing,
+        connected_clients is back to one, and the only honest reading of any of
+        it is "the client is no longer connected", which was never in doubt.
 
-        So the test runs here, at the moment it happens, on the connection that
-        is still known to work. Whether the server sees the write at all is the
-        question the next run should answer by itself.
+        So the write goes on a thread and the server is questioned from here
+        while it is still outstanding. CLIENT LIST settles it in one line. If
+        the stalled connection is there with a full query buffer and cmd=hset,
+        the server has the write and is not finishing it. If it is not there at
+        all, the server never took the connection, and nothing about the index
+        or the module is involved.
         """
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
-            pipe.execute()
+            future = pool.submit(pipe.execute)
+            try:
+                return future.result(timeout=STALL_OBSERVE_S)
+            except FuturesTimeout:
+                pass
+            print(f"[valkey] a write of {rows:,} rows has not returned after "
+                  f"{STALL_OBSERVE_S:.0f}s. The server, while it is still "
+                  f"outstanding:", flush=True)
+            print(self._live_server_state(), flush=True)
+            return future.result(
+                timeout=max(1.0, CHURN_WRITE_TIMEOUT_S - STALL_OBSERVE_S))
+        except FuturesTimeout as exc:
+            raise TimeoutError(
+                f"the write did not return within "
+                f"{CHURN_WRITE_TIMEOUT_S:.0f}s") from exc
+        finally:
+            # Not waited on: the thread is blocked on a socket that is about to
+            # be closed under it, and holding the run for that is the failure
+            # this path exists to end.
+            pool.shutdown(wait=False)
+
+    def _live_server_state(self) -> str:
+        """CLIENT LIST and the input counter, over the monitoring connection.
+
+        Deliberately best-effort: this runs while something is already wrong.
+        """
+        lines = []
+        try:
+            clients = self._conn.execute_command("CLIENT", "LIST")
+            if isinstance(clients, bytes):
+                clients = clients.decode(errors="replace")
+            for row in str(clients).splitlines():
+                lines.append(f"    {row}")
         except Exception as exc:
-            raise RuntimeError(
-                f"{type(exc).__name__}: {exc}\n"
-                f"{self._diagnose_stalled_write(ids, vectors, tags)}"
-            ) from exc
+            lines.append(f"    CLIENT LIST failed: {type(exc).__name__}: {exc}")
+        for field in ("connected_clients", "blocked_clients",
+                      "total_net_input_bytes", "instantaneous_ops_per_sec",
+                      "used_memory_human"):
+            try:
+                lines.append(f"    INFO {field:24} = "
+                             f"{self._conn.info().get(field, 'n/a')}")
+            except Exception:
+                break
+        try:
+            info = self._ft_info()
+            lines.append(f"    FT.INFO mutation_queue_size = "
+                         f"{info.get('mutation_queue_size', 'n/a')}, "
+                         f"num_docs = {info.get('num_docs', 'n/a')}")
+        except Exception:
+            pass
+        return "\n".join(lines)
+
+    @property
+    def write_batch_used(self) -> int:
+        """The batch size the re-insert settled on, for the record.
+
+        A churn that completed at one row per write and one that completed at a
+        thousand are not the same result, and nothing else in the record would
+        say which happened.
+        """
+        return self._write_batch
 
     def _diagnose_stalled_write(self, ids, vectors, tags) -> str:
         """What the server was doing when a write did not come back.
@@ -521,33 +658,49 @@ class ValkeyDriver(EngineDriver):
                       "loading", "total_net_input_bytes"):
             lines.append(f"    INFO    {field:26} = {server.get(field, 'n/a')}")
 
-        # The decisive test. One HSET, fresh connection, short timeout, into
-        # the same prefix and the same index. If this returns while the batch
-        # did not, the engine was never the thing that stopped.
-        canary = f"{PREFIX}{int(ids[0])}"
+        # num_docs disagreeing with the keyspace is the difference between an
+        # index that is behind and one that is wrong, and only one of those is
+        # something to wait out.
+        try:
+            lines.append(f"    DBSIZE  {'keys':26} = {self._conn.dbsize():,}")
+        except Exception:
+            pass
+
+        # The decisive test, and then the size at which it stops working. One
+        # HSET returning while a thousand did not says the engine was never
+        # what stalled; where between one and a thousand it turns over says
+        # what to do about it.
+        for size in _PROBE_SIZES:
+            if size > len(ids):
+                break
+            outcome = self._probe_write(ids[:size], vectors[:size], tags[:size])
+            lines.append(f"    write of {size:>5} row(s) on a fresh "
+                         f"connection: {outcome}")
+        return "\n".join(lines)
+
+    def _probe_write(self, ids, vectors, tags) -> str:
+        """Try one sized write and describe what happened, without raising."""
         try:
             probe = self._write_connection(timeout_s=CANARY_TIMEOUT_S)
-            try:
-                started = time.time()
-                probe.hset(canary, mapping={
-                    TAG_FIELD: int(tags[0]),
-                    VECTOR_FIELD: encode_vector(vectors[0]),
-                })
-                lines.append(
-                    f"    single HSET on a fresh connection: OK in "
-                    f"{(time.time() - started) * 1000:.0f} ms")
-                lines.append(
-                    "    -- the server accepts writes into this index. What "
-                    "stalled was the batched connection, not the engine.")
-            finally:
-                probe.close()
         except Exception as exc:
-            lines.append(f"    single HSET on a fresh connection: "
-                         f"{type(exc).__name__}: {exc}")
-            lines.append(
-                "    -- the server does not accept writes into this index at "
-                "all. The stall is in the engine, not in one connection.")
-        return "\n".join(lines)
+            return f"could not connect: {type(exc).__name__}: {exc}"
+        try:
+            started = time.time()
+            pipe = probe.pipeline(transaction=False)
+            for i, key_id in enumerate(ids):
+                pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
+                    TAG_FIELD: int(tags[i]),
+                    VECTOR_FIELD: encode_vector(vectors[i]),
+                })
+            pipe.execute()
+            return f"OK in {(time.time() - started) * 1000:.0f} ms"
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
 
     def count_rows(self) -> int:
         info = self._ft_info()

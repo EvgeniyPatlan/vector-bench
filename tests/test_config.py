@@ -2956,9 +2956,9 @@ class TestValkeyChurnIsBatched:
             def close(self): pass
 
         d._conn = FakeConn()
-        # Bulk writes deliberately open their own connection, with no read
-        # timeout; the fake stands in for it.
-        d._write_connection = lambda: FakeConn()
+        # Bulk writes deliberately open their own connection, on a leash
+        # of their own; the fake stands in for it.
+        d._write_connection = lambda timeout_s=None: FakeConn()
         return d
 
     def test_deletes_are_chunked(self, monkeypatch):
@@ -3248,7 +3248,8 @@ class TestReRunningAUnitReplacesItsRecords:
         The churn one differed, and that was the whole failure."""
         source = open(os.path.join(VB_ROOT, "harness", "drivers",
                                    "valkey.py")).read()
-        for method in ("def delete_ids", "def insert_rows", "def _write_range"):
+        for method in ("def delete_ids", "def _write_batch_once",
+                       "def _write_range"):
             block = source.split(method)[1].split("\n    def ")[0]
             assert "_write_connection" in block, method
     def test_the_reinsert_is_sliced_so_progress_is_visible(self):
@@ -3679,24 +3680,44 @@ class TestAStalledWriteExplainsItself:
         block = source.split("def delete_ids")[1].split("\n    def ")[0]
         assert "expected_docs=" in block
 
-    def test_the_canary_says_the_engine_is_fine(self):
-        """One HSET returning on a fresh connection, while the batch did not,
+    def test_the_ladder_says_the_engine_is_fine(self):
+        """One HSET returning on a fresh connection, while a thousand did not,
         means the engine was never the thing that stopped."""
         d = self._driver()
         d._ft_info = lambda: {"num_docs": 891000}
         d._conn = _FakeConn(info={"blocked_clients": 0})
         d._write_connection = lambda timeout_s=None: _FakeConn()
-        report = d._diagnose_stalled_write([7], [[0.0]], [1])
-        assert "single HSET on a fresh connection: OK" in report
-        assert "not the engine" in report
+        report = d._diagnose_stalled_write(list(range(1000)),
+                                           [[0.0]] * 1000, [1] * 1000)
+        assert "write of     1 row(s) on a fresh connection: OK" in report
 
-    def test_the_canary_says_the_engine_is_not_fine(self):
+    def test_the_ladder_finds_where_the_write_turns_over(self):
+        """Where between one and a thousand it stops coming back is the
+        difference between a batching limit and something not about size."""
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 891000}
+        d._conn = _FakeConn(info={})
+        d._write_connection = lambda timeout_s=None: _FakeConn(stall_above=10)
+        report = d._diagnose_stalled_write(list(range(1000)),
+                                           [[0.0]] * 1000, [1] * 1000)
+        assert "write of     1 row(s) on a fresh connection: OK" in report
+        assert "write of    10 row(s) on a fresh connection: OK" in report
+        assert "write of   100 row(s) on a fresh connection: TimeoutError" in report
+
+    def test_the_ladder_says_the_engine_is_not_fine(self):
         d = self._driver()
         d._ft_info = lambda: {"num_docs": 891000}
         d._conn = _FakeConn(info={"blocked_clients": 1})
         d._write_connection = _raising
         report = d._diagnose_stalled_write([7], [[0.0]], [1])
-        assert "in the engine, not in one connection" in report
+        assert "could not connect" in report
+
+    def test_a_probe_never_raises(self):
+        """It runs while something is already wrong; a diagnosis that raises
+        tells nobody anything."""
+        d = self._driver()
+        d._write_connection = _raising
+        assert isinstance(d._probe_write([7], [[0.0]], [1]), str)
 
     def test_a_dead_monitoring_connection_is_itself_the_answer(self):
         d = self._driver()
@@ -3705,23 +3726,37 @@ class TestAStalledWriteExplainsItself:
         report = d._diagnose_stalled_write([7], [[0.0]], [1])
         assert "stopped answering" in report
 
-    def test_the_diagnosis_reaches_the_caller(self):
-        """_reinsert prints the exception and moves on, so the diagnosis has to
-        travel inside the exception or it is lost."""
+    def test_a_stalled_batch_is_retried_smaller(self):
+        """The whole point: a write that does not return halves the batch
+        instead of ending the measurement."""
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 1}
+        d._conn = _FakeConn(info={})
+        sizes = []
+
+        def connection(timeout_s=None):
+            return _FakeConn(stall_above=100, seen=sizes)
+
+        d._write_connection = connection
+        d.insert_rows(list(range(400)), [[0.0]] * 400, [1] * 400)
+        assert max(sizes) > 100, "it should try the configured size first"
+        assert d.write_batch_used <= 100, "and settle at one the server takes"
+        assert sum(s for s in sizes if s <= d.write_batch_used) >= 400
+
+    def test_a_floor_that_still_stalls_is_reported_not_looped(self):
         d = self._driver()
         d._ft_info = lambda: {}
         d._conn = _FakeConn(info={})
-        d._write_connection = _raising
-
-        class Pipe:
-            def execute(self):
-                raise TimeoutError("Timeout reading from socket")
-
+        d._write_connection = lambda timeout_s=None: _FakeConn(stall_above=0)
         with pytest.raises(RuntimeError) as caught:
-            d._execute_writes(Pipe(), [7], [[0.0]], [1])
-        text = str(caught.value)
-        assert "Timeout reading from socket" in text
-        assert "Server state at that moment" in text
+            d.insert_rows([7], [[0.0]], [1])
+        assert "single-row write did not return" in str(caught.value)
+
+    def test_the_batch_that_worked_is_reported(self):
+        """A churn that completed one row at a time and one that completed a
+        thousand at a time are not the same result."""
+        d = self._driver()
+        assert d.write_batch_used == 1000
 
     def test_the_canary_cannot_become_a_second_stall(self):
         from harness.drivers.valkey import CANARY_TIMEOUT_S, WRITE_TIMEOUT_S
@@ -3733,19 +3768,46 @@ def _raising(timeout_s=None):
 
 
 class _FakeConn:
-    def __init__(self, info=None):
+    """A server that takes writes up to a size and then stops answering."""
+
+    def __init__(self, info=None, stall_above=None, seen=None):
         self._info = info if info is not None else {}
+        self._stall_above = stall_above
+        self._seen = seen
 
     def info(self, *a):
         if isinstance(self._info, Exception):
             raise self._info
         return self._info
 
+    def dbsize(self):
+        return 891000
+
     def hset(self, *a, **kw):
         return 1
 
+    def pipeline(self, transaction=False):
+        return _FakePipe(self)
+
     def close(self):
         pass
+
+
+class _FakePipe:
+    def __init__(self, conn):
+        self._conn = conn
+        self._queued = 0
+
+    def hset(self, *a, **kw):
+        self._queued += 1
+
+    def execute(self):
+        if self._conn._seen is not None:
+            self._conn._seen.append(self._queued)
+        limit = self._conn._stall_above
+        if limit is not None and self._queued > limit:
+            raise TimeoutError("Timeout reading from socket")
+        self._queued = 0
 
 
 class TestARunIdDockerWillRefuseIsCaughtFirst:

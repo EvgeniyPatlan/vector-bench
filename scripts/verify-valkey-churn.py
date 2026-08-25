@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Check that Valkey can re-insert into a populated index, before a long run.
+"""Find out why Valkey will not take a write into a populated index.
 
-The tuned churn spent two hours re-inserting 803 of 99,000 rows and then made
-no further progress. The server was healthy throughout: index caught up with
-the keyspace, empty mutation queue, 6 GB resident against a 101 GB limit, and
-12% of the container's memory in use. What it was doing was 30 GB of block I/O,
-which an in-memory store with persistence disabled has no reason to do.
+The tuned churn has now failed the same way five times: a pipeline of a
+thousand HSETs into the populated index does not come back, while a single
+HSET into that same index, on a connection opened at the moment of the stall,
+returns in one millisecond. The index is ready, the mutation queue is empty,
+memory is 6 GB against a 101 GB cap, and the server sits at exactly the idle
+CPU it had before the corpus was loaded.
 
-This reproduces that path directly, at whatever scale is asked for, and reports
-the re-insert rate against the bulk load rate. Those two numbers are the whole
-question: the load writes into a collection with no index yet and has always
-been fast, while churn writes into a populated HNSW graph.
+Every explanation offered for that was reasoned from the outside and five were
+wrong. This runs the experiment instead, and it is small enough to run while
+something else is going on:
 
-Usage, inside the bench image against a running server container:
+  1. write a batch into the populated index, having deleted nothing
+  2. delete a batch, then write one
+  3. halve the batch until a write returns
+
+(1) against (2) says whether the delete is involved at all -- which is the
+open question, and the one the benchmark cannot answer because it always
+deletes first. (3) says whether it is about size, and where.
 
     python3 verify-valkey-churn.py --host valkey-srv --rows 100000
 
-Start with a tenth of the corpus. If the rates are within an order of magnitude
-of each other the path is healthy and the full run is worth starting; if the
-re-insert rate collapses again, kill it and say so rather than waiting.
+Start at a tenth of the corpus. The failure is index-size dependent -- it does
+not happen at 20,000 rows and does at 990,000 -- so if a tenth comes back
+clean, say so and raise it rather than concluding the path is healthy.
+
+Add --full to run a whole churn cycle at the end and report the rate.
 """
 
 from __future__ import annotations
@@ -45,6 +53,12 @@ def parse_args(argv=None):
     p.add_argument("--dim", type=int, default=1536)
     p.add_argument("--churn", type=float, default=0.10)
     p.add_argument("--load-threads", type=int, default=8)
+    p.add_argument("--batch", type=int, default=1000,
+                   help="pipeline size to start the bisect from; the load and "
+                        "the churn both use 1000")
+    p.add_argument("--full", action="store_true",
+                   help="after the probes, run a whole churn cycle and report "
+                        "the re-insert rate against the load rate")
     return p.parse_args(argv)
 
 
@@ -66,6 +80,99 @@ def check_persistence(driver) -> bool:
         print("\n  Persistence is on. The image is older than the entrypoint "
               "that disables it:\n    ./run-benchmark.sh build --engine valkey\n")
     return ok
+
+
+def _write(driver, first_id: int, count: int, vectors, tags, timeout_s: float):
+    """One pipeline of `count` HSETs on a fresh connection. Never raises."""
+    from harness.drivers.valkey import PREFIX, TAG_FIELD, VECTOR_FIELD, encode_vector
+    conn = driver._write_connection(timeout_s=timeout_s)
+    try:
+        pipe = conn.pipeline(transaction=False)
+        for i in range(count):
+            pipe.hset(f"{PREFIX}{first_id + i}", mapping={
+                TAG_FIELD: int(tags[i]),
+                VECTOR_FIELD: encode_vector(vectors[i]),
+            })
+        started = time.time()
+        pipe.execute()
+        return True, time.time() - started
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def probe_without_deleting(driver, args, vectors, tags) -> bool:
+    """Does a batched write into the populated index work on its own?
+
+    The benchmark always deletes first, so it cannot separate 'writing into a
+    live HNSW graph is what stalls' from 'writing into one that has just lost
+    a tenth of its nodes is what stalls'. This is the half it never runs.
+    """
+    print(f"\n1. write {args.batch:,} new rows, nothing deleted first")
+    base = args.rows * 10
+    ok, detail = _write(driver, base, args.batch, vectors, tags, 60.0)
+    if ok:
+        print(f"   OK in {detail:.2f}s "
+              f"({args.batch / max(detail, 1e-9):,.0f} rows/s)")
+        print("   -> a batched write into the populated index is fine by "
+              "itself. Whatever stalls the churn involves the delete.")
+    else:
+        print(f"   {detail}")
+        print("   -> a batched write into the populated index stalls with no "
+              "delete anywhere near it. The delete is not involved.")
+    return ok
+
+
+def probe_after_deleting(driver, args, vectors, tags) -> bool:
+    """The churn's own sequence, at one batch instead of ninety-nine."""
+    from harness.drivers.valkey import PREFIX
+    print(f"\n2. delete {args.batch:,} rows, then write {args.batch:,} new ones")
+    conn = driver._write_connection(timeout_s=60.0)
+    try:
+        started = time.time()
+        conn.delete(*[f"{PREFIX}{i}" for i in range(args.batch)])
+        print(f"   delete returned in {time.time() - started:.2f}s")
+    finally:
+        conn.close()
+    driver._wait_for_mutations(timeout_s=120)
+
+    base = args.rows * 20
+    ok, detail = _write(driver, base, args.batch, vectors, tags, 60.0)
+    if ok:
+        print(f"   OK in {detail:.2f}s "
+              f"({args.batch / max(detail, 1e-9):,.0f} rows/s)")
+    else:
+        print(f"   {detail}")
+    return ok
+
+
+def bisect_batch(driver, args, vectors, tags) -> int:
+    """Halve until a write returns. Returns the size that worked, or 0."""
+    print("\n3. halving the batch until a write returns")
+    size = args.batch
+    base = args.rows * 30
+    while size >= 1:
+        ok, detail = _write(driver, base, size, vectors, tags, 60.0)
+        base += size
+        if ok:
+            print(f"   {size:>6,} rows: OK in {detail:.2f}s "
+                  f"({size / max(detail, 1e-9):,.0f} rows/s)")
+            if size == args.batch:
+                print("   -> the configured batch works here. The stall needs "
+                      "a bigger index than this run built.")
+            else:
+                print(f"   -> {size:,} is the largest that comes back. "
+                      f"99,000 rows at this rate is "
+                      f"{99_000 / max(size / max(detail, 1e-9), 1e-9) / 60:.1f} min.")
+            return size
+        print(f"   {size:>6,} rows: {detail}")
+        size //= 2
+    print("   -> not even one row at a time. This is not about batching.")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -96,6 +203,29 @@ def main(argv=None) -> int:
     print(f"index build {time.time() - started:8.1f}s  "
           f"{driver.count_rows():,} docs indexed")
 
+    probe_vectors = numpy.random.rand(args.batch, args.dim).astype(numpy.float32)
+    probe_tags = numpy.arange(args.batch) % 100
+
+    clean = probe_without_deleting(driver, args, probe_vectors, probe_tags)
+    after_delete = probe_after_deleting(driver, args, probe_vectors, probe_tags)
+    working = args.batch if (clean and after_delete) else bisect_batch(
+        driver, args, probe_vectors, probe_tags)
+
+    print("\nsummary")
+    print(f"  index holds       {driver.count_rows():,} docs")
+    print(f"  write, no delete  {'OK' if clean else 'STALLED'}")
+    print(f"  write after delete {'OK' if after_delete else 'STALLED'}")
+    print(f"  largest batch     {working:,}" if working else
+          "  largest batch     none")
+
+    if not persistence_ok:
+        print("\n  ...and persistence is still on, so none of this means "
+              "anything until the image is rebuilt")
+        return 2
+
+    if not args.full:
+        return 0 if working else 1
+
     count = int(args.rows * args.churn)
     print(f"\nchurning {count:,} rows into the populated index")
 
@@ -125,16 +255,8 @@ def main(argv=None) -> int:
     print(f"load was    {load.rows_per_second:10,.0f} rows/s  "
           f"-> re-insert is {load.rows_per_second / max(rate, 1e-9):,.0f}x slower")
     print(f"rows now    {driver.count_rows():,}")
-
-    # A tenth of a million rows at the observed rate is what the real churn
-    # costs, and it is the number that decides whether to start the run.
-    projected = 99_000 / max(rate, 1e-9)
-    print(f"\n990k corpus, 10% churn would take {projected / 60:,.1f} min "
-          f"at this rate")
-    if not persistence_ok:
-        print("...and persistence is still on, so this number means nothing "
-              "until the image is rebuilt")
-        return 2
+    print(f"\n990k corpus, 10% churn would take "
+          f"{99_000 / max(rate, 1e-9) / 60:,.1f} min at this rate")
     return 0
 
 
