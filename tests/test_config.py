@@ -3248,7 +3248,7 @@ class TestReRunningAUnitReplacesItsRecords:
         The churn one differed, and that was the whole failure."""
         source = open(os.path.join(VB_ROOT, "harness", "drivers",
                                    "valkey.py")).read()
-        for method in ("def delete_ids", "def _write_batch_once",
+        for method in ("def delete_ids", "def _churn_connection",
                        "def _write_range"):
             block = source.split(method)[1].split("\n    def ")[0]
             assert "_write_connection" in block, method
@@ -3691,6 +3691,12 @@ class TestAStalledWriteExplainsItself:
                                            [[0.0]] * 1000, [1] * 1000)
         assert "write of     1 row(s) on a fresh connection: OK" in report
 
+    def test_the_ladder_pins_whether_two_is_already_too_many(self):
+        """The first ladder put the turnover between 1 and 10. Two rungs at 2
+        and 3 say whether it is a threshold or pipelining itself."""
+        from harness.drivers.valkey import _PROBE_SIZES
+        assert _PROBE_SIZES[:3] == (1, 2, 3)
+
     def test_the_ladder_finds_where_the_write_turns_over(self):
         """Where between one and a thousand it stops coming back is the
         difference between a batching limit and something not about size."""
@@ -3726,31 +3732,71 @@ class TestAStalledWriteExplainsItself:
         report = d._diagnose_stalled_write([7], [[0.0]], [1])
         assert "stopped answering" in report
 
-    def test_a_stalled_batch_is_retried_smaller(self):
-        """The whole point: a write that does not return halves the batch
-        instead of ending the measurement."""
+    def test_the_ladder_chooses_the_batch(self):
+        """Halving from a thousand to one costs nine more timeouts to learn
+        what the ladder measured in one pass."""
         d = self._driver()
         d._ft_info = lambda: {"num_docs": 1}
         d._conn = _FakeConn(info={})
         sizes = []
+        d._write_connection = lambda timeout_s=None: _FakeConn(
+            stall_above=3, seen=sizes)
+        d.insert_rows(list(range(30)), [[0.0]] * 30, [1] * 30)
+        assert d.write_batch_used == 3, "the largest rung that returned"
+        assert 500 not in sizes and 250 not in sizes, "it should not halve"
+
+    def test_every_row_still_lands(self):
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 1}
+        d._conn = _FakeConn(info={})
+        written = []
+        d._write_connection = lambda timeout_s=None: _FakeConn(
+            stall_above=5, seen=written)
+        d.insert_rows(list(range(100)), [[0.0]] * 100, [1] * 100)
+        assert sum(n for n in written if n <= 5) >= 100
+
+    def test_a_connection_is_not_opened_per_row(self):
+        """At one row per write, 99,000 rows means 99,000 writes. Reconnecting
+        for each would measure connection setup, not the write."""
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 1}
+        d._conn = _FakeConn(info={})
+        opened = []
 
         def connection(timeout_s=None):
-            return _FakeConn(stall_above=100, seen=sizes)
+            conn = _FakeConn(stall_above=1000)
+            opened.append(conn)
+            return conn
 
         d._write_connection = connection
-        d.insert_rows(list(range(400)), [[0.0]] * 400, [1] * 400)
-        assert max(sizes) > 100, "it should try the configured size first"
-        assert d.write_batch_used <= 100, "and settle at one the server takes"
-        assert sum(s for s in sizes if s <= d.write_batch_used) >= 400
+        d.insert_rows(list(range(4000)), [[0.0]] * 4000, [1] * 4000)
+        assert len(opened) == 1
 
-    def test_a_floor_that_still_stalls_is_reported_not_looped(self):
+    def test_a_stalled_connection_is_dropped(self):
+        """redis-py has already disconnected it; reusing the object would
+        confuse a wedged socket with a wedged server."""
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 1}
+        d._conn = _FakeConn(info={})
+        opened = []
+
+        def connection(timeout_s=None):
+            conn = _FakeConn(stall_above=3)
+            opened.append(conn)
+            return conn
+
+        d._write_connection = connection
+        d.insert_rows(list(range(9)), [[0.0]] * 9, [1] * 9)
+        assert len(opened) > 1
+
+    def test_nothing_working_at_any_size_is_not_a_batching_problem(self):
         d = self._driver()
         d._ft_info = lambda: {}
         d._conn = _FakeConn(info={})
         d._write_connection = lambda timeout_s=None: _FakeConn(stall_above=0)
         with pytest.raises(RuntimeError) as caught:
             d.insert_rows([7], [[0.0]], [1])
-        assert "single-row write did not return" in str(caught.value)
+        assert "not about batching" in str(caught.value)
 
     def test_the_batch_that_worked_is_reported(self):
         """A churn that completed one row at a time and one that completed a

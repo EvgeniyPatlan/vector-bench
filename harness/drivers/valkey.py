@@ -84,11 +84,12 @@ CANARY_TIMEOUT_S = float(os.environ.get("VB_VALKEY_CANARY_TIMEOUT", "30"))
 CHURN_WRITE_TIMEOUT_S = float(
     os.environ.get("VB_VALKEY_CHURN_WRITE_TIMEOUT", "60"))
 
-# Where the diagnosis looks for the turnover. One row is known to work and
-# a thousand is known not to; the point of the ladder is to say where
-# between them the write stops coming back, because that is the difference
-# between a batching limit and something that is not about size at all.
-_PROBE_SIZES = (1, 10, 100, 1000)
+# Where the diagnosis looks for the turnover. The first ladder put it
+# between 1 and 10 -- one HSET returns in a millisecond, ten never come
+# back, and ten HSETs is sixty kilobytes, so this was never about buffer
+# size. The low rungs are there to say whether two is already too many,
+# which is the difference between a threshold and pipelining itself.
+_PROBE_SIZES = (1, 2, 3, 5, 10, 100, 1000)
 
 # How long a write may be outstanding before the server is asked about it,
 # rather than after. A healthy batch of a thousand took a quarter of a
@@ -138,6 +139,9 @@ class ValkeyDriver(EngineDriver):
         # Not a constant: see insert_rows. Starts where the load writes
         # and shrinks only if the engine will not take that size.
         self._write_batch = CHURN_BATCH
+        self._write_conn = None
+        self._probed = False
+        self._largest_working = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -179,6 +183,7 @@ class ValkeyDriver(EngineDriver):
             return None
 
     def close(self) -> None:
+        self._drop_write_connection()
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -505,20 +510,36 @@ class ValkeyDriver(EngineDriver):
                 self._write_batch_once(ids[cursor:stop], vectors[cursor:stop],
                                        tags[cursor:stop])
             except _WriteStalled:
-                if self._write_batch <= 1:
+                self._drop_write_connection()
+                if self._probed:
+                    # The ladder has already run once; a stall past that is a
+                    # different failure from the one it measured, so back off
+                    # rather than re-measuring the same thing.
+                    if self._write_batch <= 1:
+                        raise RuntimeError(
+                            "a single-row write did not return either, and the "
+                            "ladder had already found a size that worked. This "
+                            "is not the batching limit.")
+                    self._write_batch = max(1, self._write_batch // 2)
+                    print(f"[valkey] write of {size:,} rows did not return; "
+                          f"retrying at {self._write_batch:,}", flush=True)
+                    continue
+
+                # First stall. Ask the server about it while it is still in the
+                # state that produced it, and let the ladder pick the batch:
+                # halving from a thousand to one costs nine more timeouts to
+                # learn what the ladder already measured.
+                self._probed = True
+                print(self._diagnose_stalled_write(
+                    ids[cursor:stop], vectors[cursor:stop],
+                    tags[cursor:stop]), flush=True)
+                if not self._largest_working:
                     raise RuntimeError(
-                        f"a single-row write did not return either.\n"
-                        f"{self._diagnose_stalled_write(ids[cursor:stop], vectors[cursor:stop], tags[cursor:stop])}"
-                    )
-                if self._write_batch == CHURN_BATCH:
-                    # Printed once, from the first stall, while the server is
-                    # still in the state that produced it.
-                    print(self._diagnose_stalled_write(
-                        ids[cursor:stop], vectors[cursor:stop],
-                        tags[cursor:stop]), flush=True)
-                self._write_batch = max(1, self._write_batch // 2)
-                print(f"[valkey] batched write of {size:,} rows did not "
-                      f"return; retrying at {self._write_batch:,}",
+                        "no write returned at any size, down to a single row. "
+                        "The stall is not about batching.")
+                self._write_batch = self._largest_working
+                print(f"[valkey] largest write the server returns is "
+                      f"{self._write_batch:,} row(s); re-inserting at that size",
                       flush=True)
                 continue
             cursor = stop
@@ -531,19 +552,36 @@ class ValkeyDriver(EngineDriver):
         socket with a wedged server -- which is the distinction this whole path
         exists to make.
         """
-        conn = self._write_connection(timeout_s=CHURN_WRITE_TIMEOUT_S)
+        conn = self._churn_connection()
+        pipe = conn.pipeline(transaction=False)
+        for i, key_id in enumerate(ids):
+            pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
+                TAG_FIELD: int(tags[i]),
+                VECTOR_FIELD: encode_vector(vectors[i]),
+            })
         try:
-            pipe = conn.pipeline(transaction=False)
-            for i, key_id in enumerate(ids):
-                pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
-                    TAG_FIELD: int(tags[i]),
-                    VECTOR_FIELD: encode_vector(vectors[i]),
-                })
-            try:
-                self._execute_watched(pipe, len(ids))
-            except Exception as exc:
-                raise _WriteStalled(str(exc)) from exc
-        finally:
+            self._execute_watched(pipe, len(ids))
+        except Exception as exc:
+            raise _WriteStalled(str(exc)) from exc
+
+    def _churn_connection(self):
+        """One connection, held while it keeps working.
+
+        Once the batch collapses to a single row, 99,000 rows means 99,000
+        writes, and opening a connection for each would measure connection
+        setup rather than the write. It is dropped the moment one fails --
+        redis-py has disconnected it by then anyway, and reusing a socket that
+        has already timed out would confuse a wedged connection with a wedged
+        server.
+        """
+        if self._write_conn is None:
+            self._write_conn = self._write_connection(
+                timeout_s=CHURN_WRITE_TIMEOUT_S)
+        return self._write_conn
+
+    def _drop_write_connection(self) -> None:
+        conn, self._write_conn = self._write_conn, None
+        if conn is not None:
             try:
                 conn.close()
             except Exception:
@@ -670,10 +708,13 @@ class ValkeyDriver(EngineDriver):
         # HSET returning while a thousand did not says the engine was never
         # what stalled; where between one and a thousand it turns over says
         # what to do about it.
+        self._largest_working = 0
         for size in _PROBE_SIZES:
             if size > len(ids):
                 break
             outcome = self._probe_write(ids[:size], vectors[:size], tags[:size])
+            if outcome.startswith("OK"):
+                self._largest_working = size
             lines.append(f"    write of {size:>5} row(s) on a fresh "
                          f"connection: {outcome}")
         return "\n".join(lines)
