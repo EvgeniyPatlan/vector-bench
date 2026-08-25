@@ -71,7 +71,17 @@ extras:
   # 5.7 GB, so scalar is the vendor-recommended configuration at this corpus
   # size rather than a thumb on the scale. Pinned to none in the normalized
   # pass, where no engine gets an axis the others lack.
-  mongodb_quantization: [scalar]
+  #
+  # Both are swept because the first complete curve stopped at recall 0.892 and
+  # did not move between numCandidates 400 and 800 -- and an index that will
+  # not reach 0.90 at any query effort is a different claim from an engine that
+  # will not. Without the unquantized curve beside it there is no way to say
+  # which of the two was measured. It also costs almost nothing: the vectors
+  # are held at full fidelity either way, so scalar took the recall and
+  # returned none of the 16.5 GB it was supposed to save.
+  #
+  # scalar stays first: ops builds one index, and it takes this list's head.
+  mongodb_quantization: [scalar, none]
   # valkey-search exposes ef_construction as pgvector does, so the tuned pass
   # sweeps it for both. The normalized pass pins both, because MariaDB and
   # AliSQL still have no equivalent.

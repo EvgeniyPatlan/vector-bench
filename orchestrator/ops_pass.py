@@ -27,6 +27,13 @@ DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
                  "alisql": 3306, "pgvector": 5432, "mongodb": 27017,
                  "valkey": 6379}
 
+# How much of the server's own log to keep beside the measurements. Generous,
+# because the lines that matter are the ones written while something was going
+# wrong and there is no way to know in advance how much noise follows them.
+# mongod is the verbose extreme at a few thousand lines an hour; the others
+# write almost nothing.
+SERVER_LOG_TAIL = 20000
+
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
 # start would charge initialisation time to the first measurement.
@@ -296,10 +303,34 @@ class OpsRun:
                       f"{os.path.relpath(saved, self.paths['run_dir'])}")
             return rc
         finally:
+            # In the finally, not on the success path: a phase that timed out
+            # or crashed is exactly the one whose server log is worth having.
+            self._save_server_log()
             if sampler is not None:
                 sampler.stop()
                 print(f"[ops] captured {sampler.samples} memory samples "
                       f"-> {os.path.basename(memory_timeseries)}")
+
+    def _save_server_log(self) -> None:
+        """Archive what the server said, not only what the client saw.
+
+        The ann path gets this for free: the engine and the benchmark share one
+        container, so one stream carries both sides. The ops path splits them,
+        and only the client's half was ever kept. A Valkey churn then stalled
+        with the client blocked on a socket and the server at its idle CPU
+        baseline, and the question of which one was wrong could not be answered
+        from the run directory at all -- the half that would have said was
+        discarded when the container was removed.
+        """
+        try:
+            text = docker_ctl.logs(self.server_name, tail=SERVER_LOG_TAIL)
+        except Exception:
+            return
+        if not text:
+            return
+        docker_ctl.save_phase_log(
+            self.paths["run_dir"], self.engine, f"server-{self.tag}",
+            self.resource_pass, text.splitlines())
 
     # ------------------------------------------------------------------
 

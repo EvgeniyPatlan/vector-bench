@@ -3520,3 +3520,229 @@ class TestAnnResultsCanActuallyBeStored:
         d = ValkeyDriver(ConnectionSpec(host="h", port=1))
         d._ft_info = lambda: {"mutation_queue_size": "0"}
         assert d._wait_for_mutations(timeout_s=30) < 1.0
+
+
+class TestAStubResultCannotSuppressAConfiguration:
+    """store_results creates the file before it writes the datasets.
+
+        with h5py.File(filename, "w") as f:
+            for k, v in attrs.items():
+                f.attrs[k] = v
+            times = f.create_dataset("times", ...)
+
+    So an attribute it cannot represent leaves a valid HDF5 file holding no
+    measurements -- and ann-benchmarks decides what to skip with
+    os.path.exists(). Percona Search wrote one such stub per attempt; by the
+    fifth run its recall curve was two points, and re-running could not
+    recover the six below them, because the stubs outlived the bug.
+    """
+
+    def _script(self):
+        from orchestrator.ann_pass import _PRUNE_SCRIPT
+        return _PRUNE_SCRIPT
+
+    def test_the_check_is_for_data_not_for_the_file_existing(self):
+        script = self._script()
+        assert '"times" in fh' in script
+        assert '"neighbors" in fh' in script
+        assert "os.remove(path)" in script
+
+    def test_a_file_it_cannot_open_is_also_a_stub(self):
+        """A truncated write leaves something h5py raises on. That is not a
+        result either, and it blocks the same configuration."""
+        script = self._script()
+        assert "except Exception:" in script
+        assert "intact = False" in script
+
+    def test_only_result_files_are_touched(self):
+        assert '.endswith(".hdf5")' in self._script()
+
+    def test_the_count_comes_back_from_the_container(self, monkeypatch):
+        from orchestrator import ann_pass
+        monkeypatch.setattr(ann_pass.docker_ctl, "run_foreground",
+                            lambda spec, **kw: kw["sink"].extend(
+                                ["pruned /results/a.hdf5", "1"]) or 0)
+        assert ann_pass.prune_empty_results("/tmp/x", "img") == 1
+
+    def test_a_prune_that_cannot_run_is_not_fatal(self, monkeypatch):
+        """This exists to stop a stale stub from hiding a configuration. Ending
+        the run over it would cost more than the stub does."""
+        from orchestrator import ann_pass
+
+        def explode(spec, **kw):
+            raise ann_pass.docker_ctl.DockerError("no docker")
+
+        monkeypatch.setattr(ann_pass.docker_ctl, "run_foreground", explode)
+        assert ann_pass.prune_empty_results("/tmp/x", "img") == 0
+
+    def test_the_sweep_prunes_before_it_counts(self):
+        """Counting first would take the stubs as existing results and print
+        'already have results' over the very files that are the problem."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        body = source.split("def run_engine")[1]
+        assert body.index("prune_empty_results(") < body.index("before = _count_results(")
+
+
+class TestTheServerSideOfAnOpsPhaseIsKept:
+    """The ann path keeps both halves because engine and benchmark share a
+    container. The ops path splits them and kept only the client's, so a churn
+    that stalled with the client blocked on a socket and the server at its idle
+    CPU baseline could not be settled from the run directory: the half that
+    would have said was discarded with the container."""
+
+    def _source(self):
+        return open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+
+    def test_the_server_log_is_archived(self):
+        source = self._source()
+        assert "def _save_server_log" in source
+        assert "docker_ctl.logs(self.server_name" in source
+
+    def test_it_runs_even_when_the_phase_failed(self):
+        """A phase that timed out is precisely the one whose server log is
+        worth having, so it cannot hang off the success path."""
+        source = self._source()
+        block = source.split("def run_harness")[1].split("\n    def ")[0]
+        finally_block = block.split("finally:")[1]
+        assert "_save_server_log()" in finally_block
+
+    def test_it_lands_beside_the_client_log(self):
+        source = self._source()
+        assert 'f"server-{self.tag}"' in source
+
+    def test_it_cannot_take_the_run_down(self, tmp_path):
+        """docker logs against a container that is already gone must not turn a
+        completed measurement into a failed one."""
+        from orchestrator import ops_pass
+
+        class Fake:
+            server_name = "gone"
+            engine = "valkey"
+            tag = "m16-post"
+            resource_pass = "tuned"
+            paths = {"run_dir": str(tmp_path)}
+            _save_server_log = ops_pass.OpsRun._save_server_log
+
+        import orchestrator.docker_ctl as dc
+        original = dc.logs
+        dc.logs = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no such container"))
+        try:
+            Fake()._save_server_log()
+        finally:
+            dc.logs = original
+
+
+class TestAStalledWriteExplainsItself:
+    """The valkey churn re-insert has failed the same way twice: the client
+    blocked on a socket read until its timeout while the server sat at exactly
+    its idle CPU baseline and answered a hand-typed HSET into the same indexed
+    prefix in 104 ms. Six explanations were offered for that from the outside
+    and none was tested against the machine while it was in that state."""
+
+    def _driver(self):
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.valkey import ValkeyDriver
+        return ValkeyDriver(ConnectionSpec(host="h", port=1))
+
+    def test_a_missing_queue_field_is_not_the_same_as_an_empty_one(self):
+        """percent_indexed did not exist either, and reading its absence as
+        'finished' meant every later measurement described an empty index."""
+        from harness.drivers.valkey import _optional_int
+        assert _optional_int(None) is None
+        assert _optional_int("0") == 0
+        assert _optional_int(0) == 0
+        assert _optional_int("nonsense") is None
+
+    def test_the_document_count_is_waited_on_too(self):
+        """The queue read zero while the index still held 481 documents more
+        than the keyspace did."""
+        d = self._driver()
+        seen = []
+
+        def info():
+            seen.append(1)
+            return {"mutation_queue_size": "0",
+                    "num_docs": 891481 if len(seen) < 3 else 891000}
+
+        d._ft_info = info
+        assert d._wait_for_mutations(expected_docs=891000, timeout_s=30) < 10
+        assert len(seen) >= 3
+
+    def test_a_build_that_reports_neither_field_does_not_hang(self):
+        d = self._driver()
+        d._ft_info = lambda: {}
+        assert d._wait_for_mutations(expected_docs=5, timeout_s=30) < 1.0
+
+    def test_the_delete_tells_the_wait_what_to_expect(self):
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        block = source.split("def delete_ids")[1].split("\n    def ")[0]
+        assert "expected_docs=" in block
+
+    def test_the_canary_says_the_engine_is_fine(self):
+        """One HSET returning on a fresh connection, while the batch did not,
+        means the engine was never the thing that stopped."""
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 891000}
+        d._conn = _FakeConn(info={"blocked_clients": 0})
+        d._write_connection = lambda timeout_s=None: _FakeConn()
+        report = d._diagnose_stalled_write([7], [[0.0]], [1])
+        assert "single HSET on a fresh connection: OK" in report
+        assert "not the engine" in report
+
+    def test_the_canary_says_the_engine_is_not_fine(self):
+        d = self._driver()
+        d._ft_info = lambda: {"num_docs": 891000}
+        d._conn = _FakeConn(info={"blocked_clients": 1})
+        d._write_connection = _raising
+        report = d._diagnose_stalled_write([7], [[0.0]], [1])
+        assert "in the engine, not in one connection" in report
+
+    def test_a_dead_monitoring_connection_is_itself_the_answer(self):
+        d = self._driver()
+        d._ft_info = lambda: {}
+        d._conn = _FakeConn(info=RuntimeError("gone"))
+        report = d._diagnose_stalled_write([7], [[0.0]], [1])
+        assert "stopped answering" in report
+
+    def test_the_diagnosis_reaches_the_caller(self):
+        """_reinsert prints the exception and moves on, so the diagnosis has to
+        travel inside the exception or it is lost."""
+        d = self._driver()
+        d._ft_info = lambda: {}
+        d._conn = _FakeConn(info={})
+        d._write_connection = _raising
+
+        class Pipe:
+            def execute(self):
+                raise TimeoutError("Timeout reading from socket")
+
+        with pytest.raises(RuntimeError) as caught:
+            d._execute_writes(Pipe(), [7], [[0.0]], [1])
+        text = str(caught.value)
+        assert "Timeout reading from socket" in text
+        assert "Server state at that moment" in text
+
+    def test_the_canary_cannot_become_a_second_stall(self):
+        from harness.drivers.valkey import CANARY_TIMEOUT_S, WRITE_TIMEOUT_S
+        assert CANARY_TIMEOUT_S < WRITE_TIMEOUT_S
+
+
+def _raising(timeout_s=None):
+    raise TimeoutError("Timeout connecting to server")
+
+
+class _FakeConn:
+    def __init__(self, info=None):
+        self._info = info if info is not None else {}
+
+    def info(self, *a):
+        if isinstance(self._info, Exception):
+            raise self._info
+        return self._info
+
+    def hset(self, *a, **kw):
+        return 1
+
+    def close(self):
+        pass

@@ -396,6 +396,10 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
         )
 
     results_dir = annb_results_dir(paths, resource_pass, resolved)
+    pruned = prune_empty_results(results_dir, image)
+    if pruned:
+        print(f"[ann] discarded {pruned} result file(s) that contain no "
+              f"measurements; those configurations will be recomputed")
     before = _count_results(results_dir, engine, dataset)
 
     # Warn before the fact, not after. ann-benchmarks signals "everything is
@@ -524,6 +528,86 @@ class _SuppressNothingToRun:
                 held, self._held = self._held, None   # some other error: show it
                 return held
         return []
+
+
+# store_results() opens the file, writes the attributes, and only then creates
+# the datasets:
+#
+#     with h5py.File(filename, "w") as f:
+#         for k, v in attrs.items():
+#             f.attrs[k] = v
+#         times = f.create_dataset("times", ...)
+#
+# An attribute h5py cannot represent therefore leaves a syntactically valid
+# HDF5 file holding no measurements at all -- and ann-benchmarks decides what
+# to skip with os.path.exists(). One `"ef_construction": None` in a module's
+# get_additional() was enough to make Percona Search write a stub for every
+# ef_search it reached, and each subsequent run then skipped that point as
+# already done. Four attempts later its recall curve was two points at the top
+# of the sweep, and the six below them could not be recomputed by re-running:
+# the stubs outlived the bug that made them.
+#
+# The modules no longer emit unwritable attributes, but a stub is permanent
+# once written, so the ones already on disk have to go. h5py is not installed
+# on the host -- deliberately, see client_memory_bytes -- so the check runs in
+# the image that has it.
+_PRUNE_SCRIPT = """
+import os, sys
+import h5py
+
+removed = 0
+for base, _dirs, files in os.walk("/results"):
+    for name in files:
+        if not name.endswith(".hdf5"):
+            continue
+        path = os.path.join(base, name)
+        try:
+            with h5py.File(path, "r") as fh:
+                intact = "times" in fh and "neighbors" in fh
+        except Exception:
+            intact = False
+        if not intact:
+            try:
+                os.remove(path)
+                removed += 1
+                print("pruned " + path, file=sys.stderr)
+            except OSError:
+                pass
+print(removed)
+"""
+
+
+def prune_empty_results(results_dir: str, image: str) -> int:
+    """Delete result files that hold no measurements, and count them.
+
+    Returns 0 rather than raising if the check itself cannot run: this exists
+    to stop a stale stub from silently suppressing a configuration, and failing
+    the run over it would be a worse trade than leaving it in place, where at
+    least the report's own empty-curve warning still fires.
+    """
+    output: List[str] = []
+    spec = docker_ctl.ContainerSpec(
+        name=f"vb-prune-{os.getpid()}",
+        image=image,
+        entrypoint="python3",
+        command=["-c", _PRUNE_SCRIPT],
+        volumes=[f"{results_dir}:/results:rw"],
+        detach=False,
+        network="none",
+    )
+    try:
+        rc = docker_ctl.run_foreground(spec, timeout=300, stream=False,
+                                       sink=output)
+    except docker_ctl.DockerError:
+        return 0
+    if rc != 0:
+        return 0
+    for line in reversed(output):
+        try:
+            return int(line.strip())
+        except ValueError:
+            continue
+    return 0
 
 
 def _count_results(results_dir: str, engine: str, dataset: str) -> int:

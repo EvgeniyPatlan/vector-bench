@@ -31,6 +31,7 @@ consequences run through this file.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
@@ -69,6 +70,26 @@ CHURN_BATCH = int(os.environ.get("VB_VALKEY_CHURN_BATCH", "1000"))
 # never coming does not hold the machine until someone notices. Never None:
 # that is what turned a stalled churn into a run that hung overnight.
 WRITE_TIMEOUT_S = float(os.environ.get("VB_VALKEY_WRITE_TIMEOUT", "300"))
+
+# The stall diagnosis must not become a second stall. A healthy write of one
+# hash is a millisecond; thirty seconds is the difference between "slow" and
+# "not coming".
+CANARY_TIMEOUT_S = float(os.environ.get("VB_VALKEY_CANARY_TIMEOUT", "30"))
+
+
+def _optional_int(value) -> Optional[int]:
+    """int(value), or None for a field FT.INFO did not report.
+
+    The distinction is the whole point: a field that is absent means the
+    build does not report it, and treating that as zero is how a wait that
+    was supposed to guard the measurement became a no-op.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def encode_vector(vector) -> bytes:
@@ -319,7 +340,7 @@ class ValkeyDriver(EngineDriver):
                 f"Raise the container memory limit or lower maxmemory."
             )
 
-    def _write_connection(self):
+    def _write_connection(self, timeout_s: Optional[float] = None):
         """A connection for bulk writes: generous timeout, keepalive, not none.
 
         This has been wrong in both directions. It first carried the driver's
@@ -337,7 +358,7 @@ class ValkeyDriver(EngineDriver):
         factory = getattr(valkey_client, "Valkey", None) or valkey_client.Redis
         return factory(
             host=self.spec.host, port=self.spec.port,
-            socket_timeout=WRITE_TIMEOUT_S,
+            socket_timeout=WRITE_TIMEOUT_S if timeout_s is None else timeout_s,
             socket_connect_timeout=30,
             socket_keepalive=True,
             health_check_interval=30,
@@ -351,40 +372,81 @@ class ValkeyDriver(EngineDriver):
         worked at smoke scale and failed at a million rows.
         """
         keys = [f"{PREFIX}{int(i)}" for i in ids]
+        before = self.count_rows()
         conn = self._write_connection()
         try:
             for start in range(0, len(keys), CHURN_BATCH):
                 conn.delete(*keys[start:start + CHURN_BATCH])
         finally:
             conn.close()
-        self._wait_for_mutations()
+        self._wait_for_mutations(expected_docs=max(0, before - len(keys)))
 
-    def _wait_for_mutations(self, timeout_s: float = 900.0) -> float:
+    def _wait_for_mutations(self, expected_docs: Optional[int] = None,
+                            timeout_s: float = 900.0) -> float:
         """Let the index absorb a mass delete before writing into it again.
 
         DEL returns as soon as the key is gone; removing the vector from the
         HNSW graph is separate work, and FT.INFO reports a mutation queue
-        precisely so a caller can see it. Deleting 99,000 keys and writing
-        immediately afterwards timed out with not one row landing, while a
-        single write into the same index from an idle server took 104 ms. The
-        engine was not refusing the write, it had not finished the delete.
+        precisely so a caller can see it.
+
+        The queue alone is not enough to wait on, and this is the second time
+        that lesson has been paid for here. `percent_indexed` does not exist,
+        so a missing field read as a finished backfill and every measurement
+        after it described an empty index. `mutation_queue_size` is the same
+        shape of trap: absent, or present and zero while the index still
+        reported 481 documents more than the keyspace held. So the document
+        count is waited on too, against the number the caller knows to expect,
+        and a missing field is reported rather than treated as agreement.
         """
         started = time.time()
         last_report = started
+        settled_for = 0
+        previous: Optional[int] = None
+        announced_missing = False
+
         while time.time() - started < timeout_s:
             info = self._ft_info()
-            try:
-                queued = int(info.get("mutation_queue_size", 0))
-            except (TypeError, ValueError):
+            queued = _optional_int(info.get("mutation_queue_size"))
+            if queued is None and not announced_missing:
+                announced_missing = True
+                print("[valkey] FT.INFO reports no mutation_queue_size in this "
+                      "build; waiting on the document count instead",
+                      flush=True)
+            docs = _optional_int(info.get("num_docs"))
+
+            queue_drained = queued in (None, 0)
+            if docs is None:
+                # This build reports no document count either. The queue is
+                # then the only signal there is; waiting on a number nobody
+                # publishes would hang every churn rather than guard one.
+                docs_ready = True
+            elif expected_docs is None:
+                # Nothing to compare against: settle instead, which needs two
+                # consecutive readings so a single sample cannot end the wait.
+                settled_for = settled_for + 1 if docs == previous else 0
+                docs_ready = settled_for >= 2
+            else:
+                docs_ready = docs <= expected_docs
+            previous = docs
+
+            if queue_drained and docs_ready:
                 return time.time() - started
-            if queued == 0:
-                return time.time() - started
+
             if time.time() - last_report >= PROGRESS_INTERVAL_S:
-                print(f"[valkey] index absorbing deletes, {queued:,} queued, "
+                print(f"[valkey] index absorbing deletes: "
+                      f"num_docs={docs if docs is not None else '?'}"
+                      f"{f' (target {expected_docs:,})' if expected_docs is not None else ''}"
+                      f", queued={queued if queued is not None else 'n/a'}, "
                       f"{time.time() - started:.0f}s elapsed", flush=True)
                 last_report = time.time()
             time.sleep(2)
-        return time.time() - started
+
+        waited = time.time() - started
+        print(f"[valkey] WARNING: the index had not absorbed the delete after "
+              f"{waited:.0f}s. Writing into it anyway; treat what follows as a "
+              f"measurement of an index that was still catching up.",
+              file=sys.stderr, flush=True)
+        return waited
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     tags: Sequence[int]) -> None:
@@ -404,10 +466,88 @@ class ValkeyDriver(EngineDriver):
                     VECTOR_FIELD: encode_vector(vectors[i]),
                 })
                 if (i + 1) % CHURN_BATCH == 0:
-                    pipe.execute()
-            pipe.execute()
+                    self._execute_writes(pipe, ids, vectors, tags)
+            self._execute_writes(pipe, ids, vectors, tags)
         finally:
             conn.close()
+
+    def _execute_writes(self, pipe, ids, vectors, tags) -> None:
+        """Run one batch, and if it stalls, find out which side stalled.
+
+        A churn re-insert has now failed the same way twice: the client blocked
+        on a socket read until its timeout, while the server sat at exactly its
+        idle CPU baseline and answered a hand-typed HSET into the same indexed
+        prefix in 104 ms. Both ends idle is not slow work, and six explanations
+        were proposed for it from the outside without one of them being tested
+        against the machine while it was in that state.
+
+        So the test runs here, at the moment it happens, on the connection that
+        is still known to work. Whether the server sees the write at all is the
+        question the next run should answer by itself.
+        """
+        try:
+            pipe.execute()
+        except Exception as exc:
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}\n"
+                f"{self._diagnose_stalled_write(ids, vectors, tags)}"
+            ) from exc
+
+    def _diagnose_stalled_write(self, ids, vectors, tags) -> str:
+        """What the server was doing when a write did not come back.
+
+        Deliberately best-effort throughout: this runs while something is
+        already wrong, and a diagnosis that raises tells nobody anything.
+        """
+        lines = ["[valkey] the write did not return. Server state at that moment:"]
+
+        info = self._ft_info()
+        for field in ("num_docs", "num_records", "mutation_queue_size",
+                      "backfill_in_progress", "backfill_complete_percent",
+                      "hash_indexing_failures", "state"):
+            lines.append(f"    FT.INFO {field:26} = {info.get(field, 'n/a')}")
+
+        try:
+            server = self._conn.info()
+        except Exception as exc:
+            lines.append(f"    INFO failed on the monitoring connection: {exc}")
+            lines.append("    -- which means the server, not one connection, "
+                         "stopped answering.")
+            return "\n".join(lines)
+
+        for field in ("connected_clients", "blocked_clients", "used_memory_human",
+                      "maxmemory_human", "mem_fragmentation_ratio",
+                      "instantaneous_ops_per_sec", "rdb_bgsave_in_progress",
+                      "loading", "total_net_input_bytes"):
+            lines.append(f"    INFO    {field:26} = {server.get(field, 'n/a')}")
+
+        # The decisive test. One HSET, fresh connection, short timeout, into
+        # the same prefix and the same index. If this returns while the batch
+        # did not, the engine was never the thing that stopped.
+        canary = f"{PREFIX}{int(ids[0])}"
+        try:
+            probe = self._write_connection(timeout_s=CANARY_TIMEOUT_S)
+            try:
+                started = time.time()
+                probe.hset(canary, mapping={
+                    TAG_FIELD: int(tags[0]),
+                    VECTOR_FIELD: encode_vector(vectors[0]),
+                })
+                lines.append(
+                    f"    single HSET on a fresh connection: OK in "
+                    f"{(time.time() - started) * 1000:.0f} ms")
+                lines.append(
+                    "    -- the server accepts writes into this index. What "
+                    "stalled was the batched connection, not the engine.")
+            finally:
+                probe.close()
+        except Exception as exc:
+            lines.append(f"    single HSET on a fresh connection: "
+                         f"{type(exc).__name__}: {exc}")
+            lines.append(
+                "    -- the server does not accept writes into this index at "
+                "all. The stall is in the engine, not in one connection.")
+        return "\n".join(lines)
 
     def count_rows(self) -> int:
         info = self._ft_info()
