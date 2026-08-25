@@ -165,6 +165,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                     "rows_expected": len(new_ids),
                     "reinsert_rows_per_s": round(rate, 3),
                     "churn_budget_s": budget_s,
+                    **_write_shape(driver),
                 },
             ))
             # Every later fraction builds on this one, so there is nothing
@@ -192,9 +193,33 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                 "delete_seconds": round(delete_timer.elapsed, 3),
                 "insert_seconds": round(insert_seconds, 3),
                 "reinsert_completed": True,
+                "reinsert_rows_per_s": round(
+                    len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
                 "recall_drop_vs_baseline": round(drop, 6),
+                **_write_shape(driver),
             },
         ))
+
+
+
+def _write_shape(driver) -> Dict[str, object]:
+    """How the driver had to write, when that is not how it normally writes.
+
+    Valkey re-inserted 99,000 rows at 86 rows/s against a load that ran at
+    30,195, and almost none of that gap is the HNSW graph: pipelined writes
+    into an indexed prefix do not return at all, so the re-insert had to fall
+    back to one command per round trip while the load pipelined a thousand.
+    Comparing those two rates as though they measured the same operation would
+    attribute to the index a cost that belongs to the write shape, so the shape
+    travels with the number.
+    """
+    used = getattr(driver, "write_batch_used", None)
+    if used is None:
+        return {}
+    shape = {"write_batch_rows": used}
+    if used < getattr(driver, "load_batch_rows", used):
+        shape["write_batch_reduced"] = True
+    return shape
 
 
 def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, tags,

@@ -3900,3 +3900,50 @@ class TestARunIdDockerWillRefuseIsCaughtFirst:
         body = source.split("def cmd_run")[1]
         assert body.index("run_id_problem(") < body.index("os.makedirs(paths")
 
+
+class TestTheWriteShapeTravelsWithTheChurnNumber:
+    """Valkey re-inserted 99,000 rows at 86 rows/s against a load that ran at
+    30,195. Almost none of that gap is the HNSW graph: pipelined writes into an
+    indexed prefix do not return at all, so the re-insert fell back to one
+    command per round trip while the load pipelined a thousand. Reported as a
+    bare rate it reads as an index cost, and it is a write-shape cost."""
+
+    def test_the_batch_is_recorded(self):
+        from harness.workloads.churn import _write_shape
+
+        class Driver:
+            write_batch_used = 1
+            load_batch_rows = 1000
+
+        shape = _write_shape(Driver())
+        assert shape["write_batch_rows"] == 1
+        assert shape["write_batch_reduced"] is True
+
+    def test_an_unreduced_batch_is_not_flagged(self):
+        from harness.workloads.churn import _write_shape
+
+        class Driver:
+            write_batch_used = 1000
+            load_batch_rows = 1000
+
+        assert "write_batch_reduced" not in _write_shape(Driver())
+
+    def test_engines_without_the_notion_add_nothing(self):
+        """Only valkey has a batch that can collapse; the record must not grow
+        an empty field for the other five."""
+        from harness.workloads.churn import _write_shape
+        assert _write_shape(object()) == {}
+
+    def test_both_records_carry_it(self):
+        """The completed churn and the abandoned one are read side by side."""
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "churn.py")).read()
+        assert source.count("**_write_shape(driver)") == 2
+
+    def test_a_completed_churn_reports_its_rate(self):
+        """The incomplete record always carried reinsert_rows_per_s and the
+        complete one did not, so the only churn with a rate was a failed one."""
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "churn.py")).read()
+        assert source.count('"reinsert_rows_per_s"') == 2
+

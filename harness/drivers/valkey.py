@@ -658,6 +658,9 @@ class ValkeyDriver(EngineDriver):
             pass
         return "\n".join(lines)
 
+    # What the load writes in one pipeline, for the record to compare against.
+    load_batch_rows = CHURN_BATCH
+
     @property
     def write_batch_used(self) -> int:
         """The batch size the re-insert settled on, for the record.
