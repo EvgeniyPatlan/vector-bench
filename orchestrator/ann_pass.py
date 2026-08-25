@@ -408,12 +408,30 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     if before and not force:
         print(f"[ann] {before} existing result file(s) for {engine} / "
               f"{dataset}; already-computed configurations will be skipped")
+    # The ops path has sampled its server all along; the ann path sampled
+    # nothing, which is why three contaminated recall points had to be
+    # identified five days later from a latency ratio rather than read off a
+    # graph. The series carries host load alongside the container's own usage,
+    # so a phase measured under someone else's job says so.
+    memory_timeseries = os.path.join(
+        paths["run_dir"],
+        f"mem-{engine}-{dataset}-{resource_pass}-ann.jsonl")
+    sampler = docker_ctl.MemorySampler(
+        container, memory_timeseries, wait_for_start_s=120.0)
+    sampler.start()
+
     output: List[str] = []
-    rc = docker_ctl.run_foreground(
-        spec, timeout=timeout_s, sink=output,
-        # Only filter when a benign traceback is actually possible.
-        line_filter=_SuppressNothingToRun() if (before and not force) else None,
-    )
+    try:
+        rc = docker_ctl.run_foreground(
+            spec, timeout=timeout_s, sink=output,
+            # Only filter when a benign traceback is actually possible.
+            line_filter=_SuppressNothingToRun() if (before and not force) else None,
+        )
+    finally:
+        sampler.stop()
+        if sampler.samples:
+            print(f"[ann] captured {sampler.samples} resource samples -> "
+                  f"{os.path.basename(memory_timeseries)}")
     after = _count_results(results_dir, engine, dataset)
     text = "\n".join(output)
 

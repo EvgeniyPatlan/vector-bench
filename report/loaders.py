@@ -340,3 +340,84 @@ def pareto_frontier(points: List[Dict[str, Any]], x: str = "recall_at_k",
             frontier.append(point)
             best_qps = point[y]
     return list(reversed(frontier))
+
+# A phase is "contended" when the machine burned meaningfully more CPU than the
+# container we were measuring did. Some gap is always there -- the kernel, the
+# sampler itself, the other cpuset -- so the threshold is a share of a core,
+# not zero.
+FOREIGN_CPU_CORES = 2.0
+
+
+def foreign_cpu(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """CPU the host spent that the measured container did not.
+
+    Three AliSQL recall points were taken while something outside the harness
+    was on the machine. Nothing recorded it, so it surfaced five days later as
+    a latency ratio somebody happened to compare by hand. Both counters are in
+    every sample now, and the difference between them over the phase is the
+    answer without anybody comparing anything.
+
+    Returns None when the series cannot answer -- an older run without the
+    host fields, or too few samples to difference.
+    """
+    usable = [r for r in rows
+              if r.get("host_cpu_seconds") is not None
+              and r.get("cpu_seconds") is not None]
+    if len(usable) < 2:
+        return None
+    first, last = usable[0], usable[-1]
+    elapsed = (last.get("t") or 0) - (first.get("t") or 0)
+    if elapsed <= 0:
+        return None
+    host = last["host_cpu_seconds"] - first["host_cpu_seconds"]
+    ours = last["cpu_seconds"] - first["cpu_seconds"]
+    foreign = host - ours
+    cores = foreign / elapsed
+    if cores < FOREIGN_CPU_CORES:
+        return None
+    loads = [r["host_load1"] for r in usable if r.get("host_load1") is not None]
+    return {
+        "elapsed_s": round(elapsed, 1),
+        "container_cores": round(ours / elapsed, 2),
+        "foreign_cores": round(cores, 2),
+        "peak_load1": round(max(loads), 1) if loads else None,
+    }
+
+def build_signature(record: Dict[str, Any]) -> Any:
+    """Everything about a measurement except the query effort.
+
+    Two points belong to the same curve when they differ only in ef_search.
+    Deciding that from named columns needs the key to list every axis a
+    profile may sweep, and it silently fails the moment an engine gains one:
+    Percona Search's quantization is not a column, so its unquantized and
+    scalar curves collapsed into a single series -- which made eight legitimate
+    measurements look like duplicates and invented six inversions comparing
+    ef_search 10 against ef_search 10.
+
+    ann-benchmarks already solves this. It names each result file after the
+    build arguments with the query argument appended:
+
+        angular_M_16_quantization_none_400.hdf5
+        angular_M_16_build_mode_post_efConstruction_200_400.hdf5
+
+    Dropping the trailing query argument leaves the build configuration, for
+    any engine, including axes this code has never heard of. The named columns
+    stay as the fallback for records loaded without a source file.
+    """
+    source = (record.get("extra") or {}).get("source_file")
+    if source:
+        stem = os.path.basename(str(source))
+        if stem.endswith(".hdf5"):
+            stem = stem[:-len(".hdf5")]
+        head, _, tail = stem.rpartition("_")
+        # Only strip a trailing query argument, never part of the build name.
+        # A stem that does not end in one is still a configuration identifier
+        # and is kept whole: falling back to the columns here would discard
+        # the very information the filename was consulted for.
+        build = head if (head and tail.isdigit()) else stem
+        return ("file", record.get("engine"), record.get("dataset"), build)
+    return ("cols", record.get("engine"), record.get("dataset"), record.get("m"),
+            record.get("build_mode"), record.get("storage_engine"),
+            record.get("ef_construction"),
+            (record.get("extra") or {}).get("quantization"))
+

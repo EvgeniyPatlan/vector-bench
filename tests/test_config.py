@@ -4019,3 +4019,185 @@ class TestTheMSweepProfileIsolatesGraphDegree:
         for engine in KNOWN_ENGINES:
             assert engine in _INGEST_ROWS_PER_S, engine
 
+
+class TestThroughputThatRisesWithEffortIsFlagged:
+    """AliSQL measured 2.6 QPS at ef_search 400 and 23.3 at 800, on one index
+    in one process. More graph traversal cannot be faster, so those points do
+    not describe the engine -- and nothing looked at the series as a series, so
+    it took five days and a hand comparison to notice."""
+
+    def _summary(self, points):
+        from report.generate import summarize
+        records = [dict(phase="recall_qps", engine="alisql", dataset="d",
+                        m=16, storage_engine="InnoDB", build_mode="post",
+                        ef_search=ef, qps=qps, recall_at_k=0.99)
+                   for ef, qps in points]
+        return summarize(records)
+
+    def test_a_clean_sweep_reports_nothing(self):
+        s = self._summary([(10, 400), (20, 300), (40, 200), (80, 100)])
+        assert s["qps_inversions"] == []
+
+    def test_the_alisql_shape_is_caught(self):
+        s = self._summary([(80, 133.2), (120, 19.6), (200, 5.2),
+                           (400, 2.6), (800, 23.3)])
+        assert len(s["qps_inversions"]) == 1
+        found = s["qps_inversions"][0]
+        assert (found["from_ef"], found["to_ef"]) == (400, 800)
+        assert found["ratio"] > 8
+        assert found["first_in_sweep"] is False
+
+    def test_the_warmup_artifact_is_caught_and_labelled(self):
+        """The first configuration pays for a cold cache and the second looks
+        faster. Real, benign, and it must not read the same as contamination."""
+        s = self._summary([(10, 239.8), (20, 436.8), (40, 247.6), (80, 139.3)])
+        assert len(s["qps_inversions"]) == 1
+        assert s["qps_inversions"][0]["first_in_sweep"] is True
+        assert s["qps_inversions"][0]["ratio"] < 2
+
+    def test_the_worst_is_reported_first(self):
+        s = self._summary([(10, 100), (20, 150), (40, 10), (80, 300)])
+        ratios = [i["ratio"] for i in s["qps_inversions"]]
+        assert ratios == sorted(ratios, reverse=True)
+
+    def test_separate_configurations_are_separate_series(self):
+        """A sweep over ef_construction is several curves, and comparing a
+        point on one with a point on another would invent inversions."""
+        from report.generate import summarize
+        records = []
+        for efc, base in ((64, 800), (400, 100)):
+            for ef, qps in ((10, base), (20, base / 2), (40, base / 4)):
+                records.append(dict(phase="recall_qps", engine="pgvector",
+                                    dataset="d", m=16, ef_construction=efc,
+                                    build_mode="post", storage_engine="heap",
+                                    ef_search=ef, qps=qps, recall_at_k=0.99))
+        assert summarize(records)["qps_inversions"] == []
+
+    def test_it_reaches_the_report(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert "Throughput that rose as query effort rose" in source
+        assert "qps_inversions" in source
+
+
+class TestAPhaseThatSharedTheMachineSaysSo:
+    """The ops path sampled its server all along; the ann path sampled nothing,
+    which is why contamination had to be inferred from a latency ratio instead
+    of read off a graph."""
+
+    def _rows(self, ours_cores, host_cores, n=20, step=1.0):
+        return [{"t": i * step,
+                 "cpu_seconds": i * step * ours_cores,
+                 "host_cpu_seconds": i * step * host_cores,
+                 "host_load1": host_cores * 1.1,
+                 "rss_bytes": 1} for i in range(n)]
+
+    def test_a_quiet_machine_reports_nothing(self):
+        from report.loaders import foreign_cpu
+        assert foreign_cpu(self._rows(8.0, 8.5)) is None
+
+    def test_a_shared_machine_is_named(self):
+        from report.loaders import foreign_cpu
+        found = foreign_cpu(self._rows(1.0, 20.0))
+        assert found is not None
+        assert found["foreign_cores"] == 19.0
+        assert found["container_cores"] == 1.0
+
+    def test_an_older_series_without_the_fields_is_not_a_finding(self):
+        """Runs that predate host sampling must not be reported as contended."""
+        from report.loaders import foreign_cpu
+        assert foreign_cpu([{"t": 0, "cpu_seconds": 0, "rss_bytes": 1},
+                            {"t": 10, "cpu_seconds": 80, "rss_bytes": 1}]) is None
+
+    def test_one_sample_cannot_be_differenced(self):
+        from report.loaders import foreign_cpu
+        assert foreign_cpu(self._rows(1.0, 20.0, n=1)) is None
+
+    def test_the_ann_phase_is_sampled(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        assert "MemorySampler(" in source
+        assert "wait_for_start_s" in source
+
+    def test_the_sampler_waits_for_a_foreground_container(self):
+        """run_foreground creates the container when it starts, so a sampler
+        started first found nothing running and exited before the phase began."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "docker_ctl.py")).read()
+        assert "_await_container" in source
+        assert "def _host_pressure" in source
+
+    def test_the_ann_series_cannot_be_mistaken_for_an_ops_one(self):
+        """attach_peak_rss looks a series up by exact name; a collision would
+        publish one phase's peak memory as another's."""
+        from report.loaders import memory_stem
+        ops = memory_stem({"engine": "alisql", "dataset": "d",
+                           "resource_pass": "tuned", "m": 16,
+                           "build_mode": "post"})
+        assert ops != "alisql-d-tuned-ann"
+
+
+class TestACurveIsIdentifiedByItsBuildNotItsColumns:
+    """Listing the axes by hand has failed twice. First when the tuned pass
+    began sweeping storage engine and ef_construction, which flagged 16 real
+    measurements as duplicates; then when Percona Search gained a quantization
+    axis that is not a column at all, which flagged 8 more and invented six
+    inversions comparing ef_search 10 against ef_search 10."""
+
+    def _record(self, engine, source, **kw):
+        base = dict(phase="recall_qps", engine=engine, dataset="d", m=16,
+                    qps=100.0, recall_at_k=0.99, ef_search=10)
+        base.update(kw)
+        base["extra"] = {"source_file": f"d/10/{engine}/{source}"}
+        return base
+
+    def test_two_quantizations_are_two_curves(self):
+        from report.loaders import build_signature
+        none = self._record("mongodb", "angular_M_16_quantization_none_400.hdf5")
+        scalar = self._record("mongodb", "angular_M_16_quantization_scalar_400.hdf5")
+        assert build_signature(none) != build_signature(scalar)
+
+    def test_two_query_efforts_are_one_curve(self):
+        from report.loaders import build_signature
+        low = self._record("mongodb", "angular_M_16_quantization_none_10.hdf5")
+        high = self._record("mongodb", "angular_M_16_quantization_none_800.hdf5")
+        assert build_signature(low) == build_signature(high)
+
+    def test_it_works_for_an_axis_nobody_named(self):
+        """The point is covering axes this code has never heard of."""
+        from report.loaders import build_signature
+        a = self._record("future", "angular_M_16_some_new_knob_a_400.hdf5")
+        b = self._record("future", "angular_M_16_some_new_knob_b_400.hdf5")
+        assert build_signature(a) != build_signature(b)
+
+    def test_engines_are_never_merged(self):
+        from report.loaders import build_signature
+        a = self._record("mariadb", "angular_M_16_engine_InnoDB_400.hdf5")
+        b = self._record("alisql", "angular_M_16_engine_InnoDB_400.hdf5")
+        assert build_signature(a) != build_signature(b)
+
+    def test_records_without_a_source_file_fall_back_to_columns(self):
+        from report.loaders import build_signature
+        a = dict(phase="recall_qps", engine="pgvector", dataset="d", m=16,
+                 build_mode="post", ef_construction=64)
+        b = dict(a, ef_construction=400)
+        assert build_signature(a) != build_signature(b)
+        assert build_signature(a) == build_signature(dict(a))
+
+    def test_a_build_name_ending_in_a_word_is_not_truncated(self):
+        """Only a trailing query argument may be stripped, never part of the
+        configuration name."""
+        from report.loaders import build_signature
+        r = self._record("valkey", "angular_M_16_build_mode_post.hdf5")
+        assert "post" in str(build_signature(r))
+
+    def test_the_real_run_has_no_duplicates_left(self):
+        """Percona Search's two quantization curves were reported as eight
+        duplicate configurations, telling the reader the report was reading
+        more than one measurement tree."""
+        from report.generate import summarize
+        records = []
+        for quant in ("none", "scalar"):
+            for ef in (10, 20, 40):
+                records.append(self._record(
+                    "mongodb", f"angular_M_16_quantization_{quant}_{ef}.hdf5",
+                    ef_search=ef, storage_engine="wiredTiger"))
+        assert summarize(records)["duplicate_ann"] == []
+

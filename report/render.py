@@ -235,6 +235,64 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             parts.append(
                 f"\n_…and {len(summary['recall_floor_gaps']) - 30} more._\n")
 
+    if summary.get("contended_phases"):
+        parts.append(
+            "\n### Phases that shared the machine\n\n"
+            "Each sample records what the host burned as well as what the "
+            "measured container did. Where the difference is more than two "
+            "cores sustained, something outside the harness was running and "
+            "the numbers from that phase describe the machine as much as the "
+            "engine.\n"
+        )
+        rows = [[_label(c.get("engine", "?")), c.get("series", "?"),
+                 f"{c.get('elapsed_s'):,.0f} s",
+                 f"{c.get('container_cores')}",
+                 f"**{c.get('foreign_cores')}**",
+                 str(c.get("peak_load1") or "—")]
+                for c in summary["contended_phases"][:30]]
+        parts.append(_md_table(
+            ["Engine", "Series", "Duration", "Our cores", "Foreign cores",
+             "Peak load1"], rows))
+
+    if summary.get("qps_inversions"):
+        inversions = summary["qps_inversions"]
+        severe = [i for i in inversions if not i.get("first_in_sweep")]
+        parts.append(
+            "\n### Throughput that rose as query effort rose\n\n"
+            "Examining more candidates cannot be faster on the same index, so "
+            "each row below is a measurement of something other than the "
+            "engine — most often load on the host that the harness did not "
+            "put there.\n\n"
+            "**Read the ratio.** An inversion of roughly 1.5–2x at the "
+            "*first* step of a sweep is the warm-up artifact: the opening "
+            "configuration pays for a cold cache and the second looks faster. "
+            "Anything larger, or anywhere other than the first step, is not "
+            "explicable that way and the affected points should be "
+            "re-measured rather than published.\n"
+        )
+        rows = [[_label(i.get("engine", "?")),
+                 str(i.get("storage_engine") or "—"),
+                 str(i.get("ef_construction") or "—"),
+                 f"{i.get('from_ef')} → {i.get('to_ef')}",
+                 f"{i.get('from_qps'):,} → {i.get('to_qps'):,}",
+                 f"{i.get('ratio')}x",
+                 "warm-up" if i.get("first_in_sweep") else "**unexplained**"]
+                for i in inversions[:30]]
+        parts.append(_md_table(
+            ["Engine", "Storage", "ef_construction", "ef_search",
+             "QPS", "Ratio", "Likely"], rows))
+        if len(inversions) > 30:
+            parts.append(f"\n_…and {len(inversions) - 30} more._\n")
+        if severe:
+            worst = severe[0]
+            parts.append(
+                f"\n**{len(severe)} of these are not at the first step.** The "
+                f"largest is {_label(worst['engine'])}, where ef_search "
+                f"{worst['from_ef']} measured {worst['from_qps']:,} QPS and "
+                f"ef_search {worst['to_ef']} measured {worst['to_qps']:,} — "
+                f"{worst['ratio']}x faster for more work. Treat every point in "
+                f"that engine's affected range as unmeasured.\n")
+
     if summary.get("duplicate_ann"):
         parts.append(
             "\n### The same configuration was measured more than once\n\n"

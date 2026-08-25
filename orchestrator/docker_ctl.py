@@ -333,11 +333,17 @@ class MemorySampler(threading.Thread):
     graph cache filling up, a build spiking, an engine steadily leaking.
     """
 
-    def __init__(self, container: str, output_path: str, interval_s: float = 0.25):
+    def __init__(self, container: str, output_path: str, interval_s: float = 0.25,
+                 wait_for_start_s: float = 0.0):
         super().__init__(daemon=True)
         self.container = container
         self.output_path = output_path
         self.interval_s = interval_s
+        # The ops path starts its server and then samples it. The ann path runs
+        # its container in the foreground, so the sampler has to be started
+        # first and wait for the container to appear -- without this it checked
+        # once, found nothing running, and exited before the phase began.
+        self.wait_for_start_s = wait_for_start_s
         self._stop_event = threading.Event()
         self.samples = 0
 
@@ -356,8 +362,53 @@ class MemorySampler(threading.Thread):
                     return None
         return None
 
+    def _host_pressure(self) -> Dict[str, Optional[float]]:
+        """What the whole machine is doing, not only this container.
+
+        The container's own cgroup cannot see load the harness did not create,
+        and that is exactly the load worth catching: three AliSQL recall points
+        were measured while something else was on the box, and the only trace
+        of it was a latency ratio that took five days and a hand comparison to
+        notice. Subtracting the container's CPU from the host's over the same
+        window names it directly.
+
+        Read from /proc rather than through the container, because the
+        orchestrator runs on the host and the container's /proc is namespaced.
+        """
+        out: Dict[str, Optional[float]] = {"host_load1": None,
+                                           "host_cpu_seconds": None}
+        try:
+            with open("/proc/loadavg") as fh:
+                out["host_load1"] = float(fh.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            with open("/proc/stat") as fh:
+                fields = fh.readline().split()
+            if fields and fields[0] == "cpu":
+                values = [int(v) for v in fields[1:8]]
+                # user+nice+system+irq+softirq+steal, i.e. everything but idle
+                # and iowait. Jiffies at the kernel's tick rate.
+                busy = values[0] + values[1] + values[2] + sum(values[5:])
+                out["host_cpu_seconds"] = busy / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError, AttributeError):
+            pass
+        return out
+
+    def _await_container(self) -> bool:
+        deadline = time.time() + self.wait_for_start_s
+        while not self._stop_event.is_set():
+            if is_running(self.container):
+                return True
+            if time.time() >= deadline:
+                return False
+            self._stop_event.wait(0.5)
+        return False
+
     def run(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
+        if self.wait_for_start_s and not self._await_container():
+            return
         with open(self.output_path, "a", buffering=1) as fh:
             while not self._stop_event.is_set():
                 if not is_running(self.container):
@@ -373,6 +424,7 @@ class MemorySampler(threading.Thread):
                         "rss_bytes": current,
                         "peak_bytes": peak,
                         "cpu_seconds": self._cpu_seconds(),
+                        **self._host_pressure(),
                     }) + "\n")
                     self.samples += 1
                 self._stop_event.wait(self.interval_s)

@@ -102,6 +102,8 @@ def summarize(records: List[Dict[str, Any]],
         "duplicate_ann": [],
         "recall_floor_gaps": [],
         "silent_ann_failures": [],
+        "qps_inversions": [],
+        "contended_phases": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
     }
@@ -111,25 +113,64 @@ def summarize(records: List[Dict[str, Any]],
     # machines, so this catches the same problem without depending on them: a
     # 16 GB curve and a 64 GB curve were merged into one chart, and the charts
     # silently showed whichever was faster at each point.
+    from report.loaders import build_signature
     by_config: Dict[Any, List[Dict[str, Any]]] = {}
     for r in recall_records:
         # The key must name every axis a profile is allowed to sweep, or a
-        # legitimate curve looks like a duplicate. The tuned pass sweeps
-        # storage engine for MariaDB (InnoDB and MyISAM) and ef_construction
-        # for pgvector, and omitting those flagged 16 real measurements as
-        # accidental repeats.
+        # legitimate curve looks like a duplicate. Listing them by hand failed
+        # twice: once when the tuned pass began sweeping storage engine and
+        # ef_construction, flagging 16 real measurements as repeats, and again
+        # when Percona Search gained a quantization axis that is not a column
+        # at all, flagging 8 more. build_signature takes the configuration from
+        # the result filename instead, which covers axes this code has never
+        # heard of.
         by_config.setdefault(
-            (r.get("engine"), r.get("dataset"), r.get("m"), r.get("ef_search"),
-             r.get("build_mode"), r.get("storage_engine"),
-             r.get("ef_construction")), []).append(r)
+            (build_signature(r), r.get("ef_search")), []).append(r)
     for key, group in sorted(by_config.items(), key=lambda kv: str(kv[0])):
         if len(group) > 1:
+            first = group[0]
             summary["duplicate_ann"].append({
-                "engine": key[0], "dataset": key[1], "m": key[2],
-                "ef_search": key[3], "storage_engine": key[5],
-                "ef_construction": key[6], "count": len(group),
+                "engine": first.get("engine"), "dataset": first.get("dataset"),
+                "m": first.get("m"), "ef_search": key[1],
+                "storage_engine": first.get("storage_engine"),
+                "ef_construction": first.get("ef_construction"),
+                "count": len(group),
                 "qps": sorted(round(g.get("qps") or 0, 1) for g in group),
             })
+
+    # Throughput that rises as query effort rises. Examining more candidates
+    # cannot be faster on the same index, so an inversion is never the engine
+    # -- it is the machine, and the measurement describes whatever else was on
+    # it. AliSQL measured 2.6 QPS at ef_search 400 and 23.3 at 800 in one
+    # process against one index, and nobody noticed for five days because
+    # nothing looked at the series as a series.
+    #
+    # The warm-up artifact lands here too, and should: the first configuration
+    # of a sweep pays for a cold cache and reads as an inversion of about
+    # 1.8x. Both are reported, with the ratio, because the ratio is what
+    # separates a cold cache from a contaminated window.
+    by_series: Dict[Any, List[Dict[str, Any]]] = {}
+    for r in recall_records:
+        if r.get("qps") is None or r.get("ef_search") is None:
+            continue
+        by_series.setdefault(build_signature(r), []).append(r)
+    for key, group in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        ordered = sorted(group, key=lambda r: r["ef_search"])
+        for previous, current in zip(ordered, ordered[1:]):
+            if current["qps"] <= previous["qps"]:
+                continue
+            summary["qps_inversions"].append({
+                "engine": previous.get("engine"),
+                "dataset": previous.get("dataset"),
+                "storage_engine": previous.get("storage_engine"),
+                "ef_construction": previous.get("ef_construction"),
+                "from_ef": previous["ef_search"], "to_ef": current["ef_search"],
+                "from_qps": round(previous["qps"], 1),
+                "to_qps": round(current["qps"], 1),
+                "ratio": round(current["qps"] / previous["qps"], 2),
+                "first_in_sweep": previous["ef_search"] == ordered[0]["ef_search"],
+            })
+    summary["qps_inversions"].sort(key=lambda i: -i["ratio"])
 
     # ann-benchmarks skips configurations that already have result files, and
     # reports that as success. A re-run after a config change therefore returns
@@ -163,6 +204,19 @@ def summarize(records: List[Dict[str, Any]],
         pressure["engine"] = engine
         pressure["series"] = name
         summary["memory_pressure"].append(pressure)
+
+    # CPU the machine spent that the container being measured did not. A phase
+    # that ran under someone else's job is not a measurement of the engine, and
+    # until both counters were sampled there was no way to say so.
+    for name, rows in sorted((memory or {}).items()):
+        from report.loaders import foreign_cpu
+        contention = foreign_cpu(rows)
+        if not contention:
+            continue
+        contention["series"] = name
+        contention["engine"] = name.split("-", 1)[0]
+        summary["contended_phases"].append(contention)
+    summary["contended_phases"].sort(key=lambda c: -c["foreign_cores"])
 
     # Any measurement taken while the vector index was NOT in the plan is a
     # full scan, and must be surfaced rather than averaged into a curve.
