@@ -183,6 +183,13 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
         "Queries per second  (higher is better ↑)",
     )
     ax.set_yscale("log")
+    # Recall lives at the top of its range and the interesting differences are
+    # in the last few percent, so a linear axis is the wrong instrument. On
+    # 0.69-1.0 linear, MariaDB 12.3 (0.9784-0.9996) occupies the rightmost 7%
+    # of the plot and AliSQL the rightmost 10%: both read as truncated rather
+    # than as accurate. A logit axis gives 0.99-0.999 the same width as
+    # 0.9-0.99, which is how ann-benchmarks plots recall and why.
+    ax.set_xscale("logit")
 
     plotted = False
     for engine, points in sorted(records_by_engine.items()):
@@ -215,10 +222,26 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
         plt.close(fig)
         return None
 
+    # A logit axis cannot reach 1.0, and the right edge has to leave room for
+    # the highest point measured rather than sitting on top of it.
+    highest = max(
+        (p["recall_at_k"] for points in records_by_engine.values()
+         for p in points if p.get("recall_at_k") is not None
+         and p.get("qps")
+         and (recall_floor is None or p["recall_at_k"] >= recall_floor)),
+        default=0.99)
+    right = min(0.9999, 1.0 - (1.0 - highest) * 0.5)
     if recall_floor is not None:
-        ax.set_xlim(left=recall_floor, right=1.002)
+        ax.set_xlim(left=recall_floor, right=right)
     else:
-        ax.set_xlim(left=max(0.0, ax.get_xlim()[0]), right=1.005)
+        ax.set_xlim(left=max(0.5, ax.get_xlim()[0]), right=right)
+    # Ticks the reader recognises, rather than logit's default 1-10^-n labels.
+    ticks = [t for t in (0.5, 0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.999)
+             if ax.get_xlim()[0] <= t <= right]
+    if ticks:
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{t:g}" for t in ticks])
+        ax.minorticks_off()
     ax.legend(frameon=False, fontsize=10, loc="lower left")
     return _save(fig, out_dir, stem)
 

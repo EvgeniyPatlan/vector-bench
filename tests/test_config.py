@@ -4265,3 +4265,78 @@ class TestConcurrencyCarriesAnErrorBar:
         assert "21.3%" in thrice
         assert "n=3" in thrice
 
+
+class TestTheRecallAxisDoesNotCrushHighRecallEngines:
+    """MHNSW and VIDX cannot be told to be fast and sloppy: their lowest query
+    effort already lands at recall 0.97-0.98. On a linear axis spanning
+    0.69-1.0 that puts MariaDB 12.3 in the rightmost 7% of the plot and AliSQL
+    in the rightmost 10%, and both read as truncated rather than as accurate.
+    A logit axis gives 0.99-0.999 the same width as 0.9-0.99."""
+
+    def _points(self):
+        return {
+            "mariadb123": [{"recall_at_k": r, "qps": q} for r, q in
+                           ((0.9784, 252), (0.9933, 218), (0.9996, 23))],
+            "valkey": [{"recall_at_k": r, "qps": q} for r, q in
+                       ((0.7711, 1516), (0.9533, 729), (0.9989, 80))],
+        }
+
+    def _axes(self, **kw):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from report import charts
+        import tempfile
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["ax"] = fig.axes[0]
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.pareto(self._points(), "d", 10, d, "t", **kw)
+        finally:
+            charts._save = original
+            plt.close("all")
+        return captured["ax"]
+
+    def test_the_axis_is_logit(self):
+        assert self._axes().get_xscale() == "logit"
+
+    def test_the_highest_point_is_inside_the_axis(self):
+        """A logit axis cannot reach 1.0, and a right edge sitting on the best
+        measurement clips the marker that matters most."""
+        ax = self._axes()
+        assert ax.get_xlim()[1] > 0.9996
+        assert ax.get_xlim()[1] < 1.0
+
+    def test_a_high_recall_engine_gets_real_width(self):
+        """The complaint this fixes: MariaDB 12.3 spanning a sliver."""
+        ax = self._axes()
+        lo, hi = ax.get_xlim()
+        import matplotlib.scale as mscale
+        t = mscale.scale_factory("logit", ax.xaxis).get_transform()
+        span = t.transform([lo, hi])
+        engine = t.transform([0.9784, 0.9996])
+        share = (engine[1] - engine[0]) / (span[1] - span[0])
+        assert share > 0.30, f"only {share:.0%} of the axis"
+
+    def test_the_ticks_are_readable_recall_values(self):
+        """Logit's default labels are 1-10^-n, which nobody reads as recall."""
+        ax = self._axes()
+        labels = [t.get_text() for t in ax.get_xticklabels() if t.get_text()]
+        assert "0.99" in labels
+        assert not any("10" in l and "^" in l for l in labels)
+
+    def test_the_floor_still_narrows_the_view(self):
+        assert self._axes(recall_floor=0.95).get_xlim()[0] == 0.95
+
+    def test_the_companion_chart_shows_the_deployable_region(self):
+        """At a 0.85 floor every engine's curve was still mostly below the
+        accuracy anyone would ship at."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert "recall_floor=0.95" in source
+

@@ -472,7 +472,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for name, fn, payload in (
             ("pareto", charts.pareto, (dict(by_engine), dataset, k)),
-            ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.85, **kw),
+            # 0.95, not 0.85. With the main chart on a logit axis the whole
+            # range is already legible, so the companion's job is the region
+            # people actually deploy at -- and at 0.85 every engine's curve was
+            # still mostly below the floor anyone would ship.
+            ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.95, **kw),
              (dict(by_engine), dataset, k)),
             ("qpsatrecall", charts.qps_at_recall, (summary, dataset)),
             ("latency", charts.latency_percentiles, (records, dataset)),
