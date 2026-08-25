@@ -93,6 +93,25 @@ def encode_vector(vector) -> Any:
     return Binary(b"\x27\x00" + values.tobytes(), 9)
 
 
+
+def hdf5_safe(values):
+    """Drop what ann-benchmarks cannot store as an HDF5 attribute.
+
+    store_results writes every key of get_additional() straight into
+    f.attrs[k]. A None has no HDF5 type, and the failure lands at the very end,
+    after the entire sweep has run:
+
+        TypeError: Object dtype dtype('O') has no native HDF5 equivalent
+
+    ann-benchmarks catches it per worker and exits zero, so the phase reports
+    completed and writes no results at all. Four runs of Percona Search failed
+    that way, in smoke and at full scale alike, because ef_construction is
+    genuinely not applicable to mongot and None was the honest thing to put
+    there. Absent is the representable way to say the same thing.
+    """
+    return {k: v for k, v in values.items() if v is not None}
+
+
 class PerconaSearch(BaseANN):
     def __init__(self, metric: str, method_param: Dict[str, Any]):
         if pymongo is None:
@@ -488,7 +507,7 @@ class PerconaSearch(BaseANN):
         return self._index_bytes / 1024.0
 
     def get_additional(self) -> Dict[str, Any]:
-        return {
+        return hdf5_safe({
             "engine": "mongodb",
             "resource_pass": os.environ.get("VB_RESOURCE_PASS", "unknown"),
             "engine_version": self._server_version(),
@@ -498,7 +517,8 @@ class PerconaSearch(BaseANN):
             # comparison is at matched M.
             "M": self._m,
             "m_applied": False,
-            "ef_construction": None,
+            # ef_construction is deliberately absent, not None: mongot does
+            # not expose it, and None is what store_results cannot write.
             "ef_search": self._num_candidates,
             "num_candidates": self._num_candidates,
             "quantization": self._quantization,
@@ -517,7 +537,7 @@ class PerconaSearch(BaseANN):
             # report and claiming one would be false.
             "march": "none",
             "jvm_version": self._jvm_version(),
-        }
+        })
 
     def _server_version(self) -> str:
         try:

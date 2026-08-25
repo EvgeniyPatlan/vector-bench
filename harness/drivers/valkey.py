@@ -357,6 +357,34 @@ class ValkeyDriver(EngineDriver):
                 conn.delete(*keys[start:start + CHURN_BATCH])
         finally:
             conn.close()
+        self._wait_for_mutations()
+
+    def _wait_for_mutations(self, timeout_s: float = 900.0) -> float:
+        """Let the index absorb a mass delete before writing into it again.
+
+        DEL returns as soon as the key is gone; removing the vector from the
+        HNSW graph is separate work, and FT.INFO reports a mutation queue
+        precisely so a caller can see it. Deleting 99,000 keys and writing
+        immediately afterwards timed out with not one row landing, while a
+        single write into the same index from an idle server took 104 ms. The
+        engine was not refusing the write, it had not finished the delete.
+        """
+        started = time.time()
+        last_report = started
+        while time.time() - started < timeout_s:
+            info = self._ft_info()
+            try:
+                queued = int(info.get("mutation_queue_size", 0))
+            except (TypeError, ValueError):
+                return time.time() - started
+            if queued == 0:
+                return time.time() - started
+            if time.time() - last_report >= PROGRESS_INTERVAL_S:
+                print(f"[valkey] index absorbing deletes, {queued:,} queued, "
+                      f"{time.time() - started:.0f}s elapsed", flush=True)
+                last_report = time.time()
+            time.sleep(2)
+        return time.time() - started
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     tags: Sequence[int]) -> None:

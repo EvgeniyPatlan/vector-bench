@@ -3436,3 +3436,87 @@ class TestPhaseLogsAreArchived:
         from orchestrator.docker_ctl import save_phase_log
         assert save_phase_log("/proc/nonexistent/nope", "e", "ann", "t",
                               ["x"]) is None
+
+
+class TestAnnResultsCanActuallyBeStored:
+    """ann-benchmarks writes get_additional() straight into HDF5 attributes.
+
+    store_results does f.attrs[k] = v for every key. A None has no HDF5 type
+    and raises at the very end, after the whole sweep has run:
+
+        TypeError: Object dtype dtype('O') has no native HDF5 equivalent
+
+    ann-benchmarks catches that per worker and exits zero, so the phase is
+    reported completed and writes no results at all. Percona Search failed that
+    way four times across two datasets while its measurements ran perfectly,
+    and the cause was one key: ef_construction, which mongot does not have and
+    which None was the honest way to describe.
+    """
+
+    MODULES = ("mongodb", "valkey", "pgvector", "mariadb", "mariadb123", "alisql")
+
+    def _source(self, engine):
+        return open(os.path.join(
+            VB_ROOT, "overlay", "ann-benchmarks", "ann_benchmarks",
+            "algorithms", engine, "module.py")).read()
+
+    def _additional_block(self, engine):
+        source = self._source(engine)
+        if "def get_additional" not in source:
+            return ""
+        return source.split("def get_additional")[1].split("\n    def ")[0]
+
+    def test_no_module_reports_a_value_hdf5_cannot_store(self):
+        import re
+        for engine in self.MODULES:
+            block = self._additional_block(engine)
+            for key, literal in re.findall(r'"(\w+)":\s*(None\b|\[|\{)', block):
+                assert False, (
+                    f"{engine} reports {key!r} as {literal}, which "
+                    f"store_results cannot write into an HDF5 attribute")
+
+    def test_the_engines_with_optional_fields_sanitise(self):
+        """Percona Search and Valkey both carry fields that are legitimately
+        not applicable, so they must strip rather than emit them."""
+        for engine in ("mongodb", "valkey"):
+            assert "hdf5_safe" in self._source(engine), engine
+            assert "return hdf5_safe(" in self._additional_block(engine), engine
+
+    def test_the_sanitiser_keeps_falsey_values(self):
+        """Dropping None must not drop False or 0: m_applied False and a zero
+        ready time are both real measurements."""
+        import ast
+        source = self._source("mongodb")
+        tree = ast.parse(source)
+        fn = next(n for n in tree.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "hdf5_safe")
+        ns = {}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "m", "exec"), ns)
+        out = ns["hdf5_safe"]({"kept": False, "zero": 0, "dropped": None})
+        assert out == {"kept": False, "zero": 0}
+
+    def test_a_mass_delete_is_absorbed_before_writing_again(self):
+        """DEL returns when the key is gone; removing the vector from the graph
+        is separate work. Deleting 99,000 keys and writing immediately timed
+        out with nothing landing, while one write into the same index from an
+        idle server took 104 ms."""
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        block = source.split("def delete_ids")[1].split("\n    def _wait_for_mutations")[0]
+        assert "_wait_for_mutations" in block
+        assert "mutation_queue_size" in source
+
+    def test_the_settle_step_is_bounded(self):
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.valkey import ValkeyDriver
+        d = ValkeyDriver(ConnectionSpec(host="h", port=1))
+        d._ft_info = lambda: {"mutation_queue_size": "5"}
+        elapsed = d._wait_for_mutations(timeout_s=0.2)
+        assert elapsed < 5.0
+
+    def test_an_empty_queue_returns_at_once(self):
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.valkey import ValkeyDriver
+        d = ValkeyDriver(ConnectionSpec(host="h", port=1))
+        d._ft_info = lambda: {"mutation_queue_size": "0"}
+        assert d._wait_for_mutations(timeout_s=30) < 1.0
