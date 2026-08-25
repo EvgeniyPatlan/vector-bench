@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,44 @@ ALL_ENGINES = ("mariadb", "alisql", "pgvector")
 # Preview besides.
 EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
 KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
+
+
+
+# Docker's own rule for container and volume names. The run id becomes both, so
+# anything outside this set fails at `docker run`, not here.
+RUN_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def run_id_problem(run_id: str) -> Optional[str]:
+    """Reject a run id Docker will not accept, before anything is created.
+
+    A shell variable picked up the escape sequence an arrow key sends, so
+    $BIG held "tuned-complete-20260820-134424\x1b[A". Everything derived from
+    it inherited the escape: the results directory, the manifest, the ann
+    results tree. Two phases ran and wrote into that directory before Docker
+    refused the third with
+
+        Invalid container name (...134424[A-annb-mongodb-dbpedia-openai)
+
+    which named the symptom four hundred lines after the cause. The id is the
+    first thing the run has and the last thing anyone inspects, so it is
+    checked before a single directory is made.
+    """
+    if RUN_ID_ALLOWED.match(run_id):
+        return None
+    printable = "".join(c if c.isprintable() else repr(c)[1:-1] for c in run_id)
+    lines = [
+        f"invalid --run-id: {printable}",
+        f"  as characters: {run_id!r}",
+        "  Docker allows [a-zA-Z0-9][a-zA-Z0-9_.-] in container and volume "
+        "names, and this id becomes both.",
+    ]
+    if any(not c.isprintable() for c in run_id):
+        lines.append(
+            "  It contains a non-printing character. A shell variable that was "
+            "edited with the arrow keys is the usual source; set it again by "
+            "typing or pasting the id rather than recalling it.")
+    return "\n".join(lines)
 
 
 def paths_for(run_id: str) -> Dict[str, str]:
@@ -283,6 +322,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not run_id and args.resume:
         run_id = _resume_target(profile)
     run_id = run_id or new_run_id(profile.get("name", "run"))
+    problem = run_id_problem(run_id)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 2
     paths = paths_for(run_id)
     os.makedirs(paths["run_dir"], exist_ok=True)
     os.makedirs(paths["annb_results"], exist_ok=True)

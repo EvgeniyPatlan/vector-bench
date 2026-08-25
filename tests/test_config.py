@@ -3746,3 +3746,49 @@ class _FakeConn:
 
     def close(self):
         pass
+
+
+class TestARunIdDockerWillRefuseIsCaughtFirst:
+    """A shell variable picked up the escape an arrow key sends, so $BIG held
+    "tuned-complete-20260820-134424\x1b[A". The results directory, the
+    manifest and the ann results tree were all created under that name, two
+    phases ran into it, and Docker refused the third with
+
+        Invalid container name (...134424[A-annb-mongodb-dbpedia-openai)
+
+    which named the symptom four hundred lines after the cause.
+    """
+
+    def test_a_normal_id_passes(self):
+        from orchestrator.cli import run_id_problem
+        assert run_id_problem("tuned-complete-20260820-134424") is None
+        assert run_id_problem("smoke_1.2-3") is None
+
+    def test_the_escape_that_caused_it_is_rejected(self):
+        from orchestrator.cli import run_id_problem
+        problem = run_id_problem("tuned-complete-20260820-134424\x1b[A")
+        assert problem is not None
+        assert "arrow keys" in problem
+
+    def test_the_message_shows_the_characters(self):
+        """The whole difficulty was that the id looked right on screen."""
+        from orchestrator.cli import run_id_problem
+        problem = run_id_problem("run\x1b[A")
+        assert "x1b" in problem
+
+    def test_a_leading_dash_is_rejected_too(self):
+        """Docker requires the first character to be alphanumeric, and an id
+        starting with a dash would also be read as a flag."""
+        from orchestrator.cli import run_id_problem
+        assert run_id_problem("-force") is not None
+
+    def test_slashes_are_rejected(self):
+        """A path fragment would escape the results directory."""
+        from orchestrator.cli import run_id_problem
+        assert run_id_problem("../elsewhere") is not None
+
+    def test_nothing_is_created_before_the_check(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        body = source.split("def cmd_run")[1]
+        assert body.index("run_id_problem(") < body.index("os.makedirs(paths")
+
