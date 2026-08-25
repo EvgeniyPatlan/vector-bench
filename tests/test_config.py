@@ -4340,3 +4340,55 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         assert "recall_floor=0.95" in source
 
+
+class TestAFloorFigureSaysWhereItWasActuallyTaken:
+    """MariaDB 12.3's lowest configuration returns recall 0.9784. It therefore
+    has no measurement at recall 0.90, and its "QPS at recall 0.90" is really
+    its throughput at 0.9888 — a materially harder task than the column asks
+    for. Printed as a bare number beside pgvector's 644, which is a real point
+    near 0.90, it invites a comparison the data does not support. Changing the
+    chart's axis made the curves legible; it did not create the missing points,
+    and the table has to say which cells are which."""
+
+    def _entry(self, **kw):
+        base = {"points": 8, "min_recall": 0.9784, "max_recall": 0.9996,
+                "qps_at_recall_90": 510, "qps_at_recall_90_recall": 0.9888,
+                "qps_at_recall_95": 510, "qps_at_recall_95_recall": 0.9888,
+                "qps_at_recall_99": 218, "qps_at_recall_99_recall": 0.9933}
+        base.update(kw)
+        return base
+
+    def _table(self, entry, engine="mariadb123"):
+        from report.render import _headline_tables
+        return _headline_tables({"per_dataset": {"d": {engine: entry}}})
+
+    def test_a_figure_above_the_floor_is_marked(self):
+        assert "510 †0.989" in self._table(self._entry())
+
+    def test_a_real_point_at_the_floor_is_not_marked(self):
+        """pgvector measured recall 0.8190, so its 0.90 figure is honest."""
+        entry = self._entry(min_recall=0.8190, qps_at_recall_90=644,
+                            qps_at_recall_90_recall=0.9250)
+        table = self._table(entry, engine="pgvector")
+        assert "644" in table
+        assert "644 †" not in table
+
+    def test_the_floor_the_engine_does_reach_is_left_alone(self):
+        """0.99 is below MariaDB 12.3's lowest recall, so that cell is real."""
+        table = self._table(self._entry())
+        assert "218 †" not in table
+
+    def test_the_marker_is_explained_under_the_table(self):
+        table = self._table(self._entry())
+        assert "†" in table.split("| ---")[-1]
+        assert "not comparable" in table
+
+    def test_the_explanation_names_the_lever(self):
+        """A reader who wants those points needs to know what would produce
+        them, and it is graph degree, not query effort."""
+        assert "graph degree" in self._table(self._entry())
+
+    def test_a_missing_figure_still_reads_as_a_dash(self):
+        entry = self._entry(qps_at_recall_99=None, qps_at_recall_99_recall=None)
+        assert "—" in self._table(entry)
+

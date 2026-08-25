@@ -501,7 +501,21 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
             def cell(floor: int) -> str:
                 value = _fmt(entry.get(f"qps_at_recall_{floor}"), 0)
                 storage = entry.get(f"qps_at_recall_{floor}_storage")
-                return f"{value} ({storage})" if multi and storage and value != "—" else value
+                if multi and storage and value != "—":
+                    value = f"{value} ({storage})"
+                # An engine with no configuration below the floor has no
+                # measurement AT the floor either -- the best it can offer is
+                # the one above it. MariaDB 12.3's lowest setting returns
+                # recall 0.9784, so its "QPS at recall 0.90" is really its QPS
+                # at 0.9888, and printing a bare number invites a comparison
+                # with engines that do have a point near 0.90. The recall the
+                # figure was actually taken at travels with it.
+                at = entry.get(f"qps_at_recall_{floor}_recall")
+                lowest = entry.get("min_recall")
+                if (value != "—" and at is not None and lowest is not None
+                        and lowest > floor / 100.0):
+                    value += f" †{at:.3f}"
+                return value
 
             # The range, not only the best. Two identical floor columns mean
             # the engine has no measurement between them, and the lowest recall
@@ -523,6 +537,13 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
             "\n_QPS at a recall floor is the comparison an operator makes: how fast "
             "is the engine at an accuracy I can accept. A dash means the engine did "
             "not reach that recall anywhere in the swept grid._\n"
+            "\n_A **†** marks a figure the engine has no measurement for at that "
+            "floor: every configuration swept returned recall above it, so the "
+            "number shown is its throughput at the higher recall printed beside "
+            "the dagger. Those cells are not comparable with engines that do have "
+            "a point near the floor — they are taken at a materially harder task. "
+            "Lowering the graph degree M is what would produce points there; this "
+            "run pins M=16 for every engine._\n"
         )
     return "".join(parts) or "_No recall/QPS data in this run._\n"
 
