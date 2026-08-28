@@ -4433,3 +4433,53 @@ class TestARunMeasuresEveryEngineByDefault:
         source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
         assert "not found. Build it first" in source
 
+
+class TestGraphDegreeCanBeSweptWhereItIsTheOnlyKnob:
+    """MHNSW and VIDX expose M and nothing else, and at M=16 their lowest query
+    effort already returns recall 0.97-0.98. They therefore have no measurement
+    anywhere near the 0.90 floor the headline table reports at, while pgvector
+    and Valkey -- which also have ef_construction -- reach down to 0.76. The
+    figures in those cells are real, but they are taken at a much harder task
+    than the column asks for, and the only way to make them comparable is to
+    give the engines a configuration that is genuinely less accurate."""
+
+    def _groups(self, engine, profile, resources=None, pass_name="normalized"):
+        from orchestrator.ann_pass import render_config
+        body = render_config(engine, profile, resources or {}, pass_name)
+        return body["float"]["any"][0]["run_groups"]
+
+    def _m(self, engine, profile, **kw):
+        return [g["arg_groups"][0]["M"] for g in
+                self._groups(engine, profile, **kw).values()]
+
+    def test_an_engine_can_be_given_its_own_m_values(self):
+        p = {"ann": {"m_values": [16], "ef_search": [10],
+                     "m_values_by_engine": {"mariadb": [6, 8, 16]}}}
+        assert self._m("mariadb", p) == [[6, 8, 16]]
+
+    def test_engines_without_an_override_are_untouched(self):
+        """pgvector already reaches 0.82; paying for a reload to give it points
+        it has would be spending hours on nothing."""
+        p = {"ann": {"m_values": [16], "ef_search": [10],
+                     "m_values_by_engine": {"mariadb": [6, 8, 16]}}}
+        assert self._m("pgvector", p) == [[16]]
+
+    def test_the_tuned_pass_reads_it_from_resources(self):
+        p = {"ann": {"m_values": [16], "ef_search": [10]}}
+        r = {"extras": {"m_values_by_engine": {"alisql": [8, 16]}}}
+        assert self._m("alisql", p, resources=r, pass_name="tuned") == [[8, 16]]
+
+    def test_the_normalized_pass_ignores_a_tuned_override(self):
+        """The normalized pass exists to give every engine the same treatment;
+        an extras-driven per-engine sweep is exactly what it must not do."""
+        p = {"ann": {"m_values": [16], "ef_search": [10]}}
+        r = {"extras": {"m_values_by_engine": {"alisql": [8, 16]}}}
+        assert self._m("alisql", p, resources=r, pass_name="normalized") == [[16]]
+
+    def test_mongodb_still_carries_one_value(self):
+        """mongot exposes no graph degree at all, so sweeping it there would
+        produce identical curves under different labels."""
+        p = {"ann": {"m_values": [16], "ef_search": [10],
+                     "m_values_by_engine": {"mongodb": [6, 8, 16]}}}
+        assert self._m("mongodb", p) == [[6]]
+

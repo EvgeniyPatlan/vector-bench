@@ -136,7 +136,17 @@ def render_config(engine: str, profile: Dict[str, Any],
     performance difference and would not be one.
     """
     ann = profile.get("ann", {}) or {}
-    m_values = list(ann.get("m_values", [16]))
+    # Graph degree is the only build knob MHNSW and VIDX expose, and at M=16
+    # their lowest query effort already returns recall 0.97-0.98. So they have
+    # no measurement anywhere near the 0.90 floor the headline table reports at,
+    # while pgvector and Valkey -- which have ef_construction as well -- reach
+    # down to 0.76. Sweeping M only where it is the sole knob costs a reload
+    # per value on the engines that need it and nothing on the engines that do
+    # not, and it turns three daggered cells into real measurements.
+    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
+                 if resource_pass == "tuned" else None) or \
+                ann.get("m_values_by_engine") or {}
+    m_values = list(by_engine.get(engine) or ann.get("m_values", [16]))
     query_args = [list(ann.get("ef_search", [10, 40, 160]))]
     extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
 
