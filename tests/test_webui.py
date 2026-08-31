@@ -212,11 +212,6 @@ def api(results_dir, tmp_path):
 
 
 class TestApi:
-    def test_health(self, api):
-        status, body = api_mod.dispatch(api, "GET", "/api/health", {})
-        assert status == 200 and body["ok"] is True
-        assert body["control_enabled"] is False
-
     def test_list_runs(self, api):
         status, body = api_mod.dispatch(api, "GET", "/api/runs", {})
         assert status == 200 and len(body["runs"]) == 2
@@ -301,6 +296,13 @@ class TestServer:
                      "/vendor/uPlot.iife.min.js"):
             status, _ = get(live_server + path)
             assert status == 200, path
+
+    def test_health_over_http(self, live_server):
+        status, body = get(f"{live_server}/api/health")
+        payload = json.loads(body)
+        assert status == 200 and payload["ok"] is True
+        assert payload["auth_enabled"] is False
+        assert payload["control_enabled"] is False
 
     def test_api_over_http(self, live_server):
         status, body = get(f"{live_server}/api/runs")

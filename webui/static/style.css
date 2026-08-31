@@ -49,20 +49,27 @@ body {
   border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
 }
 
-.layout { display: grid; grid-template-columns: 300px 1fr; min-height: calc(100vh - 45px); }
+.layout { display: grid; grid-template-columns: 290px 1fr; min-height: calc(100vh - 45px); }
 .sidebar { border-right: 1px solid var(--line); background: var(--panel); padding: 10px; overflow-y: auto; }
+.side-group + .side-group { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); }
+.side-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em;
+  color: var(--muted); font-weight: 600; margin: 0 0 7px 3px;
+}
 #run-filter {
   width: 100%; padding: 6px 9px; font: inherit; margin-bottom: 8px;
   border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink);
 }
-.run-list { list-style: none; margin: 0; padding: 0; }
-.run-list li {
-  padding: 8px 10px; border-radius: 6px; cursor: pointer; border: 1px solid transparent;
+.side-list { list-style: none; margin: 0; padding: 0; }
+.side-list li {
+  padding: 7px 10px; border-radius: 6px; cursor: pointer; border: 1px solid transparent;
 }
-.run-list li:hover { background: var(--bg); }
-.run-list li.active { background: var(--bg); border-color: var(--accent); }
-.run-list .rid { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
-.run-list .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.side-list li:hover { background: var(--bg); }
+.side-list li.active { background: var(--bg); border-color: var(--accent); }
+.side-list .rid { font-weight: 600; font-family: var(--mono); font-size: 12.5px; }
+.side-list .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.pad { padding: 8px 10px; }
+.context { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
 
 main { padding: 18px 22px; overflow-x: auto; }
 .panel h2 { font-size: 15px; margin: 0 0 10px; }
@@ -82,7 +89,22 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
 
 .warn { background: var(--warn-bg); border-left: 3px solid var(--warn-line); padding: 8px 12px; margin: 6px 0; border-radius: 0 6px 6px 0; font-size: 12.5px; }
 
-.facets { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 14px; }
+.viewbar { display: flex; align-items: baseline; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }
+.viewpick { font-size: 12.5px; color: var(--muted); }
+.viewpick select {
+  font: inherit; font-size: 14px; font-weight: 600; color: var(--ink);
+  padding: 5px 8px; margin-left: 6px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+}
+.axis-fixed {
+  font-size: 12.5px; color: var(--muted); font-family: var(--mono);
+  border: 1px solid var(--line); border-radius: 5px; padding: 3px 8px;
+}
+.filters-head {
+  width: 100%; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: .09em; font-weight: 600; margin-bottom: -4px;
+}
+.facets { display: flex; flex-wrap: wrap; gap: 14px; margin: 16px 0 4px; }
 .facet { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 130px; }
 .facet strong { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 5px; }
 .facet label { display: block; font-size: 12.5px; cursor: pointer; font-family: var(--mono); }
@@ -121,3 +143,21 @@ pre.log {
 }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
 .err { color: var(--bad); font-size: 12.5px; }
+
+#chart-note { font-size: 12px; margin-top: 6px; }
+.panel > h3:first-of-type { margin-top: 6px; }
+
+/* Sign-in */
+.login-page { display: grid; place-items: center; min-height: 100vh; }
+.login {
+  width: min(340px, 90vw); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; padding: 26px 24px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.login h1 { font-size: 16px; margin: 0; }
+.login label { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 5px; }
+.login input {
+  font: inherit; padding: 8px 10px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+}
+.login .err:empty { display: none; }

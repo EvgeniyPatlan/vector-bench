@@ -927,6 +927,10 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
 WEBUI_IMAGE = "vector-bench/webui:latest"
 
 
+def _webui_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost", "")
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     """Serve the web UI.
 
@@ -936,9 +940,19 @@ def cmd_web(args: argparse.Namespace) -> int:
     Docker daemon -- a container-only path would resolve to nothing on the host
     and silently mount an empty directory.
     """
+    auth_enabled = args.auth
+    if not _webui_loopback(args.host) and not args.no_auth:
+        auth_enabled = True
+    if args.auth and args.no_auth:
+        print("--auth and --no-auth are contradictory", file=sys.stderr)
+        return 2
+
     if args.no_container:
         from webui.server import serve
-        return serve(VB_ROOT, args.host, args.port, args.allow_control)
+        return serve(VB_ROOT, args.host, args.port, args.allow_control,
+                     auth_enabled=auth_enabled,
+                     password=os.environ.get("VB_WEB_PASSWORD"),
+                     behind_proxy=args.behind_proxy)
 
     if not docker_ctl.image_exists(WEBUI_IMAGE):
         print(f"{WEBUI_IMAGE} not found; build it with:\n"
@@ -970,12 +984,25 @@ def cmd_web(args: argparse.Namespace) -> int:
             print(f"warning: cannot stat {socket_path}; launching runs from the "
                   f"UI may fail with a permission error", file=sys.stderr)
 
-    command += [WEBUI_IMAGE, "--root", VB_ROOT, "--host", "0.0.0.0", "--port", "8080"]
+    if os.environ.get("VB_WEB_PASSWORD"):
+        command += ["--env", "VB_WEB_PASSWORD"]
+
+    command += [WEBUI_IMAGE, "--root", VB_ROOT, "--host", "0.0.0.0", "--port", "8080",
+                # The container binds every interface; only the publish address
+                # decides who can reach it, and only this side knows it.
+                "--published-host", args.host]
     if args.allow_control:
         command.append("--allow-control")
+    # The container always binds 0.0.0.0 -- publishing decides who reaches it --
+    # so the auth decision is made here from the published address, not there.
+    command.append("--auth" if auth_enabled else "--no-auth")
+    if args.behind_proxy:
+        command.append("--behind-proxy")
 
     mode = "control enabled" if args.allow_control else "read-only"
-    print(f"web UI on http://{args.host}:{args.port}  ({mode})")
+    scheme = "https" if args.behind_proxy else "http"
+    print(f"web UI on {scheme}://{args.host}:{args.port}  ({mode}, "
+          f"auth {'on' if auth_enabled else 'off'})")
     if not args.allow_control:
         print("  add --allow-control to edit profiles and launch runs")
     print("  Ctrl-C to stop")
@@ -1076,6 +1103,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "(mounts the Docker socket)")
     w.add_argument("--no-container", action="store_true",
                    help="run the server directly on the host instead")
+    w.add_argument("--auth", action="store_true",
+                   help="require a password (implied by a non-loopback --host)")
+    w.add_argument("--no-auth", action="store_true",
+                   help="publish on a non-loopback address with no password. "
+                        "Only for a network you already trust")
+    w.add_argument("--behind-proxy", action="store_true",
+                   help="TLS is terminated in front; marks cookies Secure")
     w.set_defaults(func=cmd_web)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")

@@ -10,54 +10,50 @@
 <body>
 <header class="topbar">
   <h1>vector-bench</h1>
-  <nav class="tabs" id="tabs" hidden>
-    <button data-tab="overview" class="active">Overview</button>
-    <button data-tab="explore">Explore</button>
-    <button data-tab="report">Report</button>
-    <button data-tab="configure" data-control="1">Configure</button>
-    <button data-tab="jobs" data-control="1">Jobs</button>
-  </nav>
+  <span id="context" class="context"></span>
+  <nav class="tabs" id="tabs" hidden></nav>
   <span class="badge" id="control-badge"></span>
 </header>
 
 <div class="layout">
   <aside class="sidebar">
-    <input type="search" id="run-filter" placeholder="filter runs…" autocomplete="off">
-    <ul id="run-list" class="run-list"></ul>
+    <div class="side-group">
+      <div class="side-head">Runs</div>
+      <input type="search" id="run-filter" placeholder="filter…" autocomplete="off">
+      <ul id="run-list" class="side-list"></ul>
+    </div>
+    <div class="side-group" id="control-group" hidden>
+      <div class="side-head">Control</div>
+      <ul id="control-list" class="side-list"></ul>
+    </div>
   </aside>
 
   <main id="main">
-    <section id="panel-overview" class="panel"></section>
-
+    <section id="panel-overview" class="panel" hidden></section>
     <section id="panel-explore" class="panel" hidden>
-      <div id="facets" class="facets"></div>
-      <div class="chart-controls">
-        <label>X <select id="axis-x"></select></label>
-        <label>Y <select id="axis-y"></select></label>
-        <label>Group <select id="group-by">
-          <option value="engine">engine</option>
-          <option value="engine,dataset">engine + dataset</option>
-          <option value="engine,m">engine + M</option>
-          <option value="engine,resource_pass">engine + pass</option>
-          <option value="engine,build_mode">engine + build mode</option>
-        </select></label>
-        <label class="check"><input type="checkbox" id="log-y"> log Y</label>
-        <span id="match-count" class="muted"></span>
+      <div class="viewbar">
+        <label class="viewpick">View
+          <select id="view-pick"></select>
+        </label>
+        <span id="view-hint" class="muted"></span>
       </div>
+      <div id="view-controls" class="chart-controls"></div>
       <div id="chart" class="chart"></div>
+      <div id="chart-note" class="muted"></div>
+      <div id="filters" class="facets"></div>
       <div id="table-wrap" class="table-wrap"></div>
     </section>
-
     <section id="panel-report" class="panel" hidden></section>
-
-    <section id="panel-configure" class="panel" hidden></section>
-
+    <section id="panel-profiles" class="panel" hidden></section>
+    <section id="panel-engines" class="panel" hidden></section>
     <section id="panel-jobs" class="panel" hidden></section>
   </main>
 </div>
 
 <script src="/vendor/uPlot.iife.min.js"></script>
+<script src="/fields.js"></script>
 <script src="/app.js"></script>
+<script src="/overview.js"></script>
 <script src="/explore.js"></script>
 <script src="/control.js"></script>
 </body>

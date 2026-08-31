@@ -45,14 +45,6 @@ def _run_dir_or_error(api: Api, run_id: str) -> Tuple[Optional[str], Optional[Re
     return run_dir, None
 
 
-def health(api: Api, _m, _q, _b=None) -> Response:
-    return 200, {
-        "ok": True,
-        "root": api.root,
-        "control_enabled": api.allow_control,
-    }
-
-
 def list_runs(api: Api, _m, _q, _b=None) -> Response:
     return 200, {"runs": runs_mod.discover_runs(api.results_dir)}
 
@@ -124,7 +116,6 @@ def get_series(api: Api, match, query, _b=None) -> Response:
 
 
 ROUTES: List[Tuple[str, Pattern, Callable[..., Response]]] = [
-    ("GET", re.compile(r"^/api/health$"), health),
     ("GET", re.compile(r"^/api/runs$"), list_runs),
     ("GET", re.compile(r"^/api/runs/(?P<run_id>[^/]+)$"), get_run),
     ("GET", re.compile(r"^/api/runs/(?P<run_id>[^/]+)/facets$"), get_facets),

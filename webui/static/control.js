@@ -65,7 +65,7 @@ async function openProfile(name) {
   if (area) area.value = profile.text;
   const datasets = (profile.parsed || {}).datasets || [];
   C.plan = { ...C.plan, datasets: [...datasets] };
-  renderConfigureBody();
+  renderProfilesBody();
   refreshEstimate();
 }
 
@@ -84,7 +84,7 @@ async function saveProfile() {
     for (const w of res.warnings || []) status.append(el("div", { class: "warn" }, w));
     C.profiles = (await api("/api/profiles")).profiles;
     C.profile = name;
-    renderConfigureBody();
+    renderProfilesBody();
   } catch (err) {
     status.append(el("div", { class: "err" }, String(err)));
   }
@@ -121,13 +121,13 @@ function checkboxRow(title, items, selected, onChange) {
   return box;
 }
 
-function renderConfigureBody() {
+function renderProfilesBody() {
   // Toggling anything in the run plan re-renders the whole panel, which would
   // otherwise reset the editor to the last loaded text and lose unsaved edits.
   const open = document.getElementById("profile-text");
   if (open) C.profileText = open.value;
 
-  const panel = document.getElementById("panel-configure");
+  const panel = document.getElementById("panel-profiles");
   clear(panel);
 
   panel.append(el("h2", {}, "Configure a run"));
@@ -147,7 +147,7 @@ function renderConfigureBody() {
         if (!name) return;
         C.profile = name;
         C.profileText = `name: ${name}\ndescription: \ndatasets:\n  - fashion-mnist-784-euclidean\nk: 10\nruns: 1\n\nann:\n  enabled: true\n  m_values: [16]\n  ef_search: [10, 40, 160]\n\nops:\n  enabled: true\n  workloads: [build, concurrency, filtered, churn]\n  m_values: [16]\n`;
-        renderConfigureBody();
+        renderProfilesBody();
       },
     }, "New")));
 
@@ -177,7 +177,7 @@ function renderConfigureBody() {
     C.plan.engines,
     (value, on) => {
       C.plan = { ...C.plan, engines: toggleIn(C.plan.engines, value, on) };
-      renderConfigureBody(); refreshEstimate();
+      renderProfilesBody(); refreshEstimate();
     }));
 
   const datasetItems = C.datasets.map((d) => ({
@@ -187,7 +187,7 @@ function renderConfigureBody() {
   grid.append(checkboxRow("datasets", datasetItems, C.plan.datasets,
     (value, on) => {
       C.plan = { ...C.plan, datasets: toggleIn(C.plan.datasets, value, on) };
-      renderConfigureBody(); refreshEstimate();
+      renderProfilesBody(); refreshEstimate();
     }));
 
   const options = el("div", { class: "facet" }, el("strong", {}, "options"));
@@ -237,19 +237,19 @@ async function launchRun() {
     });
     C.jobId = res.job.id;
     C.logOffset = 0;
-    showTab("jobs");
+    go("#/control/jobs");
   } catch (err) {
     status.append(el("span", { class: "err" }, String(err)));
   }
 }
 
-window.renderConfigure = async function renderConfigure() {
+window.renderProfiles = async function renderProfiles() {
   await loadReference();
   if (!C.profile && C.profiles.length) {
     await openProfile(C.profiles[0].name);
     return;
   }
-  renderConfigureBody();
+  renderProfilesBody();
   refreshEstimate();
 };
 
@@ -351,6 +351,14 @@ window.renderJobs = async function renderJobs() {
   await renderJobsBody();
 };
 
+// Polling must not outlive the panel that shows the log.
 window.addEventListener("hashchange", () => {
-  if (S.tab !== "jobs") stopPolling();
+  if (S.route.kind !== "control" || S.route.section !== "jobs") stopPolling();
 });
+
+window.renderEngines = async function renderEngines() {
+  const panel = document.getElementById("panel-engines");
+  clear(panel);
+  panel.append(el("h2", {}, "Engines"),
+    el("p", { class: "muted" }, "Coming in the next change."));
+};

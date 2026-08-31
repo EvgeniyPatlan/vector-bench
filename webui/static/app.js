@@ -1,30 +1,39 @@
 "use strict";
 
-const ENGINE_COLOR = {
-  mariadb: "#1f77b4", mariadb123: "#5fa8d3", alisql: "#d62728",
-  pgvector: "#2ca02c", mongodb: "#9467bd", valkey: "#e377c2",
-};
-const ENGINE_LABEL = {
-  mariadb: "MariaDB 11.8 (MHNSW)", mariadb123: "MariaDB 12.3 (MHNSW)",
-  alisql: "AliSQL (VIDX)", pgvector: "PostgreSQL (pgvector)",
-  mongodb: "Percona Search (mongot)", valkey: "Valkey (valkey-search)",
-};
-const PALETTE = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#e377c2",
-                 "#ff7f0e", "#8c564b", "#17becf"];
-
 const S = {
-  runs: [], runId: null, run: null, tab: "overview",
-  control: false, facets: {}, measures: [], filters: {},
-  records: [], source: "", chart: null,
+  runs: [], runId: null, run: null,
+  route: { kind: "run", tab: "overview", section: "profiles" },
+  control: false, facets: {}, measures: [], source: "",
+  filters: {}, viewId: "recall", chart: null,
 };
+
+const RUN_TABS = [
+  { id: "overview", label: "Overview" },
+  { id: "explore", label: "Explore" },
+  { id: "report", label: "Report" },
+];
+
+const CONTROL_SECTIONS = [
+  { id: "profiles", label: "Profiles" },
+  { id: "engines", label: "Engines" },
+  { id: "jobs", label: "Jobs" },
+];
 
 // -- utilities ---------------------------------------------------------
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  if (res.status === 401) { window.location.href = "/login.html"; throw new Error("not signed in"); }
   const body = await res.json().catch(() => ({ error: res.statusText }));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(body.error || (body.errors || []).join("; ") || `HTTP ${res.status}`);
   return body;
+}
+
+function post(path, payload) {
+  return api(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
 }
 
 function el(tag, attrs, ...kids) {
@@ -46,7 +55,7 @@ function el(tag, attrs, ...kids) {
 function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
 function engineColor(name, index) {
-  return ENGINE_COLOR[name] || PALETTE[index % PALETTE.length];
+  return ENGINE_COLOR[name] || PALETTE[(index || 0) % PALETTE.length];
 }
 
 function fmtBytes(n) {
@@ -71,7 +80,12 @@ function fmtNum(v) {
   return Math.abs(v) >= 100 ? v.toFixed(1) : v.toPrecision(4);
 }
 
-// -- run list ----------------------------------------------------------
+function fmtValue(field, v) {
+  if (typeof v === "number" && field.endsWith("_bytes")) return fmtBytes(v);
+  return fmtNum(v);
+}
+
+// -- sidebar -----------------------------------------------------------
 
 function renderRunList() {
   const list = document.getElementById("run-list");
@@ -80,119 +94,141 @@ function renderRunList() {
 
   const shown = S.runs.filter((r) => {
     if (!needle) return true;
-    const hay = [r.dir_name, r.profile, r.resource_pass,
-                 (r.engines || []).join(" "), (r.datasets || []).join(" ")]
-      .join(" ").toLowerCase();
-    return hay.includes(needle);
+    return [r.dir_name, r.profile, r.resource_pass, (r.engines || []).join(" "),
+            (r.datasets || []).join(" ")].join(" ").toLowerCase().includes(needle);
   });
 
-  if (!shown.length) {
-    list.append(el("li", { class: "muted" }, "no runs"));
-    return;
-  }
+  if (!shown.length) { list.append(el("li", { class: "muted pad" }, "no runs")); return; }
 
   for (const run of shown) {
-    const started = (run.started_at || "").replace("T", " ").replace("Z", "");
+    const active = S.route.kind === "run" && run.dir_name === S.runId;
+    const started = (run.started_at || "").replace("T", " ").replace("Z", "").slice(0, 16);
     list.append(el("li", {
-      class: run.dir_name === S.runId ? "active" : "",
-      onclick: () => selectRun(run.dir_name),
+      class: active ? "active" : "",
+      onclick: () => go(`#/run/${encodeURIComponent(run.dir_name)}/${S.route.tab}`),
     },
       el("div", { class: "rid" }, run.dir_name),
       el("div", { class: "meta" },
-        `${run.profile || "?"} · ${run.resource_pass || "?"} · ${(run.engines || []).length} engines`),
-      el("div", { class: "meta" },
-        `${started} · ${run.status}${run.record_count ? ` · ${run.record_count} records` : ""}`)));
+        `${run.profile || "?"} · ${(run.engines || []).length} engines · ${run.status}`),
+      el("div", { class: "meta" }, started)));
   }
 }
 
-// -- overview ----------------------------------------------------------
+function renderControlList() {
+  const group = document.getElementById("control-group");
+  group.hidden = !S.control;
+  if (!S.control) return;
+  const list = document.getElementById("control-list");
+  clear(list);
+  for (const section of CONTROL_SECTIONS) {
+    const active = S.route.kind === "control" && S.route.section === section.id;
+    list.append(el("li", {
+      class: active ? "active" : "",
+      onclick: () => go(`#/control/${section.id}`),
+    }, el("div", { class: "rid" }, section.label)));
+  }
+}
 
-function renderOverview() {
-  const panel = document.getElementById("panel-overview");
-  clear(panel);
-  if (!S.run) {
-    panel.append(el("p", { class: "empty" }, "Select a run from the left."));
+function renderTabs() {
+  const bar = document.getElementById("tabs");
+  const context = document.getElementById("context");
+  clear(bar);
+
+  if (S.route.kind !== "run" || !S.runId) {
+    bar.hidden = true;
+    context.textContent = S.route.kind === "control"
+      ? (CONTROL_SECTIONS.find((s) => s.id === S.route.section) || {}).label || ""
+      : "";
     return;
   }
 
-  const { summary, manifest } = S.run;
-  const host = manifest.host || {};
-  const cpu = host.cpu || {};
-
-  panel.append(el("h2", {}, summary.run_id),
-    summary.description ? el("p", { class: "muted" }, summary.description) : null);
-
-  const dl = el("dl", { class: "kv" });
-  const pairs = [
-    ["status", summary.status],
-    ["profile", summary.profile],
-    ["resource pass", summary.resource_pass],
-    ["started", summary.started_at],
-    ["finished", summary.finished_at],
-    ["measured time", fmtDuration(summary.duration_s)],
-    ["datasets", (summary.datasets || []).join(", ") || "—"],
-    ["records", `${summary.record_count} (${summary.has_records ? "merged" : "ops only"})`],
-    ["CPU", cpu.model],
-    ["cores", cpu.physical_cores ? `${cpu.physical_cores} physical / ${cpu.logical_cpus} logical${cpu.hybrid ? " (hybrid)" : ""}` : null],
-    ["SIMD", (cpu.simd_flags || []).join(" ") || null],
-    ["AVX-512", cpu.has_avx512 === undefined ? null : (cpu.has_avx512 ? "yes" : "no")],
-    ["RAM", host.total_ram_bytes ? fmtBytes(host.total_ram_bytes) : null],
-    ["kernel", host.kernel],
-    ["docker", host.docker_version],
-  ];
-  for (const [k, v] of pairs) {
-    if (v === null || v === undefined) continue;
-    dl.append(el("dt", {}, k), el("dd", {}, String(v)));
+  bar.hidden = false;
+  context.textContent = S.runId;
+  for (const tab of RUN_TABS) {
+    bar.append(el("button", {
+      class: tab.id === S.route.tab ? "active" : "",
+      onclick: () => go(`#/run/${encodeURIComponent(S.runId)}/${tab.id}`),
+    }, tab.label));
   }
-  panel.append(dl);
+}
 
-  const engines = manifest.engines || {};
-  if (Object.keys(engines).length) {
-    panel.append(el("h3", {}, "Engines"));
-    const rows = Object.entries(engines).map(([name, info]) => {
-      const build = info.build || {};
-      return el("tr", {},
-        el("td", {}, el("span", { class: "pill", style: `border-color:${engineColor(name, 0)};color:${engineColor(name, 0)}` }, name)),
-        el("td", {}, ENGINE_LABEL[name] || name),
-        el("td", {}, build.tag || info.tag || "—"),
-        el("td", {}, build.march || "—"),
-        el("td", {}, build.build_type || "—"));
-    });
-    panel.append(el("table", {},
-      el("thead", {}, el("tr", {}, ...["engine", "implementation", "tag", "-march", "build"].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...rows)));
+// -- routing -----------------------------------------------------------
+
+const PANELS = ["overview", "explore", "report", "profiles", "engines", "jobs"];
+
+function showPanel(name) {
+  for (const id of PANELS) {
+    document.getElementById(`panel-${id}`).hidden = id !== name;
   }
+}
 
-  const resolved = (manifest.config || {}).resolved_resources;
-  if (resolved) {
-    panel.append(el("h3", {}, "Resolved resources"));
-    const rdl = el("dl", { class: "kv" });
-    for (const [k, v] of Object.entries(resolved)) {
-      if (k.startsWith("_") || v === null || v === "") continue;
-      const shown = k.endsWith("_bytes") ? fmtBytes(v) : String(v);
-      rdl.append(el("dt", {}, k.replace(/_/g, " ")), el("dd", {}, shown));
-    }
-    panel.append(rdl);
+function parseHash() {
+  const hash = window.location.hash || "";
+  let m = /^#\/run\/([^/]+)(?:\/([a-z]+))?/.exec(hash);
+  if (m) {
+    const tab = RUN_TABS.some((t) => t.id === m[2]) ? m[2] : "overview";
+    return { kind: "run", runId: decodeURIComponent(m[1]), tab };
   }
+  m = /^#\/control\/([a-z]+)/.exec(hash);
+  if (m && CONTROL_SECTIONS.some((s) => s.id === m[1])) {
+    return { kind: "control", section: m[1] };
+  }
+  return null;
+}
 
-  const warnings = manifest.warnings || [];
-  if (warnings.length) {
-    panel.append(el("h3", {}, `Validity — ${warnings.length} warning${warnings.length > 1 ? "s" : ""}`));
-    for (const w of warnings) panel.append(el("div", { class: "warn" }, w));
+function go(hash) {
+  if (window.location.hash === hash) applyRoute();
+  else window.location.hash = hash;
+}
+
+const RENDERERS = {
+  overview: () => window.renderOverview(),
+  explore: () => window.renderExplore(),
+  report: () => renderReport(),
+  profiles: () => window.renderProfiles(),
+  engines: () => window.renderEngines(),
+  jobs: () => window.renderJobs(),
+};
+
+async function applyRoute() {
+  const wanted = parseHash() || { kind: "run", tab: "overview" };
+
+  if (wanted.kind === "control") {
+    S.route = { ...S.route, kind: "control", section: wanted.section };
+    renderRunList(); renderControlList(); renderTabs();
+    showPanel(wanted.section);
+    await RENDERERS[wanted.section]();
+    return;
   }
 
-  const phases = manifest.phases || [];
-  if (phases.length) {
-    panel.append(el("h3", {}, "Phases"));
-    const rows = phases.map((p) => el("tr", {},
-      el("td", {}, p.phase), el("td", {}, p.engine), el("td", {}, p.dataset),
-      el("td", {}, p.resource_pass),
-      el("td", {}, el("span", { class: `pill ${p.status === "completed" ? "ok" : "bad"}` }, p.status)),
-      el("td", { class: "num" }, fmtDuration(p.duration_s))));
-    panel.append(el("table", {},
-      el("thead", {}, el("tr", {}, ...["phase", "engine", "dataset", "pass", "status", "duration"].map((h) => el("th", {}, h)))),
-      el("tbody", {}, ...rows)));
+  const runId = wanted.runId && S.runs.some((r) => r.dir_name === wanted.runId)
+    ? wanted.runId
+    : (S.runs.length ? S.runs[0].dir_name : null);
+
+  S.route = { ...S.route, kind: "run", tab: wanted.tab };
+  if (!runId) {
+    renderRunList(); renderControlList(); renderTabs();
+    showPanel("overview");
+    const panel = document.getElementById("panel-overview");
+    clear(panel);
+    panel.append(el("p", { class: "empty" }, "No runs in results/ yet."));
+    return;
   }
+
+  if (runId !== S.runId) await loadRun(runId);
+  renderRunList(); renderControlList(); renderTabs();
+  showPanel(wanted.tab);
+  await RENDERERS[wanted.tab]();
+}
+
+async function loadRun(runId) {
+  S.runId = runId;
+  S.filters = {};
+  S.run = await api(`/api/runs/${encodeURIComponent(runId)}`);
+  const meta = await api(`/api/runs/${encodeURIComponent(runId)}/facets`);
+  S.facets = meta.facets;
+  S.measures = meta.measures;
+  S.source = meta.source;
 }
 
 // -- report tab --------------------------------------------------------
@@ -203,7 +239,9 @@ function renderReport() {
   if (!S.run) { panel.append(el("p", { class: "empty" }, "Select a run.")); return; }
   if (!S.run.summary.has_report) {
     panel.append(el("p", { class: "empty" },
-      "No generated report for this run. Run: ./run-benchmark.sh report --run-dir results/" + S.runId));
+      "No generated report for this run yet."),
+      el("pre", { class: "log" },
+        `./run-benchmark.sh report --run-dir results/${S.runId}`));
     return;
   }
   panel.append(el("iframe", {
@@ -211,106 +249,38 @@ function renderReport() {
   }));
 }
 
-// -- navigation --------------------------------------------------------
-
-const RENDERERS = {
-  overview: renderOverview,
-  explore: () => window.renderExplore(),
-  report: renderReport,
-  configure: () => window.renderConfigure(),
-  jobs: () => window.renderJobs(),
-};
-
-function showTab(name) {
-  S.tab = name;
-  writeHash();
-  for (const button of document.querySelectorAll("#tabs button")) {
-    button.classList.toggle("active", button.dataset.tab === name);
-  }
-  for (const panel of document.querySelectorAll(".panel")) {
-    panel.hidden = panel.id !== `panel-${name}`;
-  }
-  const render = RENDERERS[name];
-  if (render) render();
-}
-
-async function selectRun(runId, tab) {
-  S.runId = runId;
-  S.filters = {};
-  S.records = [];
-  document.getElementById("tabs").hidden = false;
-  renderRunList();
-  try {
-    S.run = await api(`/api/runs/${encodeURIComponent(runId)}`);
-    const meta = await api(`/api/runs/${encodeURIComponent(runId)}/facets`);
-    S.facets = meta.facets; S.measures = meta.measures; S.source = meta.source;
-  } catch (err) {
-    S.run = null;
-    document.getElementById("panel-overview").append(el("p", { class: "err" }, String(err)));
-    return;
-  }
-  showTab(tab || "overview");
-}
+// -- boot --------------------------------------------------------------
 
 async function boot() {
   document.getElementById("run-filter").addEventListener("input", renderRunList);
-  for (const button of document.querySelectorAll("#tabs button")) {
-    button.addEventListener("click", () => showTab(button.dataset.tab));
-  }
+  window.addEventListener("hashchange", () => applyRoute().catch(showError));
 
   const health = await api("/api/health");
   S.control = !!health.control_enabled;
-  document.getElementById("control-badge").textContent =
-    S.control ? "control enabled" : "read-only";
-  for (const button of document.querySelectorAll("#tabs button[data-control]")) {
-    button.hidden = !S.control;
+  const badge = document.getElementById("control-badge");
+  clear(badge);
+  badge.append(S.control ? "control enabled" : "read-only");
+  if (health.auth_enabled) {
+    badge.append(" · ", el("a", { href: "#", onclick: signOut }, "sign out"));
   }
 
-  const { runs } = await api("/api/runs");
-  S.runs = runs;
-  renderRunList();
-  renderOverview();
-
-  window.addEventListener("hashchange", onHashChange);
-  const wanted = parseHash();
-  const runId = wanted.runId && runs.some((r) => r.dir_name === wanted.runId)
-    ? wanted.runId : (runs.length ? runs[0].dir_name : null);
-  if (runId) await selectRun(runId, wanted.tab);
+  S.runs = (await api("/api/runs")).runs;
+  await applyRoute();
 }
 
-// -- hash routing ------------------------------------------------------
-
-function parseHash() {
-  const match = /^#\/run\/([^/]+)(?:\/([a-z]+))?/.exec(window.location.hash || "");
-  if (!match) return {};
-  return { runId: decodeURIComponent(match[1]), tab: match[2] };
+async function signOut(ev) {
+  ev.preventDefault();
+  await post("/api/logout");
+  window.location.href = "/login.html";
 }
 
-function writeHash() {
-  if (!S.runId) return;
-  const next = `#/run/${encodeURIComponent(S.runId)}/${S.tab}`;
-  if (window.location.hash !== next) {
-    history.replaceState(null, "", next);
-  }
+function showError(err) {
+  const main = document.getElementById("main");
+  main.append(el("p", { class: "err" }, String(err)));
 }
 
-function onHashChange() {
-  const wanted = parseHash();
-  if (!wanted.runId) return;
-  if (wanted.runId !== S.runId) selectRun(wanted.runId, wanted.tab);
-  else if (wanted.tab && wanted.tab !== S.tab) showTab(wanted.tab);
-}
-
-window.S = S;
-window.api = api;
-window.el = el;
-window.clear = clear;
-window.engineColor = engineColor;
-window.fmtNum = fmtNum;
-window.fmtBytes = fmtBytes;
-window.fmtDuration = fmtDuration;
-window.showTab = showTab;
-
-boot().catch((err) => {
-  document.getElementById("main").append(el("p", { class: "err" }, String(err)));
+Object.assign(window, {
+  S, api, post, el, clear, engineColor, fmtBytes, fmtDuration, fmtNum, fmtValue, go,
 });
+
+boot().catch(showError);

@@ -48,24 +48,57 @@ The UI adds:
 
 ## Access model
 
-The server binds **127.0.0.1** and is reached over an SSH port-forward when the
-benchmark host is remote:
+Two independent switches: **who can reach it** (`--host`) and **what it can do**
+(`--allow-control`).
+
+`--allow-control` is off by default. Without it every mutating endpoint returns
+403 and the Profiles, Engines and Jobs sections are hidden, so read-only mode is
+safe to leave running.
+
+### Local — the default
+
+Binds 127.0.0.1, no password. Reach a remote rig over SSH:
 
 ```bash
 ssh -N -L 8080:127.0.0.1:8080 you@bench-host
 ```
 
-There are no accounts and no tokens: SSH is the authentication. A `Host` header
-allowlist rejects anything that is not localhost, so a hostile page in your
-browser cannot reach it by DNS rebinding.
+SSH is the authentication. A `Host` header allowlist also rejects anything that
+is not localhost, so a hostile page in your browser cannot reach it by DNS
+rebinding.
 
-`--allow-control` is off by default. Without it every mutating endpoint returns
-403 and the Configure and Jobs tabs are hidden — the read-only mode is safe to
-leave running.
+### Remote — password plus TLS
 
-> **`--host 0.0.0.0` is available and is not recommended.** It publishes a
-> service that can start a two-day job to everything on the network, with no
-> authentication of any kind.
+**Binding a non-loopback address turns auth on by itself.** `--host 0.0.0.0`
+without a password refuses to run silently; pass `--no-auth` to override, which
+you should only do on a network that is already private. In a container the bind
+address is always `0.0.0.0`, so `--published-host` carries the address you
+actually reach it on and the decision follows that.
+
+```bash
+export VB_WEB_PASSWORD='…'          # or let one be generated and printed once
+./run-benchmark.sh web --allow-control --host 0.0.0.0 --behind-proxy
+```
+
+| | |
+| --- | --- |
+| Password | `VB_WEB_PASSWORD`, else generated on first run and printed once |
+| Stored as | `scrypt` hash + per-install salt in `state/webui/credentials.json`, mode 0600. A password given by environment is never written down. |
+| Session | random 256-bit id in a cookie: `HttpOnly`, `SameSite=Strict`, `Secure` under `--behind-proxy`, idle and absolute expiry |
+| Revocation | `POST /api/logout`, and a server restart ends every session |
+| Brute force | per-client exponential backoff after 3 failures; no lockout, because a lockout lets anyone lock you out |
+| CSRF | `SameSite=Strict` plus an `Origin` check on every mutation |
+
+**Why not JWT.** JWT buys stateless verification across many servers. This is one
+process on one machine, so the only thing it would add is a token that cannot be
+revoked without a server-side blocklist — which is the state back again, minus
+the simplicity. A random session id in a dict this process owns is smaller and
+can actually be revoked.
+
+> **Auth is not enough on its own.** Over plain HTTP the password and the session
+> cookie cross the network in cleartext and can be replayed, and this endpoint
+> holds the Docker socket. The server says so at startup if you bind a public
+> address without `--behind-proxy`. Put TLS in front — see below.
 
 ---
 
@@ -131,6 +164,20 @@ escape sequence is rejected with a message rather than executed.
 
 ---
 
+## Deploying it with TLS
+
+`docker/webui/compose.yml` runs the UI behind Caddy, which obtains and renews a
+real certificate. The UI gets no public port of its own.
+
+```bash
+cp docker/webui/.env.example docker/webui/.env   # fill in the five values
+docker compose -f docker/webui/compose.yml --env-file docker/webui/.env up -d
+docker compose -f docker/webui/compose.yml logs webui   # the generated password
+```
+
+On a machine with no public DNS name, prefer WireGuard or Tailscale and drop
+Caddy: the transport is already encrypted, and the UI still wants `--auth`.
+
 ## How it runs
 
 ```
@@ -144,10 +191,17 @@ host                                    container (vector-bench/webui)
                                                   └─▶ docker run (engine containers)
 ```
 
-The image carries python3, pyyaml, numpy and the Docker **CLI** — the daemon
+The image carries python3, pyyaml, numpy, git and the Docker **CLI** — the daemon
 stays on the host. It is not built from an engine bench image: the UI does not
-need matplotlib or h5py, and building separately means it takes a minute and
-does not go stale when an engine is rebuilt.
+need matplotlib or h5py, and building separately means it does not go stale when
+an engine is rebuilt.
+
+The CLI is fetched in a build stage and checked against a **pinned sha256** for
+each architecture, then exactly one binary is copied forward; the published
+tarball also carries dockerd, containerd and runc, none of which belong here.
+There is no `.sha256` sidecar published for these artifacts, so the checksums are
+constants in the Dockerfile and must be updated with `DOCKER_CLI_VERSION`. A
+truncated download is a real failure mode — one occurred while this was written.
 
 **The repo is mounted at its own absolute host path**, not at some tidy `/app`.
 The orchestrator hands *host* paths to the Docker daemon when it launches engine
