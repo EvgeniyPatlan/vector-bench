@@ -945,16 +945,30 @@ def cmd_web(args: argparse.Namespace) -> int:
               f"  ./scripts/build-images.sh --engine webui", file=sys.stderr)
         return 1
 
+    # Run as the invoking user, not root. The repo is a bind mount owned by that
+    # user: as root, git refuses the working copy as "dubious ownership" and
+    # every file the server writes lands root-owned on the host.
     command = [
         "docker", "run", "--rm", "--name", f"vb-webui-{os.getpid()}",
         "--publish", f"{args.host}:{args.port}:8080",
         "--volume", f"{VB_ROOT}:{VB_ROOT}",
         "--workdir", VB_ROOT,
+        "--user", f"{os.getuid()}:{os.getgid()}",
         "--env", "PYTHONUNBUFFERED=1",
+        # No home directory exists for that uid inside the image.
+        "--env", "HOME=/tmp",
     ]
     if args.allow_control:
-        # Launching runs means driving the host's Docker daemon.
-        command += ["--volume", "/var/run/docker.sock:/var/run/docker.sock"]
+        # Launching runs means driving the host's Docker daemon. A non-root user
+        # reaches the socket only through its group, which is read from the
+        # socket itself rather than assumed to be called "docker".
+        socket_path = "/var/run/docker.sock"
+        command += ["--volume", f"{socket_path}:{socket_path}"]
+        try:
+            command += ["--group-add", str(os.stat(socket_path).st_gid)]
+        except OSError:
+            print(f"warning: cannot stat {socket_path}; launching runs from the "
+                  f"UI may fail with a permission error", file=sys.stderr)
 
     command += [WEBUI_IMAGE, "--root", VB_ROOT, "--host", "0.0.0.0", "--port", "8080"]
     if args.allow_control:

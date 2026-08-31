@@ -31,6 +31,13 @@ RUN set -eux; \
     rm -rf /tmp/docker; \
     docker --version
 
+# The repo arrives as a bind mount owned by the host user. git refuses to touch
+# a repository owned by someone else, and run-benchmark.sh runs git on every run
+# to re-apply the ann-benchmarks overlay. The container is normally run as that
+# same host user, which resolves it; this is the safety net for when it is not,
+# and applies to every uid rather than one.
+RUN git config --system --add safe.directory '*'
+
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 

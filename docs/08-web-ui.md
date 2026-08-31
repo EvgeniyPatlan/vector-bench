@@ -155,8 +155,21 @@ containers, so a container-only path would be resolved by the daemon against the
 host filesystem, where it does not exist, and the engine would come up with an
 empty mount. Mounting at the same path makes every path line up.
 
-Files the server writes on a bind mount would be root-owned; it chowns them to
-the owner of the directory they land in.
+**The container runs as the invoking user**, not root. Two things break when it
+does not: git refuses the ann-benchmarks working copy as "dubious ownership",
+which stops every run before it starts, and everything the server writes under
+`state/` and `config/profiles/` lands root-owned on the host, where its owner
+cannot delete it. Reaching the Docker socket as a non-root user needs its group,
+which is read from the socket itself rather than assumed to be called `docker`.
+
+If you started the UI as root at some point, `state/webui/` may still be
+root-owned and launching will fail with a permission error. Remove it with a
+root container rather than sudo:
+
+```bash
+docker run --rm --user 0 -v "$PWD/state:/s" --entrypoint sh \
+  vector-bench/webui:latest -c 'rm -rf /s/webui'
+```
 
 `./run-benchmark.sh web --no-container` runs the server directly on the host
 instead. It is standard-library-only apart from PyYAML, so it works with the

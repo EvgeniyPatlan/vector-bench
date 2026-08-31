@@ -154,8 +154,10 @@ def write_profile(config_dir: str, name: str, text: str) -> Tuple[bool, List[str
 def _match_owner(reference_dir: str, path: str) -> None:
     """Give a written file the owner of its directory.
 
-    The server runs as root inside a container; files it creates on a bind mount
-    would otherwise be root-owned on the host.
+    A fallback, not the mechanism: `run-benchmark.sh web` runs the container as
+    the invoking user, so this is a no-op there. It matters only when the server
+    is started as root by hand, where a file written to a bind mount would
+    otherwise be root-owned on the host and undeletable by its owner.
     """
     if os.geteuid() != 0:
         return
