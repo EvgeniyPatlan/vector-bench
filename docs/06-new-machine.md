@@ -151,9 +151,19 @@ sections 3, 4, 6 and 7 as a checklist that does each step — build the images, 
 corpus, run the smoke gate, then measure — and checks that every image agrees on
 `-march`.
 
-To expose it properly rather than tunnelling, see
-[08-web-ui.md](08-web-ui.md): binding a non-loopback address turns password auth
-on by itself, and `docker/webui/compose.yml` puts Caddy in front for TLS.
+That command runs in the foreground and dies with your SSH session. On a
+machine you connect to, install it as a service instead — the unit and its
+settings file are in `docker/webui/`, and the steps are in
+[08-web-ui.md](08-web-ui.md):
+
+```bash
+sudo cp docker/webui/vector-bench-web.service /etc/systemd/system/
+sudo systemctl enable --now vector-bench-web
+```
+
+To expose it properly rather than tunnelling, see the same document: binding a
+non-loopback address turns password auth on by itself, and
+`docker/webui/compose.yml` puts Caddy in front for TLS.
 
 ---
 

@@ -1,0 +1,55 @@
+# vector-bench web interface, as a system service.
+#
+# The `web` command runs a container in the foreground so Ctrl-C stops it, which
+# is right at a terminal and wrong on a machine you connect to: the interface
+# dies with the SSH session that started it, and does not come back after a
+# reboot. This unit is the same command with systemd holding it open.
+#
+# INSTALL
+#   sudo install -d -m 0750 /etc/vector-bench
+#   sudo install -m 0600 docker/webui/web.env.example /etc/vector-bench/web.env
+#   sudoedit /etc/vector-bench/web.env          # set the password
+#   sudo cp docker/webui/vector-bench-web.service /etc/systemd/system/
+#   sudoedit /etc/systemd/system/vector-bench-web.service   # set User and paths
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vector-bench-web
+#   systemctl status vector-bench-web
+#   journalctl -u vector-bench-web -f
+#
+# The password lives in a root-only file rather than the unit, so it stays out
+# of `systemctl cat`, shell history and the process list.
+
+[Unit]
+Description=vector-bench web interface
+Documentation=file:///opt/vector-bench/docs/08-web-ui.md
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=exec
+
+# The container runs as this user so that files it writes into the checkout are
+# owned by whoever owns the checkout. Set both to match your install.
+User=CHANGE-ME
+WorkingDirectory=/home/CHANGE-ME/vector-bench
+
+EnvironmentFile=/etc/vector-bench/web.env
+ExecStart=/bin/sh -c 'exec ./run-benchmark.sh web $VB_WEB_ARGS'
+
+Restart=on-failure
+RestartSec=5s
+
+# A benchmark launched from the interface is a detached process group and
+# outlives this unit on purpose: restarting the interface must not kill a run
+# that is twenty hours in.
+KillMode=process
+TimeoutStopSec=30s
+
+# It needs the Docker socket and the checkout, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/home/CHANGE-ME/vector-bench
+
+[Install]
+WantedBy=multi-user.target

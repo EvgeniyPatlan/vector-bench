@@ -23,6 +23,7 @@ Stop it with Ctrl-C.
 - [Configuring and launching](#configuring-and-launching)
 - [Sharing a result](#sharing-a-result)
 - [Viewing results measured somewhere else](#viewing-results-measured-somewhere-else)
+- [Running it on a machine you connect to](#running-it-on-a-machine-you-connect-to)
 - [Deploying it with TLS](#deploying-it-with-tls)
 - [How it runs](#how-it-runs)
 - [What it deliberately does not do](#what-it-deliberately-does-not-do)
@@ -289,6 +290,50 @@ Two things can then go wrong, and they are opposites:
 
 A run that recorded its own `ann_fingerprint` and whose tree is present gets no
 warning, because the generator can narrow to exactly its own results.
+
+## Running it on a machine you connect to
+
+`./run-benchmark.sh web` runs the container in the foreground, so Ctrl-C stops
+it. That is right at a terminal and wrong on a remote host: the interface dies
+with the SSH session that started it, and does not come back after a reboot.
+
+`docker/webui/vector-bench-web.service` is the same command with systemd holding
+it open:
+
+```bash
+sudo install -d -m 0750 /etc/vector-bench
+sudo install -m 0600 docker/webui/web.env.example /etc/vector-bench/web.env
+sudoedit /etc/vector-bench/web.env                      # set VB_WEB_PASSWORD
+
+sudo cp docker/webui/vector-bench-web.service /etc/systemd/system/
+sudoedit /etc/systemd/system/vector-bench-web.service   # set User and the paths
+sudo systemctl daemon-reload
+sudo systemctl enable --now vector-bench-web
+
+systemctl status vector-bench-web
+journalctl -u vector-bench-web -f
+```
+
+The password lives in a root-only file rather than in the unit, so it stays out
+of `systemctl cat`, shell history and the process list. Leave it empty and one
+is generated on first start and printed once to the journal:
+
+```bash
+journalctl -u vector-bench-web | grep -A2 'generated a password'
+```
+
+`VB_WEB_ARGS` in that file chooses the exposure — loopback plus a tunnel, a
+public address behind TLS, or a private network. The examples are in the file.
+
+> **A run started from the interface outlives the service.** The unit uses
+> `KillMode=process` deliberately: restarting or stopping the web interface must
+> not kill a benchmark that is twenty hours in. The run keeps going and is still
+> there in Jobs when the interface comes back — though the log it was streaming
+> is not, since the process that was capturing it has gone. The run's own output
+> under `results/<run-id>/` is unaffected.
+
+Without systemd, `tmux new -s web './run-benchmark.sh web --allow-control --auth'`
+survives a disconnect but not a reboot.
 
 ## Deploying it with TLS
 
