@@ -780,9 +780,9 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     )
     return True
 
-def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
-                         datasets: List[str], passes: List[str],
-                         phases: List[str]) -> None:
+def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
+                        datasets: List[str], passes: List[str],
+                        phases: List[str]) -> Dict[str, Any]:
     """Estimate ingest time before the run starts.
 
     ann-benchmarks reloads the whole dataset for every M value, and the
@@ -790,10 +790,14 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
     multiplies quietly: a seven-value M grid over four datasets is days of pure
     loading. Showing the number up front is the difference between choosing that
     and discovering it six hours in.
+
+    Returns the breakdown rather than printing it, so the CLI and the web UI
+    cannot report different numbers for the same plan.
     """
     m_count = max(1, len(profile.get("ann", {}).get("m_values", [16])))
-    total_h = 0.0
-    rows_per_pass: List[str] = []
+    ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
+    per_engine: Dict[str, float] = {}
+    unknown: List[str] = [d for d in datasets if d not in _DATASET_ROWS]
 
     for engine in engines:
         engine_h = 0.0
@@ -805,19 +809,36 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
             if "ann" in phases:
                 engine_h += (rows / effective) * m_count / 3600
             if "ops" in phases:
-                ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
                 engine_h += (rows / effective) * ops_m / 3600
-        engine_h *= len(passes)
-        total_h += engine_h
-        rows_per_pass.append(f"{engine} ~{engine_h:.1f} h")
+        per_engine[engine] = round(engine_h * len(passes), 2)
 
+    total_h = round(sum(per_engine.values()), 2)
+    return {
+        "total_hours": total_h,
+        "per_engine_hours": per_engine,
+        "m_values": m_count,
+        "ops_m_values": ops_m,
+        "passes": len(passes),
+        "phases": list(phases),
+        "datasets_without_estimate": unknown,
+        "long_run": total_h > 12,
+    }
+
+
+def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
+                         datasets: List[str], passes: List[str],
+                         phases: List[str]) -> None:
+    estimate = estimate_load_hours(profile, engines, datasets, passes, phases)
+    total_h = estimate["total_hours"]
     if total_h < 1:
         return
+    rows_per_pass = [f"{engine} ~{hours:.1f} h"
+                     for engine, hours in estimate["per_engine_hours"].items()]
     print(f"\nestimated ingest time (loading only, before any queries):")
     print("  " + "  |  ".join(rows_per_pass))
-    print(f"  total ~{total_h:.1f} h across {len(passes)} pass(es), "
-          f"{m_count} M value(s)")
-    if total_h > 12:
+    print(f"  total ~{total_h:.1f} h across {estimate['passes']} pass(es), "
+          f"{estimate['m_values']} M value(s)")
+    if estimate["long_run"]:
         print(f"  ! This is a long run. Each M value costs a full reload of every "
               f"dataset,\n    and MHNSW/VIDX build incrementally at a few hundred "
               f"rows/s. Reduce\n    ann.m_values or the dataset list to cut it "
@@ -903,6 +924,53 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
     raise ValueError(f"unknown phase: {phase}")
 
 
+WEBUI_IMAGE = "vector-bench/webui:latest"
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """Serve the web UI.
+
+    In a container by default, following the report generator: the host keeps
+    its python3-and-pyyaml guarantee. The repo is mounted at its own absolute
+    path because the orchestrator inside the container hands host paths to the
+    Docker daemon -- a container-only path would resolve to nothing on the host
+    and silently mount an empty directory.
+    """
+    if args.no_container:
+        from webui.server import serve
+        return serve(VB_ROOT, args.host, args.port, args.allow_control)
+
+    if not docker_ctl.image_exists(WEBUI_IMAGE):
+        print(f"{WEBUI_IMAGE} not found; build it with:\n"
+              f"  ./scripts/build-images.sh --engine webui", file=sys.stderr)
+        return 1
+
+    command = [
+        "docker", "run", "--rm", "--name", f"vb-webui-{os.getpid()}",
+        "--publish", f"{args.host}:{args.port}:8080",
+        "--volume", f"{VB_ROOT}:{VB_ROOT}",
+        "--workdir", VB_ROOT,
+        "--env", "PYTHONUNBUFFERED=1",
+    ]
+    if args.allow_control:
+        # Launching runs means driving the host's Docker daemon.
+        command += ["--volume", "/var/run/docker.sock:/var/run/docker.sock"]
+
+    command += [WEBUI_IMAGE, "--root", VB_ROOT, "--host", "0.0.0.0", "--port", "8080"]
+    if args.allow_control:
+        command.append("--allow-control")
+
+    mode = "control enabled" if args.allow_control else "read-only"
+    print(f"web UI on http://{args.host}:{args.port}  ({mode})")
+    if not args.allow_control:
+        print("  add --allow-control to edit profiles and launch runs")
+    print("  Ctrl-C to stop")
+    try:
+        return subprocess.call(command)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     run_dir = os.path.abspath(args.run_dir)
     if not os.path.isdir(run_dir):
@@ -983,6 +1051,18 @@ def build_parser() -> argparse.ArgumentParser:
                           "not by corpus, so a machine that measured two "
                           "corpora under one configuration reports both.")
     rep.set_defaults(func=cmd_report)
+
+    w = sub.add_parser("web", help="serve the configuration and report web UI")
+    w.add_argument("--port", type=int, default=8080)
+    w.add_argument("--host", default="127.0.0.1",
+                   help="host interface to publish on; loopback by default, "
+                        "reach a remote rig over an SSH port-forward")
+    w.add_argument("--allow-control", action="store_true",
+                   help="enable profile editing and run launching "
+                        "(mounts the Docker socket)")
+    w.add_argument("--no-container", action="store_true",
+                   help="run the server directly on the host instead")
+    w.set_defaults(func=cmd_web)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
     c.add_argument("--run-id", default=None,

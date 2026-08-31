@@ -20,6 +20,7 @@ than algorithm choice.
 - [What you get](#what-you-get)
 - [Step by step](#step-by-step)
 - [Commands](#commands)
+- [The web UI](docs/08-web-ui.md)
 - [Running the engines by hand](#running-the-engines-by-hand)
 - [Things that will ruin your results](#things-that-will-ruin-your-results)
 - [Documentation](#documentation)
@@ -156,7 +157,7 @@ mistaken for a complete dataset.
 ### 4. Verify before measuring
 
 ```bash
-python3 -m pytest tests/ -q          # 73 unit tests, ~2 s
+python3 -m pytest tests/ -q          # 559 unit tests, ~14 s
 ./tests/verify-alisql-traps.sh       # 8 engine-behaviour checks against a live server
 ./run-benchmark.sh run --profile smoke
 ```
@@ -205,6 +206,24 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
   results/<run-id>/report/records.jsonl | sort -k5 -rn | head
 ```
 
+### 7. Or use the browser
+
+```bash
+./run-benchmark.sh build --engine webui     # once, ~1 min
+./run-benchmark.sh web                      # http://127.0.0.1:8080
+```
+
+An index of every run in `results/`, the manifest as a readable page, and an
+interactive explorer over `records.jsonl` — facet filters, a chart on any
+numeric pair, a sortable table. The generated `report.html` is still there,
+unchanged, in its own tab.
+
+`--allow-control` additionally allows editing `config/profiles/*.yml` with
+validation and an ingest estimate, launching a run, and watching its output
+live. It is off by default, and the server binds loopback only — reach a remote
+rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
+[docs/08-web-ui.md](docs/08-web-ui.md).
+
 ---
 
 ## Commands
@@ -215,6 +234,7 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 | `fetch` | Download datasets |
 | `run` | Execute a benchmark run |
 | `report` | Regenerate the report from an existing run directory |
+| `web` | Serve the web UI: run index, interactive explorer, profile editor, launcher |
 | `render` | Regenerate the ann-benchmarks configs for a profile |
 | `sources` | Export sources only, without building |
 | `clean` | Remove containers, networks and volumes left by a run |
@@ -337,6 +357,7 @@ on a value its vendor plainly intended you to change.
 | [05-methodology.md](docs/05-methodology.md) | What is measured, how, fairness policy, known asymmetries |
 | [06-new-machine.md](docs/06-new-machine.md) | Moving the framework to another machine |
 | [07-planning-a-run.md](docs/07-planning-a-run.md) | **Read before a long run.** Measured ingest rates, what each profile costs, how to scope, resumption |
+| [08-web-ui.md](docs/08-web-ui.md) | The browser front end: run index, record explorer, profile editing, launching and live monitoring |
 
 ---
 
@@ -392,7 +413,8 @@ vector-bench/
 ├── harness/                  ops harness: drivers, workloads, metrics
 ├── orchestrator/             host-side: containers, limits, manifest
 ├── report/                   charts, Markdown and self-contained HTML
-├── docs/                     the six documents above
+├── webui/                    web UI: HTTP server, JSON API, static front end
+├── docs/                     the documents above
 ├── tests/                    unit tests + live engine-behaviour checks
 └── sources/ work/ datasets/ results/     generated, gitignored
 ```
