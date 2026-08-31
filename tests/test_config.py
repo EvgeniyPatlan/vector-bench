@@ -4546,3 +4546,76 @@ class TestAReportCanBeNarrowedToOneCorpus:
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         assert 'if not r.get("dataset") or r["dataset"] in wanted' in source
 
+
+class TestTwoGraphDegreesAreTwoLines:
+    """Every engine swept a single M until MHNSW and VIDX were given M=6 as
+    well, so they would have real measurements below recall 0.90. M was not a
+    series axis, so the two configurations were drawn as one line: on the
+    latency chart, which plots against ef_search, that put two y-values at
+    every x and joined them, and AliSQL appeared to swing between 383 ms and
+    95 ms at adjacent search widths."""
+
+    def _records(self):
+        return [{"phase": "recall_qps", "engine": "alisql", "dataset": "d",
+                 "storage_engine": "InnoDB", "m": m, "ef_search": ef,
+                 "qps": 100.0, "recall_at_k": 0.9,
+                 "latency_p50_ms": 5.0, "latency_p99_ms": 9.0}
+                for m in (6, 16) for ef in (10, 20, 40)]
+
+    def test_m_is_a_series_axis(self):
+        from report.charts import SERIES_AXES
+        assert "m" in SERIES_AXES
+
+    def test_two_degrees_make_two_series(self):
+        from report.charts import _grouped
+        groups, _labels, _st, _deg = _grouped(self._records())
+        assert len(groups) == 2
+
+    def test_the_legend_says_m_not_ef_c(self):
+        """An M=6 curve labelled ef_c=6 is worse than one labelled nothing."""
+        from report.charts import series_labels
+        labels = set(series_labels(self._records()).values())
+        assert any("M=6" in l for l in labels)
+        assert not any("ef_c=" in l for l in labels)
+
+    def test_a_single_degree_keeps_a_bare_label(self):
+        """Naming an axis the run did not sweep implies a comparison it did
+        not make."""
+        from report.charts import series_labels
+        rows = [r for r in self._records() if r["m"] == 16]
+        assert not any("M=" in l for l in series_labels(rows).values())
+
+    def test_the_two_lines_are_told_apart(self):
+        """Colour is the engine and linestyle is the storage engine, so a
+        second degree had nothing left to carry it and both came out
+        identical."""
+        from report.charts import series_style
+        sparse = series_style({"engine": "alisql", "m": 6}, degrees=[6, 16])
+        dense = series_style({"engine": "alisql", "m": 16}, degrees=[6, 16])
+        assert (sparse["alpha"], sparse["linewidth"]) != \
+               (dense.get("alpha"), dense["linewidth"])
+
+    def test_the_key_width_is_derived_not_written_down(self):
+        """churn_impact builds a wider key and slices it back, and it did that
+        with a literal 3 -- so adding an axis shifted every index under it."""
+        from report.charts import SERIES_AXES, SERIES_KEY_WIDTH
+        assert SERIES_KEY_WIDTH == 1 + len(SERIES_AXES)
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        block = source.split("def churn_impact")[1]
+        assert "key[:3]" not in block
+        assert "key[3]" not in block
+
+    def test_churn_still_renders_with_the_wider_key(self):
+        import tempfile
+        import matplotlib
+        matplotlib.use("Agg")
+        from report.charts import churn_impact
+        rows = []
+        for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
+            rows.append({"phase": "churn", "engine": "mariadb", "dataset": "d",
+                         "storage_engine": "InnoDB", "m": 16, "qps": qps,
+                         "churn_fraction": frac, "resource_pass": "tuned",
+                         "build_mode": "post"})
+        with tempfile.TemporaryDirectory() as out:
+            assert churn_impact(rows, "d", out, "c") is not None
+

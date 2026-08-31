@@ -51,7 +51,28 @@ def style_for(engine: str) -> Dict[str, Any]:
 # one engine that differ on either are different curves, not repeats of one:
 # grouping a chart by engine name alone put several points at every x and drew
 # a line through all of them that no configuration ever produced.
-SERIES_AXES = ("storage_engine", "ef_construction")
+# What separates one plotted line from another, beyond the engine itself.
+#
+# `m` belongs here and was missing. Every engine swept a single graph degree
+# until MHNSW and VIDX were given M=6 as well, so that they would have real
+# measurements below recall 0.90 -- and then two configurations of the same
+# engine were drawn as one line. On the latency chart, which plots against
+# ef_search, that put two y-values at every x and joined them: AliSQL appeared
+# to swing between 383 ms and 95 ms and back to 370 ms at adjacent search
+# widths. The Pareto chart was unaffected, because it takes a frontier across
+# every configuration an engine was swept over, which is what it should do.
+SERIES_AXES = ("storage_engine", "ef_construction", "m")
+
+# How each axis names itself in a legend. Empty means the value speaks for
+# itself, as a storage engine does. Everything else needs saying: an M=6 curve
+# labelled "ef_c=6" is worse than one labelled nothing at all.
+AXIS_LABELS = {"storage_engine": "", "ef_construction": "ef_c=", "m": "M="}
+
+# Length of a series key: the engine plus one slot per axis. churn_impact
+# builds a wider key and then slices it back, and it did that with the
+# literal 3 -- so adding `m` to SERIES_AXES shifted every index under it and
+# the lookup stopped matching anything at all.
+SERIES_KEY_WIDTH = 1 + len(SERIES_AXES)
 
 # Colour stays with the engine so versions remain comparable at a glance; the
 # storage engine is carried by the linestyle instead.
@@ -83,38 +104,55 @@ def series_labels(records: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
         for i, axis in enumerate(SERIES_AXES):
             value = key[i + 1]
             if value is not None and len(varying[key[0]][i]) > 1:
-                label += (f" / {value}" if axis == "storage_engine"
-                          else f" / ef_c={value}")
+                label += f" / {AXIS_LABELS[axis]}{value}" if AXIS_LABELS[axis] \
+                    else f" / {value}"
         labels[key] = label
     return labels
 
 
 def series_style(record: Dict[str, Any],
-                 storages: Optional[List[Optional[str]]] = None) -> Dict[str, Any]:
+                 storages: Optional[List[Optional[str]]] = None,
+                 degrees: Optional[List[Optional[int]]] = None) -> Dict[str, Any]:
     """Engine colour and marker, with the linestyle carrying storage engine."""
     style = dict(style_for(record.get("engine")))
     if storages and len(storages) > 1:
         idx = storages.index(record.get("storage_engine"))
         style["linestyle"] = STORAGE_LINESTYLES[idx % len(STORAGE_LINESTYLES)]
+    # Colour is the engine and linestyle is the storage engine, so a second
+    # graph degree had nothing left to carry it and two AliSQL curves came out
+    # identical. Width and transparency are free: the denser graph stays solid
+    # and prominent, the sparser one recedes, and which is which is legible
+    # without reading the legend.
+    if degrees and len(degrees) > 1 and record.get("m") is not None:
+        rank = degrees.index(record.get("m"))
+        style["alpha"] = 1.0 if rank == len(degrees) - 1 else 0.55
+        style["linewidth"] = 2.0 if rank == len(degrees) - 1 else 1.3
     return style
 
 
 def _grouped(records: List[Dict[str, Any]]
              ) -> Tuple[Dict[Tuple[Any, ...], List[Dict[str, Any]]],
                         Dict[Tuple[Any, ...], str],
-                        Dict[str, List[Optional[str]]]]:
-    """Split records into plotted series, with their labels and storage order."""
+                        Dict[str, List[Optional[str]]],
+                        Dict[str, List[Optional[int]]]]:
+    """Split records into plotted series, with their labels, storage engines
+    and graph degrees -- the last two because a style has to be chosen per
+    series and both need to be distinguishable within one engine's colour."""
     groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
     for r in records:
         groups.setdefault(series_key(r), []).append(r)
     per_engine: Dict[str, List[Optional[str]]] = {}
+    degrees: Dict[str, List[Optional[int]]] = {}
     for key in groups:
         storages = per_engine.setdefault(key[0], [])
         if key[1] not in storages:
             storages.append(key[1])
-    for v in per_engine.values():
+        ms = degrees.setdefault(key[0], [])
+        if key[3] not in ms:
+            ms.append(key[3])
+    for v in list(per_engine.values()) + list(degrees.values()):
         v.sort(key=lambda x: (x is None, x))
-    return groups, series_labels(records), per_engine
+    return groups, series_labels(records), per_engine, degrees
 
 
 def _new_axes(title: str, xlabel: str, ylabel: str,
@@ -257,7 +295,7 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                        and r.get("build_wall_s") is not None]
     if not plotted_records:
         return None
-    by_series, labels, storages = _grouped(plotted_records)
+    by_series, labels, storages, degrees = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     fig.patch.set_alpha(0.0)
@@ -279,7 +317,7 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
             ax.yaxis.set_major_formatter(FuncFormatter(formatter))
 
         for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-            style = series_style(rows[0], storages.get(key[0]))
+            style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
             points = sorted(
                 ((r.get("m"), r.get(field)) for r in rows
                  if r.get("m") is not None and r.get(field) is not None),
@@ -329,7 +367,7 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     plotted_records = [r for r in records if _is_concurrency_point(r, dataset)]
     if not plotted_records:
         return None
-    by_series, labels, storages = _grouped(plotted_records)
+    by_series, labels, storages, degrees = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
     fig.patch.set_alpha(0.0)
@@ -347,7 +385,7 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[2].set_ylabel("Scaling efficiency  (1.0 = linear)", fontsize=10)
 
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-        style = series_style(rows[0], storages.get(key[0]))
+        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["clients"])
         clients = [r["clients"] for r in rows]
 
@@ -396,7 +434,7 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                        and r.get("selectivity") is not None]
     if not plotted_records:
         return None
-    by_series, labels, storages = _grouped(plotted_records)
+    by_series, labels, storages, degrees = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     fig.patch.set_alpha(0.0)
@@ -413,7 +451,7 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_yscale("log")
 
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-        style = series_style(rows[0], storages.get(key[0]))
+        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["selectivity"])
         sel = [r["selectivity"] for r in rows]
 
@@ -457,7 +495,7 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                        and r.get("churn_fraction") is not None]
     if not plotted_records:
         return None
-    by_series, labels, storages = _grouped(plotted_records)
+    by_series, labels, storages, degrees = _grouped(plotted_records)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     fig.patch.set_alpha(0.0)
@@ -472,7 +510,7 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_ylabel("Queries per second  (higher is better ↑)", fontsize=10)
 
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-        style = series_style(rows[0], storages.get(key[0]))
+        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["churn_fraction"])
         fractions = [r["churn_fraction"] for r in rows]
         axes[0].plot(fractions, [r.get("recall_at_k") for r in rows],
@@ -677,7 +715,7 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
                        and r.get("ef_search") and r.get("latency_p99_ms")]
     if not plotted_records:
         return None
-    by_series, labels, storages = _grouped(plotted_records)
+    by_series, labels, storages, degrees = _grouped(plotted_records)
 
     fig, ax = _new_axes(
         f"Query latency distribution — {dataset}",
@@ -687,7 +725,7 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
     ax.set_xscale("log", base=2)
 
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-        style = series_style(rows[0], storages.get(key[0]))
+        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["ef_search"])
         ef = [r["ef_search"] for r in rows]
         p50 = [r.get("latency_p50_ms") for r in rows]
@@ -828,18 +866,19 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     # holds more than one of them. On a single-pass run they turned every
     # legend entry into "... (post) / tuned", which crowds out the storage
     # engine -- the one distinction this chart exists to show.
-    passes = {key[3] for key in retained}
-    modes = {key[4] for key in retained}
+    passes = {key[SERIES_KEY_WIDTH] for key in retained}
+    modes = {key[SERIES_KEY_WIDTH + 1] for key in retained}
 
     for key, points in sorted(retained.items(), key=lambda kv: str(kv[0])):
-        sample = next(r for r in churn_records if series_key(r) == key[:3])
+        sample = next(r for r in churn_records
+                      if series_key(r) == key[:SERIES_KEY_WIDTH])
         style = series_style(sample, storages.get(key[0]))
         points = sorted(points)
-        label = labels.get(key[:3], key[0])
-        if key[4] and len(modes) > 1:
-            label += f" ({key[4]})"
-        if key[3] and len(passes) > 1:
-            label += f" / {key[3]}"
+        label = labels.get(key[:SERIES_KEY_WIDTH], key[0])
+        if key[SERIES_KEY_WIDTH + 1] and len(modes) > 1:
+            label += f" ({key[SERIES_KEY_WIDTH + 1]})"
+        if key[SERIES_KEY_WIDTH] and len(passes) > 1:
+            label += f" / {key[SERIES_KEY_WIDTH]}"
         ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] for p in points],
                 color=style["color"], marker=style["marker"],
                 linestyle=style["linestyle"], linewidth=1.9, markersize=6,
