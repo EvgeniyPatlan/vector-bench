@@ -22,8 +22,11 @@ function imagesStep(step) {
     el("thead", {}, el("tr", {}, ...["", "engine", "tag", "image", "-march"]
       .map((h) => el("th", {}, h)))),
     el("tbody", {}, ...engines.map((e) => el("tr", {},
-      el("td", {}, el("input", {
-        type: "checkbox", disabled: e.bench_built,
+      // A built engine gets no control at all. It used to get a disabled one,
+      // which stayed ticked from before the build and could not be un-ticked:
+      // a dead switch stuck in the on position.
+      el("td", {}, e.bench_built ? "" : el("input", {
+        type: "checkbox",
         checked: SU.engines.includes(e.name),
         onchange: (ev) => {
           SU.engines = ev.target.checked
@@ -239,5 +242,11 @@ function renderSetupBody() {
 
 window.renderSetup = async function renderSetup() {
   SU.plan = await api("/api/setup");
+  // Drop anything that has since been built. Selection means "build this", and
+  // an engine that now has an image is not a thing to build.
+  const step = SU.plan.steps.find((s) => s.id === "images");
+  const buildable = new Set((step ? step.detail.engines : [])
+    .filter((e) => !e.bench_built).map((e) => e.name));
+  SU.engines = SU.engines.filter((name) => buildable.has(name));
   renderSetupBody();
 };
