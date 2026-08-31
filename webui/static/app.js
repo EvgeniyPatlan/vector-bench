@@ -13,9 +13,14 @@ const RUN_TABS = [
   { id: "report", label: "Report" },
 ];
 
-const CONTROL_SECTIONS = [
-  { id: "profiles", label: "Profiles" },
+// Flat, in the order you need them: is the machine ready, what can it measure,
+// what shall it measure, what is it doing. "Control" as a grouping label told
+// you nothing about what was inside it.
+const SECTIONS = [
+  { id: "status", label: "Status" },
   { id: "engines", label: "Engines" },
+  { id: "datasets", label: "Datasets" },
+  { id: "profiles", label: "Profiles & launch" },
   { id: "jobs", label: "Jobs" },
 ];
 
@@ -114,13 +119,10 @@ function renderRunList() {
   }
 }
 
-function renderControlList() {
-  const group = document.getElementById("control-group");
-  group.hidden = !S.control;
-  if (!S.control) return;
-  const list = document.getElementById("control-list");
+function renderSectionList() {
+  const list = document.getElementById("section-list");
   clear(list);
-  for (const section of CONTROL_SECTIONS) {
+  for (const section of SECTIONS) {
     const active = S.route.kind === "control" && S.route.section === section.id;
     list.append(el("li", {
       class: active ? "active" : "",
@@ -137,7 +139,7 @@ function renderTabs() {
   if (S.route.kind !== "run" || !S.runId) {
     bar.hidden = true;
     context.textContent = S.route.kind === "control"
-      ? (CONTROL_SECTIONS.find((s) => s.id === S.route.section) || {}).label || ""
+      ? (SECTIONS.find((s) => s.id === S.route.section) || {}).label || ""
       : "";
     return;
   }
@@ -154,7 +156,8 @@ function renderTabs() {
 
 // -- routing -----------------------------------------------------------
 
-const PANELS = ["overview", "explore", "report", "profiles", "engines", "jobs"];
+const PANELS = ["status", "datasets", "overview", "explore", "report",
+                "profiles", "engines", "jobs"];
 
 function showPanel(name) {
   for (const id of PANELS) {
@@ -170,7 +173,7 @@ function parseHash() {
     return { kind: "run", runId: decodeURIComponent(m[1]), tab };
   }
   m = /^#\/control\/([a-z]+)/.exec(hash);
-  if (m && CONTROL_SECTIONS.some((s) => s.id === m[1])) {
+  if (m && SECTIONS.some((s) => s.id === m[1])) {
     return { kind: "control", section: m[1] };
   }
   return null;
@@ -182,6 +185,8 @@ function go(hash) {
 }
 
 const RENDERERS = {
+  status: () => window.renderStatus(),
+  datasets: () => window.renderDatasets(),
   overview: () => window.renderOverview(),
   explore: () => window.renderExplore(),
   report: () => renderReport(),
@@ -191,11 +196,13 @@ const RENDERERS = {
 };
 
 async function applyRoute() {
-  const wanted = parseHash() || { kind: "run", tab: "overview" };
+  const wanted = parseHash()
+    || (S.runs.length ? { kind: "run", tab: "overview" }
+                      : { kind: "control", section: "status" });
 
   if (wanted.kind === "control") {
     S.route = { ...S.route, kind: "control", section: wanted.section };
-    renderRunList(); renderControlList(); renderTabs();
+    renderRunList(); renderSectionList(); renderTabs();
     showPanel(wanted.section);
     await RENDERERS[wanted.section]();
     return;
@@ -207,7 +214,7 @@ async function applyRoute() {
 
   S.route = { ...S.route, kind: "run", tab: wanted.tab };
   if (!runId) {
-    renderRunList(); renderControlList(); renderTabs();
+    renderRunList(); renderSectionList(); renderTabs();
     showPanel("overview");
     const panel = document.getElementById("panel-overview");
     clear(panel);
@@ -216,7 +223,7 @@ async function applyRoute() {
   }
 
   if (runId !== S.runId) await loadRun(runId);
-  renderRunList(); renderControlList(); renderTabs();
+  renderRunList(); renderSectionList(); renderTabs();
   showPanel(wanted.tab);
   await RENDERERS[wanted.tab]();
 }
@@ -237,14 +244,25 @@ function renderReport() {
   const panel = document.getElementById("panel-report");
   clear(panel);
   if (!S.run) { panel.append(el("p", { class: "empty" }, "Select a run.")); return; }
+  const regenerate = el("div", { class: "row" },
+    el("button", {
+      class: "action" + (S.run.summary.has_report ? " secondary" : ""),
+      disabled: !S.control,
+      onclick: () => startJob({ kind: "report", run_id: S.runId },
+                              document.getElementById("report-status")),
+    }, S.run.summary.has_report ? "Regenerate" : "Generate report"),
+    el("span", { id: "report-status" }),
+    S.control ? null : el("span", { class: "muted" },
+      "read-only; start with --allow-control to generate from here"));
+
   if (!S.run.summary.has_report) {
-    panel.append(el("p", { class: "empty" },
-      "No generated report for this run yet."),
-      el("pre", { class: "log" },
-        `./run-benchmark.sh report --run-dir results/${S.runId}`));
+    panel.append(el("p", { class: "empty" }, "No report generated for this run yet."),
+      el("pre", { class: "log cmd" },
+        `./run-benchmark.sh report --run-dir results/${S.runId}`),
+      regenerate);
     return;
   }
-  panel.append(el("iframe", {
+  panel.append(regenerate, el("iframe", {
     class: "report", src: `/runs/${encodeURIComponent(S.runId)}/report/report.html`,
   }));
 }

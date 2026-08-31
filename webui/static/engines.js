@@ -1,6 +1,7 @@
 "use strict";
 
-const NG = { engines: [], drivers: [], name: null, text: "", dirty: false };
+const NG = { engines: [], drivers: [], name: null, text: "", dirty: false,
+             chosen: [], target: "all", march: "" };
 
 async function loadEngines() {
   const data = await api("/api/engines");
@@ -10,12 +11,22 @@ async function loadEngines() {
 
 function engineTable() {
   const rows = NG.engines.map((e) => el("tr", {
-    onclick: () => openEngine(e.name),
-    style: "cursor:pointer" + (e.name === NG.name ? ";font-weight:600" : ""),
+    style: e.name === NG.name ? "font-weight:600" : "",
   },
-    el("td", {}, el("span", {
-      class: "pill", style: `border-color:${e.color};color:${e.color}`,
-    }, e.name)),
+    el("td", {},
+      el("input", {
+        type: "checkbox", checked: NG.chosen.includes(e.name),
+        onchange: (ev) => {
+          NG.chosen = ev.target.checked
+            ? [...new Set([...NG.chosen, e.name])]
+            : NG.chosen.filter((n) => n !== e.name);
+          render();
+        },
+      })),
+    el("td", { style: "cursor:pointer", onclick: () => openEngine(e.name) },
+      el("span", {
+        class: "pill", style: `border-color:${e.color};color:${e.color}`,
+      }, e.name)),
     el("td", {}, e.label),
     el("td", {}, e.tag || "—"),
     el("td", { class: "num" }, e.port),
@@ -26,10 +37,51 @@ function engineTable() {
     }, kind)))));
 
   return el("table", {},
-    el("thead", {}, el("tr", {}, ...["engine", "implementation", "tag", "port",
+    el("thead", {}, el("tr", {}, ...["", "engine", "implementation", "tag", "port",
                                      "driver", "group", "images"]
       .map((h) => el("th", {}, h)))),
     el("tbody", {}, ...rows));
+}
+
+function buildSection() {
+  const box = el("div", {});
+  box.append(el("h3", {}, "Build images"),
+    el("p", { class: "muted" },
+      "Each engine produces a runtime image (the server alone) and a bench "
+      + "image (runtime plus the Python stack). AliSQL takes 1.5–3 hours; "
+      + "pgvector about ten minutes."),
+    el("div", { class: "warn" },
+      "Never mix -march between engines. All of them compile SIMD distance "
+      + "kernels, so rebuilding one with a different value turns the benchmark "
+      + "into a comparison of compiler flags. Use native only when this machine "
+      + "is also the benchmark host."));
+
+  const argv = [];
+  if (NG.chosen.length) argv.push("--engines", NG.chosen.join(","));
+  if (NG.target !== "all") argv.push("--target", NG.target);
+  if (NG.march) argv.push("--march", NG.march);
+
+  box.append(el("div", { class: "row" },
+    el("label", { class: "muted" }, "target ",
+      el("select", { onchange: (ev) => { NG.target = ev.target.value; render(); } },
+        ...["all", "runtime", "bench"].map((t) =>
+          el("option", { value: t, selected: t === NG.target }, t)))),
+    el("label", { class: "muted" }, "-march ",
+      el("input", {
+        value: NG.march, size: 14, placeholder: "x86-64-v3",
+        oninput: (ev) => { NG.march = ev.target.value.trim(); },
+      }))),
+    commandPreview("build", argv.length ? argv : ["--engines", "…"]),
+    el("div", { class: "row" },
+      el("button", {
+        class: "action", disabled: !NG.chosen.length,
+        onclick: () => startJob(
+          { kind: "build", engines: NG.chosen, target: NG.target,
+            march: NG.march || undefined },
+          document.getElementById("build-status")),
+      }, NG.chosen.length ? `Build ${NG.chosen.join(", ")}` : "Tick an engine above"),
+      el("span", { id: "build-status" })));
+  return box;
 }
 
 async function openEngine(name) {
@@ -80,8 +132,9 @@ async function saveEngine() {
     NG.dirty = false;
     status.append(el("span", { class: "muted" }, `saved config/engines/${NG.name}.yml`));
     for (const w of res.warnings || []) status.append(el("div", { class: "warn" }, w));
-    status.append(el("div", { class: "muted" }, "Now build it:"),
-                  el("pre", { class: "log" }, res.next));
+    status.append(el("div", { class: "muted" }, "Now build it — tick it above, "
+                                                + "or:"),
+                  el("pre", { class: "log cmd" }, res.next));
     await loadEngines();
     render();
   } catch (err) {
@@ -97,11 +150,9 @@ function render() {
 
   panel.append(el("h2", {}, "Engines"), engineTable());
 
-  if (!S.control) {
-    panel.append(el("p", { class: "muted" },
-      "Read-only. Restart with --allow-control to add or edit an engine."));
-    return;
-  }
+  if (requiresControl(panel)) return;
+
+  panel.append(buildSection());
 
   panel.append(el("h3", {}, "Add a variant"),
     el("p", { class: "muted" },

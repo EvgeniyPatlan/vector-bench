@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import profiles as profiles_mod
+from . import runs as runs_mod
 from .api import Api, Response
 
 DATASET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -93,27 +94,104 @@ def clone_engine(api: Api, _m, _q, body=None) -> Response:
 
 
 def list_datasets(api: Api, _m, _q, _b=None) -> Response:
+    """Every dataset this framework knows, and whether it is here yet.
+
+    A missing dataset used to be invisible until a run failed on it.
+    """
     from harness.datasets import KNOWN_DATASETS
 
-    present = set()
+    on_disk: Dict[str, int] = {}
     try:
         for filename in os.listdir(api.datasets_dir):
             if filename.endswith(".hdf5"):
-                present.add(filename[:-len(".hdf5")])
+                path = os.path.join(api.datasets_dir, filename)
+                try:
+                    on_disk[filename[:-len(".hdf5")]] = os.path.getsize(path)
+                except OSError:
+                    on_disk[filename[:-len(".hdf5")]] = 0
     except OSError:
         pass
 
-    known = [{
-        "name": name,
-        "dim": facts.get("dim"),
-        "train": facts.get("train"),
-        "metric": facts.get("metric"),
-        "role": facts.get("role"),
-        "downloaded": name in present,
-    } for name, facts in sorted(KNOWN_DATASETS.items())]
+    known = []
+    for name, facts in sorted(KNOWN_DATASETS.items()):
+        generated = name.startswith("dbpedia-openai-")
+        known.append({
+            "name": name,
+            "dim": facts.get("dim"),
+            "train": facts.get("train"),
+            "test": facts.get("test"),
+            "metric": facts.get("metric"),
+            "role": facts.get("role"),
+            "approx_bytes": facts.get("approx_bytes"),
+            "downloaded": name in on_disk,
+            "bytes_on_disk": on_disk.get(name),
+            # fetch cannot retrieve these; scripts/generate-dataset.sh builds them.
+            "generated": generated,
+        })
 
-    extra = sorted(present - {d["name"] for d in known})
-    return 200, {"datasets": known, "local_only": extra}
+    extra = sorted(set(on_disk) - {d["name"] for d in known})
+    return 200, {
+        "datasets": known,
+        "local_only": [{"name": n, "bytes_on_disk": on_disk[n]} for n in extra],
+        "datasets_dir": api.datasets_dir,
+    }
+
+
+def status(api: Api, _m, _q, _b=None) -> Response:
+    """Is this machine ready to measure, and if not what is missing.
+
+    The answer used to be spread across `fetch --list`, `docker images` and a
+    failed run.
+    """
+    import shutil
+
+    from harness.datasets import KNOWN_DATASETS
+    from orchestrator import docker_ctl
+    from orchestrator import engines as engines_mod
+
+    engines = []
+    for name, engine in engines_mod.registry().items():
+        from orchestrator.config import load_engine
+        try:
+            images = (load_engine(name).get("image") or {})
+        except FileNotFoundError:
+            images = {}
+        engines.append({
+            "name": name,
+            "label": engine.label,
+            "color": engine.color,
+            "group": engine.group,
+            "tag": engine.tag,
+            "runtime_built": bool(images.get("runtime")) and
+                             docker_ctl.image_exists(images["runtime"]),
+            "bench_built": bool(images.get("bench")) and
+                           docker_ctl.image_exists(images["bench"]),
+        })
+
+    present = set()
+    try:
+        present = {f[:-len(".hdf5")] for f in os.listdir(api.datasets_dir)
+                   if f.endswith(".hdf5")}
+    except OSError:
+        pass
+
+    try:
+        usage = shutil.disk_usage(api.root)
+        disk = {"free_bytes": usage.free, "total_bytes": usage.total}
+    except OSError:
+        disk = {}
+
+    active = api.jobs.active()
+    return 200, {
+        "engines": engines,
+        "engines_ready": sum(1 for e in engines if e["bench_built"]),
+        "datasets_present": sorted(present),
+        "datasets_known": len(KNOWN_DATASETS),
+        "disk": disk,
+        "runs": len(runs_mod.discover_runs(api.results_dir)),
+        "active_job": active,
+        "control_enabled": api.allow_control,
+    }
 
 
 def list_profiles(api: Api, _m, _q, _b=None) -> Response:
@@ -195,10 +273,17 @@ def create_job(api: Api, _m, _q, body=None) -> Response:
     denied = _guard(api)
     if denied:
         return denied
-    job, errors = api.jobs.launch(body or {})
+    spec = body or {}
+    # Asked before launching rather than inferred from the message afterwards:
+    # a refusal because the machine is busy is a different answer from a
+    # refusal because the request was wrong, and the status code should say so.
+    conflict = api.jobs.conflict_for(str(spec.get("kind") or "run"))
+    if conflict:
+        return 409, {"ok": False, "errors": [conflict]}
+
+    job, errors = api.jobs.launch(spec)
     if errors:
-        conflict = any("already in progress" in e for e in errors)
-        return (409 if conflict else 400), {"ok": False, "errors": errors}
+        return 400, {"ok": False, "errors": errors}
     return 201, {"ok": True, "job": job}
 
 
@@ -235,6 +320,7 @@ ROUTES: List[Tuple[str, Any, Any]] = [
     ("PUT", re.compile(r"^/api/engines/(?P<name>[^/]+)$"), put_engine),
     ("POST", re.compile(r"^/api/engines/(?P<name>[^/]+)/validate$"), validate_engine),
     ("GET", re.compile(r"^/api/datasets$"), list_datasets),
+    ("GET", re.compile(r"^/api/status$"), status),
     ("GET", re.compile(r"^/api/profiles$"), list_profiles),
     ("GET", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), get_profile),
     ("PUT", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), put_profile),

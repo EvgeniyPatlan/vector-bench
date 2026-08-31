@@ -213,14 +213,15 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 ./run-benchmark.sh web                      # http://127.0.0.1:8080
 ```
 
-An index of every run in `results/`, the manifest as a readable page, and an
-interactive explorer over `records.jsonl` — facet filters, a chart on any
-numeric pair, a sortable table. The generated `report.html` is still there,
-unchanged, in its own tab.
+A Status page saying whether the machine can measure yet, an index of every run,
+the manifest as a readable page, and an explorer over `records.jsonl` that leads
+with the five things this framework measures. The generated `report.html` is
+still there, unchanged, in its own tab.
 
-`--allow-control` additionally allows editing `config/profiles/*.yml` with
-validation and an ingest estimate, launching a run, and watching its output
-live. It is off by default, and the server binds loopback only — reach a remote
+`--allow-control` additionally allows downloading datasets, building images,
+adding an engine variant, editing `config/profiles/*.yml` with validation and an
+ingest estimate, launching a run, and watching any of it live. Every button shows
+the command it runs. Nothing may run alongside a benchmark. It is off by default, and the server binds loopback only — reach a remote
 rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
 [docs/08-web-ui.md](docs/08-web-ui.md).
 

@@ -274,9 +274,10 @@ async function pollLog() {
   if (badge) {
     badge.textContent = chunk.status + (chunk.exit_code === null || chunk.exit_code === undefined
       ? "" : ` (exit ${chunk.exit_code})`);
-    badge.className = `pill ${chunk.status === "completed" ? "ok" : chunk.status === "running" ? "" : "bad"}`;
+    badge.className = "pill " + (chunk.status === "completed" ? "ok"
+      : ["running", "stopping", "stopped"].includes(chunk.status) ? "" : "bad");
   }
-  if (chunk.status !== "running" && chunk.status !== "stopping") {
+  if (!["running", "stopping"].includes(chunk.status)) {
     stopPolling();
     C.jobs = (await api("/api/jobs")).jobs;
   }
@@ -298,10 +299,13 @@ async function stopJob() {
 async function renderJobsBody() {
   const panel = document.getElementById("panel-jobs");
   clear(panel);
-  panel.append(el("h2", {}, "Runs"));
+  panel.append(el("h2", {}, "Jobs"),
+    el("p", { class: "muted" },
+      "Every long command started from here — downloads, builds, benchmark "
+      + "runs, report generation — with its live output."));
 
   if (!C.jobs.length) {
-    panel.append(el("p", { class: "muted" }, "No runs launched from here yet."));
+    panel.append(el("p", { class: "muted" }, "Nothing started from here yet."));
     return;
   }
 
@@ -310,15 +314,18 @@ async function renderJobsBody() {
     style: "cursor:pointer" + (job.id === C.jobId ? ";font-weight:600" : ""),
   },
     el("td", {}, job.id),
+    el("td", {}, job.kind || "run"),
     el("td", {}, el("span", {
-      class: `pill ${job.status === "completed" ? "ok" : job.status === "running" ? "" : "bad"}`,
+      class: "pill " + (job.status === "completed" ? "ok"
+        : ["running", "stopping", "stopped"].includes(job.status) ? "" : "bad"),
     }, job.status)),
     el("td", {}, job.started_at || ""),
     el("td", {}, job.finished_at || ""),
     el("td", {}, job.command_display || "")));
 
   panel.append(el("table", {},
-    el("thead", {}, el("tr", {}, ...["job", "status", "started", "finished", "command"]
+    el("thead", {}, el("tr", {}, ...["job", "kind", "status", "started",
+                                     "finished", "command"]
       .map((h) => el("th", {}, h)))),
     el("tbody", {}, ...rows)));
 

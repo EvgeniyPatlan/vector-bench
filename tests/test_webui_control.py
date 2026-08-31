@@ -179,6 +179,128 @@ class TestJobValidation:
 
 
 # ---------------------------------------------------------------------------
+# The other long commands
+# ---------------------------------------------------------------------------
+
+class TestJobKinds:
+    """fetch and build used to be printed as advice and left to the terminal."""
+
+    def test_fetch(self, store):
+        errors, argv = store.validate({"kind": "fetch",
+                                       "datasets": ["sift-128-euclidean"]})
+        assert errors == []
+        assert argv == ["--datasets", "sift-128-euclidean"]
+
+    def test_fetch_needs_a_dataset(self, store):
+        errors, _argv = store.validate({"kind": "fetch", "datasets": []})
+        assert any("at least one dataset" in e for e in errors)
+
+    def test_build(self, store):
+        errors, argv = store.validate({"kind": "build", "engines": ["mariadb"],
+                                       "target": "bench", "march": "x86-64-v3"})
+        assert errors == []
+        assert argv == ["--engines", "mariadb", "--target", "bench",
+                        "--march", "x86-64-v3"]
+
+    def test_build_needs_an_engine(self, store):
+        errors, _argv = store.validate({"kind": "build", "engines": []})
+        assert any("at least one engine" in e for e in errors)
+
+    @pytest.mark.parametrize("march", ["native; id", "$(uname -m)", "a b", "--x"])
+    def test_march_injection_refused(self, store, march):
+        """-march reaches a compiler; it is the token most worth pinning down."""
+        errors, _argv = store.validate({"kind": "build", "engines": ["mariadb"],
+                                        "march": march})
+        assert any("plain gcc -march value" in e for e in errors)
+
+    def test_bad_target_refused(self, store):
+        errors, _argv = store.validate({"kind": "build", "engines": ["mariadb"],
+                                        "target": "everything"})
+        assert any("target must be one of" in e for e in errors)
+
+    def test_report_needs_an_existing_run(self, store, root):
+        errors, _argv = store.validate({"kind": "report", "run_id": "nope"})
+        assert any("no such run" in e for e in errors)
+
+    def test_report_of_a_real_run(self, store, root):
+        os.makedirs(os.path.join(root, "results", "r1"), exist_ok=True)
+        errors, argv = store.validate({"kind": "report", "run_id": "r1"})
+        assert errors == []
+        assert argv[0] == "--run-dir" and argv[1].endswith("results/r1")
+
+    def test_render(self, store):
+        errors, argv = store.validate({"kind": "render", "profile": "sample",
+                                       "resource_pass": "tuned"})
+        assert errors == []
+        assert argv == ["--profile", "sample", "--resource-pass", "tuned"]
+
+    def test_unknown_kind_names_the_alternatives(self, store):
+        errors, _argv = store.validate({"kind": "destroy"})
+        assert any("unknown job kind" in e and "fetch" in e for e in errors)
+
+    def test_kind_defaults_to_run(self, store):
+        errors, argv = store.validate({"profile": "sample"})
+        assert errors == [] and argv == ["--profile", "sample"]
+
+
+class TestExclusivity:
+    """Nothing runs alongside a benchmark.
+
+    A 5 GB download or a compile during an ingest measurement perturbs exactly
+    what is being measured; a competing build distorted MariaDB's numbers by 2x
+    once. Setup jobs may overlap each other, because nothing is being measured
+    then.
+    """
+
+    @pytest.fixture
+    def slow(self, root):
+        script = os.path.join(root, "run-benchmark.sh")
+        with open(script, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 10\n")
+        os.chmod(script, 0o755)
+        os.makedirs(os.path.join(root, "results", "r1"), exist_ok=True)
+        return jobs_mod.JobStore(root, ("mariadb",))
+
+    def test_a_benchmark_blocks_a_download(self, slow):
+        run, errors = slow.launch({"kind": "run", "profile": "sample"})
+        assert errors == []
+        _job, errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert any(run["id"] in e and "measures the interference" in e
+                   for e in errors), errors
+        slow.stop(run["id"])
+
+    def test_a_download_blocks_a_benchmark(self, slow):
+        fetch, errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert errors == []
+        _job, errors = slow.launch({"kind": "run", "profile": "sample"})
+        assert any(fetch["id"] in e and "would measure it too" in e
+                   for e in errors), errors
+        slow.stop(fetch["id"])
+
+    def test_setup_jobs_may_overlap(self, slow):
+        fetch, errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert errors == []
+        build, errors = slow.launch({"kind": "build", "engines": ["mariadb"]})
+        assert errors == [], errors
+        assert build is not None
+        slow.stop(fetch["id"])
+        slow.stop(build["id"])
+
+    def test_the_identical_command_is_refused(self, slow):
+        first, errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert errors == []
+        _job, errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert any("already running" in e for e in errors)
+        slow.stop(first["id"])
+
+    def test_the_job_records_its_kind(self, slow):
+        job, _errors = slow.launch({"kind": "fetch", "datasets": ["glove-25-angular"]})
+        assert job["kind"] == "fetch"
+        assert job["command_display"].startswith("./run-benchmark.sh fetch")
+        slow.stop(job["id"])
+
+
+# ---------------------------------------------------------------------------
 # Job lifecycle
 # ---------------------------------------------------------------------------
 
@@ -227,7 +349,8 @@ class TestJobLifecycle:
         assert errors == []
         second, errors = store.launch({"profile": "sample"})
         assert second is None
-        assert any("already in progress" in e for e in errors)
+        # The refusal has to name the job in the way, or it is just a "no".
+        assert any(first["id"] in e for e in errors), errors
         store.stop(first["id"])
 
     def test_stop_terminates(self, root):
@@ -239,12 +362,23 @@ class TestJobLifecycle:
         job, _errors = store.launch({"profile": "sample"})
         ok, errors = store.stop(job["id"])
         assert ok and errors == []
-        finished = wait_for(store, job["id"], {"completed", "failed"})
-        assert finished["status"] == "failed"
+        finished = wait_for(store, job["id"], {"completed", "failed", "stopped"})
+        # Asked to stop, so this is the answer rather than a failure.
+        assert finished["status"] == "stopped"
 
     def test_stop_unknown_job(self, runnable):
         ok, errors = runnable.stop("nope")
         assert not ok and errors
+
+    def test_older_records_without_a_kind_still_load(self, root):
+        """jobs.json predates having more than one kind of job."""
+        state = os.path.join(root, "state", "webui")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "jobs.json"), "w") as fh:
+            json.dump([{"id": "old", "status": "completed",
+                        "started_at": "2026-01-01T00:00:00Z"}], fh)
+        store = jobs_mod.JobStore(root, ("mariadb",))
+        assert store.get("old")["kind"] == "run"
 
     def test_jobs_survive_restart_as_orphaned(self, root):
         state = os.path.join(root, "state", "webui")
@@ -426,7 +560,7 @@ class TestControlGuards:
         status, payload = api_mod.dispatch(
             control_api, "POST", "/api/jobs", {}, {"profile": "sample"})
         assert status == 409
-        assert any("already in progress" in e for e in payload["errors"])
+        assert any("measure" in e or "running" in e for e in payload["errors"])
 
         control_api.jobs.stop(control_api.jobs.active()["id"])
 

@@ -35,14 +35,19 @@ directories under `results/`.
 
 The UI adds:
 
-| | |
-| --- | --- |
-| **Run index** | Every run in `results/`, newest first, with profile, pass, engines, datasets, status and record count |
-| **Overview** | The manifest as a page: CPU and SIMD, engine tags and `-march`, resolved resource limits, validity warnings, per-phase outcomes |
-| **Explore** | Facet filters over every record, an interactive chart on any numeric pair, and a sortable table |
-| **Report** | The generated `report.html`, unmodified, in a frame |
-| **Configure** | Profile YAML editing with validation and an ingest-time estimate |
-| **Jobs** | Launch a run and watch its output live |
+| Page | What it does | Command it runs |
+| --- | --- | --- |
+| **Status** | Whether this machine can measure yet: which images are built, which datasets are here, disk free — and a link to whatever is missing | — |
+| **Engines** | Build images; add a variant of an engine family | `build` |
+| **Datasets** | Every corpus, its shape and whether it is downloaded; download the ones that are not | `fetch` |
+| **Profiles & launch** | Edit a profile with validation, see the ingest estimate, start a run | `run` |
+| **Jobs** | Every long command started here, with live output and a stop button | — |
+| **Runs → Overview** | The manifest as a page: CPU and SIMD, engine tags and `-march`, resolved limits, validity warnings, per-phase outcomes | — |
+| **Runs → Explore** | The five measurements, each with its axes and filters already set; raw mode for anything else | — |
+| **Runs → Report** | The generated `report.html` in a frame, and a button to regenerate it | `report` |
+
+Every button shows the command it is about to run, so the UI teaches the CLI
+rather than replacing it with something you cannot reproduce in a terminal.
 
 ---
 
@@ -149,11 +154,16 @@ estimate is built from, so the two cannot disagree.
 long log does not re-transfer. Stop terminates the process group; units already
 checkpointed stay done, so `--resume` picks up where it left off.
 
-### One run at a time
+### Nothing runs alongside a benchmark
 
-A second launch is refused while one is running. This is a correctness
-constraint, not a resource one: two concurrent runs compete for the same cores
-and invalidate both sets of measurements. The refusal names the running job.
+A download or a compile during an ingest measurement perturbs exactly what is
+being measured — a competing build distorted MariaDB's numbers by 2× once,
+which is why the README says to give the machine to the benchmark. So a run
+blocks `fetch` and `build`, and they block a run. Setup jobs may overlap each
+other, because nothing is being measured then.
+
+The refusal names the job in the way and why, and an identical command that is
+already running is refused rather than started twice.
 
 ### Command construction
 
