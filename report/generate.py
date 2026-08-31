@@ -548,9 +548,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"[report] chart -> {os.path.basename(paths['svg'])}")
 
     if memory:
-        paths = charts.memory_timeline(memory, chart_dir, "memory-timeline")
-        if paths:
-            chart_paths["memory-timeline"] = paths
+        # One chart per phase. The ann phase loads a corpus and sweeps a grid;
+        # the ops phase loads it again and runs four workloads. Different
+        # durations, different questions, and twelve series on one axis was
+        # crowded before any of them held two measurements.
+        for stem, phase in (("memory-timeline", None),
+                            ("memory-timeline-ann", "ann")):
+            paths = charts.memory_timeline(memory, chart_dir, stem, phase=phase)
+            if paths:
+                chart_paths[stem] = paths
 
     md_path = os.path.join(out_dir, "report.md")
     html_path = os.path.join(out_dir, "report.html")

@@ -531,51 +531,63 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
 
 def memory_timeline(series: Dict[str, List[Dict[str, Any]]], out_dir: str,
-                    stem: str) -> Optional[Dict[str, str]]:
-    """Server memory over the whole run.
+                    stem: str, phase: Optional[str] = None
+                    ) -> Optional[Dict[str, str]]:
+    """Server memory through one phase, every measurement from its own zero.
 
-    More informative than a single peak: a cache filling to its configured
-    ceiling looks different from a build spike, which looks different again
-    from a steady climb that never plateaus.
+    What this chart is for is the shape: a cache filling to its ceiling looks
+    different from a build spike, which looks different again from a steady
+    climb that never plateaus. Shapes are compared by overlaying them, so every
+    measurement starts at zero -- including two measurements that happen to
+    live in one file because a phase was run twice.
+
+    Anchoring them to the file's start instead put the second measurement 123
+    hours to the right, which turned the whole chart into empty space with two
+    thin bands at either end. That is the same picture as before the sessions
+    were split, and it was not what splitting them was for.
+
+    `phase` selects which measurements to draw. The ann phase loads a corpus
+    and sweeps a grid; the ops phase loads it again and runs four workloads.
+    They take different times and answer different questions, and twelve series
+    on one axis was already crowded before any of them had two measurements.
     """
-    if not series:
+    from .loaders import split_sessions
+
+    wanted = {}
+    for name, rows in series.items():
+        if phase and not name.endswith(f"-{phase}"):
+            continue
+        if phase is None and name.endswith("-ann"):
+            continue
+        rows = [r for r in rows if r.get("rss_bytes")]
+        if rows:
+            wanted[name] = rows
+    if not wanted:
         return None
-    fig, ax = _new_axes("Server memory over the run", "Elapsed (s)  "
-                        "(gaps are separate measurements, not idle time)",
+
+    title = "Server memory" + (f" — {phase} phase" if phase else " — ops phase")
+    fig, ax = _new_axes(title, "Elapsed within the measurement (s)",
                         "Resident memory  (lower is better ↓)", figsize=(11, 4.6))
     ax.yaxis.set_major_formatter(FuncFormatter(_bytes_formatter))
 
-    plotted = False
-    for name, rows in sorted(series.items()):
-        rows = [r for r in rows if r.get("rss_bytes")]
-        if not rows:
-            continue
-        plotted = True
+    for name, rows in sorted(wanted.items()):
         engine = name.split("-")[0]
         style = style_for(engine)
-        # One line per measurement, not one per file. A phase that ran twice
-        # appends to the same file, and joining the two drew a line across the
-        # gap between them -- 123 hours, in the run that surfaced this -- as
-        # though the server had held that memory the whole time.
-        from .loaders import split_sessions
         segments = split_sessions(rows)
-        t0 = segments[0][0]["t"]
         for index, segment in enumerate(segments):
+            # Each measurement from its own zero, so the shapes overlay.
+            t0 = segment[0]["t"]
+            label = name if index == 0 else None
+            if len(segments) > 1 and index == 0:
+                label = f"{name}  ({len(segments)} measurements)"
             ax.plot([r["t"] - t0 for r in segment],
                     [r["rss_bytes"] for r in segment],
                     color=style["color"], linestyle=style["linestyle"],
-                    linewidth=1.4,
-                    label=name if index == 0 else None)
+                    linewidth=1.4, alpha=1.0 if index == 0 else 0.55,
+                    label=label)
 
-    if not plotted:
-        plt.close(fig)
-        return None
     ax.legend(frameon=False, fontsize=8, ncol=2)
     return _save(fig, out_dir, stem)
-
-# ---------------------------------------------------------------------------
-# Headline: throughput at a recall floor
-# ---------------------------------------------------------------------------
 
 def qps_at_recall(summary: Dict[str, Any], dataset: str, out_dir: str,
                   stem: str, floors: Sequence[float] = (0.90, 0.95, 0.99)

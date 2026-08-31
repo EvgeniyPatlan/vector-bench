@@ -880,7 +880,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
          else _not_measured("churn", profile)),
     ]
     for stem, paths in sorted(chart_paths.items()):
-        if stem.split("-")[0] in ("churn", "churnimpact", "passcompare") or stem == "memory-timeline":
+        if stem.split("-")[0] in ("churn", "churnimpact", "passcompare") or stem.startswith("memory-timeline"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [

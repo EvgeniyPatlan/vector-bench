@@ -4673,11 +4673,12 @@ class TestAPhaseThatRanTwiceIsTwoMeasurements:
         assert found["foreign_cores"] > 2.0, "the busy segment must be reported"
         assert found["elapsed_s"] < 100, "and judged over its own window"
 
-    def test_the_chart_breaks_the_line(self):
+    def test_the_chart_draws_each_measurement_separately(self):
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
         block = source.split("def memory_timeline")[1]
         assert "split_sessions" in block
-        assert "label=name if index == 0 else None" in block
+        # One legend entry per series, not one per segment.
+        assert "label = name if index == 0 else None" in block
 
     def test_empty_input_is_not_a_crash(self):
         from report.loaders import split_sessions
@@ -4710,4 +4711,75 @@ class TestChartsFromAPreviousReportAreCleared:
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         body = source.split("def main")[1]
         assert body.index("cleared") < body.index("chart_paths")
+
+
+class TestMemoryChartsCompareShapesNotClocks:
+    """The chart exists to show the shape of memory through a phase: a cache
+    filling to its ceiling looks different from a build spike. Shapes are
+    compared by overlaying them. Anchoring two measurements from one file to
+    the file's start instead put the second 123 hours to the right, leaving a
+    chart that was almost entirely empty with two thin bands at the edges --
+    which looked exactly like the problem splitting the sessions was meant to
+    fix."""
+
+    def _series(self):
+        ops = [{"t": 100.0 + i, "rss_bytes": 1_000_000 + i} for i in range(30)]
+        ann = ([{"t": 200.0 + i, "rss_bytes": 2_000_000 + i, "session": 1}
+                for i in range(30)]
+               + [{"t": 500000.0 + i, "rss_bytes": 3_000_000 + i, "session": 2}
+                  for i in range(30)])
+        return {"mariadb-d-tuned-m16-post": ops, "mariadb-d-tuned-ann": ann}
+
+    def _axis(self, **kw):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+        from report import charts
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["ax"] = fig.axes[0]
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.memory_timeline(self._series(), d, "t", **kw)
+        finally:
+            charts._save = original
+            plt.close("all")
+        return captured.get("ax")
+
+    def test_every_measurement_starts_at_zero(self):
+        ax = self._axis(phase="ann")
+        for line in ax.get_lines():
+            assert min(line.get_xdata()) < 1.0
+
+    def test_the_axis_is_not_mostly_empty(self):
+        """The second measurement is five days later in wall clock; the axis
+        must span one measurement, not the gap between two."""
+        ax = self._axis(phase="ann")
+        assert ax.get_xlim()[1] < 1000, "axis still spans the wall-clock gap"
+
+    def test_the_phases_are_separate_charts(self):
+        """The ann phase loads a corpus and sweeps a grid; ops loads it again
+        and runs four workloads. Different durations, different questions."""
+        ann = {l.get_label() for l in self._axis(phase="ann").get_lines()}
+        ops = {l.get_label() for l in self._axis().get_lines()}
+        assert any("ann" in str(l) for l in ann)
+        assert not any("ann" in str(l) for l in ops)
+
+    def test_a_repeated_phase_says_so_in_the_legend(self):
+        labels = [str(l.get_label()) for l in self._axis(phase="ann").get_lines()]
+        assert any("2 measurements" in l for l in labels)
+
+    def test_both_charts_are_produced(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert '("memory-timeline-ann", "ann")' in source
+
+    def test_the_renderer_shows_both(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert 'stem.startswith("memory-timeline")' in source
 
