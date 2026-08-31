@@ -276,7 +276,8 @@ def collect() -> SysInfo:
 
 
 def recommended_cpuset(want: int, prefer: str = "performance",
-                       allow_smt: bool = False) -> List[int]:
+                       allow_smt: bool = False, cpu=None,
+                       siblings: Optional[Dict[int, List[int]]] = None) -> List[int]:
     """Choose a homogeneous CPU set of `want` logical CPUs.
 
     Order of preference:
@@ -286,8 +287,19 @@ def recommended_cpuset(want: int, prefer: str = "performance",
 
     Returns fewer than `want` CPUs if the machine cannot supply them, rather
     than silently mixing core classes.
+
+    `cpu` and `siblings` default to this machine, which is what a run wants.
+    They are arguments so that a caller which has already collected the
+    topology resolves against that one rather than re-reading the host: a
+    resolution that half-uses the topology it was handed is not reproducible
+    from the manifest it writes.
+
+    Note that passing `cpu` alone still reads this machine's SMT siblings,
+    because a CpuInfo does not carry them. In a run that is the same host and
+    so correct; a caller resolving against a topology that is not this machine
+    should pass `siblings` too.
     """
-    cpu = detect_cpu()
+    cpu = cpu if cpu is not None else detect_cpu()
     if prefer == "performance" and cpu.performance_cpus:
         pool = list(cpu.performance_cpus)
     elif prefer == "efficiency" and cpu.efficiency_cpus:
@@ -296,7 +308,7 @@ def recommended_cpuset(want: int, prefer: str = "performance",
         pool = list(range(cpu.logical_cpus))
 
     if not allow_smt:
-        siblings = hyperthread_siblings()
+        siblings = siblings if siblings is not None else hyperthread_siblings()
         chosen: List[int] = []
         claimed = set()
         for c in pool:

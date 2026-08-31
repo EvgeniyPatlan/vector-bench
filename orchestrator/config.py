@@ -155,7 +155,12 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     want_server = int(cpu_cfg.get("server_cpus", 0) or 0)
     want_client = int(cpu_cfg.get("client_cpus", 2) or 2)
 
-    pool = recommended_cpuset(10 ** 6, prefer=prefer, allow_smt=allow_smt)
+    # Resolve against the topology we were handed, not the live machine. In a
+    # run they are the same host; in anything that passes a topology in, they
+    # were not, and the pool silently came from wherever the code happened to
+    # be running.
+    pool = recommended_cpuset(10 ** 6, prefer=prefer, allow_smt=allow_smt,
+                              cpu=sysinfo.cpu)
     if not pool:
         pool = list(range(sysinfo.cpu.logical_cpus))
         warnings.append("could not determine core topology; using all logical CPUs")
