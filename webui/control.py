@@ -200,6 +200,32 @@ def status(api: Api, _m, _q, _b=None) -> Response:
     }
 
 
+def set_run_label(api: Api, match, _q, body=None) -> Response:
+    denied = _guard(api)
+    if denied:
+        return denied
+    from . import importing as importing_mod
+
+    run_dir = runs_mod.resolve_run_dir(api.results_dir, match.group("run_id"))
+    if run_dir is None:
+        return 404, {"error": f"no such run: {match.group('run_id')}"}
+
+    spec = body or {}
+    label = spec.get("label")
+    if label is None:
+        return 400, {"error": "body must contain 'label' (empty string clears it)"}
+    if str(label).strip():
+        importing_mod.set_label(run_dir, str(label), spec.get("source"))
+    else:
+        importing_mod.clear_label(run_dir)
+    return 200, {"ok": True}
+
+
+def import_run(api: Api, _m, query, _b=None) -> Response:
+    """Handled in the server: the body is an archive, not JSON."""
+    return 400, {"error": "internal: import is handled by the server"}
+
+
 def list_profiles(api: Api, _m, _q, _b=None) -> Response:
     return 200, {"profiles": profiles_mod.list_profiles(api.config_dir)}
 
@@ -327,6 +353,7 @@ ROUTES: List[Tuple[str, Any, Any]] = [
     ("POST", re.compile(r"^/api/engines/(?P<name>[^/]+)/validate$"), validate_engine),
     ("GET", re.compile(r"^/api/datasets$"), list_datasets),
     ("GET", re.compile(r"^/api/status$"), status),
+    ("PUT", re.compile(r"^/api/runs/(?P<run_id>[^/]+)/label$"), set_run_label),
     ("GET", re.compile(r"^/api/setup$"), setup_plan),
     ("GET", re.compile(r"^/api/profiles$"), list_profiles),
     ("GET", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), get_profile),

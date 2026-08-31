@@ -23,6 +23,7 @@ const SECTIONS = [
   { id: "datasets", label: "Datasets" },
   { id: "profiles", label: "Profiles & launch" },
   { id: "jobs", label: "Jobs" },
+  { id: "import", label: "Import a run" },
 ];
 
 // -- utilities ---------------------------------------------------------
@@ -124,8 +125,9 @@ function renderRunList() {
 
   const shown = S.runs.filter((r) => {
     if (!needle) return true;
-    return [r.dir_name, r.profile, r.resource_pass, (r.engines || []).join(" "),
-            (r.datasets || []).join(" ")].join(" ").toLowerCase().includes(needle);
+    return [r.dir_name, r.label, r.source, r.profile, r.resource_pass,
+            (r.engines || []).join(" "), (r.datasets || []).join(" ")]
+      .join(" ").toLowerCase().includes(needle);
   });
 
   // The count belongs in the header so a collapsed group still tells you
@@ -145,9 +147,11 @@ function renderRunList() {
       class: active ? "active" : "",
       onclick: () => go(`#/run/${encodeURIComponent(run.dir_name)}/${S.route.tab}`),
     },
-      el("div", { class: "rid" }, run.dir_name),
+      el("div", { class: "rid" }, run.label || run.dir_name),
+      run.label ? el("div", { class: "meta" }, run.dir_name) : null,
       el("div", { class: "meta" },
-        `${run.profile || "?"} · ${(run.engines || []).length} engines · ${run.status}`),
+        `${run.profile || "?"} · ${(run.engines || []).length} engines · ${run.status}`
+        + (run.source ? ` · from ${run.source}` : "")),
       el("div", { class: "meta" }, started)));
   }
 }
@@ -189,7 +193,7 @@ function renderTabs() {
 
 // -- routing -----------------------------------------------------------
 
-const PANELS = ["setup", "status", "datasets", "overview", "explore", "report",
+const PANELS = ["setup", "status", "datasets", "import", "overview", "explore", "report",
                 "profiles", "engines", "jobs"];
 
 function showPanel(name) {
@@ -227,6 +231,7 @@ const RENDERERS = {
   profiles: () => window.renderProfiles(),
   engines: () => window.renderEngines(),
   jobs: () => window.renderJobs(),
+  import: () => window.renderImport(),
 };
 
 async function applyRoute() {
@@ -328,10 +333,21 @@ function shareRow() {
     el("a", {
       class: "action secondary", href: `/runs/${id}/bundle`,
     }, "Download run bundle (.tar.gz)"),
+    el("button", {
+      class: "action secondary",
+      // The browser's own PDF export. The report carries a print stylesheet, so
+      // it paginates by section, drops to one light palette whatever theme you
+      // are in, and stops its tables running off the page.
+      onclick: () => {
+        const frame = document.querySelector("iframe.report");
+        if (frame && frame.contentWindow) frame.contentWindow.print();
+      },
+    }, "Print / Save as PDF"),
     el("span", { class: "muted" },
       "report.html is self-contained — charts inlined, nothing fetched — so it "
       + "opens anywhere offline. The bundle adds the raw records and a README, "
-      + "and drops into someone else's results/ directory."));
+      + "and drops into someone else's results/ directory. Print goes through "
+      + "your browser's Save as PDF."));
 }
 
 // -- boot --------------------------------------------------------------
@@ -369,6 +385,7 @@ function showError(err) {
 
 Object.assign(window, {
   S, api, post, el, clear, engineColor, fmtBytes, fmtDuration, fmtNum, fmtValue, go,
+  loadRun, renderRunList,
 });
 
 boot().catch(showError);

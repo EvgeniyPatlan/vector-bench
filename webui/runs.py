@@ -67,9 +67,17 @@ def summarize(run_id: str, run_dir: str, manifest: Dict[str, Any]) -> Dict[str, 
     cpu = host.get("cpu") or {}
     records_path = os.path.join(run_dir, RECORDS_NAME)
 
+    from .importing import read_label
+    label = read_label(run_dir)
+
     return {
         "run_id": manifest.get("run_id") or run_id,
         "dir_name": run_id,
+        # A nickname and where it came from, kept beside the manifest rather
+        # than in it: the manifest is provenance, not somewhere to write notes.
+        "label": label.get("label") or "",
+        "source": label.get("source") or "",
+        "imported_at": label.get("imported_at") or "",
         "status": manifest.get("status") or "unknown",
         "started_at": manifest.get("started_at"),
         "finished_at": manifest.get("finished_at"),

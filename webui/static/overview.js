@@ -38,6 +38,37 @@ function phasesTable(phases) {
     el("tbody", {}, ...rows));
 }
 
+function labelEditor(summary) {
+  if (!S.control) return null;
+  return el("div", { class: "row" },
+    el("label", { class: "muted" }, "label ",
+      el("input", {
+        id: "run-label", size: 30, value: summary.label || "",
+        placeholder: "a nickname for the run list",
+      })),
+    el("button", {
+      class: "action secondary",
+      onclick: async () => {
+        const status = document.getElementById("label-status");
+        clear(status);
+        const value = document.getElementById("run-label").value;
+        try {
+          await api(`/api/runs/${encodeURIComponent(S.runId)}/label`, {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ label: value }),
+          });
+          S.runs = (await api("/api/runs")).runs;
+          await loadRun(S.runId);
+          window.renderOverview();
+          renderRunList();
+        } catch (err) {
+          status.append(el("span", { class: "err" }, String(err)));
+        }
+      },
+    }, "Save label"),
+    el("span", { id: "label-status" }));
+}
+
 window.renderOverview = function renderOverview() {
   const panel = document.getElementById("panel-overview");
   clear(panel);
@@ -47,8 +78,18 @@ window.renderOverview = function renderOverview() {
   const host = manifest.host || {};
   const cpu = host.cpu || {};
 
-  panel.append(el("h2", {}, summary.run_id),
-    summary.description ? el("p", { class: "muted" }, summary.description) : null);
+  panel.append(el("h2", {}, summary.label || summary.run_id),
+    summary.label
+      ? el("p", { class: "muted" }, `run id ${summary.run_id}`)
+      : null,
+    summary.description ? el("p", { class: "muted" }, summary.description) : null,
+    summary.imported_at
+      ? el("p", { class: "muted" },
+          `Imported ${summary.imported_at.replace("T", " ").replace("Z", "")}`
+          + (summary.source ? ` from ${summary.source}` : "")
+          + ". The hardware below is that machine's, not this one's.")
+      : null,
+    labelEditor(summary));
 
   // Validity first: the report puts caveats above the charts for the same
   // reason, and a warning read after a conclusion is read too late.

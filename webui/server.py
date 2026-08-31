@@ -131,6 +131,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "cross-site request refused"})
             return
 
+        if path == "/api/import" and method == "POST":
+            if self.auth.enabled and not self._authenticated():
+                self._send_json(401, {"error": "not signed in"})
+            else:
+                self._handle_import(query)
+            return
+
         if path == "/api/login" and method == "POST":
             self._handle_login()
             return
@@ -257,6 +264,64 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         self._handle("DELETE")
+
+    def _handle_import(self, query) -> None:
+        """Receive a run bundle as a raw body.
+
+        Raw rather than multipart: the stdlib's multipart parser went away with
+        the cgi module, and the only client is this project's own page.
+        """
+        if not self.api.allow_control:
+            self._send_json(403, {"error": "control is disabled; start the UI "
+                                           "with --allow-control"})
+            return
+
+        from webui import importing as importing_mod
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "no archive in the request"})
+            return
+        if length > importing_mod.MAX_BYTES:
+            self._send_json(413, {
+                "error": f"archive is {length / 1024 ** 3:.1f} GB; the limit is "
+                         f"{importing_mod.MAX_BYTES / 1024 ** 3:.0f} GB. Copy it "
+                         f"into results/ directly instead."})
+            return
+
+        run_id = (query.get("run_id") or [None])[0]
+        label = (query.get("label") or [None])[0]
+        source = (query.get("source") or [None])[0]
+
+        # Streamed to disk rather than held in memory: a run bundle is large,
+        # and this process is also serving the page that is uploading it.
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(1024 * 256, remaining))
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                remaining -= len(chunk)
+            staged = tmp.name
+
+        try:
+            imported, errors = importing_mod.import_bundle(
+                self.api.results_dir, staged, run_id=run_id, label=label,
+                source=source)
+        finally:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+
+        if errors:
+            self._send_json(400, {"ok": False, "errors": errors})
+        else:
+            self._send_json(201, {"ok": True, "run_id": imported})
 
     def _handle_login(self) -> None:
         if not self.auth.enabled:

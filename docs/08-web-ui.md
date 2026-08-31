@@ -47,6 +47,7 @@ The UI adds:
 | **Datasets** | Every corpus, its shape and whether it is here; download the published ones, generate the ones that are not published | `fetch`, `generate` |
 | **Profiles & launch** | Edit a profile with validation, see the ingest estimate, start a run | `run` |
 | **Jobs** | Every long command started here, with live output and a stop button | — |
+| **Import a run** | Take in a run measured on another machine, renaming and labelling it | — |
 | **Runs → Overview** | The manifest as a page: CPU and SIMD, engine tags and `-march`, resolved limits, validity warnings, per-phase outcomes | — |
 | **Runs → Explore** | The five measurements, each with its axes and filters already set; raw mode for anything else | — |
 | **Runs → Report** | The generated `report.html` in a frame, and a button to regenerate it | `report` |
@@ -218,6 +219,13 @@ Three ways out, in order of how little the recipient needs.
 charts inlined, nothing fetched — so it opens in any browser, offline, and looks
 the same everywhere. The Report tab has a Download button for it.
 
+**As a PDF.** `Print / Save as PDF` on the same tab, or just Ctrl-P on the
+report file itself — the browser's own PDF export is the whole mechanism, so
+there is nothing extra to install. The report carries a print stylesheet: one
+light palette whatever theme you are reading in, a page per numbered section,
+charts and tables kept whole rather than split across a break, and cells allowed
+to wrap so a wide table cannot run off the right of the page.
+
 **The run bundle.** `Download run bundle (.tar.gz)` on the same tab, or:
 
 ```bash
@@ -240,6 +248,27 @@ A run directory is self-contained to *view*. Copy one in and it appears:
 ```bash
 rsync -avz you@other-rig:~/vector-bench/results/<run-id>/ ./results/<run-id>/
 ```
+
+Or, with no shell on the box, upload the `.tar.gz` that `export` produces on the
+**Import a run** page. Same result; the page just adds two things a copy cannot:
+
+- **A name.** Two machines running the same profile on the same day produce the
+  same run id, and the second copy would collide. Import can rename it going in.
+- **A label.** A nickname shown in the run list, alongside which machine it came
+  from and when it arrived. It is kept in `vb-label.json` beside the manifest,
+  never written into it — the manifest is the provenance of a measurement, not
+  somewhere to keep notes. You can edit or clear it later from the run's
+  Overview.
+
+An imported run says so at the top of Overview, naming the host it was measured
+on, because the hardware table below it is *that* machine's.
+
+The archive is checked before anything is unpacked: absolute paths, `..`,
+symlinks and hardlinks, device nodes, more than one top-level directory, and an
+archive with no `run-manifest.json` are all refused. Extraction normalises file
+modes rather than honouring the archive's, and unpacks into a temporary
+directory that is only moved into place once it is known to hold a run — so a
+rejected archive leaves nothing behind.
 
 Run discovery is "any directory under `results/` holding a `run-manifest.json`",
 so nothing has to be imported or registered. Overview shows *that machine's*

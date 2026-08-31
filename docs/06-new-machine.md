@@ -193,7 +193,10 @@ The run directory is self-contained: manifest, raw records, charts and both
 report formats. `report.html` inlines its charts and needs no network.
 
 Copied runs appear in the web UI with no further step: run discovery is any
-directory under `results/` holding a manifest.
+directory under `results/` holding a manifest. With no shell on the receiving
+box, the UI's **Import a run** page takes the `.tar.gz` that
+`./run-benchmark.sh export` produces, and can rename it on the way in — two
+machines running the same profile on the same day produce the same run id.
 
 To regenerate the report locally from copied results:
 
