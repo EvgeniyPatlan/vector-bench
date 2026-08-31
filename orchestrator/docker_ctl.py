@@ -346,6 +346,13 @@ class MemorySampler(threading.Thread):
         self.wait_for_start_s = wait_for_start_s
         self._stop_event = threading.Event()
         self.samples = 0
+        # Which measurement these samples belong to. The file is opened for
+        # append, so a phase that runs twice for one engine, dataset and
+        # resource pass lands both in it -- which is what happened when MHNSW
+        # and VIDX were given a second graph degree five days after the first
+        # run. Without a marker the two are one series with a 123-hour gap in
+        # the middle, drawn as a continuous line and differenced end to end.
+        self.session = int(time.time())
 
     def _read(self, path: str) -> Optional[int]:
         proc = exec_in(self.container, ["cat", path], timeout=10)
@@ -424,6 +431,7 @@ class MemorySampler(threading.Thread):
                         "rss_bytes": current,
                         "peak_bytes": peak,
                         "cpu_seconds": self._cpu_seconds(),
+                        "session": self.session,
                         **self._host_pressure(),
                     }) + "\n")
                     self.samples += 1

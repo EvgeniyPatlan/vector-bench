@@ -540,7 +540,8 @@ def memory_timeline(series: Dict[str, List[Dict[str, Any]]], out_dir: str,
     """
     if not series:
         return None
-    fig, ax = _new_axes("Server memory over the run", "Elapsed (s)",
+    fig, ax = _new_axes("Server memory over the run", "Elapsed (s)  "
+                        "(gaps are separate measurements, not idle time)",
                         "Resident memory  (lower is better ↓)", figsize=(11, 4.6))
     ax.yaxis.set_major_formatter(FuncFormatter(_bytes_formatter))
 
@@ -550,12 +551,21 @@ def memory_timeline(series: Dict[str, List[Dict[str, Any]]], out_dir: str,
         if not rows:
             continue
         plotted = True
-        t0 = rows[0]["t"]
         engine = name.split("-")[0]
         style = style_for(engine)
-        ax.plot([r["t"] - t0 for r in rows], [r["rss_bytes"] for r in rows],
-                color=style["color"], linestyle=style["linestyle"],
-                linewidth=1.4, label=name)
+        # One line per measurement, not one per file. A phase that ran twice
+        # appends to the same file, and joining the two drew a line across the
+        # gap between them -- 123 hours, in the run that surfaced this -- as
+        # though the server had held that memory the whole time.
+        from .loaders import split_sessions
+        segments = split_sessions(rows)
+        t0 = segments[0][0]["t"]
+        for index, segment in enumerate(segments):
+            ax.plot([r["t"] - t0 for r in segment],
+                    [r["rss_bytes"] for r in segment],
+                    color=style["color"], linestyle=style["linestyle"],
+                    linewidth=1.4,
+                    label=name if index == 0 else None)
 
     if not plotted:
         plt.close(fig)

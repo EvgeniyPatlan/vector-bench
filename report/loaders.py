@@ -360,6 +360,16 @@ def foreign_cpu(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     Returns None when the series cannot answer -- an older run without the
     host fields, or too few samples to difference.
     """
+    worst = None
+    for segment in split_sessions(rows):
+        found = _foreign_cpu_one(segment)
+        if found and (worst is None or found["foreign_cores"] > worst["foreign_cores"]):
+            worst = found
+    return worst
+
+
+def _foreign_cpu_one(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """foreign_cpu for a single measurement. See split_sessions."""
     usable = [r for r in rows
               if r.get("host_cpu_seconds") is not None
               and r.get("cpu_seconds") is not None]
@@ -420,4 +430,42 @@ def build_signature(record: Dict[str, Any]) -> Any:
             record.get("build_mode"), record.get("storage_engine"),
             record.get("ef_construction"),
             (record.get("extra") or {}).get("quantization"))
+
+# A gap this long between consecutive samples cannot be sampling jitter -- the
+# sampler runs four times a second -- so it separates two measurements that
+# were appended to one file. Used only for series written before sessions were
+# stamped.
+SESSION_GAP_S = 300.0
+
+
+def split_sessions(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """One list per measurement, from a file that may hold several.
+
+    The sampler appends, so a phase that runs twice for the same engine,
+    dataset and resource pass writes both into one file. That is deliberate --
+    the earlier measurement is not wrong and should not be discarded -- but
+    treating the result as a single continuous series draws a line across the
+    gap and differences the two ends as though they bracketed one run. When
+    MHNSW and VIDX were given a second graph degree five days after the first
+    run, that gap was 123 hours.
+
+    Splits on the recorded session where there is one, and on a long gap
+    between samples otherwise, so files written before the marker existed are
+    still read correctly.
+    """
+    if not rows:
+        return []
+    ordered = sorted(rows, key=lambda r: r.get("t") or 0)
+    if any(r.get("session") is not None for r in ordered):
+        by_session: Dict[Any, List[Dict[str, Any]]] = {}
+        for r in ordered:
+            by_session.setdefault(r.get("session"), []).append(r)
+        return [v for _k, v in sorted(by_session.items(), key=lambda kv: str(kv[0]))]
+
+    segments: List[List[Dict[str, Any]]] = [[ordered[0]]]
+    for previous, current in zip(ordered, ordered[1:]):
+        if (current.get("t") or 0) - (previous.get("t") or 0) > SESSION_GAP_S:
+            segments.append([])
+        segments[-1].append(current)
+    return segments
 

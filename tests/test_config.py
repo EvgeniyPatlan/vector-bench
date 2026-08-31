@@ -4619,3 +4619,67 @@ class TestTwoGraphDegreesAreTwoLines:
         with tempfile.TemporaryDirectory() as out:
             assert churn_impact(rows, "d", out, "c") is not None
 
+
+class TestAPhaseThatRanTwiceIsTwoMeasurements:
+    """The memory sampler appends, so a phase that runs twice for one engine,
+    dataset and resource pass writes both into one file. That is deliberate --
+    the earlier measurement is not wrong -- but reading the result as a single
+    continuous series draws a line across the gap and differences the two ends
+    as though they bracketed one run. When MHNSW and VIDX were given a second
+    graph degree five days after the first run, that gap was 123 hours, and
+    the memory chart showed one run that appeared to pause for five days."""
+
+    def _two_runs(self):
+        a = [{"t": 1000.0 + i, "rss_bytes": 10, "cpu_seconds": i * 1.0,
+              "host_cpu_seconds": i * 1.4, "session": 1} for i in range(20)]
+        b = [{"t": 500000.0 + i, "rss_bytes": 10, "cpu_seconds": 100 + i * 1.0,
+              "host_cpu_seconds": 200 + i * 1.4, "session": 2} for i in range(20)]
+        return a + b
+
+    def test_the_sampler_stamps_a_session(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "docker_ctl.py")).read()
+        assert '"session": self.session' in source
+
+    def test_sessions_split_the_series(self):
+        from report.loaders import split_sessions
+        assert len(split_sessions(self._two_runs())) == 2
+
+    def test_an_older_file_splits_on_the_gap(self):
+        """Series written before the marker existed must still read right."""
+        from report.loaders import split_sessions
+        rows = [{k: v for k, v in r.items() if k != "session"}
+                for r in self._two_runs()]
+        assert len(split_sessions(rows)) == 2
+
+    def test_one_measurement_stays_one(self):
+        from report.loaders import split_sessions
+        rows = [{"t": float(i), "rss_bytes": 1, "session": 7} for i in range(50)]
+        assert len(split_sessions(rows)) == 1
+
+    def test_contention_is_judged_per_measurement(self):
+        """Differencing across the gap averages a busy host over days the
+        container was not even running."""
+        from report.loaders import foreign_cpu
+        rows = []
+        for i in range(30):
+            rows.append({"t": float(i), "cpu_seconds": i * 1.0,
+                         "host_cpu_seconds": i * 20.0, "session": 1})
+        for i in range(30):
+            rows.append({"t": 900000.0 + i, "cpu_seconds": 100 + i * 1.0,
+                         "host_cpu_seconds": 1000 + i * 1.2, "session": 2})
+        found = foreign_cpu(rows)
+        assert found is not None
+        assert found["foreign_cores"] > 2.0, "the busy segment must be reported"
+        assert found["elapsed_s"] < 100, "and judged over its own window"
+
+    def test_the_chart_breaks_the_line(self):
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        block = source.split("def memory_timeline")[1]
+        assert "split_sessions" in block
+        assert "label=name if index == 0 else None" in block
+
+    def test_empty_input_is_not_a_crash(self):
+        from report.loaders import split_sessions
+        assert split_sessions([]) == []
+
