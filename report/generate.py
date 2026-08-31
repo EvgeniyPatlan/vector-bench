@@ -400,6 +400,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir = args.output_dir or os.path.join(run_dir, "report")
     chart_dir = os.path.join(out_dir, "charts")
     os.makedirs(chart_dir, exist_ok=True)
+    # Every chart is redrawn from the records on each run, so anything already
+    # here is from a previous one. Left in place they accumulate: narrowing a
+    # report to one corpus with --datasets leaves the other corpus's charts
+    # sitting beside the new ones, named after a dataset the report no longer
+    # covers. Nothing references them, which is exactly what makes them
+    # dangerous -- a stale file that nothing points at is one somebody opens
+    # by hand and believes.
+    removed = 0
+    for name in os.listdir(chart_dir):
+        if name.endswith((".png", ".svg")):
+            try:
+                os.remove(os.path.join(chart_dir, name))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"[report] cleared {removed} chart(s) from the previous report")
 
     print(f"[report] run       : {run_id}")
     print(f"[report] ann-bench : {annb_dir}")
@@ -532,9 +549,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"[report] chart -> {os.path.basename(paths['svg'])}")
 
     if memory:
-        paths = charts.memory_timeline(memory, chart_dir, "memory-timeline")
-        if paths:
-            chart_paths["memory-timeline"] = paths
+        # One chart per phase. The ann phase loads a corpus and sweeps a grid;
+        # the ops phase loads it again and runs four workloads. Different
+        # durations, different questions, and twelve series on one axis was
+        # crowded before any of them held two measurements.
+        for stem, phase in (("memory-timeline", None),
+                            ("memory-timeline-ann", "ann")):
+            paths = charts.memory_timeline(memory, chart_dir, stem, phase=phase)
+            if paths:
+                chart_paths[stem] = paths
 
     md_path = os.path.join(out_dir, "report.md")
     html_path = os.path.join(out_dir, "report.html")

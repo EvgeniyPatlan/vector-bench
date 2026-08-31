@@ -4611,3 +4611,240 @@ class TestAReportCanBeNarrowedToOneCorpus:
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         assert 'if not r.get("dataset") or r["dataset"] in wanted' in source
 
+
+class TestTwoGraphDegreesAreTwoLines:
+    """Every engine swept a single M until MHNSW and VIDX were given M=6 as
+    well, so they would have real measurements below recall 0.90. M was not a
+    series axis, so the two configurations were drawn as one line: on the
+    latency chart, which plots against ef_search, that put two y-values at
+    every x and joined them, and AliSQL appeared to swing between 383 ms and
+    95 ms at adjacent search widths."""
+
+    def _records(self):
+        return [{"phase": "recall_qps", "engine": "alisql", "dataset": "d",
+                 "storage_engine": "InnoDB", "m": m, "ef_search": ef,
+                 "qps": 100.0, "recall_at_k": 0.9,
+                 "latency_p50_ms": 5.0, "latency_p99_ms": 9.0}
+                for m in (6, 16) for ef in (10, 20, 40)]
+
+    def test_m_is_a_series_axis(self):
+        from report.charts import SERIES_AXES
+        assert "m" in SERIES_AXES
+
+    def test_two_degrees_make_two_series(self):
+        from report.charts import _grouped
+        groups, _labels, _st, _deg = _grouped(self._records())
+        assert len(groups) == 2
+
+    def test_the_legend_says_m_not_ef_c(self):
+        """An M=6 curve labelled ef_c=6 is worse than one labelled nothing."""
+        from report.charts import series_labels
+        labels = set(series_labels(self._records()).values())
+        assert any("M=6" in l for l in labels)
+        assert not any("ef_c=" in l for l in labels)
+
+    def test_a_single_degree_keeps_a_bare_label(self):
+        """Naming an axis the run did not sweep implies a comparison it did
+        not make."""
+        from report.charts import series_labels
+        rows = [r for r in self._records() if r["m"] == 16]
+        assert not any("M=" in l for l in series_labels(rows).values())
+
+    def test_the_two_lines_are_told_apart(self):
+        """Colour is the engine and linestyle is the storage engine, so a
+        second degree had nothing left to carry it and both came out
+        identical."""
+        from report.charts import series_style
+        sparse = series_style({"engine": "alisql", "m": 6}, degrees=[6, 16])
+        dense = series_style({"engine": "alisql", "m": 16}, degrees=[6, 16])
+        assert (sparse["alpha"], sparse["linewidth"]) != \
+               (dense.get("alpha"), dense["linewidth"])
+
+    def test_the_key_width_is_derived_not_written_down(self):
+        """churn_impact builds a wider key and slices it back, and it did that
+        with a literal 3 -- so adding an axis shifted every index under it."""
+        from report.charts import SERIES_AXES, SERIES_KEY_WIDTH
+        assert SERIES_KEY_WIDTH == 1 + len(SERIES_AXES)
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        block = source.split("def churn_impact")[1]
+        assert "key[:3]" not in block
+        assert "key[3]" not in block
+
+    def test_churn_still_renders_with_the_wider_key(self):
+        import tempfile
+        import matplotlib
+        matplotlib.use("Agg")
+        from report.charts import churn_impact
+        rows = []
+        for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
+            rows.append({"phase": "churn", "engine": "mariadb", "dataset": "d",
+                         "storage_engine": "InnoDB", "m": 16, "qps": qps,
+                         "churn_fraction": frac, "resource_pass": "tuned",
+                         "build_mode": "post"})
+        with tempfile.TemporaryDirectory() as out:
+            assert churn_impact(rows, "d", out, "c") is not None
+
+
+class TestAPhaseThatRanTwiceIsTwoMeasurements:
+    """The memory sampler appends, so a phase that runs twice for one engine,
+    dataset and resource pass writes both into one file. That is deliberate --
+    the earlier measurement is not wrong -- but reading the result as a single
+    continuous series draws a line across the gap and differences the two ends
+    as though they bracketed one run. When MHNSW and VIDX were given a second
+    graph degree five days after the first run, that gap was 123 hours, and
+    the memory chart showed one run that appeared to pause for five days."""
+
+    def _two_runs(self):
+        a = [{"t": 1000.0 + i, "rss_bytes": 10, "cpu_seconds": i * 1.0,
+              "host_cpu_seconds": i * 1.4, "session": 1} for i in range(20)]
+        b = [{"t": 500000.0 + i, "rss_bytes": 10, "cpu_seconds": 100 + i * 1.0,
+              "host_cpu_seconds": 200 + i * 1.4, "session": 2} for i in range(20)]
+        return a + b
+
+    def test_the_sampler_stamps_a_session(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "docker_ctl.py")).read()
+        assert '"session": self.session' in source
+
+    def test_sessions_split_the_series(self):
+        from report.loaders import split_sessions
+        assert len(split_sessions(self._two_runs())) == 2
+
+    def test_an_older_file_splits_on_the_gap(self):
+        """Series written before the marker existed must still read right."""
+        from report.loaders import split_sessions
+        rows = [{k: v for k, v in r.items() if k != "session"}
+                for r in self._two_runs()]
+        assert len(split_sessions(rows)) == 2
+
+    def test_one_measurement_stays_one(self):
+        from report.loaders import split_sessions
+        rows = [{"t": float(i), "rss_bytes": 1, "session": 7} for i in range(50)]
+        assert len(split_sessions(rows)) == 1
+
+    def test_contention_is_judged_per_measurement(self):
+        """Differencing across the gap averages a busy host over days the
+        container was not even running."""
+        from report.loaders import foreign_cpu
+        rows = []
+        for i in range(30):
+            rows.append({"t": float(i), "cpu_seconds": i * 1.0,
+                         "host_cpu_seconds": i * 20.0, "session": 1})
+        for i in range(30):
+            rows.append({"t": 900000.0 + i, "cpu_seconds": 100 + i * 1.0,
+                         "host_cpu_seconds": 1000 + i * 1.2, "session": 2})
+        found = foreign_cpu(rows)
+        assert found is not None
+        assert found["foreign_cores"] > 2.0, "the busy segment must be reported"
+        assert found["elapsed_s"] < 100, "and judged over its own window"
+
+    def test_the_chart_draws_each_measurement_separately(self):
+        source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
+        block = source.split("def memory_timeline")[1]
+        assert "split_sessions" in block
+        # One legend entry per series, not one per segment.
+        assert "label = name if index == 0 else None" in block
+
+    def test_empty_input_is_not_a_crash(self):
+        from report.loaders import split_sessions
+        assert split_sessions([]) == []
+
+
+class TestChartsFromAPreviousReportAreCleared:
+    """Charts are redrawn from the records every time, so anything already in
+    the directory is from a previous run. Narrowing a report to one corpus with
+    --datasets left the other corpus's charts sitting beside the new ones,
+    named after a dataset the report no longer covers. Nothing references them,
+    which is what makes them dangerous: a stale file nothing points at is one
+    somebody opens by hand and believes."""
+
+    def test_the_generator_clears_them(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        block = source.split("chart_dir = os.path.join")[1][:1200]
+        assert "os.remove" in block
+        assert '.endswith((".png", ".svg"))' in block
+
+    def test_only_generated_files_are_removed(self):
+        """The directory is inside the run, and removing anything the report
+        did not write would be destroying somebody else's data."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        block = source.split("chart_dir = os.path.join")[1][:1200]
+        assert "listdir" in block and '.endswith' in block
+        assert "rmtree" not in block
+
+    def test_it_clears_before_anything_is_drawn(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        body = source.split("def main")[1]
+        assert body.index("cleared") < body.index("chart_paths")
+
+
+class TestMemoryChartsCompareShapesNotClocks:
+    """The chart exists to show the shape of memory through a phase: a cache
+    filling to its ceiling looks different from a build spike. Shapes are
+    compared by overlaying them. Anchoring two measurements from one file to
+    the file's start instead put the second 123 hours to the right, leaving a
+    chart that was almost entirely empty with two thin bands at the edges --
+    which looked exactly like the problem splitting the sessions was meant to
+    fix."""
+
+    def _series(self):
+        ops = [{"t": 100.0 + i, "rss_bytes": 1_000_000 + i} for i in range(30)]
+        ann = ([{"t": 200.0 + i, "rss_bytes": 2_000_000 + i, "session": 1}
+                for i in range(30)]
+               + [{"t": 500000.0 + i, "rss_bytes": 3_000_000 + i, "session": 2}
+                  for i in range(30)])
+        return {"mariadb-d-tuned-m16-post": ops, "mariadb-d-tuned-ann": ann}
+
+    def _axis(self, **kw):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+        from report import charts
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["ax"] = fig.axes[0]
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.memory_timeline(self._series(), d, "t", **kw)
+        finally:
+            charts._save = original
+            plt.close("all")
+        return captured.get("ax")
+
+    def test_every_measurement_starts_at_zero(self):
+        ax = self._axis(phase="ann")
+        for line in ax.get_lines():
+            assert min(line.get_xdata()) < 1.0
+
+    def test_the_axis_is_not_mostly_empty(self):
+        """The second measurement is five days later in wall clock; the axis
+        must span one measurement, not the gap between two."""
+        ax = self._axis(phase="ann")
+        assert ax.get_xlim()[1] < 1000, "axis still spans the wall-clock gap"
+
+    def test_the_phases_are_separate_charts(self):
+        """The ann phase loads a corpus and sweeps a grid; ops loads it again
+        and runs four workloads. Different durations, different questions."""
+        ann = {l.get_label() for l in self._axis(phase="ann").get_lines()}
+        ops = {l.get_label() for l in self._axis().get_lines()}
+        assert any("ann" in str(l) for l in ann)
+        assert not any("ann" in str(l) for l in ops)
+
+    def test_a_repeated_phase_says_so_in_the_legend(self):
+        labels = [str(l.get_label()) for l in self._axis(phase="ann").get_lines()]
+        assert any("2 measurements" in l for l in labels)
+
+    def test_both_charts_are_produced(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert '("memory-timeline-ann", "ann")' in source
+
+    def test_the_renderer_shows_both(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert 'stem.startswith("memory-timeline")' in source
+
