@@ -18,6 +18,7 @@ rather than the whole sweep.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -1042,6 +1043,24 @@ def cmd_web(args: argparse.Namespace) -> int:
                      auth_enabled=auth_enabled,
                      password=os.environ.get("VB_WEB_PASSWORD"),
                      behind_proxy=args.behind_proxy)
+
+    # Ask whether Docker answers at all before asking what images it has.
+    # image_exists() cannot tell "no such image" from "cannot reach the daemon",
+    # so a permission problem on the socket used to be reported as a missing
+    # image -- which sends you off to rebuild something you already have.
+    if not docker_ctl.docker_available():
+        socket_path = "/var/run/docker.sock"
+        print(f"cannot reach the Docker daemon as {getpass.getuser()!r}.\n"
+              f"  Check with:  docker info\n"
+              f"  Running as a service, this usually means the service user is "
+              f"not in the group that owns {socket_path}"
+              + (f" (gid {os.stat(socket_path).st_gid})"
+                 if os.path.exists(socket_path) else "")
+              + ".\n"
+              f"  Add it, then restart:  sudo usermod -aG docker "
+              f"{getpass.getuser()} && sudo systemctl restart vector-bench-web",
+              file=sys.stderr)
+        return 1
 
     if not docker_ctl.image_exists(WEBUI_IMAGE):
         print(f"{WEBUI_IMAGE} not found; build it with:\n"

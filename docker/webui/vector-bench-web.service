@@ -5,6 +5,16 @@
 # dies with the SSH session that started it, and does not come back after a
 # reboot. This unit is the same command with systemd holding it open.
 #
+# BEFORE YOU START IT
+#   The image must exist, and the User= below must be able to reach Docker.
+#   systemd grants that user the groups it has in /etc/group, so the check is:
+#
+#     sudo -u THAT-USER docker image inspect vector-bench/webui:latest >/dev/null \
+#       && echo ok || echo 'no image, or no docker access for that user'
+#
+#   No docker access:  sudo usermod -aG docker THAT-USER
+#   No image:          ./scripts/build-images.sh --engine webui
+#
 # INSTALL
 #   sudo install -d -m 0750 /etc/vector-bench
 #   sudo install -m 0600 docker/webui/web.env.example /etc/vector-bench/web.env

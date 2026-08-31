@@ -357,6 +357,18 @@ systemctl status vector-bench-web
 journalctl -u vector-bench-web -f
 ```
 
+Two things must be true before it will start, and one command checks both:
+
+```bash
+sudo -u THAT-USER docker image inspect vector-bench/webui:latest >/dev/null \
+  && echo ok || echo 'no image, or that user cannot reach docker'
+```
+
+systemd gives the service user the groups it holds in `/etc/group`, so if that
+user is not in the group owning `/var/run/docker.sock`, nothing it runs can
+speak to Docker. `sudo usermod -aG docker THAT-USER` fixes it; the image is
+built with `./scripts/build-images.sh --engine webui`.
+
 The password lives in a root-only file rather than in the unit, so it stays out
 of `systemctl cat`, shell history and the process list. Leave it empty and one
 is generated on first start and printed once to the journal:
