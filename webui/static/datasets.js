@@ -84,12 +84,50 @@ window.renderDatasets = async function renderDatasets() {
     el("span", { id: "fetch-status" })));
 
   const generated = DS.datasets.filter((d) => d.generated && !d.downloaded);
-  if (generated.length) {
-    panel.append(el("div", { class: "warn" },
-      "These are not published as prebuilt files and cannot be downloaded: "
-      + generated.map((d) => d.name).join(", ")
-      + ". They are assembled locally, and computing their ground truth by "
-      + "brute force takes hours and tens of GB: "
-      + "scripts/generate-dataset.sh <name>"));
+  if (!generated.length) return;
+
+  panel.append(el("h3", {}, "Generate"),
+    el("p", { class: "muted" },
+      "These are not published as prebuilt files, so fetch cannot retrieve "
+      + "them. ann-benchmarks assembles them from a source corpus and then "
+      + "computes exact ground truth by brute force."),
+    el("div", { class: "warn" },
+      "This is not a download. For the dbpedia family the full 1M-row source "
+      + "is fetched whichever size you pick (~6–10 GB) — choosing a smaller "
+      + "variant only shrinks the ground-truth computation and every later "
+      + "engine load. Budget hours and about 20 GB of working space for the "
+      + "1000k variant, and a bench image must already be built."),
+    el("div", { class: "row" },
+      el("label", { class: "muted" }, "dataset ",
+        el("select", { id: "gen-pick" },
+          ...generated.map((d) => el("option", { value: d.name }, d.name))))),
+    commandPreview("generate", [generated[0].name]),
+    el("div", { class: "row" },
+      el("button", {
+        class: "action secondary",
+        onclick: () => {
+          const name = document.getElementById("gen-pick").value;
+          const rows = (DS.datasets.find((d) => d.name === name) || {}).train;
+          const warning = rows && rows >= 500000
+            ? `Generate ${name}? Ground truth for ${(rows / 1e6).toFixed(2)}M `
+              + "vectors at 1536 dimensions is hours of brute force."
+            : `Generate ${name}?`;
+          if (!confirm(warning)) return;
+          startJob({ kind: "generate", datasets: [name] },
+                   document.getElementById("gen-status"));
+        },
+      }, "Generate"),
+      el("span", { id: "gen-status" })));
+
+  // The preview should follow the picker, not stay on the first entry.
+  const picker = document.getElementById("gen-pick");
+  if (picker) {
+    picker.addEventListener("change", () => {
+      const preview = panel.querySelector("pre.cmd:last-of-type");
+      if (preview) {
+        preview.textContent =
+          `./run-benchmark.sh generate ${picker.value}`;
+      }
+    });
   }
 };

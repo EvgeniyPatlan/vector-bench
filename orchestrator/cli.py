@@ -176,6 +176,22 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return _script("fetch-datasets.sh", *fetch_args)
 
 
+def cmd_generate(args: argparse.Namespace) -> int:
+    """Build a dataset ann-benchmarks constructs rather than publishes.
+
+    `fetch` cannot retrieve these: they are assembled from a source corpus and
+    then have their ground truth computed by brute force, which is hours of
+    work and tens of GB rather than a download.
+    """
+    if args.list:
+        return _script("generate-dataset.sh", "--list")
+    if not args.dataset:
+        print("which dataset? try: ./run-benchmark.sh generate --list",
+              file=sys.stderr)
+        return 2
+    return _script("generate-dataset.sh", args.dataset)
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile)
     resources = merge_resource_overrides(
@@ -1117,6 +1133,13 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("fetch", help="download datasets")
     f.add_argument("--datasets", default=None)
     f.set_defaults(func=cmd_fetch)
+
+    g = sub.add_parser("generate",
+                       help="build a dataset that is not published for download")
+    g.add_argument("dataset", nargs="?", default=None)
+    g.add_argument("--list", action="store_true",
+                   help="datasets that must be generated rather than fetched")
+    g.set_defaults(func=cmd_generate)
 
     r = sub.add_parser("render", help="regenerate ann-benchmarks configs")
     r.add_argument("--profile", default="quick")

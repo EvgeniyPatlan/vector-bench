@@ -276,13 +276,30 @@ function renderReport() {
   const panel = document.getElementById("panel-report");
   clear(panel);
   if (!S.run) { panel.append(el("p", { class: "empty" }, "Select a run.")); return; }
+  const inputs = S.run.report_inputs || {};
+  if (inputs.regenerate_note) {
+    panel.append(el("div", { class: "warn" },
+      el("strong", {}, inputs.regenerate_risk === "loses_recall"
+        ? "Regenerating would drop the recall section. "
+        : "Regenerating would not use only this run's data. "),
+      inputs.regenerate_note));
+  }
+  if (inputs.measured_elsewhere) {
+    panel.append(el("p", { class: "muted" },
+      `Measured on ${inputs.measured_on}. The report below is self-contained — `
+      + "its charts are inlined — so it displays exactly as it did there."));
+  }
+
   const regenerate = el("div", { class: "row" },
     el("button", {
       class: "action" + (S.run.summary.has_report ? " secondary" : ""),
       disabled: !S.control,
       onclick: () => startJob({ kind: "report", run_id: S.runId },
                               document.getElementById("report-status")),
-    }, S.run.summary.has_report ? "Regenerate" : "Generate report"),
+    }, S.run.summary.has_report
+      ? (inputs.regenerate_risk && inputs.regenerate_risk !== "none"
+          ? "Regenerate anyway" : "Regenerate")
+      : "Generate report"),
     el("span", { id: "report-status" }),
     S.control ? null : el("span", { class: "muted" },
       "read-only; start with --allow-control to generate from here"));

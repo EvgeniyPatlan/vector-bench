@@ -60,6 +60,8 @@ def get_run(api: Api, match, _q, _b=None) -> Response:
     return 200, {
         "summary": runs_mod.summarize(run_id, run_dir, manifest),
         "manifest": manifest,
+        "report_inputs": runs_mod.report_inputs(
+            api.results_dir, api.datasets_dir, run_dir, manifest),
     }
 
 

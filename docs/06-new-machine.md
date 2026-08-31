@@ -192,11 +192,23 @@ rsync -avz user@target:~/vector-bench/results/<run-id>/ ./results/<run-id>/
 The run directory is self-contained: manifest, raw records, charts and both
 report formats. `report.html` inlines its charts and needs no network.
 
+Copied runs appear in the web UI with no further step: run discovery is any
+directory under `results/` holding a manifest.
+
 To regenerate the report locally from copied results:
 
 ```bash
 ./run-benchmark.sh report --run-dir results/<run-id>
 ```
+
+> **Regenerating a copied run is not the same as viewing it.** The recall
+> measurements live in `results/annb/`, a sibling of the run directory rather
+> than part of it, and scoring them needs the dataset file. Neither is included
+> by the rsync above. Without them the regenerated report loses its recall
+> section; with unrelated ann results present it reads those instead, since
+> nothing ties them to this run. The web UI's Report tab checks both and warns
+> before the button does anything. Viewing the copied `report.html` is
+> unaffected — it is self-contained.
 
 ---
 

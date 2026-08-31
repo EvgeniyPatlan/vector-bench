@@ -39,7 +39,7 @@ The UI adds:
 | --- | --- | --- |
 | **Status** | Whether this machine can measure yet: which images are built, which datasets are here, disk free — and a link to whatever is missing | — |
 | **Engines** | Build images; add a variant of an engine family | `build` |
-| **Datasets** | Every corpus, its shape and whether it is downloaded; download the ones that are not | `fetch` |
+| **Datasets** | Every corpus, its shape and whether it is here; download the published ones, generate the ones that are not published | `fetch`, `generate` |
 | **Profiles & launch** | Edit a profile with validation, see the ingest estimate, start a run | `run` |
 | **Jobs** | Every long command started here, with live output and a stop button | — |
 | **Runs → Overview** | The manifest as a page: CPU and SIMD, engine tags and `-march`, resolved limits, validity warnings, per-phase outcomes | — |
@@ -173,6 +173,34 @@ engine, a dataset name with a space in it, or a run id carrying a terminal
 escape sequence is rejected with a message rather than executed.
 
 ---
+
+## Viewing results measured somewhere else
+
+A run directory is self-contained to *view*. Copy one in and it appears:
+
+```bash
+rsync -avz you@other-rig:~/vector-bench/results/<run-id>/ ./results/<run-id>/
+```
+
+Run discovery is "any directory under `results/` holding a `run-manifest.json`",
+so nothing has to be imported or registered. Overview shows *that machine's*
+CPU, SIMD flags, engine tags and resource limits, because the manifest travels
+with the run — which is the point, since a number without the environment that
+produced it is not a result. `report.html` inlines its charts, so it renders
+exactly as it did there.
+
+**Regenerating a copied run is a different matter**, and the Report tab says so
+before you click. The recall measurements live in `results/annb/`, a sibling of
+the run directory, and scoring them needs the dataset file. Neither travels.
+Two things can then go wrong, and they are opposites:
+
+| What the tab says | What would happen |
+| --- | --- |
+| *Regenerating would drop the recall section* | There are no ann results here at all, so the new report would have the ops measurements and no recall curves |
+| *Regenerating would not use only this run's data* | There are ann results here, but nothing ties them to this run — so it would read every ann result on this machine. If the run was measured elsewhere, the tab names the host and says plainly that those are somebody else's measurements |
+
+A run that recorded its own `ann_fingerprint` and whose tree is present gets no
+warning, because the generator can narrow to exactly its own results.
 
 ## Deploying it with TLS
 

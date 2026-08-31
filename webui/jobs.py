@@ -39,6 +39,7 @@ KINDS = {
     "build": {"measurement": False, "label": "image build"},
     "report": {"measurement": False, "label": "report generation"},
     "render": {"measurement": False, "label": "config render"},
+    "generate": {"measurement": False, "label": "dataset generation"},
 }
 
 
@@ -242,6 +243,15 @@ class JobStore:
         if datasets:
             argv += ["--datasets", ",".join(datasets)]
         return errors, argv
+
+    def _validate_generate(self, spec: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+        datasets, errors = self._dataset_list(spec.get("datasets"))
+        if errors:
+            return errors, []
+        if len(datasets) != 1:
+            return ["generate builds exactly one dataset at a time: it is hours "
+                    "of brute-force ground truth, not a download"], []
+        return [], [datasets[0]]
 
     def _validate_render(self, spec: Dict[str, Any]) -> Tuple[List[str], List[str]]:
         errors: List[str] = []

@@ -286,6 +286,99 @@ def get(url, headers=None):
         return exc.code, exc.read()
 
 
+class TestReportRegenerationRisk:
+    """A run directory is self-contained to view, but not to regenerate.
+
+    The recall measurements live in results/annb/, a sibling of the run, and
+    scoring them needs the dataset. Neither travels when a run is copied from
+    another machine, and the two ways that goes wrong are opposite: the recall
+    section vanishes, or it silently fills with this machine's measurements.
+    """
+
+    def _inputs(self, tmp_path, *, annb=None, fingerprint=None, recall=True,
+                hostname="elsewhere"):
+        results = tmp_path / "results"
+        datasets = tmp_path / "datasets"
+        datasets.mkdir(parents=True, exist_ok=True)
+        records = [{"phase": "recall_qps", "dataset": "d1", "engine": "mariadb",
+                    "recall_at_k": 0.9, "qps": 10.0}] if recall else []
+        manifest = basic_manifest("r1")
+        manifest["host"]["hostname"] = hostname
+        manifest["config"]["resource_pass"] = "normalized"
+        if fingerprint:
+            manifest["config"]["ann_fingerprint"] = fingerprint
+        run_dir = write_run(str(results), "r1", manifest=manifest, records=records)
+
+        for relative in (annb or []):
+            path = results / "annb" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\x89HDF\r\n\x1a\n")
+
+        (datasets / "d1.hdf5").write_bytes(b"x")
+        return runs_mod.report_inputs(str(results), str(datasets), run_dir, manifest)
+
+    def test_copied_run_with_no_ann_data_loses_recall(self, tmp_path):
+        found = self._inputs(tmp_path)
+        assert found["regenerate_risk"] == "loses_recall"
+        assert "no recall curves" in found["regenerate_note"]
+
+    def test_its_own_fingerprinted_tree_is_safe(self, tmp_path):
+        found = self._inputs(tmp_path, fingerprint="abc123",
+                             annb=["normalized/abc123/x.hdf5"])
+        assert found["ann_tree_narrowed"] is True
+        assert found["regenerate_risk"] == "none"
+        assert found["regenerate_note"] == ""
+
+    def test_unnarrowed_tree_is_flagged(self, tmp_path):
+        """A run predating the fingerprint reads the whole tree, as the
+        generator itself does. That is not a loss, but it is not only this
+        run's data either."""
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"])
+        assert found["regenerate_risk"] == "unnarrowed"
+        assert found["ann_results_present"] == 1
+
+    def test_a_foreign_run_says_whose_data_it_would_read(self, tmp_path):
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             hostname="bench-rig-2")
+        assert found["measured_elsewhere"] is True
+        assert "bench-rig-2" in found["regenerate_note"]
+        assert "somebody else's" in found["regenerate_note"]
+
+    def test_a_local_run_does_not_claim_it_is_foreign(self, tmp_path):
+        import socket
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             hostname=socket.gethostname())
+        assert found["measured_elsewhere"] is False
+        assert "somebody else" not in found["regenerate_note"]
+
+    def test_a_run_with_no_recall_is_not_warned_about(self, tmp_path):
+        found = self._inputs(tmp_path, recall=False)
+        assert found["regenerate_risk"] == "none"
+
+    def test_missing_dataset_is_reported(self, tmp_path):
+        results = tmp_path / "results"
+        datasets = tmp_path / "datasets"
+        datasets.mkdir(parents=True)
+        manifest = basic_manifest("r1")
+        manifest["config"]["resource_pass"] = "normalized"
+        manifest["config"]["ann_fingerprint"] = "abc123"
+        run_dir = write_run(str(results), "r1", manifest=manifest,
+                            records=[{"phase": "recall_qps", "dataset": "gone"}])
+        tree = results / "annb" / "normalized" / "abc123"
+        tree.mkdir(parents=True)
+        (tree / "x.hdf5").write_bytes(b"x")
+        found = runs_mod.report_inputs(str(results), str(datasets), run_dir, manifest)
+        assert found["missing_datasets"] == ["gone"]
+        assert "gone" in found["regenerate_note"]
+
+    def test_exposed_on_the_run_detail(self, results_dir, tmp_path):
+        instance = api_mod.Api(str(tmp_path))
+        instance.results_dir = results_dir
+        _status, body = api_mod.dispatch(instance, "GET", "/api/runs/run-a", {})
+        assert "report_inputs" in body
+        assert "regenerate_risk" in body["report_inputs"]
+
+
 class TestFrontEndWiring:
     """Element ids are a contract between three files that never import each other.
 

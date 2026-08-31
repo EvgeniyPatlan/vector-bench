@@ -233,6 +233,7 @@ rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
 | --- | --- |
 | `build` | Export sources at pinned tags, build runtime + bench images |
 | `fetch` | Download datasets |
+| `generate` | Build a dataset that is not published for download (dbpedia-openai-*) |
 | `run` | Execute a benchmark run |
 | `report` | Regenerate the report from an existing run directory |
 | `web` | Serve the web UI: run index, interactive explorer, profile editor, launcher |

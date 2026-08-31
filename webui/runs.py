@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from typing import Any, Dict, List, Optional
 
 MANIFEST_NAME = "run-manifest.json"
@@ -108,6 +109,131 @@ def discover_runs(results_dir: str) -> List[Dict[str, Any]]:
 
     return sorted(out, key=lambda r: (r.get("started_at") or "", r["dir_name"]),
                   reverse=True)
+
+
+def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
+                  manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """What regenerating this run's report would have to work from.
+
+    A run directory is self-contained to *view*: report.html inlines its charts.
+    Regenerating is different. The recall measurements live in the
+    ann-benchmarks tree at results/annb/<pass>/<fingerprint>/, which is a
+    sibling of the run rather than inside it, and scoring them needs the dataset
+    to compute ground truth against. Copy a run from another machine and
+    neither travels, so regenerating there silently produces a report with the
+    ops measurements and no recall curves.
+    """
+    config = manifest.get("config") or {}
+    resource_pass = config.get("resource_pass")
+    fingerprint = config.get("ann_fingerprint")
+    if resource_pass and not fingerprint and config.get("resolved_resources"):
+        try:
+            from orchestrator.ann_pass import ann_fingerprint
+            fingerprint = ann_fingerprint(config["resolved_resources"])
+        except Exception:  # noqa: BLE001
+            fingerprint = None
+
+    # Mirror what generate_report actually does: prefer the tree keyed by this
+    # run's resource configuration, and fall back to everything under annb/ when
+    # that path does not exist -- which is the case for every run recorded
+    # before the fingerprint was introduced. Checking only the keyed path
+    # reported "recall will be lost" for legacy runs whose recall is right
+    # there.
+    annb_root = os.path.join(results_dir, "annb")
+    tree = None
+    narrowed = False
+    if resource_pass and fingerprint:
+        candidate = os.path.join(annb_root, resource_pass, fingerprint)
+        if os.path.isdir(candidate):
+            tree, narrowed = candidate, True
+    if tree is None:
+        tree = annb_root
+    tree_files = _count_hdf5(tree)
+
+    records = _records_summary(run_dir)
+    missing_datasets = sorted(
+        name for name in records["recall_datasets"]
+        if not os.path.isfile(os.path.join(datasets_dir, f"{name}.hdf5")))
+
+    measured_on = ((manifest.get("host") or {}).get("hostname") or "")
+    try:
+        elsewhere = bool(measured_on) and measured_on != socket.gethostname()
+    except OSError:
+        elsewhere = False
+
+    # Three outcomes, not two. Losing the recall section is the obvious one;
+    # quietly gaining someone else's is worse, and happens whenever the tree
+    # cannot be narrowed to this run's own configuration.
+    if narrowed:
+        risk, note = "none", ""
+    elif tree_files == 0 and records["recall"]:
+        risk = "loses_recall"
+        note = (f"This run's report has {records['recall']} recall measurements. "
+                f"They live in results/annb/, which is a sibling of the run "
+                f"directory and does not travel with it, and there are none on "
+                f"this machine. Regenerating would produce a report with the "
+                f"ops measurements and no recall curves.")
+    elif tree_files == 0:
+        risk, note = "none", ""
+    else:
+        risk = "unnarrowed"
+        note = (f"This run does not record which ann results are its own, so "
+                f"regenerating reads every ann result on this machine "
+                f"({tree_files} files) rather than only this run's. "
+                + (f"This run was measured on {measured_on}, not here, so those "
+                   f"are somebody else's measurements. "
+                   if elsewhere else "")
+                + "The report flags what it could not attribute in its Validity "
+                  "section.")
+
+    if missing_datasets and risk != "loses_recall":
+        note = (note + " " if note else "") + (
+            f"Ground truth is recomputed from the dataset files, and "
+            f"{', '.join(missing_datasets)} is not here, so those recall "
+            f"points would be skipped.")
+        risk = risk if risk != "none" else "missing_datasets"
+
+    return {
+        "ann_tree": tree,
+        "ann_tree_narrowed": narrowed,
+        "ann_results_present": tree_files,
+        "recall_records": records["recall"],
+        "recall_datasets": sorted(records["recall_datasets"]),
+        "missing_datasets": missing_datasets,
+        "measured_on": measured_on,
+        "measured_elsewhere": elsewhere,
+        "regenerate_risk": risk,
+        "regenerate_note": note,
+    }
+
+
+def _count_hdf5(path: str) -> int:
+    total = 0
+    for _root, _dirs, files in os.walk(path):
+        total += sum(1 for f in files if f.endswith(".hdf5"))
+    return total
+
+
+def _records_summary(run_dir: str) -> Dict[str, Any]:
+    path = os.path.join(run_dir, RECORDS_NAME)
+    recall = 0
+    datasets = set()
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '"recall_qps"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("phase") == "recall_qps":
+                    recall += 1
+                    if record.get("dataset"):
+                        datasets.add(str(record["dataset"]))
+    except OSError:
+        pass
+    return {"recall": recall, "recall_datasets": datasets}
 
 
 def resolve_run_dir(results_dir: str, run_id: str) -> Optional[str]:
