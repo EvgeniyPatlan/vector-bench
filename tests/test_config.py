@@ -860,6 +860,31 @@ class TestCleanup:
         assert cli.cmd_clean(args) == 0
 
 
+class TestFreshCheckoutBootstraps:
+    """A checkout where nothing has been built yet still has to work.
+
+    `sources/` exists as soon as any engine image has been built, which hid two
+    things: prepare-harness.sh wrote its provenance record into that directory
+    without creating it, and run-benchmark.sh did not run prepare-harness for
+    `generate` at all. Together they made `generate` on a new machine fail
+    telling you to run by hand the script the entrypoint exists to run for you.
+    """
+
+    def test_generate_prepares_the_working_copy(self):
+        source = open(os.path.join(VB_ROOT, "run-benchmark.sh")).read()
+        block = source.split("case \"${1:-}\" in")[1].split("esac")[0]
+        assert "prepare-harness.sh" in block
+        for command in ("run", "render", "generate"):
+            assert command in block.split(")")[0], \
+                f"{command} does not trigger prepare-harness"
+
+    def test_prepare_harness_creates_the_directory_it_writes_to(self):
+        source = open(os.path.join(VB_ROOT, "scripts", "prepare-harness.sh")).read()
+        creates = [line for line in source.splitlines()
+                   if line.startswith("mkdir -p") and "VB_SOURCES" in line]
+        assert creates, "sources/ is written to but never created"
+
+
 class TestHarnessIsolation:
     """The ops harness container mounts harness/ only.
 

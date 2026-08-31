@@ -82,7 +82,11 @@ fi
 # symlink at a bind-mount target resolves on the host side in ways that are
 # easy to get subtly wrong. Real directories make the mount unambiguous.
 mkdir -p "$WORKDIR/data" "$WORKDIR/results"
-mkdir -p "$VB_DATASETS" "$VB_RESULTS/annb"
+# $VB_SOURCES holds the provenance record written below. It exists as soon as
+# anything has been built, which is why this went unnoticed -- but on a checkout
+# where only the webui image was built it does not, and writing the record
+# failed with a bare FileNotFoundError.
+mkdir -p "$VB_DATASETS" "$VB_RESULTS/annb" "$VB_SOURCES"
 
 python3 - "$VB_SOURCES/annbench.source.json" "$ANNB_SHA" "$VB_REPO_ANNB" <<'PY'
 import json, sys
