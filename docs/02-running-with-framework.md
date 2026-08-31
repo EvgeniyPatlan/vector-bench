@@ -108,7 +108,10 @@ an interrupted run can resume without recomputing points it already has.
 
 Everything in the third column can be driven from
 [the web UI](08-web-ui.md) instead, which shows the command it is about to run
-before it runs it. The CLI remains the whole interface on a machine you have
+before it runs it. Its **Setup** page walks a fresh machine through the first
+three in order, and checks that every image agrees on `-march` — a mixed build
+compares compiler flags rather than implementations, and looks perfectly
+plausible in the report. The CLI remains the whole interface on a machine you have
 only SSH'd into.
 
 ### `run` options

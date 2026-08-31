@@ -17,6 +17,7 @@ const RUN_TABS = [
 // what shall it measure, what is it doing. "Control" as a grouping label told
 // you nothing about what was inside it.
 const SECTIONS = [
+  { id: "setup", label: "Setup" },
   { id: "status", label: "Status" },
   { id: "engines", label: "Engines" },
   { id: "datasets", label: "Datasets" },
@@ -188,7 +189,7 @@ function renderTabs() {
 
 // -- routing -----------------------------------------------------------
 
-const PANELS = ["status", "datasets", "overview", "explore", "report",
+const PANELS = ["setup", "status", "datasets", "overview", "explore", "report",
                 "profiles", "engines", "jobs"];
 
 function showPanel(name) {
@@ -217,6 +218,7 @@ function go(hash) {
 }
 
 const RENDERERS = {
+  setup: () => window.renderSetup(),
   status: () => window.renderStatus(),
   datasets: () => window.renderDatasets(),
   overview: () => window.renderOverview(),
@@ -230,7 +232,7 @@ const RENDERERS = {
 async function applyRoute() {
   const wanted = parseHash()
     || (S.runs.length ? { kind: "run", tab: "overview" }
-                      : { kind: "control", section: "status" });
+                      : { kind: "control", section: "setup" });
 
   if (wanted.kind === "control") {
     S.route = { ...S.route, kind: "control", section: wanted.section };

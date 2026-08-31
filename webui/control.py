@@ -137,6 +137,12 @@ def list_datasets(api: Api, _m, _q, _b=None) -> Response:
     }
 
 
+def setup_plan(api: Api, _m, _q, _b=None) -> Response:
+    from . import setup as setup_mod
+    return 200, {**setup_mod.plan(api.root, api.results_dir, api.datasets_dir),
+                 "control_enabled": api.allow_control}
+
+
 def status(api: Api, _m, _q, _b=None) -> Response:
     """Is this machine ready to measure, and if not what is missing.
 
@@ -321,6 +327,7 @@ ROUTES: List[Tuple[str, Any, Any]] = [
     ("POST", re.compile(r"^/api/engines/(?P<name>[^/]+)/validate$"), validate_engine),
     ("GET", re.compile(r"^/api/datasets$"), list_datasets),
     ("GET", re.compile(r"^/api/status$"), status),
+    ("GET", re.compile(r"^/api/setup$"), setup_plan),
     ("GET", re.compile(r"^/api/profiles$"), list_profiles),
     ("GET", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), get_profile),
     ("PUT", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), put_profile),

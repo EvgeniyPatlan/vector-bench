@@ -20,7 +20,7 @@ function engineTable() {
           NG.chosen = ev.target.checked
             ? [...new Set([...NG.chosen, e.name])]
             : NG.chosen.filter((n) => n !== e.name);
-          render();
+          renderEnginesBody();
         },
       })),
     el("td", { style: "cursor:pointer", onclick: () => openEngine(e.name) },
@@ -63,7 +63,7 @@ function buildSection() {
 
   box.append(el("div", { class: "row" },
     el("label", { class: "muted" }, "target ",
-      el("select", { onchange: (ev) => { NG.target = ev.target.value; render(); } },
+      el("select", { onchange: (ev) => { NG.target = ev.target.value; renderEnginesBody(); } },
         ...["all", "runtime", "bench"].map((t) =>
           el("option", { value: t, selected: t === NG.target }, t)))),
     el("label", { class: "muted" }, "-march ",
@@ -89,7 +89,7 @@ async function openEngine(name) {
   NG.name = name;
   NG.text = found.text;
   NG.dirty = false;
-  render();
+  renderEnginesBody();
 }
 
 async function addVariant() {
@@ -103,7 +103,7 @@ async function addVariant() {
     NG.name = res.name;
     NG.text = res.text;
     NG.dirty = true;
-    render();
+    renderEnginesBody();
   } catch (err) {
     status.append(el("span", { class: "err" }, String(err)));
   }
@@ -136,13 +136,13 @@ async function saveEngine() {
                                                 + "or:"),
                   el("pre", { class: "log cmd" }, res.next));
     await loadEngines();
-    render();
+    renderEnginesBody();
   } catch (err) {
     status.append(el("div", { class: "err" }, String(err)));
   }
 }
 
-function render() {
+function renderEnginesBody() {
   const panel = document.getElementById("panel-engines");
   const open = document.getElementById("engine-text");
   if (open) NG.text = open.value;
@@ -188,5 +188,5 @@ function render() {
 
 window.renderEngines = async function renderEngines() {
   if (!NG.engines.length) await loadEngines();
-  render();
+  renderEnginesBody();
 };

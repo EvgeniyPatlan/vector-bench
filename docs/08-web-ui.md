@@ -17,6 +17,7 @@ Stop it with Ctrl-C.
 ## Contents
 
 - [What it is for](#what-it-is-for)
+- [Getting a machine ready](#getting-a-machine-ready)
 - [Access model](#access-model)
 - [Reading results](#reading-results)
 - [Configuring and launching](#configuring-and-launching)
@@ -40,7 +41,8 @@ The UI adds:
 
 | Page | What it does | Command it runs |
 | --- | --- | --- |
-| **Status** | Whether this machine can measure yet: which images are built, which datasets are here, disk free — and a link to whatever is missing | — |
+| **Setup** | The ordered path from a fresh checkout to a number you can trust, doing each step from the page | `build`, `fetch`, `run` |
+| **Status** | The inventory: which images are built and with what `-march`, which datasets are here, disk free, what every page does | — |
 | **Engines** | Build images; add a variant of an engine family | `build` |
 | **Datasets** | Every corpus, its shape and whether it is here; download the published ones, generate the ones that are not published | `fetch`, `generate` |
 | **Profiles & launch** | Edit a profile with validation, see the ingest estimate, start a run | `run` |
@@ -53,6 +55,37 @@ Every button shows the command it is about to run, so the UI teaches the CLI
 rather than replacing it with something you cannot reproduce in a terminal.
 
 ---
+
+## Getting a machine ready
+
+**Setup** is four steps in the order you do them, each showing whether it is
+done and doing it from the page:
+
+1. **Build the engine images.** Lists every engine with its tag, whether its
+   bench image exists, and the `-march` it was built with. The original three
+   are selected by default and the rest are opt-in, for the same reason `build`
+   leaves them out of its own default: each is another image to compile or
+   another process to stand up, and a result does not need them.
+2. **Get a corpus.** Offers the smoke dataset — 217 MB, the smallest thing that
+   proves the pipeline on real data — and points at Datasets for the rest.
+3. **Prove the pipeline.** Runs the smoke profile, which exercises every stage
+   for every engine: images start, vector DDL is accepted, the index is actually
+   used, records are written and the report renders. It says so, but: do not
+   skip it.
+4. **Measure.** The smoke profile is a gate, not a measurement — its grids are
+   far too sparse to draw a curve from.
+
+### The `-march` guard
+
+Every engine compiles SIMD distance kernels, so building one with a different
+`-march` turns the benchmark into a comparison of compiler flags — and nothing
+about the resulting numbers looks wrong. Setup reads the value each image was
+actually built with from `sources/<engine>.image.json`, defaults the field to
+whatever the existing images agree on, and says so plainly if you change it or
+if the images already here disagree with each other.
+
+`native` is offered but is only correct when the machine building the images is
+also the machine running the benchmark.
 
 ## Access model
 

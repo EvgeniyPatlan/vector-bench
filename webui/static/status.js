@@ -7,26 +7,8 @@ window.renderStatus = async function renderStatus() {
 
   panel.append(el("h2", {}, "Status"));
 
-  const missingImages = st.engines.filter((e) => !e.bench_built);
-  const noDatasets = st.datasets_present.length === 0;
-  const freeGb = st.disk.free_bytes ? st.disk.free_bytes / 1024 ** 3 : null;
-
-  // What to do next, before the inventory. An engine list is only useful once
-  // you know whether you can measure anything with it.
-  const todo = [];
-  if (missingImages.length) {
-    todo.push([`${missingImages.length} engine image(s) not built`,
-               "Build them on the Engines page", "#/control/engines"]);
-  }
-  if (noDatasets) {
-    todo.push(["no datasets downloaded",
-               "Get one on the Datasets page", "#/control/datasets"]);
-  }
-  if (freeGb !== null && freeGb < 80) {
-    todo.push([`${freeGb.toFixed(0)} GB free`,
-               "A full run wants about 80 GB", null]);
-  }
-
+  // What to do about any of this lives on Setup. Two pages answering the same
+  // question is what made the old navigation hard to follow.
   if (st.active_job) {
     panel.append(el("div", { class: "warn" },
       `${st.active_job.kind || "job"} in progress: `,
@@ -34,17 +16,17 @@ window.renderStatus = async function renderStatus() {
       ` — ${st.active_job.command_display}`));
   }
 
-  if (todo.length) {
-    panel.append(el("h3", {}, "Before you can measure"));
-    for (const [what, hint, href] of todo) {
-      panel.append(el("div", { class: "warn" },
-        what + " — ",
-        href ? el("a", { href }, hint) : hint));
-    }
-  } else {
+  const setup = await api("/api/setup");
+  if (setup.ready) {
     panel.append(el("div", { class: "ready" },
-      "Ready to measure: every engine image is built and at least one dataset "
-      + "is here."));
+      "Ready to measure: every engine image is built, a corpus is here, and the "
+      + "smoke profile has passed."));
+  } else {
+    const pending = setup.steps.filter((s) => !s.done && s.id !== "measure");
+    panel.append(el("div", { class: "warn" },
+      `Not ready: ${pending.map((s) => s.title.toLowerCase()).join(", ")}. `,
+      el("a", { href: "#/control/setup" }, "Setup"),
+      " walks through it."));
   }
 
   panel.append(el("h3", {}, "Engines"));
@@ -81,11 +63,12 @@ window.renderStatus = async function renderStatus() {
       el("thead", {}, el("tr", {}, ...["page", "does", "command"]
         .map((h) => el("th", {}, h)))),
       el("tbody", {}, ...[
+        ["Setup", "get this machine ready, in order", "build, fetch, run"],
         ["Engines", "build images, add an engine variant", "build"],
-        ["Datasets", "download the HDF5 corpora", "fetch"],
+        ["Datasets", "download a corpus, or generate one", "fetch, generate"],
         ["Profiles & launch", "edit a profile, estimate cost, start a run", "run"],
         ["Jobs", "watch a running command, stop it", "—"],
-        ["Runs → Report", "regenerate a report", "report"],
+        ["Runs → Report", "regenerate, download, export a bundle", "report, export"],
       ].map(([page, does, cmd]) => el("tr", {},
         el("td", {}, page), el("td", {}, does),
         el("td", {}, el("code", {}, cmd === "—" ? "—" : `./run-benchmark.sh ${cmd}`)))))));

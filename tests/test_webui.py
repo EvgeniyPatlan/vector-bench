@@ -413,6 +413,29 @@ class TestFrontEndWiring:
         for src in re.findall(r'<script src="/([^"]+)"', self._read("index.html")):
             assert os.path.isfile(os.path.join(self.STATIC, src)), src
 
+    def test_no_two_scripts_declare_the_same_global(self):
+        """The static files share one global scope.
+
+        engines.js and setup.js both declared `function render()`, and the
+        later script silently replaced the earlier one's — so opening Engines
+        ran Setup's renderer against a null plan. Nothing about that looks like
+        a name clash when you read either file.
+        """
+        import glob
+        import re
+        from collections import defaultdict
+
+        seen = defaultdict(list)
+        for path in sorted(glob.glob(os.path.join(self.STATIC, "*.js"))):
+            source = open(path).read()
+            for name in re.findall(r"^(?:async\s+)?function\s+(\w+)", source, re.M):
+                seen[name].append(os.path.basename(path))
+            for name in re.findall(r"^const\s+(\w+)\s*=", source, re.M):
+                seen[name].append(os.path.basename(path))
+
+        clashes = {n: f for n, f in seen.items() if len(f) > 1}
+        assert not clashes, f"top-level names declared twice: {clashes}"
+
     def test_setup_comes_before_runs_in_the_sidebar(self):
         """Configuration is what you reach for first; results are the archive."""
         page = self._read("index.html")
