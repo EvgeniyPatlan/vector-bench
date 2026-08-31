@@ -110,6 +110,49 @@ SSH is the authentication. A `Host` header allowlist also rejects anything that
 is not localhost, so a hostile page in your browser cannot reach it by DNS
 rebinding.
 
+### Shared — letting colleagues at it by IP
+
+`--host 0.0.0.0` binds every interface, and the startup line then prints the
+address to hand out rather than the useless `0.0.0.0`:
+
+```bash
+./run-benchmark.sh web --host 0.0.0.0 --port 8085
+```
+```
+  http://192.168.50.227:8085   (share this one)
+  http://127.0.0.1:8085   (on this machine)
+```
+
+Auth turns itself on, so everyone needs the password. **Give them a read-only
+instance.** `--allow-control` hands whoever signs in the ability to start a
+two-day run, and, through the Docker socket, effective root on the benchmark
+host. Sharing results does not need any of that.
+
+Two instances is the arrangement worth copying — different ports, different
+passwords, and the control one never leaves the machine:
+
+```bash
+# yours: control, loopback only, reached over an SSH tunnel
+VB_WEB_PASSWORD=… ./run-benchmark.sh web --allow-control --auth --port 8080
+
+# theirs: read-only, on the network
+VB_WEB_PASSWORD=… ./run-benchmark.sh web --host 0.0.0.0 --port 8085
+```
+
+A password set on one is not accepted by the other, and the control instance is
+not reachable on the machine's LAN address at all.
+
+> **Plain HTTP means the password crosses in cleartext**, and so does the
+> session cookie, which is as good as the password to anyone who captures it.
+> On a LAN you already trust that may be a fair trade for a read-only view. It
+> is not one for `--allow-control`, and the server says so at startup.
+>
+> For TLS without a public DNS name — which is the usual case for an IP on a
+> LAN — the practical options are a private network that encrypts for you
+> (WireGuard, Tailscale, which also gives the machine a name), or Caddy with
+> `tls internal`, whose certificate every viewer must be told to trust. Caddy
+> with a real certificate needs a real hostname; see below.
+
 ### Remote — password plus TLS
 
 **Binding a non-loopback address turns auth on by itself.** `--host 0.0.0.0`

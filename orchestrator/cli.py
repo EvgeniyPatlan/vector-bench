@@ -977,6 +977,21 @@ def _webui_reachable_host(host: str) -> str:
     return "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
 
 
+def _outbound_address() -> Optional[str]:
+    """This machine's address on the network it routes through.
+
+    Opening a UDP socket to a documentation address asks the routing table
+    which interface would be used; nothing is sent and nothing listens there.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("192.0.2.1", 1))  # TEST-NET-1, RFC 5737
+            return probe.getsockname()[0]
+    except OSError:
+        return None
+
+
 def _port_holder(host: str, port: int) -> Optional[str]:
     """A description of what holds this port, or None if it is free.
 
@@ -1096,7 +1111,18 @@ def cmd_web(args: argparse.Namespace) -> int:
         deadline = time.time() + 30
         while time.time() < deadline and not ready.is_set():
             if _webui_responds(args.host, args.port):
-                print(f"\n  {url}")
+                # "http://0.0.0.0:8085" is not an address anyone can open.
+                # Bound to everything means the useful answer is the address
+                # other machines would actually type.
+                if args.host in ("0.0.0.0", "", "::"):
+                    outbound = _outbound_address()
+                    if outbound:
+                        print(f"\n  {scheme}://{outbound}:{args.port}"
+                              f"   (share this one)")
+                    print(f"  {scheme}://127.0.0.1:{args.port}"
+                          f"   (on this machine)")
+                else:
+                    print(f"\n  {url}")
                 if not args.allow_control:
                     print("  read-only; add --allow-control to edit profiles "
                           "and launch runs")
