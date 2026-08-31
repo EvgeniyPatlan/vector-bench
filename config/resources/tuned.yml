@@ -86,3 +86,30 @@ extras:
   # sweeps it for both. The normalized pass pins both, because MariaDB and
   # AliSQL still have no equivalent.
   valkey_ef_construction: [64, 200, 400]
+  # Graph degree, swept only where it is the engine's sole build knob.
+  #
+  # At M=16 the lowest query effort MHNSW and VIDX offer already returns recall
+  # 0.94-0.98, so all three had no measurement anywhere near the 0.90 floor the
+  # headline table reports at, while pgvector and Valkey -- which have
+  # ef_construction as well -- reach 0.76. The m-sweep of 2026-08-28 measured
+  # what each M actually reaches at 90,000 rows:
+  #
+  #            M=6     M=8     M=16
+  #   mariadb     0.815   0.891   0.949
+  #   mariadb123  0.818   0.909   0.976
+  #   alisql      0.736   0.875   0.964
+  #
+  # M=8 would leave MariaDB 12.3 at 0.909, still above the floor and still
+  # daggered. M=6 puts all three around 0.82 and its ef sweep runs up to 0.98,
+  # so one extra value covers the 0.90 and 0.95 floors with real points.
+  #
+  # Recall at fixed M barely moves with corpus size -- M=16 differs by at most
+  # 0.014 between 90,000 and 990,000 rows -- so the mapping above transfers.
+  #
+  # It costs a full incremental reload per engine: about 16 hours for the three
+  # together, and nothing for the other three, which is the point of doing it
+  # per engine rather than globally.
+  m_values_by_engine:
+    mariadb: [6, 16]
+    mariadb123: [6, 16]
+    alisql: [6, 16]
