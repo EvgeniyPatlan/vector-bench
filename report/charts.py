@@ -51,28 +51,24 @@ def style_for(engine: str) -> Dict[str, Any]:
 # one engine that differ on either are different curves, not repeats of one:
 # grouping a chart by engine name alone put several points at every x and drew
 # a line through all of them that no configuration ever produced.
-# What separates one plotted line from another, beyond the engine itself.
+# Fallback axes, for records that arrive without a source file -- a report
+# rebuilt with --from-records from an archive, for instance.
 #
-# `m` belongs here and was missing. Every engine swept a single graph degree
-# until MHNSW and VIDX were given M=6 as well, so that they would have real
-# measurements below recall 0.90 -- and then two configurations of the same
-# engine were drawn as one line. On the latency chart, which plots against
-# ef_search, that put two y-values at every x and joined them: AliSQL appeared
-# to swing between 383 ms and 95 ms and back to 370 ms at adjacent search
-# widths. The Pareto chart was unaffected, because it takes a frontier across
-# every configuration an engine was swept over, which is what it should do.
+# Listing the axes by hand has now failed three times. It missed storage engine
+# and ef_construction, then graph degree, and then quantization: two Percona
+# Search curves were drawn as one line and came out as a sawtooth. Each time
+# the fix was to add the axis that had just been added to the sweep, and each
+# time the next axis was already waiting. So identity comes from the result
+# filename now, which ann-benchmarks names after the build arguments and which
+# therefore covers axes this code has never heard of.
 SERIES_AXES = ("storage_engine", "ef_construction", "m")
 
-# How each axis names itself in a legend. Empty means the value speaks for
-# itself, as a storage engine does. Everything else needs saying: an M=6 curve
-# labelled "ef_c=6" is worse than one labelled nothing at all.
+# How each fallback axis names itself in a legend. Empty means the value speaks
+# for itself, as a storage engine does.
 AXIS_LABELS = {"storage_engine": "", "ef_construction": "ef_c=", "m": "M="}
 
-# Length of a series key: the engine plus one slot per axis. churn_impact
-# builds a wider key and then slices it back, and it did that with the
-# literal 3 -- so adding `m` to SERIES_AXES shifted every index under it and
-# the lookup stopped matching anything at all.
-SERIES_KEY_WIDTH = 1 + len(SERIES_AXES)
+# (engine, configuration). churn_impact widens this and slices it back.
+SERIES_KEY_WIDTH = 2
 
 # Colour stays with the engine so versions remain comparable at a glance; the
 # storage engine is carried by the linestyle instead.
@@ -80,33 +76,72 @@ STORAGE_LINESTYLES = ("-", "--", ":", "-.")
 
 
 def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    """Identity of one plotted line."""
-    return (record.get("engine"),) + tuple(record.get(a) for a in SERIES_AXES)
+    """Identity of one plotted line: the engine, and which build it came from."""
+    from .loaders import build_signature
+    # The whole signature, not its last element: the filename branch ends in
+    # the build stem, but the column fallback ends in one field, and taking
+    # [-1] blindly collapsed every fallback record into a single series.
+    return (record.get("engine"), build_signature(record))
+
+
+def _config_tokens(record: Dict[str, Any]) -> Optional[List[str]]:
+    """The build configuration as ann-benchmarks spelled it in the filename.
+
+    `angular_M_16_quantization_scalar` -> [angular, M, 16, quantization, scalar]
+    """
+    from .loaders import build_signature
+    signature = build_signature(record)
+    if signature[0] != "file":
+        return None
+    return str(signature[-1]).split("_")
 
 
 def series_labels(records: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
-    """Legend text per series, naming only the axes that actually vary.
+    """Legend text per series, naming only what actually varies.
 
-    An engine swept over one value keeps its bare label: AliSQL is InnoDB-only
-    and only pgvector exposes ef_construction, so naming either there would
-    imply a comparison the run did not make.
+    An engine swept over one configuration keeps its bare label: naming an axis
+    the run did not sweep implies a comparison it did not make.
+
+    Where the records carry a result filename, the varying part is found by
+    comparing those filenames token by token within one engine, so a new build
+    knob names itself without this code being taught about it. The token before
+    the one that differs is its name -- `..._quantization_scalar` against
+    `..._quantization_none` gives `quantization=scalar`.
     """
-    varying: Dict[str, List[set]] = {}
+    per_engine: Dict[Any, List[Dict[str, Any]]] = {}
     for r in records:
-        seen = varying.setdefault(r.get("engine"), [set() for _ in SERIES_AXES])
-        for i, axis in enumerate(SERIES_AXES):
-            seen[i].add(r.get(axis))
+        per_engine.setdefault(r.get("engine"), []).append(r)
 
-    labels = {}
-    for r in records:
-        key = series_key(r)
-        label = style_for(key[0])["label"]
-        for i, axis in enumerate(SERIES_AXES):
-            value = key[i + 1]
-            if value is not None and len(varying[key[0]][i]) > 1:
-                label += f" / {AXIS_LABELS[axis]}{value}" if AXIS_LABELS[axis] \
-                    else f" / {value}"
-        labels[key] = label
+    labels: Dict[Tuple[Any, ...], str] = {}
+    for engine, rows in per_engine.items():
+        base = style_for(engine)["label"]
+        tokenised = {series_key(r): _config_tokens(r) for r in rows}
+        usable = [t for t in tokenised.values() if t]
+        widths = {len(t) for t in usable}
+
+        if len(usable) == len(tokenised) and len(widths) == 1 and len(usable) > 1:
+            differing = [i for i in range(widths.pop())
+                         if len({tuple(t)[i] for t in usable}) > 1]
+            for key, tokens in tokenised.items():
+                parts = [f"{tokens[i - 1]}={tokens[i]}" if i else tokens[i]
+                         for i in differing]
+                labels[key] = base + (" / " + " / ".join(parts) if parts else "")
+            continue
+
+        # No filenames, or filenames that cannot be compared: fall back to the
+        # named axes, which is all a --from-records rebuild has.
+        varying = [set() for _ in SERIES_AXES]
+        for r in rows:
+            for i, axis in enumerate(SERIES_AXES):
+                varying[i].add(r.get(axis))
+        for r in rows:
+            label = base
+            for i, axis in enumerate(SERIES_AXES):
+                value = r.get(axis)
+                if value is not None and len(varying[i]) > 1:
+                    label += (f" / {AXIS_LABELS[axis]}{value}"
+                              if AXIS_LABELS[axis] else f" / {value}")
+            labels[series_key(r)] = label
     return labels
 
 
@@ -143,13 +178,14 @@ def _grouped(records: List[Dict[str, Any]]
         groups.setdefault(series_key(r), []).append(r)
     per_engine: Dict[str, List[Optional[str]]] = {}
     degrees: Dict[str, List[Optional[int]]] = {}
-    for key in groups:
+    for key, rows_in in groups.items():
+        sample = rows_in[0]
         storages = per_engine.setdefault(key[0], [])
-        if key[1] not in storages:
-            storages.append(key[1])
+        if sample.get("storage_engine") not in storages:
+            storages.append(sample.get("storage_engine"))
         ms = degrees.setdefault(key[0], [])
-        if key[3] not in ms:
-            ms.append(key[3])
+        if sample.get("m") not in ms:
+            ms.append(sample.get("m"))
     for v in list(per_engine.values()) + list(degrees.values()):
         v.sort(key=lambda x: (x is None, x))
     return groups, series_labels(records), per_engine, degrees
@@ -726,11 +762,19 @@ def pass_comparison(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
 def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
                         out_dir: str, stem: str) -> Optional[Dict[str, str]]:
-    """p50 / p95 / p99 against search width.
+    """p50 and p99 against search width, one panel per engine.
 
     Mean latency hides the tail, and the tail is what a service-level objective
     is written against. An engine with a good p50 and a bad p99 is a different
     proposition from one with both merely acceptable.
+
+    One panel each, rather than everything on one axis. Two things made the
+    single-axis version unreadable and they compound: the sweep grew to a dozen
+    series once graph degree and ef_construction were both being varied, and
+    AliSQL's cliff put 384 ms on the same linear scale as Valkey's 0.7 ms, so
+    five engines were pressed flat against the floor. Panels fix the crowding
+    and a shared log scale fixes the range, while still letting a reader
+    compare across panels -- which a per-engine y-scale would not.
     """
     plotted_records = [r for r in records
                        if r.get("phase") == "recall_qps" and r.get("dataset") == dataset
@@ -739,34 +783,73 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
         return None
     by_series, labels, storages, degrees = _grouped(plotted_records)
 
-    fig, ax = _new_axes(
-        f"Query latency distribution — {dataset}",
-        "ef_search  (search width)",
-        "Latency (ms)  (lower is better ↓)", figsize=(9.5, 5.4),
-    )
-    ax.set_xscale("log", base=2)
+    engines = sorted({key[0] for key in by_series})
+    columns = min(3, len(engines))
+    rows_count = (len(engines) + columns - 1) // columns
+    fig, axes = plt.subplots(rows_count, columns, sharex=True, sharey=True,
+                             figsize=(4.4 * columns, 3.1 * rows_count))
+    fig.patch.set_alpha(0.0)
+    axes = list(axes.ravel()) if hasattr(axes, "ravel") else [axes]
 
-    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
-        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
-        rows = sorted(rows, key=lambda r: r["ef_search"])
-        ef = [r["ef_search"] for r in rows]
-        p50 = [r.get("latency_p50_ms") for r in rows]
-        p99 = [r.get("latency_p99_ms") for r in rows]
-        # Band between p50 and p99 makes the spread visible at a glance; the
-        # solid line is p50 so the medians stay comparable across engines.
-        ax.fill_between(ef, p50, p99, color=style["color"], alpha=0.13, linewidth=0)
-        ax.plot(ef, p50, color=style["color"], marker=style["marker"],
-                linestyle=style["linestyle"], linewidth=1.9, markersize=5,
-                label=f"{labels[key]} p50")
-        ax.plot(ef, p99, color=style["color"], linestyle=":", linewidth=1.2,
-                alpha=0.85)
+    values = [v for r in plotted_records
+              for v in (r.get("latency_p50_ms"), r.get("latency_p99_ms"))
+              if v]
+    low = max(0.1, min(values) * 0.7)
+    high = max(values) * 1.4
 
-    ax.legend(frameon=False, fontsize=9)
-    ax.text(0.99, 0.02, "shaded band = p50 to p99;  dotted = p99",
-            transform=ax.transAxes, ha="right", va="bottom",
-            fontsize=8, color="#888888")
+    for index, engine in enumerate(engines):
+        ax = axes[index]
+        ax.patch.set_alpha(0.0)
+        ax.set_xscale("log", base=2)
+        ax.set_yscale("log")
+        ax.set_ylim(low, high)
+        ax.set_title(style_for(engine)["label"], fontsize=10.5, pad=6)
+        ax.grid(True, which="major", alpha=0.25, linewidth=0.6)
+
+        for key, series_rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+            if key[0] != engine:
+                continue
+            style = series_style(series_rows[0], storages.get(engine),
+                                 degrees.get(engine))
+            series_rows = sorted(series_rows, key=lambda r: r["ef_search"])
+            ef = [r["ef_search"] for r in series_rows]
+            p50 = [r.get("latency_p50_ms") for r in series_rows]
+            p99 = [r.get("latency_p99_ms") for r in series_rows]
+            # Band between p50 and p99 makes the spread visible at a glance;
+            # the solid line is p50 so the medians stay comparable.
+            ax.fill_between(ef, p50, p99, color=style["color"],
+                            alpha=0.13, linewidth=0)
+            # The engine is the panel, so within it the label names only what
+            # varies -- the graph degree, or the build-quality setting.
+            within = labels[key]
+            within = within.split(" / ", 1)[1] if " / " in within else None
+            ax.plot(ef, p50, color=style["color"], marker=style["marker"],
+                    linestyle=style["linestyle"],
+                    linewidth=style.get("linewidth", 1.9),
+                    alpha=style.get("alpha", 1.0), markersize=4,
+                    label=within)
+            ax.plot(ef, p99, color=style["color"], linestyle=":",
+                    linewidth=1.1, alpha=0.8 * style.get("alpha", 1.0))
+
+        if any(l.get_label() and not l.get_label().startswith("_")
+               for l in ax.get_lines()):
+            ax.legend(frameon=False, fontsize=8, loc="upper left")
+
+    for spare in axes[len(engines):]:
+        spare.set_visible(False)
+
+    for index, ax in enumerate(axes[:len(engines)]):
+        if index >= len(engines) - columns:
+            ax.set_xlabel("ef_search  (search width)", fontsize=9.5)
+        if index % columns == 0:
+            ax.set_ylabel("Latency (ms)  ↓", fontsize=9.5)
+
+    fig.suptitle(f"Query latency distribution — {dataset}", fontsize=13)
+    fig.text(0.99, 0.005, "solid = p50;  dotted = p99;  shaded = the span "
+             "between them.  Log scale, shared across panels.",
+             ha="right", va="bottom", fontsize=8, color="#888888")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
     return _save(fig, out_dir, stem)
-
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -880,7 +963,7 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     labels = series_labels(churn_records)
     storages: Dict[str, List[Optional[str]]] = {}
     for key in {series_key(r) for r in churn_records}:
-        storages.setdefault(key[0], []).append(key[1])
+        storages.setdefault(key[0], []).append(None)
     for v in storages.values():
         v.sort(key=lambda x: (x is None, x))
 

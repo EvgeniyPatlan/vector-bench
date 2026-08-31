@@ -1567,7 +1567,18 @@ class TestStorageEngineIsNeverCollapsed:
                 + self._pair("churn", churn_fraction=0.1, qps=0))
         for r, qps in zip(rows, (148.0, 137.0, 23.0, 132.0)):
             r["qps"] = qps
-        retained = {k[1]: v for k, v in churn_retention(rows, "d").items()}
+        # Keyed by series identity, whose shape is not this test's business:
+        # map back through the records to find which curve is which.
+        from report.charts import series_key
+        by_storage = {}
+        for r in rows:
+            if (r.get("churn_fraction") or 0) == 0:
+                continue
+            key = series_key(r) + (r.get("resource_pass"), r.get("build_mode"))
+            by_storage[r["storage_engine"]] = key
+        result = churn_retention(rows, "d")
+        assert len(result) == 2, "one baseline per storage engine"
+        retained = {name: result[key] for name, key in by_storage.items()}
         assert round(retained["InnoDB"][0][1], 2) == 0.16
         assert round(retained["MyISAM"][0][1], 2) == 0.96
 
@@ -4595,11 +4606,11 @@ class TestTwoGraphDegreesAreTwoLines:
         assert (sparse["alpha"], sparse["linewidth"]) != \
                (dense.get("alpha"), dense["linewidth"])
 
-    def test_the_key_width_is_derived_not_written_down(self):
+    def test_the_key_width_matches_the_key(self):
         """churn_impact builds a wider key and slices it back, and it did that
-        with a literal 3 -- so adding an axis shifted every index under it."""
-        from report.charts import SERIES_AXES, SERIES_KEY_WIDTH
-        assert SERIES_KEY_WIDTH == 1 + len(SERIES_AXES)
+        with a literal 3 -- so changing the key shifted every index under it."""
+        from report.charts import SERIES_KEY_WIDTH, series_key
+        assert SERIES_KEY_WIDTH == len(series_key({"engine": "e"}))
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
         block = source.split("def churn_impact")[1]
         assert "key[:3]" not in block
@@ -4782,4 +4793,116 @@ class TestMemoryChartsCompareShapesNotClocks:
     def test_the_renderer_shows_both(self):
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         assert 'stem.startswith("memory-timeline")' in source
+
+
+class TestASweepAxisNamesItselfWithoutBeingTaught:
+    """Listing the plotted axes by hand has failed three times. It missed
+    storage engine and ef_construction, then graph degree, and then
+    quantization -- two Percona Search curves drawn as one line, which showed
+    up as a sawtooth on the latency chart. Each fix added the axis that had
+    just been added to the sweep, and each time the next one was already
+    waiting. Identity comes from the result filename now, which ann-benchmarks
+    names after the build arguments."""
+
+    def _rows(self, engine, stems):
+        return [{"phase": "recall_qps", "engine": engine, "dataset": "d",
+                 "ef_search": ef, "qps": 100.0, "recall_at_k": 0.9,
+                 "latency_p50_ms": 5.0, "latency_p99_ms": 9.0,
+                 "extra": {"source_file": f"d/10/{engine}/{stem}_{ef}.hdf5"}}
+                for stem in stems for ef in (10, 20)]
+
+    def test_quantization_separates_curves_without_being_named(self):
+        """It is not a column on the record at all -- it exists only in the
+        filename."""
+        from report.charts import _grouped
+        rows = self._rows("mongodb", ["angular_M_16_quantization_none",
+                                      "angular_M_16_quantization_scalar"])
+        groups, labels, _s, _d = _grouped(rows)
+        assert len(groups) == 2
+        assert any("quantization=scalar" in l for l in labels.values())
+
+    def test_an_axis_this_code_has_never_heard_of_still_works(self):
+        from report.charts import series_labels
+        rows = self._rows("future", ["angular_M_16_someNewKnob_a",
+                                     "angular_M_16_someNewKnob_b"])
+        labels = set(series_labels(rows).values())
+        assert any("someNewKnob=a" in l for l in labels)
+        assert any("someNewKnob=b" in l for l in labels)
+
+    def test_only_the_varying_part_is_named(self):
+        """Naming an axis the run did not sweep implies a comparison it did
+        not make. M is identical in both stems below."""
+        from report.charts import series_labels
+        rows = self._rows("mongodb", ["angular_M_16_quantization_none",
+                                      "angular_M_16_quantization_scalar"])
+        assert not any("M=" in l for l in series_labels(rows).values())
+
+    def test_one_configuration_keeps_a_bare_label(self):
+        from report.charts import series_labels
+        rows = self._rows("alisql", ["angular_M_16_engine_InnoDB"])
+        assert set(series_labels(rows).values()) == {"AliSQL (VIDX)"}
+
+    def test_records_without_a_filename_fall_back_to_named_axes(self):
+        """A report rebuilt with --from-records from an archive has no
+        filenames, and must still split on what it does have."""
+        from report.charts import _grouped
+        rows = [{"phase": "recall_qps", "engine": "pgvector", "dataset": "d",
+                 "ef_search": 10, "qps": 1.0, "recall_at_k": 0.9,
+                 "ef_construction": efc, "m": 16}
+                for efc in (64, 400)]
+        groups, labels, _s, _d = _grouped(rows)
+        assert len(groups) == 2
+        assert any("ef_c=64" in l for l in labels.values())
+
+
+class TestTheLatencyChartIsOnePanelPerEngine:
+    """A dozen series on one axis, with AliSQL's 384 ms cliff on the same
+    linear scale as Valkey's 0.7 ms, pressed five engines flat against the
+    floor."""
+
+    def _rows(self):
+        rows = []
+        for engine, ms in (("alisql", 380.0), ("valkey", 0.7)):
+            for ef in (10, 100, 800):
+                rows.append({"phase": "recall_qps", "engine": engine,
+                             "dataset": "d", "ef_search": ef, "qps": 10.0,
+                             "recall_at_k": 0.9, "latency_p50_ms": ms,
+                             "latency_p99_ms": ms * 1.5})
+        return rows
+
+    def _figure(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+        from report import charts
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["fig"] = fig
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.latency_percentiles(self._rows(), "d", d, "t")
+        finally:
+            charts._save = original
+        return captured["fig"]
+
+    def test_one_visible_panel_per_engine(self):
+        fig = self._figure()
+        assert len([a for a in fig.axes if a.get_visible()]) == 2
+
+    def test_the_scale_is_logarithmic(self):
+        """Otherwise 0.7 ms and 384 ms cannot share an axis."""
+        for ax in self._figure().axes:
+            if ax.get_visible():
+                assert ax.get_yscale() == "log"
+
+    def test_the_panels_share_a_scale(self):
+        """A per-panel scale would make every engine look the same shape."""
+        limits = {ax.get_ylim() for ax in self._figure().axes if ax.get_visible()}
+        assert len(limits) == 1
 
