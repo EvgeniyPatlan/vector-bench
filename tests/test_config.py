@@ -25,6 +25,24 @@ from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources, resolve_resources,
                                  server_args)
 
+# Charts are drawn inside a bench image, which carries matplotlib; the host is
+# promised nothing beyond python3 and PyYAML. A test that renders one therefore
+# skips on a machine set up from the documented prerequisites, rather than
+# failing there and making a clean install look broken.
+def _can_draw() -> bool:
+    """Whether a chart can actually be drawn, not whether a file is on the path.
+
+    find_spec() answers the second question, and a matplotlib that is present
+    but unimportable would pass it and then fail the test anyway.
+    """
+    from report.charts import have_matplotlib
+    return have_matplotlib()
+
+
+needs_matplotlib = pytest.mark.skipif(
+    not _can_draw(),
+    reason="draws a chart; matplotlib lives in the bench images, not on the host")
+
 ENGINES = ("mariadb", "alisql", "pgvector")
 PROFILES = ("smoke", "quick", "full")
 PASSES = ("normalized", "tuned")
@@ -4368,9 +4386,11 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
             plt.close("all")
         return captured["ax"]
 
+    @needs_matplotlib
     def test_the_axis_is_logit(self):
         assert self._axes().get_xscale() == "logit"
 
+    @needs_matplotlib
     def test_the_highest_point_is_inside_the_axis(self):
         """A logit axis cannot reach 1.0, and a right edge sitting on the best
         measurement clips the marker that matters most."""
@@ -4378,6 +4398,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         assert ax.get_xlim()[1] > 0.9996
         assert ax.get_xlim()[1] < 1.0
 
+    @needs_matplotlib
     def test_a_high_recall_engine_gets_real_width(self):
         """The complaint this fixes: MariaDB 12.3 spanning a sliver."""
         ax = self._axes()
@@ -4389,6 +4410,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         share = (engine[1] - engine[0]) / (span[1] - span[0])
         assert share > 0.30, f"only {share:.0%} of the axis"
 
+    @needs_matplotlib
     def test_the_ticks_are_readable_recall_values(self):
         """Logit's default labels are 1-10^-n, which nobody reads as recall."""
         ax = self._axes()
@@ -4396,6 +4418,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         assert "0.99" in labels
         assert not any("10" in l and "^" in l for l in labels)
 
+    @needs_matplotlib
     def test_the_floor_still_narrows_the_view(self):
         assert self._axes(recall_floor=0.95).get_xlim()[0] == 0.95
 
@@ -4670,6 +4693,7 @@ class TestTwoGraphDegreesAreTwoLines:
         assert "key[:3]" not in block
         assert "key[3]" not in block
 
+    @needs_matplotlib
     def test_churn_still_renders_with_the_wider_key(self):
         import tempfile
         import matplotlib
@@ -4817,17 +4841,20 @@ class TestMemoryChartsCompareShapesNotClocks:
             plt.close("all")
         return captured.get("ax")
 
+    @needs_matplotlib
     def test_every_measurement_starts_at_zero(self):
         ax = self._axis(phase="ann")
         for line in ax.get_lines():
             assert min(line.get_xdata()) < 1.0
 
+    @needs_matplotlib
     def test_the_axis_is_not_mostly_empty(self):
         """The second measurement is five days later in wall clock; the axis
         must span one measurement, not the gap between two."""
         ax = self._axis(phase="ann")
         assert ax.get_xlim()[1] < 1000, "axis still spans the wall-clock gap"
 
+    @needs_matplotlib
     def test_the_phases_are_separate_charts(self):
         """The ann phase loads a corpus and sweeps a grid; ops loads it again
         and runs four workloads. Different durations, different questions."""
@@ -4836,6 +4863,7 @@ class TestMemoryChartsCompareShapesNotClocks:
         assert any("ann" in str(l) for l in ann)
         assert not any("ann" in str(l) for l in ops)
 
+    @needs_matplotlib
     def test_a_repeated_phase_says_so_in_the_legend(self):
         labels = [str(l.get_label()) for l in self._axis(phase="ann").get_lines()]
         assert any("2 measurements" in l for l in labels)

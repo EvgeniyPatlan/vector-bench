@@ -47,6 +47,12 @@ Host requirements are deliberately only `docker`, `python3`, `pyyaml`, `git`, `c
 add a host-side Python dependency: a benchmark framework must not modify the machine it
 measures. Everything heavy (numpy, h5py, matplotlib, DB clients) lives inside the images.
 
+**That constraint binds the test suite too.** `report/charts.py` guards its matplotlib import
+and `_new_axes()` refuses loudly if it is missing, so `report.generate`'s pure-logic helpers
+stay importable on a bare host; the dozen tests that actually render are marked
+`@needs_matplotlib` and skip. A test that fails on a machine set up from the documented
+prerequisites makes a correct install look broken — which is exactly what happened.
+
 ## Architecture
 
 Two measurement paths converge on **one flat record schema** (`harness/metrics/records.py`,

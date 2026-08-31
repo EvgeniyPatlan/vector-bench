@@ -165,6 +165,11 @@ python3 -m pytest tests/ -q                     # 777 unit tests, ~30 s
 ./run-benchmark.sh run --profile smoke          # ~45 min/pass, every engine
 ```
 
+A dozen of those tests draw a chart and skip unless matplotlib is installed.
+That is expected: matplotlib lives in the bench images, not on the host, and
+this framework does not put a scientific Python stack on the machine it
+measures. Skipped is the right outcome; failed would not be.
+
 **Do not skip the smoke profile.** It exercises every stage end to end and is
 far cheaper than discovering a broken image eight hours into a full run.
 

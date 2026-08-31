@@ -18,10 +18,40 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.ticker import FuncFormatter  # noqa: E402
+# matplotlib is a container dependency, not a host one. Charts are drawn inside
+# a bench image, which carries it; the host is promised nothing beyond python3
+# and PyYAML, and importing this module must not quietly break that promise.
+# It does get imported on the host: the test suite reaches report.generate for
+# its pure-logic helpers, and on a machine set up from the documented
+# prerequisites that failed with ModuleNotFoundError seventy-six times.
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: E402
+    from matplotlib.ticker import FuncFormatter  # noqa: E402
+except ImportError:  # pragma: no cover - every bench image has it
+    matplotlib = None
+    plt = None
+    FuncFormatter = None
+
+
+def have_matplotlib() -> bool:
+    return plt is not None
+
+
+def _require_matplotlib() -> None:
+    """Refuse to draw rather than draw nothing.
+
+    A report that came out with its charts silently missing would be worse than
+    one that did not come out, which is the same reasoning that makes the
+    generator refuse a run directory with no manifest.
+    """
+    if plt is None:
+        raise RuntimeError(
+            "matplotlib is not installed, so no chart can be drawn. Charts are "
+            "generated inside a bench image which carries it: run "
+            "`./run-benchmark.sh report --run-dir ...` rather than invoking "
+            "report/generate.py on the host.")
 
 # Engine identity is consistent across every chart in the report. Colour is never
 # the only channel: each engine also gets a marker and a line style, so the
@@ -184,6 +214,8 @@ def _grouped(records: List[Dict[str, Any]]
 
 def _new_axes(title: str, xlabel: str, ylabel: str,
               figsize: Tuple[float, float] = (9, 5.5)):
+    # Every chart starts here, so this is the one place that has to check.
+    _require_matplotlib()
     fig, ax = plt.subplots(figsize=figsize)
     fig.patch.set_alpha(0.0)
     ax.patch.set_alpha(0.0)
