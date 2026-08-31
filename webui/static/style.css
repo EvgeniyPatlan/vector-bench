@@ -24,6 +24,8 @@
 }
 
 * { box-sizing: border-box; }
+/* Collapsing is done by setting the attribute; nothing may out-specify it. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -56,6 +58,20 @@ body {
   font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em;
   color: var(--muted); font-weight: 600; margin: 0 0 7px 3px;
 }
+button.side-head.toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  background: none; border: 0; padding: 2px 3px; cursor: pointer;
+  font-family: inherit; text-align: left;
+}
+button.side-head.toggle:hover { color: var(--ink); }
+button.side-head.toggle .caret { transition: transform .12s ease; font-size: 9px; }
+.side-group.collapsed button.side-head.toggle .caret { transform: rotate(-90deg); }
+button.side-head.toggle .count {
+  margin-left: auto; font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line); border-radius: 999px; padding: 0 6px;
+  letter-spacing: 0; font-size: 10px;
+}
+.side-group.collapsed { margin-bottom: 0; }
 #run-filter {
   width: 100%; padding: 6px 9px; font: inherit; margin-bottom: 8px;
   border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink);

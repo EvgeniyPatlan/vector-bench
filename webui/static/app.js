@@ -92,6 +92,30 @@ function fmtValue(field, v) {
 
 // -- sidebar -----------------------------------------------------------
 
+const RUNS_COLLAPSED_KEY = "vb.runs.collapsed";
+
+function runsCollapsed() {
+  try {
+    return window.localStorage.getItem(RUNS_COLLAPSED_KEY) === "1";
+  } catch (err) {
+    // Private windows and blocked site data throw on access, not on read.
+    return false;
+  }
+}
+
+function setRunsCollapsed(collapsed) {
+  const group = document.getElementById("runs-group");
+  const toggle = document.getElementById("runs-toggle");
+  group.classList.toggle("collapsed", collapsed);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  document.getElementById("runs-body").hidden = collapsed;
+  try {
+    window.localStorage.setItem(RUNS_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch (err) {
+    // Remembering the choice is a convenience, not a requirement.
+  }
+}
+
 function renderRunList() {
   const list = document.getElementById("run-list");
   const needle = document.getElementById("run-filter").value.toLowerCase();
@@ -102,6 +126,14 @@ function renderRunList() {
     return [r.dir_name, r.profile, r.resource_pass, (r.engines || []).join(" "),
             (r.datasets || []).join(" ")].join(" ").toLowerCase().includes(needle);
   });
+
+  // The count belongs in the header so a collapsed group still tells you
+  // whether there is anything in it.
+  const count = document.getElementById("runs-count");
+  if (count) {
+    count.textContent = needle && shown.length !== S.runs.length
+      ? `${shown.length}/${S.runs.length}` : String(S.runs.length);
+  }
 
   if (!shown.length) { list.append(el("li", { class: "muted pad" }, "no runs")); return; }
 
@@ -271,6 +303,9 @@ function renderReport() {
 
 async function boot() {
   document.getElementById("run-filter").addEventListener("input", renderRunList);
+  const toggle = document.getElementById("runs-toggle");
+  toggle.addEventListener("click", () => setRunsCollapsed(!runsCollapsed()));
+  setRunsCollapsed(runsCollapsed());
   window.addEventListener("hashchange", () => applyRoute().catch(showError));
 
   const health = await api("/api/health");

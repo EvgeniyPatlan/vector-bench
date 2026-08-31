@@ -286,6 +286,46 @@ def get(url, headers=None):
         return exc.code, exc.read()
 
 
+class TestFrontEndWiring:
+    """Element ids are a contract between three files that never import each other.
+
+    A rename in index.html shows up as a silently dead button, not an error.
+    """
+
+    STATIC = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui", "static")
+
+    def _read(self, name):
+        with open(os.path.join(self.STATIC, name)) as fh:
+            return fh.read()
+
+    @pytest.mark.parametrize("element_id", [
+        "section-list", "run-list", "run-filter",
+        "runs-group", "runs-toggle", "runs-body", "runs-count",
+        "tabs", "context", "control-badge", "main",
+    ])
+    def test_ids_used_by_app_js_exist_in_the_page(self, element_id):
+        assert f'id="{element_id}"' in self._read("index.html")
+        assert element_id in self._read("app.js")
+
+    @pytest.mark.parametrize("panel", [
+        "status", "datasets", "overview", "explore", "report",
+        "profiles", "engines", "jobs",
+    ])
+    def test_every_route_has_a_panel(self, panel):
+        assert f'id="panel-{panel}"' in self._read("index.html")
+
+    def test_every_script_the_page_loads_exists(self):
+        import re
+        for src in re.findall(r'<script src="/([^"]+)"', self._read("index.html")):
+            assert os.path.isfile(os.path.join(self.STATIC, src)), src
+
+    def test_setup_comes_before_runs_in_the_sidebar(self):
+        """Configuration is what you reach for first; results are the archive."""
+        page = self._read("index.html")
+        assert page.index("Set up") < page.index(">Runs<")
+
+
 class TestServer:
     def test_index_is_served(self, live_server):
         status, body = get(f"{live_server}/")

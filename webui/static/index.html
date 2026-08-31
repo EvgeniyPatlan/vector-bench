@@ -17,14 +17,21 @@
 
 <div class="layout">
   <aside class="sidebar">
-    <div class="side-group" id="runs-group">
-      <div class="side-head">Runs</div>
-      <input type="search" id="run-filter" placeholder="filter…" autocomplete="off">
-      <ul id="run-list" class="side-list"></ul>
-    </div>
     <div class="side-group">
       <div class="side-head">Set up &amp; operate</div>
       <ul id="section-list" class="side-list"></ul>
+    </div>
+    <div class="side-group" id="runs-group">
+      <button type="button" class="side-head toggle" id="runs-toggle"
+              aria-expanded="true" aria-controls="runs-body">
+        <span class="caret" aria-hidden="true">▾</span>
+        <span>Runs</span>
+        <span class="count" id="runs-count"></span>
+      </button>
+      <div id="runs-body">
+        <input type="search" id="run-filter" placeholder="filter…" autocomplete="off">
+        <ul id="run-list" class="side-list"></ul>
+      </div>
     </div>
   </aside>
 
