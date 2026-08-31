@@ -4950,3 +4950,35 @@ class TestEqualFloorColumnsAreExplained:
         table = self._table(min_recall=0.9784)
         assert "†" in table
 
+
+class TestTheChurnBudgetFitsAHealthyEngine:
+    """The budget exists so an engine that takes a write and never finishes it
+    releases the machine, which is what Valkey did before its pipelined-write
+    defect was found. Thirty minutes was sized against that failure, not
+    against a healthy engine: MHNSW and VIDX maintain the graph on every
+    INSERT and need 58 to 99 minutes to write 99,000 rows back. All three were
+    cut off at roughly 1,830 seconds and the run recorded no churn result for
+    any of them -- losing the study's largest single finding."""
+
+    def test_the_headline_profile_allows_the_slowest_observed_reinsert(self):
+        from orchestrator.config import load_profile
+        budget = load_profile("tuned-complete")["ops"]["churn_budget_s"]
+        assert budget >= 5960, "AliSQL's measured re-insert was 5,960 s"
+
+    def test_it_is_still_bounded(self):
+        """Unbounded is how a stalled write held the machine overnight."""
+        from orchestrator.config import load_profile
+        assert load_profile("tuned-complete")["ops"]["churn_budget_s"] <= 14400
+
+    def test_the_orchestrator_passes_the_profile_value(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert 'ops.get("churn_budget_s"' in source
+
+    def test_an_incomplete_reinsert_records_no_throughput(self):
+        """A corpus missing rows is neither the baseline nor a churned corpus,
+        so a figure taken there would be read as one of them."""
+        source = open(os.path.join(VB_ROOT, "harness", "workloads",
+                                   "churn.py")).read()
+        block = source.split("if inserted < len(new_ids):")[1].split("break")[0]
+        assert "recall" not in block.split("notes=")[0].split("extra=")[0]
+

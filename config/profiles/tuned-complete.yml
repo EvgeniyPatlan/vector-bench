@@ -91,3 +91,20 @@ ops:
   concurrency_repeats: 3
   selectivities: [0.10, 0.01]
   churn_fractions: [0.10]
+  # Two hours, not the thirty-minute default.
+  #
+  # The budget exists so that an engine which takes a write and never finishes
+  # it releases the machine instead of holding the run overnight -- which is
+  # what Valkey did before its pipelined-write defect was found. Thirty minutes
+  # was sized against that failure, not against a healthy engine.
+  #
+  # MHNSW and VIDX maintain the graph on every INSERT, so writing 99,000 rows
+  # back into a populated index takes them 58 to 99 minutes. All three were cut
+  # off at roughly 1,830 seconds with the re-insert unfinished, and the run
+  # recorded no churn result for any of them: the recall and throughput they
+  # would have had after churn are simply absent, and that was the study's
+  # largest single finding.
+  #
+  # Two hours clears the slowest observed re-insert with margin and is still
+  # far short of holding a run overnight.
+  churn_budget_s: 7200
