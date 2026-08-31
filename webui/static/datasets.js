@@ -80,7 +80,10 @@ window.renderDatasets = async function renderDatasets() {
       class: "action", disabled: !DS.chosen.length,
       onclick: (ev) => startJob({ kind: "fetch", datasets: DS.chosen },
                                 document.getElementById("fetch-status")),
-    }, DS.chosen.length ? `Download ${DS.chosen.length} dataset(s)` : "Select a dataset"),
+      // Name them while the list is short; "1 dataset(s)" is neither.
+    }, DS.chosen.length === 0 ? "Select a dataset"
+      : DS.chosen.length <= 2 ? `Download ${DS.chosen.join(", ")}`
+      : `Download ${DS.chosen.length} datasets`),
     el("span", { id: "fetch-status" })));
 
   const generated = DS.datasets.filter((d) => d.generated && !d.downloaded);

@@ -194,7 +194,9 @@ function drawChart(payload, resolved) {
 
   const singles = series.filter((s) => s.x.length === 1).map((s) => s.key);
   if (singles.length) {
-    note.textContent = `${singles.length} series has a single point (${singles.join(", ")}) — `
+    note.textContent = (singles.length === 1
+        ? `${singles[0]} has a single point — `
+        : `${singles.length} series have a single point (${singles.join(", ")}) — `)
       + `a line needs at least two values of ${fieldLabel(resolved.x)}.`;
   }
 }

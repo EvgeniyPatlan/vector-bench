@@ -88,10 +88,13 @@ function imagesStep(step) {
       + "and looks stalled while it compiles a bundled DuckDB it does not use."),
     missingExtra.length
       ? el("p", { class: "muted" },
-          `${missingExtra.map((e) => e.name).join(", ")} are not in the original `
-          + "comparison and are left out unless you tick them — each is another "
-          + "image to compile or another process to stand up, and a result does "
-          + "not need them.")
+          `${missing.length} engines have no bench image. `,
+          el("strong", {}, missingOriginal.map((e) => e.name).join(", ")),
+          " are ticked by default — they are the original comparison and enough "
+          + "to produce a result. ",
+          el("strong", {}, missingExtra.map((e) => e.name).join(", ")),
+          " are left out unless you tick them: each is another image to compile "
+          + "or another process to stand up.")
       : null,
     commandPreview("build", chosen.length
       ? ["--engines", chosen.join(","), "--march", value]
@@ -101,9 +104,12 @@ function imagesStep(step) {
         class: "action", disabled: !chosen.length,
         onclick: () => startJob({ kind: "build", engines: chosen, march: value },
                                 document.getElementById("setup-build-status")),
-      }, SU.engines.length
-        ? `Build ${SU.engines.length} engine(s)`
-        : `Build the ${missingOriginal.length} missing`),
+        // Name what it will build. A count here read as a count of what is
+        // missing -- "Build the 3 missing" under "0 of 6 engines have a bench
+        // image" -- which is two numbers on one page disagreeing.
+      }, chosen.length <= 3
+        ? `Build ${chosen.join(", ")}`
+        : `Build ${chosen.length} engines`),
       el("span", { id: "setup-build-status" })));
   return box;
 }
