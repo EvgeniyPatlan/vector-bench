@@ -978,6 +978,47 @@ def _webui_reachable_host(host: str) -> str:
     return "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
 
 
+def _socket_group(socket_path: str) -> Optional[str]:
+    """The name of the group owning the Docker socket.
+
+    Read rather than assumed: it is `docker` on most installs and is not on all
+    of them, and telling someone to add themselves to a group that does not
+    exist wastes the one instruction they were given.
+    """
+    try:
+        import grp
+        return grp.getgrgid(os.stat(socket_path).st_gid).gr_name
+    except (OSError, KeyError, ImportError):
+        return None
+
+
+def _no_docker_message() -> str:
+    user = getpass.getuser()
+    socket_path = os.environ.get("DOCKER_HOST", "").replace("unix://", "") \
+        or "/var/run/docker.sock"
+    lines = [f"cannot reach the Docker daemon as {user!r}.",
+             "  Check with:  docker info"]
+
+    if os.path.exists(socket_path):
+        group = _socket_group(socket_path)
+        gid = os.stat(socket_path).st_gid
+        named = group or f"the group with gid {gid}"
+        lines += [
+            f"  {socket_path} is owned by {named}"
+            + (f" (gid {gid})" if group else "") + ".",
+            f"  A service user gets the groups it holds in /etc/group, so if "
+            f"{user!r} is not in it, nothing this runs can speak to Docker:",
+            f"      id {user}",
+        ]
+        if group:
+            lines.append(f"      sudo usermod -aG {group} {user}")
+            lines.append(f"      sudo systemctl restart vector-bench-web")
+    else:
+        lines.append(f"  {socket_path} does not exist. Is Docker installed and "
+                     f"running?  systemctl status docker")
+    return "\n".join(lines)
+
+
 def _outbound_address() -> Optional[str]:
     """This machine's address on the network it routes through.
 
@@ -1049,17 +1090,7 @@ def cmd_web(args: argparse.Namespace) -> int:
     # so a permission problem on the socket used to be reported as a missing
     # image -- which sends you off to rebuild something you already have.
     if not docker_ctl.docker_available():
-        socket_path = "/var/run/docker.sock"
-        print(f"cannot reach the Docker daemon as {getpass.getuser()!r}.\n"
-              f"  Check with:  docker info\n"
-              f"  Running as a service, this usually means the service user is "
-              f"not in the group that owns {socket_path}"
-              + (f" (gid {os.stat(socket_path).st_gid})"
-                 if os.path.exists(socket_path) else "")
-              + ".\n"
-              f"  Add it, then restart:  sudo usermod -aG docker "
-              f"{getpass.getuser()} && sudo systemctl restart vector-bench-web",
-              file=sys.stderr)
+        print(_no_docker_message(), file=sys.stderr)
         return 1
 
     if not docker_ctl.image_exists(WEBUI_IMAGE):
