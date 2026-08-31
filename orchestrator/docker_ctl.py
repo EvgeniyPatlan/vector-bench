@@ -441,6 +441,22 @@ def running_containers() -> List[str]:
     return [n for n in (proc.stdout or "").split() if n]
 
 
+def containers_publishing(port: int) -> List[str]:
+    """Names of containers publishing this host port, vector-bench or not.
+
+    Docker reports a taken port as an endpoint id and a network driver, which
+    does not tell an operator which container to stop.
+    """
+    proc = _run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+                check=False, timeout=30)
+    names: List[str] = []
+    for line in (proc.stdout or "").splitlines():
+        name, _, ports = line.partition("\t")
+        if f":{port}->" in ports:
+            names.append(name)
+    return names
+
+
 def remove_tree_as_root(path: str, image: str) -> bool:
     """Delete a host directory that a container filled as root.
 

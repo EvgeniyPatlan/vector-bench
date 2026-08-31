@@ -258,6 +258,108 @@ class TestJobLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Starting the server
+# ---------------------------------------------------------------------------
+
+class TestWebCommandDiagnostics:
+    """Failures must not arrive underneath a line claiming success.
+
+    `web` printed the URL before starting the container, so a port clash read
+    as: "web UI on http://127.0.0.1:8080" followed by Docker's own message
+    about an endpoint id and a network driver.
+    """
+
+    @pytest.mark.parametrize("host,expected", [
+        ("0.0.0.0", "127.0.0.1"), ("", "127.0.0.1"), ("::", "127.0.0.1"),
+        ("127.0.0.1", "127.0.0.1"), ("192.168.1.10", "192.168.1.10"),
+    ])
+    def test_reachable_host(self, host, expected):
+        from orchestrator.cli import _webui_reachable_host
+        assert _webui_reachable_host(host) == expected
+
+    def test_free_port_has_no_holder(self):
+        import socket as socket_mod
+        from orchestrator.cli import _port_holder
+        with socket_mod.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free = probe.getsockname()[1]
+        assert _port_holder("127.0.0.1", free) is None
+
+    def test_taken_port_is_detected(self):
+        import socket as socket_mod
+        from orchestrator.cli import _port_holder
+        with socket_mod.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            assert _port_holder("127.0.0.1", port) is not None
+
+    def test_a_container_holding_the_port_is_named(self, monkeypatch):
+        import socket as socket_mod
+        from orchestrator import cli as cli_mod
+        from orchestrator import docker_ctl
+
+        monkeypatch.setattr(docker_ctl, "containers_publishing",
+                            lambda port: ["vb-webui-42"])
+        with socket_mod.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            assert "vb-webui-42" in cli_mod._port_holder("127.0.0.1", port)
+
+    def test_containers_publishing_reads_the_port_column(self, monkeypatch):
+        from orchestrator import docker_ctl
+
+        class Result:
+            stdout = ("other\t0.0.0.0:9000->9000/tcp\n"
+                      "mine\t127.0.0.1:8080->8080/tcp\n"
+                      "noports\t\n")
+
+        monkeypatch.setattr(docker_ctl, "_run", lambda *a, **k: Result())
+        assert docker_ctl.containers_publishing(8080) == ["mine"]
+        assert docker_ctl.containers_publishing(9000) == ["other"]
+        assert docker_ctl.containers_publishing(1234) == []
+
+    def test_the_container_banner_claims_no_url(self, capsys, tmp_path, monkeypatch):
+        """Behind a publish the port here is the internal one.
+
+        Printing it beside the real address is worse than not printing it.
+        """
+        from webui import server as server_mod
+
+        started = {}
+
+        class FakeServer:
+            def serve_forever(self):
+                started["ran"] = True
+
+            def server_close(self):
+                pass
+
+        monkeypatch.setattr(server_mod, "make_server",
+                            lambda *a, **k: FakeServer())
+        server_mod.serve(str(tmp_path), host="0.0.0.0", port=8080,
+                         published_host="127.0.0.1")
+        out = capsys.readouterr().out
+        assert "in-container" in out
+        assert "http://0.0.0.0:8080" not in out
+
+    def test_the_direct_banner_does_name_itself(self, capsys, tmp_path, monkeypatch):
+        from webui import server as server_mod
+
+        class FakeServer:
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        monkeypatch.setattr(server_mod, "make_server", lambda *a, **k: FakeServer())
+        server_mod.serve(str(tmp_path), host="127.0.0.1", port=8452)
+        assert "http://127.0.0.1:8452" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # Control guards
 # ---------------------------------------------------------------------------
 

@@ -294,7 +294,15 @@ def serve(root: str = VB_ROOT, host: str = "127.0.0.1", port: int = 8080,
 
     control = "enabled" if allow_control else "disabled (read-only)"
     scheme = "https" if behind_proxy else "http"
-    print(f"[webui] serving {root} on {scheme}://{host}:{port}  control: {control}  "
+    # Only claim a URL when this process is the thing you connect to. Behind a
+    # container publish the port here is the internal one, and printing it beside
+    # the real address is worse than not printing it: the caller that set up the
+    # publish knows the address and announces it.
+    if published_host is None:
+        where = f"on {scheme}://{host}:{port}"
+    else:
+        where = f"(bound {host}:{port} in-container)"
+    print(f"[webui] serving {root} {where}  control: {control}  "
           f"auth: {'on' if auth_enabled else 'off'}", flush=True)
     if auth.generated_password:
         print("\n[webui] generated a password (shown once, stored hashed in "

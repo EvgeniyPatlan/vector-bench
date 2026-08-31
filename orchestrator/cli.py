@@ -22,7 +22,9 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import sys
 import traceback
 import time
@@ -927,6 +929,39 @@ def _webui_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost", "")
 
 
+def _webui_reachable_host(host: str) -> str:
+    """The address to talk to a server published on `host`."""
+    return "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+
+
+def _port_holder(host: str, port: int) -> Optional[str]:
+    """A description of what holds this port, or None if it is free.
+
+    Docker's own message for a taken port names an endpoint id and a network
+    driver, which tells an operator nothing about what to do next.
+    """
+    probe = _webui_reachable_host(host)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex((probe, port)) != 0:
+            return None
+
+    for container in docker_ctl.containers_publishing(port):
+        return f" by container {container}"
+    return ""
+
+
+def _webui_responds(host: str, port: int) -> bool:
+    import urllib.error
+    import urllib.request
+    url = f"http://{_webui_reachable_host(host)}:{port}/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            return response.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     """Serve the web UI.
 
@@ -995,17 +1030,50 @@ def cmd_web(args: argparse.Namespace) -> int:
     if args.behind_proxy:
         command.append("--behind-proxy")
 
+    busy = _port_holder(args.host, args.port)
+    if busy:
+        print(f"port {args.port} is already in use{busy}.\n"
+              f"  Use a different one:  ./run-benchmark.sh web --port {args.port + 1}",
+              file=sys.stderr)
+        return 1
+
     mode = "control enabled" if args.allow_control else "read-only"
     scheme = "https" if args.behind_proxy else "http"
-    print(f"web UI on {scheme}://{args.host}:{args.port}  ({mode}, "
-          f"auth {'on' if auth_enabled else 'off'})")
-    if not args.allow_control:
-        print("  add --allow-control to edit profiles and launch runs")
-    print("  Ctrl-C to stop")
+    url = f"{scheme}://{args.host}:{args.port}"
+    print(f"starting the web UI ({mode}, auth {'on' if auth_enabled else 'off'}) …",
+          flush=True)
+
+    # The URL is announced by a watcher once the server actually answers, not
+    # before the container is started. Printing it up front meant a failure --
+    # a port clash, a missing mount -- arrived underneath a line claiming
+    # success, which is the opposite of what an error message is for.
+    ready = threading.Event()
+
+    def announce() -> None:
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready.is_set():
+            if _webui_responds(args.host, args.port):
+                print(f"\n  {url}")
+                if not args.allow_control:
+                    print("  read-only; add --allow-control to edit profiles "
+                          "and launch runs")
+                print("  Ctrl-C to stop\n", flush=True)
+                return
+            time.sleep(0.4)
+
+    watcher = threading.Thread(target=announce, daemon=True)
+    watcher.start()
     try:
-        return subprocess.call(command)
+        code = subprocess.call(command)
     except KeyboardInterrupt:
         return 0
+    finally:
+        ready.set()
+
+    if code != 0:
+        print(f"\nthe web UI container exited with {code}; see the error above.",
+              file=sys.stderr)
+    return code
 
 
 def cmd_report(args: argparse.Namespace) -> int:
