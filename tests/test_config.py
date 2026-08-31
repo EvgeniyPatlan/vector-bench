@@ -4503,3 +4503,46 @@ class TestGraphDegreeCanBeSweptWhereItIsTheOnlyKnob:
         assert by_engine["mariadb123"] == [6, 16]
         assert "pgvector" not in by_engine
 
+
+class TestAReportCanBeNarrowedToOneCorpus:
+    """The ann results tree is keyed by resource configuration, not by corpus.
+    A machine that measured dbpedia at 90,000 rows and at 990,000 under the
+    same configuration has both in one tree, so regenerating a run's report
+    grows a second dataset section. Both are correct and the report separates
+    them — but a report meant to describe one corpus should be able to say so
+    rather than leaving a reader to notice which section they are reading."""
+
+    def _argv(self, *extra):
+        from report.generate import parse_args
+        return parse_args(["--run-dir", "/x", *extra])
+
+    def test_the_generator_takes_the_flag(self):
+        assert self._argv("--datasets", "a,b").datasets == "a,b"
+
+    def test_it_defaults_to_everything(self):
+        assert self._argv().datasets is None
+
+    def test_the_cli_passes_it_through(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        assert 'rep.add_argument("--datasets"' in source
+        assert 'generate_report(paths, list(KNOWN_ENGINES), args.datasets)' in source
+
+    def test_the_container_command_carries_it_only_when_asked(self):
+        """An always-present empty flag would make every report a filtered
+        one, and an empty filter matches nothing."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        assert '*(["--datasets", datasets] if datasets else [])' in source
+
+    def test_a_name_that_was_never_measured_is_an_error(self):
+        """Silently reporting on nothing is how a typo becomes an empty
+        report that looks like a failed run."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        block = source.split("if args.datasets:")[1].split("if not records:")[0]
+        assert "unknown" in block and "return 2" in block
+
+    def test_records_without_a_dataset_survive_the_filter(self):
+        """Some records are not per-corpus. Dropping them would empty the
+        environment and validity sections along with the other corpus."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert 'if not r.get("dataset") or r["dataset"] in wanted' in source
+

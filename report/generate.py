@@ -46,6 +46,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--output-dir", default=None,
                    help="where to write the report (default: <run-dir>/report)")
     p.add_argument("--title", default="Vector search benchmark")
+    p.add_argument("--datasets", default=None,
+                   help="comma-separated dataset names to report on. The ann "
+                        "results tree is keyed by resource configuration, not "
+                        "by corpus, so a machine that has measured two corpora "
+                        "under one configuration reports both. Both are "
+                        "correct and separated, but a report meant to describe "
+                        "one of them should say which.")
     p.add_argument("--from-records", default=None,
                    help="regenerate from a previously merged records.jsonl "
                         "instead of reading the ops and ann-benchmarks trees. "
@@ -414,6 +421,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
         records += annb
         print(f"[report] ann-benchmarks records: {len(annb)}")
+
+    if args.datasets:
+        wanted = {d.strip() for d in args.datasets.split(",") if d.strip()}
+        present = {r.get("dataset") for r in records if r.get("dataset")}
+        unknown = wanted - present
+        if unknown:
+            print(f"[report] --datasets names nothing measured here: "
+                  f"{sorted(unknown)}. Present: {sorted(present)}",
+                  file=sys.stderr)
+            return 2
+        before = len(records)
+        records = [r for r in records
+                   if not r.get("dataset") or r["dataset"] in wanted]
+        print(f"[report] narrowed to {sorted(wanted)}: "
+              f"{len(records)} of {before} records")
 
     if not records:
         print("[report] no records found — nothing to report", file=sys.stderr)

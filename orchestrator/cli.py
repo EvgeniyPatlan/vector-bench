@@ -529,7 +529,8 @@ def _read_manifest_config(run_dir: str) -> Dict[str, Any]:
         return {}
 
 
-def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
+def generate_report(paths: Dict[str, str], engines: List[str],
+                    datasets: Optional[str] = None) -> int:
     """Run the report generator inside a bench image.
 
     The generator needs numpy, h5py and matplotlib. Those already exist in every
@@ -588,6 +589,7 @@ def generate_report(paths: Dict[str, str], engines: List[str]) -> int:
             "--run-dir", f"/results/{os.path.basename(paths['run_dir'])}",
             "--annb-results", annb_mount,
             "--datasets-dir", "/datasets",
+            *(["--datasets", datasets] if datasets else []),
         ],
         detach=False,
     )
@@ -912,7 +914,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             return 1
     paths = paths_for(os.path.basename(run_dir))
     paths["run_dir"] = run_dir
-    return generate_report(paths, list(KNOWN_ENGINES))
+    return generate_report(paths, list(KNOWN_ENGINES), args.datasets)
 
 
 # ---------------------------------------------------------------------------
@@ -975,6 +977,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     rep = sub.add_parser("report", help="generate the report for an existing run")
     rep.add_argument("--run-dir", required=True)
+    rep.add_argument("--datasets", default=None,
+                     help="comma-separated corpora to report on. The ann "
+                          "results tree is keyed by resource configuration, "
+                          "not by corpus, so a machine that measured two "
+                          "corpora under one configuration reports both.")
     rep.set_defaults(func=cmd_report)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
