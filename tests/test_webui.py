@@ -495,6 +495,23 @@ class TestServer:
         # the connection dying under a body the server never read.
         assert status in (400, 401, 403, 405)
 
+    def test_a_failing_handler_answers_instead_of_dropping(self, live_server, monkeypatch):
+        """A connection that closes with no reply looks like a network fault.
+
+        It was one: an exception escaping the handler dropped the socket, and a
+        client that had just finished uploading saw its upload "drop" with
+        every byte delivered.
+        """
+        from webui import runs as runs_module
+
+        def explode(*_a, **_k):
+            raise RuntimeError("deliberate fault")
+
+        monkeypatch.setattr(runs_module, "discover_runs", explode)
+        status, body = get(f"{live_server}/api/runs")
+        assert status == 500
+        assert b"deliberate fault" in body
+
     def test_bundle_is_a_download(self, live_server):
         import urllib.request
         with urllib.request.urlopen(f"{live_server}/runs/run-a/bundle", timeout=10) as res:

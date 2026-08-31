@@ -107,7 +107,16 @@ def import_bundle(results_dir: str, archive_path: str,
         return None, [f"results/{target_id} already exists. Give it another "
                       f"name, or remove the existing one first."]
 
-    staging = tempfile.mkdtemp(dir=results_dir, prefix=".import-")
+    # results/ is generated and gitignored, so on a checkout where nothing has
+    # been run yet it does not exist. Creating the staging directory inside it
+    # then raised FileNotFoundError out of this function, killed the request
+    # handler, and closed the connection with no reply -- which the browser
+    # reported as the upload dropping after every byte had arrived.
+    try:
+        os.makedirs(results_dir, exist_ok=True)
+        staging = tempfile.mkdtemp(dir=results_dir, prefix=".import-")
+    except OSError as exc:
+        return None, [f"cannot write to {results_dir}: {exc}"]
     try:
         # 3.12 warns that 3.14 will filter by default, and 3.11 does not accept
         # the argument at all. Members are validated above either way; this only

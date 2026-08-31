@@ -175,6 +175,35 @@ class TestImport:
             assert json.load(fh) == MANIFEST
 
 
+class TestFreshCheckout:
+    """results/ is generated and gitignored, so a new machine has none.
+
+    Creating the staging directory inside it raised FileNotFoundError out of
+    import_bundle, killed the request handler, and closed the connection with
+    no reply -- which the browser reported as the upload dropping after every
+    byte of it had arrived.
+    """
+
+    def test_import_creates_results_if_it_is_missing(self, tmp_path):
+        results = tmp_path / "results"          # deliberately not created
+        assert not results.exists()
+        run_id, errors = importing_mod.import_bundle(
+            str(results), good_archive(tmp_path))
+        assert errors == [] and run_id == "r1"
+        assert (results / "r1" / "run-manifest.json").is_file()
+
+    def test_an_unwritable_destination_is_an_error_not_a_crash(self, tmp_path):
+        blocked = tmp_path / "blocked"
+        blocked.mkdir(mode=0o500)
+        try:
+            run_id, errors = importing_mod.import_bundle(
+                str(blocked / "results"), good_archive(tmp_path))
+            assert run_id is None
+            assert any("cannot write to" in e for e in errors)
+        finally:
+            blocked.chmod(0o700)
+
+
 class TestLabels:
     def test_set_read_and_clear(self, tmp_path):
         run = tmp_path / "r1"

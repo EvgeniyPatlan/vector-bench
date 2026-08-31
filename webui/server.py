@@ -12,6 +12,7 @@ import mimetypes
 import os
 import posixpath
 import sys
+import traceback
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
@@ -289,20 +290,42 @@ class Handler(BaseHTTPRequestHandler):
         self._send_file(target)
         return True
 
+    def _handle_guarded(self, method: str) -> None:
+        """Answer even when the handler fails.
+
+        An exception escaping _handle closes the socket without a reply, and a
+        client that has just finished uploading sees that as its upload
+        dropping. A 500 that names the fault is worth far more than a silence
+        that looks like a network fault.
+        """
+        try:
+            self._handle(method)
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            try:
+                self._send_json(500, {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "detail": "This is a fault in the server, not in the "
+                              "request. The full traceback is in its log: "
+                              "journalctl -u vector-bench-web",
+                })
+            except Exception:  # noqa: BLE001
+                pass
+
     def do_GET(self) -> None:
-        self._handle("GET")
+        self._handle_guarded("GET")
 
     def do_HEAD(self) -> None:
-        self._handle("HEAD")
+        self._handle_guarded("HEAD")
 
     def do_POST(self) -> None:
-        self._handle("POST")
+        self._handle_guarded("POST")
 
     def do_PUT(self) -> None:
-        self._handle("PUT")
+        self._handle_guarded("PUT")
 
     def do_DELETE(self) -> None:
-        self._handle("DELETE")
+        self._handle_guarded("DELETE")
 
     def _handle_import(self, query) -> None:
         """Receive a run bundle as a raw body.
