@@ -4683,3 +4683,31 @@ class TestAPhaseThatRanTwiceIsTwoMeasurements:
         from report.loaders import split_sessions
         assert split_sessions([]) == []
 
+
+class TestChartsFromAPreviousReportAreCleared:
+    """Charts are redrawn from the records every time, so anything already in
+    the directory is from a previous run. Narrowing a report to one corpus with
+    --datasets left the other corpus's charts sitting beside the new ones,
+    named after a dataset the report no longer covers. Nothing references them,
+    which is what makes them dangerous: a stale file nothing points at is one
+    somebody opens by hand and believes."""
+
+    def test_the_generator_clears_them(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        block = source.split("chart_dir = os.path.join")[1][:1200]
+        assert "os.remove" in block
+        assert '.endswith((".png", ".svg"))' in block
+
+    def test_only_generated_files_are_removed(self):
+        """The directory is inside the run, and removing anything the report
+        did not write would be destroying somebody else's data."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        block = source.split("chart_dir = os.path.join")[1][:1200]
+        assert "listdir" in block and '.endswith' in block
+        assert "rmtree" not in block
+
+    def test_it_clears_before_anything_is_drawn(self):
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        body = source.split("def main")[1]
+        assert body.index("cleared") < body.index("chart_paths")
+
