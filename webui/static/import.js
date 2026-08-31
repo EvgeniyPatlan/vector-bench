@@ -1,6 +1,6 @@
 "use strict";
 
-const IM = { file: null, busy: false };
+const IM = { file: null, busy: false, sent: 0 };
 
 function importForm() {
   const panel = document.getElementById("panel-import");
@@ -50,7 +50,7 @@ function importForm() {
       el("span", { id: "import-status" })));
 }
 
-async function uploadRun() {
+function uploadRun() {
   const status = document.getElementById("import-status");
   clear(status);
   if (!IM.file) return;
@@ -64,46 +64,67 @@ async function uploadRun() {
 
   IM.busy = true;
   importForm();
-  document.getElementById("import-status").textContent = "uploading…";
-  try {
-    const res = await fetch(`/api/import?${params}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/gzip" },
-      body: IM.file,
-    });
-    const body = await res.json().catch(() => ({}));
-    IM.busy = false;
-    if (res.status === 401) {
-      window.location.href = "/login.html";
-      return;
-    }
-    if (!res.ok) {
-      importForm();
-      const node = document.getElementById("import-status");
-      for (const e of body.errors || [body.error || `HTTP ${res.status}`]) {
-        node.append(el("div", { class: "err" }, e));
-      }
-      return;
-    }
-    IM.file = null;
-    S.runs = (await api("/api/runs")).runs;
-    go(`#/run/${encodeURIComponent(body.run_id)}/overview`);
-  } catch (err) {
+  const node = document.getElementById("import-status");
+  const progress = el("span", { class: "muted" }, "starting…");
+  node.append(progress);
+
+  // XMLHttpRequest rather than fetch: it reports how much of the body has
+  // actually gone, and it still hands over the status when the response is an
+  // error. fetch() does neither -- a large upload that is refused or
+  // interrupted arrives as "Failed to fetch" with the reason discarded, which
+  // is indistinguishable from the server being unreachable.
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/api/import?${params}`);
+  xhr.setRequestHeader("Content-Type", "application/gzip");
+
+  xhr.upload.onprogress = (ev) => {
+    if (!ev.lengthComputable) { progress.textContent = "uploading…"; return; }
+    const pct = Math.round((ev.loaded / ev.total) * 100);
+    progress.textContent = `${pct}% — ${fmtBytes(ev.loaded)} of ${fmtBytes(ev.total)}`;
+  };
+
+  const failed = (headline, detail) => {
     IM.busy = false;
     importForm();
-    const node = document.getElementById("import-status");
-    node.append(el("div", { class: "err" }, String(err)));
-    // fetch() reports a connection that ends mid-upload as "Failed to fetch"
-    // and keeps the status to itself, so say what it usually means rather than
-    // leaving a browser-level string as the whole explanation.
-    if (String(err).includes("Failed to fetch") || err instanceof TypeError) {
-      node.append(el("div", { class: "muted" },
-        "The connection ended before the upload finished. Usually the session "
-        + "expired mid-upload — reload the page, sign in, and try again. If it "
-        + "persists, copy the archive into results/ on the server instead; "
-        + "an unpacked run directory needs no upload."));
+    const where = document.getElementById("import-status");
+    where.append(el("div", { class: "err" }, headline));
+    if (detail) where.append(el("div", { class: "muted" }, detail));
+  };
+
+  xhr.onload = () => {
+    IM.busy = false;
+    if (xhr.status === 401) { window.location.href = "/login.html"; return; }
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch (err) { /* not JSON */ }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      IM.file = null;
+      api("/api/runs").then((data) => { S.runs = data.runs; })
+        .finally(() => go(`#/run/${encodeURIComponent(body.run_id)}/overview`));
+      return;
     }
-  }
+    importForm();
+    const where = document.getElementById("import-status");
+    for (const e of body.errors || [body.error || `HTTP ${xhr.status}`]) {
+      where.append(el("div", { class: "err" }, e));
+    }
+  };
+
+  xhr.onerror = () => failed(
+    `The connection dropped after ${fmtBytes(IM.sent)} of ${fmtBytes(IM.file.size)}.`,
+    "Nothing was left behind on the server — an import is only unpacked once the "
+    + "whole archive has arrived. If it keeps happening, copy the archive onto "
+    + "the server and extract it into results/ instead; that needs no upload at "
+    + "all. Check the server's own view with: "
+    + "journalctl -u vector-bench-web | grep import");
+
+  xhr.ontimeout = () => failed("The upload timed out.", null);
+  xhr.onabort = () => failed("The upload was cancelled.", null);
+  xhr.upload.onprogress = ((original) => (ev) => {
+    IM.sent = ev.loaded;
+    original(ev);
+  })(xhr.upload.onprogress);
+
+  xhr.send(IM.file);
 }
 
 window.renderImport = async function renderImport() {

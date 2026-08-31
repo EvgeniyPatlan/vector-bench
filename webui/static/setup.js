@@ -1,6 +1,6 @@
 "use strict";
 
-const SU = { plan: null, march: "", engines: [] };
+const SU = { plan: null, march: "", engines: [], profiles: [], profile: null };
 
 function stepHead(index, step) {
   return el("div", { class: "step-head" },
@@ -178,15 +178,74 @@ function smokeStep(step) {
 // -- step 4: measure ---------------------------------------------------
 
 function measureStep() {
-  return el("div", {},
+  const box = el("div", {},
     el("p", { class: "muted" },
       "The smoke profile proves the pipeline; it measures nothing — its grids "
-      + "are far too sparse to draw a curve from. "),
-    el("p", { class: "muted" },
-      "Pick a profile on ",
-      el("a", { href: "#/control/profiles" }, "Profiles & launch"),
-      ", where the ingest estimate updates as you narrow the engines, datasets "
-      + "and resource pass. Read it before starting: main is about two days."));
+      + "are far too sparse to draw a curve from. This starts a real one."));
+
+  if (!S.control) {
+    box.append(el("p", { class: "muted" },
+      "Read-only. Restart with --allow-control to launch a run."));
+    return box;
+  }
+
+  // Anything but smoke: that is the step above, and re-running it here would
+  // look like a measurement without being one.
+  const choices = SU.profiles.filter((p) => p.name !== "smoke");
+  if (!choices.length) {
+    box.append(el("p", { class: "muted" }, "No profiles found in config/profiles/."));
+    return box;
+  }
+  if (!SU.profile || !choices.some((p) => p.name === SU.profile)) {
+    SU.profile = (choices.find((p) => p.name === "main") || choices[0]).name;
+  }
+  const chosen = choices.find((p) => p.name === SU.profile);
+
+  box.append(el("div", { class: "row" },
+    el("label", { class: "muted" }, "profile ",
+      el("select", {
+        onchange: (ev) => { SU.profile = ev.target.value; renderSetupBody(); },
+      }, ...choices.map((p) =>
+        el("option", { value: p.name, selected: p.name === SU.profile }, p.name)))),
+    chosen && chosen.description
+      ? el("span", { class: "muted" }, chosen.description) : null));
+
+  box.append(el("div", { class: "facet", id: "setup-estimate" }, "estimating…"));
+  box.append(commandPreview("run", ["--profile", SU.profile]));
+  box.append(el("div", { class: "row" },
+    el("button", {
+      class: "action",
+      onclick: () => {
+        if (!confirm(`Start ${SU.profile}? Read the estimate above first — a `
+                     + "real profile is hours to days, and nothing else may run "
+                     + "beside it.")) return;
+        startJob({ kind: "run", profile: SU.profile },
+                 document.getElementById("setup-run-status"));
+      },
+    }, `Launch ${SU.profile}`),
+    el("span", { id: "setup-run-status" }),
+    el("span", { class: "muted" },
+      "Narrow the engines, datasets or resource pass on "),
+    el("a", { href: "#/control/profiles" }, "Profiles & launch")));
+
+  // The same figure the CLI prints, from the same function.
+  post("/api/estimate", { profile: SU.profile }).then((est) => {
+    const target = document.getElementById("setup-estimate");
+    if (!target) return;
+    clear(target);
+    target.append(
+      el("strong", {}, `estimated ingest ~${est.total_hours.toFixed(1)} h`),
+      el("div", { class: "muted" },
+        `${est.passes} pass(es) · ${est.m_values} ann M value(s) · loading only, `
+        + "before any query runs"));
+    if (est.long_run) {
+      target.append(el("div", { class: "warn" },
+        "Every M value reloads the whole corpus. Cut ann.m_values or the "
+        + "dataset list to reduce it roughly proportionally."));
+    }
+  }).catch(() => {});
+
+  return box;
 }
 
 const BODIES = {
@@ -242,6 +301,9 @@ function renderSetupBody() {
 
 window.renderSetup = async function renderSetup() {
   SU.plan = await api("/api/setup");
+  if (!SU.profiles.length) {
+    SU.profiles = (await api("/api/profiles").catch(() => ({ profiles: [] }))).profiles || [];
+  }
   // Drop anything that has since been built. Selection means "build this", and
   // an engine that now has an image is not a thing to build.
   const step = SU.plan.steps.find((s) => s.id === "images");
