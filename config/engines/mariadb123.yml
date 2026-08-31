@@ -159,6 +159,9 @@ runtime:
     - "-c"
     - "/opt/mariadb/bin/mariadb -ubench -pbench --socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1"
   chart:
+    # Same hue family as 11.8 so the two versions read as related,
+    # dashed so they stay distinguishable in greyscale and for
+    # colour-blind readers.
     color: "#5fa8d3"
     marker: "s"
     linestyle: "--"

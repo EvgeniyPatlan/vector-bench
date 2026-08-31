@@ -177,6 +177,8 @@ runtime:
     - "-c"
     - "valkey-cli MODULE LIST 2>/dev/null | grep -qi search"
   chart:
+    # Its own hue as well: the only in-memory engine, so it should not
+    # read as a variant of any disk-backed one.
     color: "#e377c2"
     marker: "D"
     linestyle: "-"

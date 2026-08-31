@@ -27,6 +27,9 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 # the only channel: each engine also gets a marker and a line style, so the
 # charts survive greyscale printing and the common colour-vision deficiencies.
 #
+# Why a given engine has a given hue is recorded beside the value itself, in
+# config/engines/<name>.yml.
+#
 # These are defaults. The authority is config/engines/*.yml, which the run copies
 # into its manifest as `engines.<name>.presentation`; adopt_presentation() below
 # applies it. The table stays because the report container mounts report/ and
