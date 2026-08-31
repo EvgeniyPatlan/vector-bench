@@ -12,6 +12,7 @@ import mimetypes
 import os
 import posixpath
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -177,9 +178,46 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(405, {"error": f"method not allowed: {method}"})
             return
 
-        served = self._serve_run_asset(path) or self._serve_static(path)
+        served = (self._serve_bundle(path) or self._serve_run_asset(path)
+                  or self._serve_static(path))
         if not served:
             self._send_json(404, {"error": f"not found: {path}"})
+
+    def _serve_bundle(self, path: str) -> bool:
+        """Package a run and send it as a download.
+
+        Built per request rather than cached: a run directory is small, and a
+        stale bundle beside a regenerated report is worse than a second of tar.
+        """
+        prefix, suffix = "/runs/", "/bundle"
+        if not (path.startswith(prefix) and path.endswith(suffix)):
+            return False
+        run_id = path[len(prefix):-len(suffix)]
+        run_dir = runs_mod.resolve_run_dir(self.api.results_dir, run_id)
+        if run_dir is None:
+            return False
+
+        from orchestrator.export import bundle_filename, write_bundle
+
+        with tempfile.TemporaryDirectory() as work:
+            out = os.path.join(work, bundle_filename(run_id))
+            ok, detail = write_bundle(run_dir, out)
+            if not ok:
+                self._send_json(500, {"error": detail})
+                return True
+            with open(out, "rb") as fh:
+                body = fh.read()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{bundle_filename(run_id)}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        return True
 
     def _serve_run_asset(self, path: str) -> bool:
         """Serve results/<run_id>/report/... so report.html and its charts open."""

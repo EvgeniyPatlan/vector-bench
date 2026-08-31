@@ -186,3 +186,6 @@ pre.log {
 pre.cmd { font-size: 12px; padding: 8px 10px; margin: 8px 0; }
 td code { font-size: 12px; color: var(--muted); }
 .warn a, .ready a { color: inherit; }
+
+a.action { text-decoration: none; display: inline-block; }
+a.action.secondary:hover { border-color: var(--accent); }

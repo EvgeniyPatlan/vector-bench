@@ -219,6 +219,33 @@ def _dir_size(path: str) -> int:
     return total
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Package a run for someone who does not have this checkout."""
+    from orchestrator.export import bundle_filename, write_bundle
+
+    run_dir = os.path.abspath(args.run_dir)
+    if not os.path.isdir(run_dir):
+        candidate = os.path.join(VB_ROOT, "results", args.run_dir)
+        if not os.path.isdir(candidate):
+            print(f"run directory not found: {args.run_dir}", file=sys.stderr)
+            return 1
+        run_dir = candidate
+
+    run_id = os.path.basename(run_dir.rstrip(os.sep))
+    out = args.output or os.path.join(os.getcwd(), bundle_filename(run_id))
+    ok, detail = write_bundle(run_dir, out)
+    if not ok:
+        print(detail, file=sys.stderr)
+        return 1
+
+    size = os.path.getsize(detail)
+    print(f"{detail}  ({size / 1024 / 1024:.1f} MB)")
+    print("  contains the report, the raw records and a README explaining what "
+          "it is.\n  The recipient needs nothing installed to read "
+          "report/report.html.")
+    return 0
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     if not docker_ctl.docker_available():
         print("cannot talk to the Docker daemon", file=sys.stderr)
@@ -1198,6 +1225,13 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--behind-proxy", action="store_true",
                    help="TLS is terminated in front; marks cookies Secure")
     w.set_defaults(func=cmd_web)
+
+    e = sub.add_parser("export", help="package a run to send to someone")
+    e.add_argument("--run-dir", required=True,
+                   help="results/<run-id>, or just the run id")
+    e.add_argument("--output", default=None,
+                   help="path for the .tar.gz (default: ./vector-bench-<run-id>.tar.gz)")
+    e.set_defaults(func=cmd_export)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
     c.add_argument("--run-id", default=None,

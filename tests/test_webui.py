@@ -449,6 +449,20 @@ class TestServer:
         status, _ = get(f"{live_server}/runs/nope/report/report.html")
         assert status == 404
 
+    def test_bundle_is_a_download(self, live_server):
+        import urllib.request
+        with urllib.request.urlopen(f"{live_server}/runs/run-a/bundle", timeout=10) as res:
+            body = res.read()
+            assert res.status == 200
+            assert res.headers["Content-Type"] == "application/gzip"
+            assert 'filename="vector-bench-run-a.tar.gz"' in \
+                res.headers["Content-Disposition"]
+        assert body[:2] == b"\x1f\x8b", "not gzip"
+
+    def test_bundle_of_an_unknown_run_is_404(self, live_server):
+        status, _body = get(f"{live_server}/runs/nope/bundle")
+        assert status == 404
+
     def test_path_traversal_is_refused(self, live_server):
         for path in ("/../../etc/passwd", "/runs/run-a/../../../etc/passwd"):
             status, _ = get(live_server + path)

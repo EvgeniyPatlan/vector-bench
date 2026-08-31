@@ -174,6 +174,29 @@ escape sequence is rejected with a message rather than executed.
 
 ---
 
+## Sharing a result
+
+Three ways out, in order of how little the recipient needs.
+
+**The report file.** `results/<run-id>/report/report.html` is self-contained —
+charts inlined, nothing fetched — so it opens in any browser, offline, and looks
+the same everywhere. The Report tab has a Download button for it.
+
+**The run bundle.** `Download run bundle (.tar.gz)` on the same tab, or:
+
+```bash
+./run-benchmark.sh export --run-dir results/<run-id>
+```
+
+The archive is the run directory plus a README naming the machine the numbers
+belong to, its SIMD flags, what was measured, and how to view it. Someone with
+vector-bench extracts it into their `results/` and it appears in their UI;
+someone without opens the HTML.
+
+**The raw records.** `report/records.jsonl` is one flat JSON object per
+measurement, for a recipient who would rather run their own analysis than read
+your charts.
+
 ## Viewing results measured somewhere else
 
 A run directory is self-contained to *view*. Copy one in and it appears:

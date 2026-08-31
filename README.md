@@ -239,6 +239,7 @@ rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
 | `web` | Serve the web UI: run index, interactive explorer, profile editor, launcher |
 | `render` | Regenerate the ann-benchmarks configs for a profile |
 | `sources` | Export sources only, without building |
+| `export` | Package a run as a .tar.gz to send to someone |
 | `clean` | Remove containers, networks and volumes left by a run |
 
 ### `run` options

@@ -311,9 +311,25 @@ function renderReport() {
       regenerate);
     return;
   }
-  panel.append(regenerate, el("iframe", {
+  panel.append(shareRow(), regenerate, el("iframe", {
     class: "report", src: `/runs/${encodeURIComponent(S.runId)}/report/report.html`,
   }));
+}
+
+function shareRow() {
+  const id = encodeURIComponent(S.runId);
+  return el("div", { class: "row" },
+    el("a", {
+      class: "action secondary", download: "",
+      href: `/runs/${id}/report/report.html`,
+    }, "Download report.html"),
+    el("a", {
+      class: "action secondary", href: `/runs/${id}/bundle`,
+    }, "Download run bundle (.tar.gz)"),
+    el("span", { class: "muted" },
+      "report.html is self-contained — charts inlined, nothing fetched — so it "
+      + "opens anywhere offline. The bundle adds the raw records and a README, "
+      + "and drops into someone else's results/ directory."));
 }
 
 // -- boot --------------------------------------------------------------
