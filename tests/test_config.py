@@ -4374,7 +4374,8 @@ class TestAFloorFigureSaysWhereItWasActuallyTaken:
         return _headline_tables({"per_dataset": {"d": {engine: entry}}})
 
     def test_a_figure_above_the_floor_is_marked(self):
-        assert "510 †0.989" in self._table(self._entry())
+        table = self._table(self._entry())
+        assert "510 @0.989 †" in table
 
     def test_a_real_point_at_the_floor_is_not_marked(self):
         """pgvector measured recall 0.8190, so its 0.90 figure is honest."""
@@ -4905,4 +4906,47 @@ class TestTheLatencyChartIsOnePanelPerEngine:
         """A per-panel scale would make every engine look the same shape."""
         limits = {ax.get_ylim() for ax in self._figure().axes if ax.get_visible()}
         assert len(limits) == 1
+
+
+class TestEqualFloorColumnsAreExplained:
+    """A frontier reports the fastest configuration at or above the floor, and
+    that configuration is frequently well above it. So two floors can be won by
+    one measurement and the columns come out identical -- which reads as a
+    missing measurement. MariaDB shows the same number at 0.90 and 0.95 because
+    its fastest setting already returns recall 0.9563, and it has three slower
+    measurements in between."""
+
+    def _table(self, **over):
+        from report.render import _headline_tables
+        entry = {"points": 16, "min_recall": 0.6935, "max_recall": 0.9961,
+                 "qps_at_recall_90": 415, "qps_at_recall_90_recall": 0.9563,
+                 "qps_at_recall_95": 415, "qps_at_recall_95_recall": 0.9563,
+                 "qps_at_recall_99": 46, "qps_at_recall_99_recall": 0.9931}
+        entry.update(over)
+        return _headline_tables({"per_dataset": {"d": {"mariadb": entry}}})
+
+    def test_every_cell_carries_its_recall(self):
+        table = self._table()
+        assert "415 @0.956" in table
+        assert "46 @0.993" in table
+
+    def test_two_equal_columns_show_the_same_recall(self):
+        """Which is what makes it obvious they are one measurement."""
+        assert self._table().count("415 @0.956") == 2
+
+    def test_the_note_explains_it(self):
+        table = self._table()
+        assert "one measurement winning both" in table
+
+    def test_a_dash_stays_a_dash(self):
+        """An engine that never reached the floor has no recall to show."""
+        table = self._table(qps_at_recall_99=None, qps_at_recall_99_recall=None)
+        assert "—" in table
+
+    def test_the_dagger_still_marks_an_unreached_floor(self):
+        """Carrying the recall everywhere does not replace the marker: one
+        says where the figure came from, the other says the engine has nothing
+        below the floor at all."""
+        table = self._table(min_recall=0.9784)
+        assert "†" in table
 

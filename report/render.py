@@ -503,6 +503,17 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
                 storage = entry.get(f"qps_at_recall_{floor}_storage")
                 if multi and storage and value != "—":
                     value = f"{value} ({storage})"
+                # The recall the figure was actually taken at, on every cell.
+                # A frontier reports the fastest configuration at or above the
+                # floor, and that configuration is often well above it -- so
+                # two floors can be served by one measurement and the columns
+                # come out identical. MariaDB reads 415 at both 0.90 and 0.95
+                # because its fastest setting already returns 0.9563, and it
+                # has three slower measurements in between. Without the recall
+                # beside it, equal columns read as a missing measurement.
+                at = entry.get(f"qps_at_recall_{floor}_recall")
+                if value != "—" and at is not None:
+                    value += f" @{at:.3f}"
                 # An engine with no configuration below the floor has no
                 # measurement AT the floor either -- the best it can offer is
                 # the one above it. MariaDB 12.3's lowest setting returns
@@ -510,11 +521,13 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
                 # at 0.9888, and printing a bare number invites a comparison
                 # with engines that do have a point near 0.90. The recall the
                 # figure was actually taken at travels with it.
-                at = entry.get(f"qps_at_recall_{floor}_recall")
+                # A bare marker now: the recall it was taken at is already on
+                # the cell, so repeating it beside a dagger said the same
+                # number twice.
                 lowest = entry.get("min_recall")
                 if (value != "—" and at is not None and lowest is not None
                         and lowest > floor / 100.0):
-                    value += f" †{at:.3f}"
+                    value += " †"
                 return value
 
             # The range, not only the best. Two identical floor columns mean
@@ -537,6 +550,13 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
             "\n_QPS at a recall floor is the comparison an operator makes: how fast "
             "is the engine at an accuracy I can accept. A dash means the engine did "
             "not reach that recall anywhere in the swept grid._\n"
+            "\n_Each cell also carries the recall the figure was measured at. "
+            "A frontier reports the fastest configuration at or above the "
+            "floor, and that configuration is frequently well above it, so two "
+            "columns showing the same number are one measurement winning both "
+            "— not a missing one. MariaDB reads the same at 0.90 and 0.95 "
+            "because its fastest setting already returns 0.956, with three "
+            "slower measurements in between._\n"
             "\n_A **†** marks a figure the engine has no measurement for at that "
             "floor: every configuration swept returned recall above it, so the "
             "number shown is its throughput at the higher recall printed beside "
