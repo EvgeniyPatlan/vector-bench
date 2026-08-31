@@ -236,7 +236,22 @@ develop against.
 
 - **Replace `report.html`.** The static report stays self-contained and
   shareable; the UI frames it rather than reimplementing it.
-- **Edit resource passes or engine definitions.** See above.
+- **Edit resource passes.** They carry the fairness invariants of the
+  comparison, and a change to one should be reviewable in git.
+- **Add a new database architecture.** The Engines tab adds a *variant* of a
+  family the harness already drives — another MySQL fork, another Postgres
+  build — because that is genuinely just `config/engines/<name>.yml`: a source
+  tag, an image name, server flags and a SQL dialect. Something none of the
+  existing drivers speak needs a driver in `harness/drivers/`, an
+  ann-benchmarks module and a Dockerfile, and the form refuses a config that
+  names a driver which does not exist rather than accepting one nothing can
+  serve.
+
+  Two collisions it also refuses, both of which would otherwise produce a
+  plausible config that measures the wrong thing: reusing another engine's
+  `ann_constructor`, because ann-benchmarks keys its result files on that name
+  and the second engine would report the first's recall; and reusing another
+  engine's image tag, because the two builds would overwrite each other.
 - **Compare runs measured under different budgets.** The ann fingerprint exists
   precisely to keep those apart. Overlaying them is a feature that would need to
   refuse more often than it accepted.

@@ -23,21 +23,45 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-# Engine identity is consistent across every chart in the report.
+# Engine identity is consistent across every chart in the report. Colour is never
+# the only channel: each engine also gets a marker and a line style, so the
+# charts survive greyscale printing and the common colour-vision deficiencies.
+#
+# These are defaults. The authority is config/engines/*.yml, which the run copies
+# into its manifest as `engines.<name>.presentation`; adopt_presentation() below
+# applies it. The table stays because the report container mounts report/ and
+# harness/ only -- importing the orchestrator from here crashed generation at the
+# end of a twenty-hour run once -- and because a manifest written before that
+# field existed still has to render.
 STYLE: Dict[str, Dict[str, Any]] = {
     "mariadb":  {"color": "#1f77b4", "marker": "o", "linestyle": "-",  "label": "MariaDB 11.8 (MHNSW)"},
-    # Same hue family as 11.8 so the two versions read as related, dashed so
-    # they stay distinguishable in greyscale and for colour-blind readers.
     "mariadb123": {"color": "#5fa8d3", "marker": "s", "linestyle": "--", "label": "MariaDB 12.3 (MHNSW)"},
     "alisql":   {"color": "#d62728", "marker": "s", "linestyle": "--", "label": "AliSQL (VIDX)"},
     "pgvector": {"color": "#2ca02c", "marker": "^", "linestyle": "-.", "label": "PostgreSQL (pgvector)"},
-    # Distinct hue: it is the only engine whose index lives in a separate
-    # process, so it should not read as a variant of anything above it.
     "mongodb":  {"color": "#9467bd", "marker": "v", "linestyle": "-",  "label": "Percona Search (mongot)"},
-    # Its own hue as well: it is the only in-memory engine, so it should not
-    # read as a variant of any disk-backed one.
     "valkey":   {"color": "#e377c2", "marker": "D", "linestyle": "-",  "label": "Valkey (valkey-search)"},
 }
+
+
+def adopt_presentation(manifest: Dict[str, Any]) -> None:
+    """Take engine colours and labels from the run that produced the numbers.
+
+    An engine added after this file was written has its style in its own config
+    and therefore in the manifest, so it draws correctly without an edit here.
+    """
+    for name, info in (manifest.get("engines") or {}).items():
+        presentation = (info or {}).get("presentation") or {}
+        if not presentation:
+            continue
+        current = dict(STYLE.get(name, FALLBACK))
+        for key, field in (("color", "color"), ("marker", "marker"),
+                           ("linestyle", "linestyle"), ("label", "chart_label")):
+            value = presentation.get(field)
+            if value:
+                current[key] = value
+        STYLE[name] = current
+
+
 FALLBACK = {"color": "#7f7f7f", "marker": "D", "linestyle": ":", "label": "unknown"}
 
 GRID = {"alpha": 0.25, "linewidth": 0.6}

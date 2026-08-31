@@ -104,24 +104,30 @@ inputs** — never check out, fetch into or otherwise modify them.
 An engine is not one file. Touch all of these, or a run gets as far as starting a server and
 then dies on `argument --engine: invalid choice`:
 
+**A variant of a family the harness already drives is config only** — a second MariaDB, a
+Percona Server, another Postgres build. Write `config/engines/<e>.yml` (the `runtime:` block
+carries driver, ann_constructor, port, mounts, credentials, probe, chart colour and label),
+build the image, done. The Engines tab in the web UI does exactly this.
+
+**A new architecture needs code:**
+
 ```
-config/engines/<e>.yml                                  build, server flags, SQL dialect
-harness/drivers/<e>.py                                  + register in _driver_table()
+config/engines/<e>.yml                                  runtime: block + build + SQL dialect
+harness/drivers/<e>.py                                  + register in _driver_classes()
                                                         (harness/drivers/postgres.py)
 overlay/ann-benchmarks/ann_benchmarks/algorithms/<e>/   module.py + config.yml
-orchestrator/cli.py                                     KNOWN_ENGINES / EXTRA_ENGINES
-orchestrator/ann_pass.py                                CONSTRUCTORS, DATA_MOUNT
-orchestrator/ops_pass.py                                DEFAULT_PORTS, SERVER_DATA_MOUNT,
-                                                        DB_CREDENTIALS
 docker/<e>/Dockerfile + entrypoint-<e>.sh               runtime + bench targets
 scripts/build-images.sh, scripts/prepare-sources.sh
-report/charts.py STYLE, report/render.py ENGINE_LABEL   colour + marker + label
-webui/static/app.js ENGINE_COLOR / ENGINE_LABEL         same palette, kept in sync by hand
-tests/test_config.py                                    add to the parametrised lists
+tests/test_engine_registry.py                           add to GOLDEN
 ```
 
-`_driver_table()` is the single source of truth for what the harness can drive; the argparse
-choices read from it.
+`orchestrator/engines.py` is the registry; `KNOWN_ENGINES`, chart styles and the driver
+lookup all derive from it. `_driver_classes()` maps driver *class name* to class — one entry
+per architecture, not per engine, which is what makes a variant configuration rather than code.
+
+**Two collisions the validator refuses, both of which produce plausible-but-wrong configs:**
+a duplicate `ann_constructor` (ann-benchmarks keys result files on it, so the second engine
+reports the first's recall — this is why `mariadb123` exists) and a duplicate image tag.
 
 ## Invariants that fail silently
 
@@ -129,6 +135,11 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 - **Never mix `-march` between engines.** All six compile SIMD distance kernels; a different
   flag on one turns the benchmark into a comparison of compiler flags.
+- **`harness/` and `report/` must not import `orchestrator`.** Each runs in a container that
+  mounts only itself. Importing the orchestrator from `report/` once crashed generation at the
+  end of a 20-hour run; the same mistake in `harness/` kills a run right after the server comes
+  up. Anything they need is decided on the host and passed in — `--driver` for the harness, the
+  manifest's `engines.<name>.presentation` for the report. Both are enforced by tests.
 - **Every engine can fall back to a full table scan** — exact results, slowly, indistinguishable
   in output from "very accurate but slow". Every driver implements
   `explain_uses_vector_index()` and it is called per configuration; anything that missed the

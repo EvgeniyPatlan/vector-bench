@@ -356,9 +356,3 @@ window.addEventListener("hashchange", () => {
   if (S.route.kind !== "control" || S.route.section !== "jobs") stopPolling();
 });
 
-window.renderEngines = async function renderEngines() {
-  const panel = document.getElementById("panel-engines");
-  clear(panel);
-  panel.append(el("h2", {}, "Engines"),
-    el("p", { class: "muted" }, "Coming in the next change."));
-};

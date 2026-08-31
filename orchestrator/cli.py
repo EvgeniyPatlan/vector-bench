@@ -34,6 +34,7 @@ sys.path.insert(0, VB_ROOT)
 from harness import datasets as datasets_mod  # noqa: E402
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
 from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
+from orchestrator import engines as engines_mod  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources,
                                  merge_resource_overrides, resolve_resources)
@@ -41,23 +42,17 @@ from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 
 GB = 1024 ** 3
 
-# The original three-way comparison. Kept as a name because the docs and the
-# profiles still refer to it, but it is no longer what a run defaults to --
-# see KNOWN_ENGINES.
-ALL_ENGINES = ("mariadb", "alisql", "pgvector")
-# These arrived after the first three and were opt-in while they were being
-# brought up: a second MariaDB version is another hour of compiling, and
-# Percona Search is two processes, a replica set and a JVM.
-EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
-# What `run` measures when nobody says otherwise. This defaulted to the
-# original three long after the other three had become part of the study, so
-# `run --profile smoke` proved three engines and `run --profile tuned-complete`
-# would have measured three over forty hours -- both reporting success, because
-# an engine nobody asked for cannot fail. A default that silently drops half
-# the comparison is worse than one that fails on a missing image, which is what
-# this now does if the extras were never built.
-KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
-
+# The original three-way comparison, and the engines that arrived after it.
+# Both are read from config/engines/*.yml rather than listed here: a name in one
+# place and a config in another is how an engine ends up half-registered.
+ALL_ENGINES = engines_mod.engines_in_group("original")
+EXTRA_ENGINES = engines_mod.engines_in_group("extra")
+# What `run` measures when nobody says otherwise. This once defaulted to the
+# original three long after the other three had joined the study, so
+# `run --profile smoke` proved three engines and a forty-hour run would have
+# measured three -- both reporting success, because an engine nobody asked for
+# cannot fail.
+KNOWN_ENGINES = engines_mod.known_engines()
 
 
 # Docker's own rule for container and volume names. The run id becomes both, so
@@ -428,6 +423,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "bench": docker_ctl.image_id(
                         engine_cfg.get("image", {}).get("bench", "")),
                 },
+                presentation=engines_mod.presentation(engine),
             )
             for warning in resolved.warnings:
                 print(f"  ! {warning}")

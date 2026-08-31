@@ -269,37 +269,85 @@ class PostgresDriver(EngineDriver):
 DRIVERS = {}
 
 
-def _driver_table() -> Dict[str, Any]:
-    """Engine name -> driver class.
+def _driver_classes() -> Dict[str, Any]:
+    """Driver class name -> class.
 
-    The single source of truth for what this harness can drive. The argument
-    parser reads it too, so adding an engine here is enough: a mismatch between
-    the two lists is how a run got as far as starting the server and then died
-    on `argument --engine: invalid choice`.
+    This is what the harness can actually drive: one entry per architecture,
+    not per engine. Several engines share a driver -- mariadb and mariadb123 are
+    the same server at different tags -- which is what makes adding a variant a
+    config change rather than a code change.
     """
     from .mongo import MongoDriver
     from .mysql_family import AliSQLDriver, MariaDBDriver
     from .valkey import ValkeyDriver
 
     return {
-        "mariadb": MariaDBDriver,
-        # Same server software at a different tag; the driver is identical.
-        "mariadb123": MariaDBDriver,
-        "alisql": AliSQLDriver,
-        "pgvector": PostgresDriver,
-        "mongodb": MongoDriver,
-        "valkey": ValkeyDriver,
+        "MariaDBDriver": MariaDBDriver,
+        "AliSQLDriver": AliSQLDriver,
+        "PostgresDriver": PostgresDriver,
+        "MongoDriver": MongoDriver,
+        "ValkeyDriver": ValkeyDriver,
     }
 
 
+def _driver_table() -> Dict[str, Any]:
+    """Engine name -> driver class, for callers that still think in engines.
+
+    Kept deliberately small and orchestrator-free. This package runs inside a
+    container that mounts harness/ and nothing else, so it cannot read
+    config/engines/*.yml and must not try: importing the orchestrator from here
+    is a ModuleNotFoundError after the server has already started.
+
+    The orchestrator knows which driver an engine wants and passes it by name,
+    so this is only a convenience for the engines that shipped with the harness.
+    """
+    classes = _driver_classes()
+    return {
+        "mariadb": classes["MariaDBDriver"],
+        # Same server software at a different tag; the driver is identical.
+        "mariadb123": classes["MariaDBDriver"],
+        "alisql": classes["AliSQLDriver"],
+        "pgvector": classes["PostgresDriver"],
+        "mongodb": classes["MongoDriver"],
+        "valkey": classes["ValkeyDriver"],
+    }
+
+
+def known_drivers() -> Tuple[str, ...]:
+    """Driver class names this harness can instantiate."""
+    return tuple(sorted(_driver_classes()))
+
+
 def known_engines() -> Tuple[str, ...]:
-    """Engine names this harness accepts, for argparse choices."""
+    """Engine names this harness recognises without being told a driver.
+
+    Not a constraint on --engine any more: the orchestrator validates the name
+    against config/engines/*.yml and passes --driver, so an engine added there
+    needs no edit here. Kept because it is the honest answer to "what does this
+    harness know about on its own".
+    """
     return tuple(_driver_table())
 
 
-def get_driver(engine: str, spec: ConnectionSpec) -> EngineDriver:
-    """Resolve an engine name to a connected-capable driver instance."""
+def get_driver(engine: str, spec: ConnectionSpec,
+               driver: Optional[str] = None) -> EngineDriver:
+    """A driver instance, chosen by driver class name when one is given.
+
+    The orchestrator reads the driver out of config/engines/*.yml and passes it,
+    which is what lets a new engine be added as configuration: this side never
+    needs a new entry. Falling back to the engine name keeps the harness usable
+    on its own for the engines it shipped with.
+    """
+    if driver:
+        classes = _driver_classes()
+        if driver not in classes:
+            raise ValueError(f"unknown driver: {driver} "
+                             f"(expected one of {sorted(classes)})")
+        return classes[driver](spec)
+
     table = _driver_table()
     if engine not in table:
-        raise ValueError(f"unknown engine: {engine} (expected one of {sorted(table)})")
+        raise ValueError(
+            f"unknown engine: {engine} (expected one of {sorted(table)}, "
+            f"or pass --driver to name one of {sorted(_driver_classes())})")
     return table[engine](spec)

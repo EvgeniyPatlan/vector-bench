@@ -26,24 +26,70 @@ def _guard(api: Api) -> Optional[Response]:
 # -- reference data ----------------------------------------------------------
 
 def list_engines(api: Api, _m, _q, _b=None) -> Response:
-    from orchestrator.cli import ALL_ENGINES, EXTRA_ENGINES, KNOWN_ENGINES
-    from orchestrator.config import load_engine
+    from . import engines as engines_mod
+    from orchestrator import docker_ctl
 
-    engines = []
-    for name in KNOWN_ENGINES:
-        try:
-            config = load_engine(name)
-        except FileNotFoundError:
-            continue
-        engines.append({
-            "name": name,
-            "display_name": config.get("display_name", name),
-            "tag": (config.get("source") or {}).get("tag")
-                   or (config.get("source") or {}).get("version"),
-            "group": "original" if name in ALL_ENGINES else "extra",
-            "bench_image": (config.get("image") or {}).get("bench"),
-        })
-    return 200, {"engines": engines, "extra": list(EXTRA_ENGINES)}
+    listed = engines_mod.listing(api.config_dir)
+    for engine in listed:
+        images = engine.get("images") or {}
+        engine["built"] = {
+            kind: bool(ref) and docker_ctl.image_exists(ref)
+            for kind, ref in images.items()
+        }
+    return 200, {
+        "engines": listed,
+        "drivers": engines_mod.available_drivers(),
+        "control_enabled": api.allow_control,
+    }
+
+
+def get_engine(api: Api, match, _q, _b=None) -> Response:
+    from . import engines as engines_mod
+    found = engines_mod.read(api.config_dir, match.group("name"))
+    if found is None:
+        return 404, {"error": f"no such engine: {match.group('name')}"}
+    return 200, found
+
+
+def validate_engine(api: Api, match, _q, body=None) -> Response:
+    denied = _guard(api)
+    if denied:
+        return denied
+    from . import engines as engines_mod
+    errors, warnings, parsed = engines_mod.validate(
+        api.config_dir, match.group("name"), (body or {}).get("text", ""))
+    return 200, {"ok": not errors, "errors": errors, "warnings": warnings,
+                 "parsed": parsed}
+
+
+def put_engine(api: Api, match, _q, body=None) -> Response:
+    denied = _guard(api)
+    if denied:
+        return denied
+    from . import engines as engines_mod
+    name = match.group("name")
+    text = (body or {}).get("text")
+    if not isinstance(text, str) or not text.strip():
+        return 400, {"error": "body must contain non-empty 'text'"}
+
+    ok, errors, warnings = engines_mod.write(api.config_dir, name, text)
+    if not ok:
+        return 400, {"ok": False, "errors": errors, "warnings": warnings}
+    return 200, {"ok": True, "errors": [], "warnings": warnings, "name": name,
+                 "next": f"./run-benchmark.sh build --engines {name}"}
+
+
+def clone_engine(api: Api, _m, _q, body=None) -> Response:
+    denied = _guard(api)
+    if denied:
+        return denied
+    from . import engines as engines_mod
+    spec = body or {}
+    text, errors = engines_mod.clone(api.config_dir, str(spec.get("base") or ""),
+                                     str(spec.get("name") or ""))
+    if errors:
+        return 400, {"ok": False, "errors": errors}
+    return 200, {"ok": True, "name": spec.get("name"), "text": text}
 
 
 def list_datasets(api: Api, _m, _q, _b=None) -> Response:
@@ -184,6 +230,10 @@ def stop_job(api: Api, match, _q, _b=None) -> Response:
 
 ROUTES: List[Tuple[str, Any, Any]] = [
     ("GET", re.compile(r"^/api/engines$"), list_engines),
+    ("POST", re.compile(r"^/api/engines/clone$"), clone_engine),
+    ("GET", re.compile(r"^/api/engines/(?P<name>[^/]+)$"), get_engine),
+    ("PUT", re.compile(r"^/api/engines/(?P<name>[^/]+)$"), put_engine),
+    ("POST", re.compile(r"^/api/engines/(?P<name>[^/]+)/validate$"), validate_engine),
     ("GET", re.compile(r"^/api/datasets$"), list_datasets),
     ("GET", re.compile(r"^/api/profiles$"), list_profiles),
     ("GET", re.compile(r"^/api/profiles/(?P<name>[^/]+)$"), get_profile),

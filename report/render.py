@@ -19,6 +19,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+# Defaults; the manifest's per-engine `presentation.label` overrides them, so an
+# engine added after this file was written names itself correctly.
 ENGINE_LABEL = {
     "mariadb": "MariaDB 11.8 (MHNSW)",
     "mariadb123": "MariaDB 12.3 (MHNSW)",
@@ -27,6 +29,13 @@ ENGINE_LABEL = {
     "mongodb": "Percona Search for MongoDB (mongot)",
     "valkey": "Valkey (valkey-search)",
 }
+
+
+def adopt_presentation(manifest: Dict[str, Any]) -> None:
+    for name, info in (manifest.get("engines") or {}).items():
+        label = ((info or {}).get("presentation") or {}).get("label")
+        if label:
+            ENGINE_LABEL[name] = label
 
 
 def _fmt_bytes(value: Optional[float]) -> str:

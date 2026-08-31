@@ -244,7 +244,8 @@ class TestOverlayModules:
         assert os.path.exists(path), f"missing overlay module for {engine}"
         source = open(path).read()
         assert f"class {constructor}" in source
-        assert ann_pass.CONSTRUCTORS[engine] == constructor
+        from orchestrator import engines as engines_mod
+        assert engines_mod.get(engine).ann_constructor == constructor
 
 
 class TestAnnResultGuard:
@@ -668,30 +669,43 @@ class TestEngineDataPlacement:
 
     def test_every_engine_has_a_declared_data_mount(self):
         """Covers extra versions too, not just the baseline three."""
-        from orchestrator.ann_pass import DATA_MOUNT
+        from orchestrator import engines as engines_mod
+        mounts = {name: e.data_mount for name, e in engines_mod.registry().items()}
         from orchestrator.cli import KNOWN_ENGINES
-        assert set(DATA_MOUNT) == set(KNOWN_ENGINES)
-        assert all(p.startswith("/var/lib/") for p in DATA_MOUNT.values())
+        assert set(mounts) == set(KNOWN_ENGINES)
+        assert all(p.startswith("/var/lib/") for p in mounts.values())
 
-    def test_every_registry_covers_every_known_engine(self):
-        """Adding an engine means touching five tables; this is the guard.
+    def test_every_engine_declares_everything_a_run_needs(self):
+        """These used to be six dicts an engine could be missing from.
 
-        mariadb123 was added as a distinct engine because ann-benchmarks keys
-        results on the algorithm name, so a retagged `mariadb` would silently
-        return 11.8.8's numbers for a 12.3 build.
+        They are one registry now, read from config/engines/*.yml, so the
+        failure this guards against is an incomplete `runtime:` block rather
+        than a table someone forgot to edit. Either way it must fail here and
+        not four hours into a run.
+
+        mariadb123 is a distinct engine because ann-benchmarks keys results on
+        the algorithm name, so a retagged `mariadb` would silently return
+        11.8.8's numbers for a 12.3 build.
         """
-        from orchestrator.ann_pass import CONSTRUCTORS, DATA_MOUNT
-        from orchestrator.ops_pass import (DB_CREDENTIALS, DEFAULT_PORTS,
-                                           PROBES, SERVER_DATA_MOUNT)
+        from orchestrator import engines as engines_mod
         from orchestrator.cli import KNOWN_ENGINES
-        for name, table in (("CONSTRUCTORS", CONSTRUCTORS),
-                            ("DATA_MOUNT", DATA_MOUNT),
-                            ("DEFAULT_PORTS", DEFAULT_PORTS),
-                            ("PROBES", PROBES),
-                            ("DB_CREDENTIALS", DB_CREDENTIALS),
-                            ("SERVER_DATA_MOUNT", SERVER_DATA_MOUNT)):
-            missing = set(KNOWN_ENGINES) - set(table)
-            assert not missing, f"{name} is missing {sorted(missing)}"
+        registry = engines_mod.registry()
+        assert set(registry) == set(KNOWN_ENGINES)
+        for name, engine in registry.items():
+            assert engine.driver, f"{name}: no driver"
+            assert engine.ann_constructor, f"{name}: no ann_constructor"
+            assert engine.port, f"{name}: no port"
+            assert engine.data_mount, f"{name}: no data_mount"
+            assert engine.probe, f"{name}: no readiness probe"
+            assert engine.label, f"{name}: no label"
+
+    def test_every_engine_names_a_driver_the_harness_has(self):
+        from orchestrator import engines as engines_mod
+        from harness.drivers.postgres import _driver_classes
+        available = set(_driver_classes())
+        for name, engine in engines_mod.registry().items():
+            assert engine.driver in available, \
+                f"{name} names driver {engine.driver!r}, which does not exist"
 
     def test_a_second_mariadb_version_is_a_distinct_engine(self):
         from orchestrator.config import load_engine
@@ -826,6 +840,49 @@ class TestCleanup:
                             lambda _n: {"engine_state": str(tmp_path / "none")})
         args = type("A", (), {"run_id": None, "force": True})()
         assert cli.cmd_clean(args) == 0
+
+
+class TestHarnessIsolation:
+    """The ops harness container mounts harness/ only.
+
+    There is a matching guard below for report/, written after an
+    orchestrator import there crashed generation at the end of a 20-hour run.
+    harness/ had no such guard, so the same mistake was made again: resolving
+    an engine's driver through config/engines/*.yml from inside the harness
+    raised ModuleNotFoundError right after the server came up. The orchestrator
+    reads the config and passes --driver instead.
+    """
+
+    def test_harness_does_not_import_the_orchestrator(self):
+        import glob
+        pattern = os.path.join(VB_ROOT, "harness", "**", "*.py")
+        for path in glob.glob(pattern, recursive=True):
+            for line in open(path).read().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                assert "import orchestrator" not in stripped, f"{path}: {stripped}"
+                assert "from orchestrator" not in stripped, f"{path}: {stripped}"
+
+    def test_harness_imports_with_nothing_else_present(self, tmp_path):
+        """Import it the way the container does: harness/ and nothing else."""
+        import shutil
+        import subprocess
+        import sys
+        shutil.copytree(os.path.join(VB_ROOT, "harness"), tmp_path / "harness")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, '.'); "
+             "from harness.drivers.postgres import _driver_table; "
+             "print(sorted(_driver_table()))"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr[-800:]
+        assert "mariadb" in result.stdout
+
+    def test_the_orchestrator_names_the_driver_it_wants(self):
+        """The engine config is read on the host and passed in."""
+        src = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert '"--driver"' in src
 
 
 class TestReportNarrowing:
@@ -1331,10 +1388,18 @@ class TestHarnessAcceptsEveryOrchestratedEngine:
         missing = set(KNOWN_ENGINES) - set(known_engines())
         assert not missing, f"the harness cannot drive: {sorted(missing)}"
 
-    def test_choices_are_not_hardcoded_in_the_parser(self):
+    def test_the_parser_does_not_keep_its_own_engine_list(self):
+        """The two lists cannot disagree if the harness does not keep one.
+
+        It used to constrain --engine to a literal, then to the driver table.
+        Now the orchestrator validates the name against config/engines/*.yml
+        and passes --driver, so there is nothing here to fall out of step.
+        """
         source = open(os.path.join(VB_ROOT, "harness", "main.py")).read()
-        assert 'choices=known_engines()' in source, \
-            "--engine choices must come from the driver table, not a literal"
+        parser = source.split("def parse_args")[1].split("\ndef ")[0]
+        assert "choices=" not in parser.split("--engine")[1].split("p.add_argument")[0], \
+            "--engine must not be constrained to a list the harness maintains"
+        assert '"--driver"' in parser, "the orchestrator must be able to name the driver"
 
     def test_every_engine_resolves_to_a_driver_class(self):
         from harness.drivers.postgres import _driver_table
@@ -1900,10 +1965,10 @@ class TestMongoAnnModule:
         """A config naming a class the module does not define fails only once
         the image is built and the corpus is loaded."""
         import ast
-        from orchestrator.ann_pass import CONSTRUCTORS
+        from orchestrator import engines as engines_mod
         tree = ast.parse(open(self.MODULE).read())
         classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
-        assert CONSTRUCTORS["mongodb"] in classes
+        assert engines_mod.get("mongodb").ann_constructor in classes
 
     def test_fit_waits_for_the_index_rather_than_timing_the_call(self):
         source = open(self.MODULE).read()
@@ -2451,13 +2516,13 @@ class TestMongotForcesAuthentication:
     """
 
     def test_the_credentials_registry_is_not_empty_for_mongodb(self):
-        from orchestrator.ops_pass import DB_CREDENTIALS
-        user, password = DB_CREDENTIALS["mongodb"]
+        from orchestrator import engines as engines_mod
+        user, password = engines_mod.get("mongodb").credentials
         assert user and password
 
     def test_the_readiness_probe_authenticates(self):
-        from orchestrator.ops_pass import PROBES
-        probe = " ".join(PROBES["mongodb"])
+        from orchestrator import engines as engines_mod
+        probe = " ".join(engines_mod.get("mongodb").probe)
         assert "-u" in probe and "authenticationDatabase" in probe
 
     def test_the_driver_builds_an_authenticated_uri(self):
@@ -2874,8 +2939,8 @@ class TestBothProcessesAreWaitedFor:
     def test_the_readiness_probe_checks_both(self):
         """A probe that passes on mongod alone reports the server ready while
         the process that answers every search query is still booting."""
-        from orchestrator.ops_pass import PROBES
-        probe = " ".join(PROBES["mongodb"])
+        from orchestrator import engines as engines_mod
+        probe = " ".join(engines_mod.get("mongodb").probe)
         assert "isWritablePrimary" in probe
         assert "8080" in probe, "the probe does not check mongot at all"
 
