@@ -472,6 +472,29 @@ class TestServer:
         status, _ = get(f"{live_server}/runs/nope/report/report.html")
         assert status == 404
 
+    def test_a_rejected_large_post_still_returns_its_status(self, live_server):
+        """Answering before the body arrives resets the connection.
+
+        curl reports the status regardless; a browser's fetch() raises
+        "Failed to fetch" and the real reason never reaches the page. An
+        11 MB import refused for a stale session looked like a network fault.
+        """
+        import urllib.error
+        import urllib.request
+
+        payload = b"x" * (3 * 1024 * 1024)
+        request = urllib.request.Request(
+            f"{live_server}/api/runs", data=payload, method="POST",
+            headers={"Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        # 405 here: the point is that a status came back at all rather than
+        # the connection dying under a body the server never read.
+        assert status in (400, 401, 403, 405)
+
     def test_bundle_is_a_download(self, live_server):
         import urllib.request
         with urllib.request.urlopen(f"{live_server}/runs/run-a/bundle", timeout=10) as res:

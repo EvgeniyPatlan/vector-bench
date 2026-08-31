@@ -507,6 +507,12 @@ develop against.
 **403 "host not allowed"** — you reached the server by a name that is not
 localhost. Use the SSH port-forward.
 
+**An upload says "failed to fetch"** — that is the browser reporting a
+connection that ended, not a server error, and the usual cause is a session
+that expired while the file was going up. Reload, sign in, try again. Copying
+the run directory into `results/` on the server needs no upload at all and is
+the better move for anything large.
+
 **A launch fails immediately** — read the Jobs log. The usual causes are a
 missing engine image and a dataset that was never fetched; both name themselves
 in the first few lines.

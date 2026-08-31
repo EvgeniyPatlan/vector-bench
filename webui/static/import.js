@@ -73,6 +73,10 @@ async function uploadRun() {
     });
     const body = await res.json().catch(() => ({}));
     IM.busy = false;
+    if (res.status === 401) {
+      window.location.href = "/login.html";
+      return;
+    }
     if (!res.ok) {
       importForm();
       const node = document.getElementById("import-status");
@@ -87,8 +91,18 @@ async function uploadRun() {
   } catch (err) {
     IM.busy = false;
     importForm();
-    document.getElementById("import-status").append(
-      el("div", { class: "err" }, String(err)));
+    const node = document.getElementById("import-status");
+    node.append(el("div", { class: "err" }, String(err)));
+    // fetch() reports a connection that ends mid-upload as "Failed to fetch"
+    // and keeps the status to itself, so say what it usually means rather than
+    // leaving a browser-level string as the whole explanation.
+    if (String(err).includes("Failed to fetch") || err instanceof TypeError) {
+      node.append(el("div", { class: "muted" },
+        "The connection ended before the upload finished. Usually the session "
+        + "expired mid-upload — reload the page, sign in, and try again. If it "
+        + "persists, copy the archive into results/ on the server instead; "
+        + "an unpacked run directory needs no upload."));
+    }
   }
 }
 

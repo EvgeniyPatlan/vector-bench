@@ -31,6 +31,11 @@ api_mod.extend(control_mod.ROUTES)
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "[::1]", "::1")
 
+#: A rejected request whose body is smaller than this is read and discarded so
+#: the client can read the status instead of meeting a reset. Anything larger
+#: gets Connection: close, which is cheaper than swallowing it.
+DRAIN_LIMIT_BYTES = 1024 * 1024
+
 # Reachable before signing in: the login page itself, what it needs to render,
 # and the endpoints it posts to.
 PUBLIC_PATHS = frozenset({
@@ -91,6 +96,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, status: int, body: bytes, content_type: str,
               cache: bool = False, cookie: Optional[str] = None) -> None:
         self.send_response(status)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", content_type)
         if cookie:
             self.send_header("Set-Cookie", cookie)
@@ -102,9 +109,41 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _pending_request_body(self) -> int:
+        """Bytes the client announced and this handler has not read."""
+        if getattr(self, "_body_consumed", False):
+            return 0
+        try:
+            return max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            return 0
+
     def _send_json(self, status: int, payload, cookie: Optional[str] = None) -> None:
+        # Answering a request whose body is still arriving and then reading no
+        # more of it resets the connection under the client. curl reports the
+        # status anyway; a browser's fetch() does not -- it raises "Failed to
+        # fetch" and the real reason, usually a 401, never reaches the page.
+        # Refusing an 11 MB upload looked like a network fault because of this.
+        pending = self._pending_request_body()
+        if pending and status >= 400:
+            if pending <= DRAIN_LIMIT_BYTES:
+                self._drain_request_body(pending)
+            else:
+                # Too large to swallow politely: say the connection ends here,
+                # which lets the client stop writing and read the response.
+                self.close_connection = True
+
         body = json.dumps(payload, default=str).encode()
         self._send(status, body, "application/json; charset=utf-8", cookie=cookie)
+
+    def _drain_request_body(self, length: int) -> None:
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        self._body_consumed = True
 
     def _send_file(self, path: str) -> None:
         try:
@@ -307,6 +346,7 @@ class Handler(BaseHTTPRequestHandler):
                 tmp.write(chunk)
                 remaining -= len(chunk)
             staged = tmp.name
+        self._body_consumed = True
 
         try:
             imported, errors = importing_mod.import_bundle(
@@ -354,8 +394,11 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode())
+            raw = self.rfile.read(length)
+            self._body_consumed = True
+            return json.loads(raw.decode())
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            self._body_consumed = True
             return None
 
 
