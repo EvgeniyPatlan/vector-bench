@@ -1147,14 +1147,18 @@ def cmd_web(args: argparse.Namespace) -> int:
     if args.behind_proxy:
         command.append("--behind-proxy")
 
-    # An unclean stop can leave the previous container running and holding the
-    # port. It is ours, it is named after this port, and nothing else should be
-    # using that name, so remove it rather than refusing to start.
-    for stale in docker_ctl.containers_publishing(args.port):
-        if stale == container:
-            print(f"removing a leftover {container} from an unclean stop")
-            docker_ctl.remove(container)
-            time.sleep(1)
+    # An unclean stop leaves the previous container running and holding the
+    # port. Match any of ours on it, not just the name this invocation would
+    # choose: containers made before the naming changed are called after the
+    # pid that started them, so an exact-name check walked straight past them
+    # and every restart then failed with "port is already in use".
+    stale = [name for name in docker_ctl.containers_publishing(args.port)
+             if name.startswith("vb-webui-")]
+    for name in stale:
+        print(f"removing a leftover {name} from an unclean stop")
+        docker_ctl.remove(name)
+    if stale:
+        time.sleep(1)
 
     busy = _port_holder(args.host, args.port)
     if busy:

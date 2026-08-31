@@ -60,8 +60,11 @@ TimeoutStopSec=30s
 # Belt and braces around the same thing: the container is named for its port,
 # so a leftover from an unclean stop can be cleared deterministically. The
 # leading `-` means a missing container is not an error.
-ExecStartPre=-/usr/bin/docker rm -f vb-webui-8080
-ExecStopPost=-/usr/bin/docker rm -f vb-webui-8080
+# Remove any of ours still holding the port, whatever it is called. An exact
+# name misses containers started by an older build, which used the pid rather
+# than the port, and one of those pins the port through every restart.
+ExecStartPre=-/bin/sh -c 'docker ps -q --filter name=^/vb-webui- | xargs -r docker rm -f'
+ExecStopPost=-/bin/sh -c 'docker ps -q --filter name=^/vb-webui- | xargs -r docker rm -f' 
 
 # It needs the Docker socket and the checkout, and nothing else.
 NoNewPrivileges=true
