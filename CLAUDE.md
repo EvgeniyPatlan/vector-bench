@@ -21,14 +21,13 @@ The repo root is `vector-bench/` (git repo, branch `master`). All commands below
 | `mongodb` | Percona Search for MongoDB (mongot) | Percona package |
 | `valkey` | Valkey + valkey-search | Percona repo `valkey-91` |
 
-**The README's engine table is stale.** It still describes a three-engine study; the code
-measures six engines by default (`KNOWN_ENGINES` in `orchestrator/cli.py`). Trust the code
-and `config/`, not the README table, when they disagree.
+`KNOWN_ENGINES` is whatever `config/engines/*.yml` holds — there is no list in Python to keep
+in step with it. `orchestrator/engines.py` is the registry everything derives from.
 
 ## Commands
 
 ```bash
-python3 -m pytest tests/ -q                 # ~560 tests, ~14 s. The fast inner loop.
+python3 -m pytest tests/ -q                 # ~777 tests, ~30 s. The fast inner loop.
 ./tests/make-tiny-dataset.sh                # synthetic corpus, no download
 ./run-benchmark.sh run --profile dev        # ~1 min/engine end-to-end cycle
 ./run-benchmark.sh run --profile smoke      # ~45 min/pass gate before any long run
@@ -37,6 +36,8 @@ python3 -m pytest tests/ -q                 # ~560 tests, ~14 s. The fast inner 
 ./run-benchmark.sh build --engines alisql --march native
 ./run-benchmark.sh clean --run-id <run-id>
 ./run-benchmark.sh web [--allow-control]    # web UI; --no-container for host mode
+./run-benchmark.sh generate <dataset>       # datasets fetch cannot download
+./run-benchmark.sh export --run-dir <id>    # bundle a run to send to someone
 ```
 
 Never pipe pytest through `tail`/`head` in a command whose exit status matters — a broken
@@ -64,7 +65,9 @@ Two measurement paths converge on **one flat record schema** (`harness/metrics/r
 The harness never starts or configures a server — the orchestrator does, so every engine gets
 identical treatment and that treatment lands in the manifest.
 
-**Web UI** (`webui/`, `docs/08-web-ui.md`). Stdlib-only HTTP server + vanilla-JS front end,
+**Web UI** (`webui/`, `docs/08-web-ui.md`). Covers every long command — `run`, `fetch`,
+`build`, `generate`, `report`, `render` — through one job supervisor (`webui/jobs.py`), with
+live log streaming. Nothing may run alongside a benchmark; setup jobs may overlap each other. Stdlib-only HTTP server + vanilla-JS front end,
 served from `vector-bench/webui` (ubuntu + python3/pyyaml/numpy/git + the Docker CLI). Read-only
 by default; `--allow-control` adds profile editing and run launching and mounts `docker.sock`.
 It reads `report/records.jsonl` when a report exists and falls back to `load_ops_records()`.

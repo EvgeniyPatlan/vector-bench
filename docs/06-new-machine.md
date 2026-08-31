@@ -120,9 +120,9 @@ be mistaken for a complete dataset.
 ## 5. Verify before measuring
 
 ```bash
-python3 -m pytest tests/ -q                     # 73 unit tests, ~2 s
+python3 -m pytest tests/ -q                     # 777 unit tests, ~30 s
 ./tests/verify-alisql-traps.sh                  # 8 engine-behaviour checks
-./run-benchmark.sh run --profile smoke          # ~30 min, all three engines
+./run-benchmark.sh run --profile smoke          # ~45 min/pass, every engine
 ```
 
 **Do not skip the smoke profile.** It exercises every stage end to end and is

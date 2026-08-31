@@ -242,11 +242,11 @@ TOASTed vectors add a detoast to every distance comparison.
 
 ---
 
-## Things that are true of all three
+## Things that are true of all of them
 
-- **The optimizer can always decline the index.** All three will fall back to
-  exact brute force under some conditions, and all three make that look like
-  high recall at low throughput. Check the plan, every time.
+- **The optimizer can always decline the index.** Every one of them will fall
+  back to exact brute force under some conditions, and every one makes that
+  look like high recall at low throughput. Check the plan, every time.
 - **Metric is fixed at index creation.** You cannot query a cosine index with a
   Euclidean distance function and get index acceleration.
 - **Recall is not deterministic across rebuilds.** HNSW construction involves

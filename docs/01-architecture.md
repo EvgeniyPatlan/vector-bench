@@ -25,6 +25,7 @@ flowchart TB
             OVL["overlay/<br/>alisql · mariadb · pgvector modules"]
             HARN["harness/<br/><i>ops workloads</i>"]
             REP["report/generate.py"]
+            WEB["webui/<br/><i>browser interface</i>"]
             RES["results/&lt;run-id&gt;/"]
         end
     end
@@ -111,9 +112,81 @@ flowchart LR
 `local` (default — `git archive` out of `sources/`) or `upstream` (clone from
 GitHub inside the builder, for publishing a recipe others can rebuild).
 
-## 3. Vector-search internals, side by side
+## 3. The web UI
 
-The three engines solve the same problem with materially different plumbing.
+A fourth container, and the only one that is not part of a measurement. It
+serves the browser interface: a run index, the manifest as a page, an explorer
+over the records, and buttons for the long commands.
+
+```mermaid
+flowchart LR
+    B["browser<br/><i>127.0.0.1:8080</i>"] --> W
+
+    subgraph wc["vector-bench/webui container"]
+        W["webui.server<br/><i>stdlib HTTP</i>"]
+    end
+
+    W -- "reads" --> RES["results/ · config/ · datasets/"]
+    W -- "./run-benchmark.sh run, fetch, build …" --> ORCH["orchestrator<br/>on the host's Docker"]
+    W -. "only with --allow-control" .-> SOCK["/var/run/docker.sock"]
+    ORCH --> ENG["engine containers"]
+```
+
+Three properties that are not obvious from the picture:
+
+* **The repo is bind-mounted at its own absolute host path**, not at a tidy
+  `/app`. The orchestrator hands *host* paths to the Docker daemon when it
+  launches engine containers, so a container-only path would be resolved by the
+  daemon against the host filesystem, where it does not exist, and the engine
+  would come up with an empty mount.
+* **The container runs as the invoking user.** As root, git refuses the
+  bind-mounted working copy as "dubious ownership" — which stops every run
+  before it starts — and everything written under `state/` and
+  `config/profiles/` lands root-owned on the host.
+* **The Docker socket is mounted only with `--allow-control`.** Read-only mode
+  needs nothing but the filesystem, so it is safe to leave running.
+
+Nothing runs alongside a benchmark: a download or a compile during an ingest
+measurement perturbs exactly what is being measured. See
+[08-web-ui.md](08-web-ui.md).
+
+### Where an engine is defined
+
+One file per engine, `config/engines/<name>.yml`, and the orchestrator reads the
+directory rather than a list. Besides the build recipe, server flags and SQL
+dialect, each carries a `runtime:` block:
+
+| Key | Used for |
+| --- | --- |
+| `driver` | Which `harness/drivers/` class drives it. Several engines share one — `mariadb` and `mariadb123` are the same server at different tags |
+| `ann_constructor` | The class name ann-benchmarks expects. Must be unique: it keys the result files |
+| `port`, `data_mount`, `server_data_mount` | Where to connect and where its data lives inside the image |
+| `credentials` | The bench account |
+| `probe` | Readiness command, run until it succeeds |
+| `chart`, `label`, `order` | How it is drawn and named, and where it sits in the ordering |
+
+These were once six dictionaries keyed by engine name, spread across
+`ann_pass`, `ops_pass`, `cli`, `charts` and `render`. Missing one did not fail
+at load: it failed after a server had already started, or drew a recall chart
+quietly missing a series.
+
+Two consumers cannot read this file, and are given what they need instead:
+
+* **`harness/`** runs in a container mounting `harness/` only, so the
+  orchestrator passes `--driver`.
+* **`report/`** mounts `report/` and `harness/` only, so each engine's colour
+  and label are written into `run-manifest.json` and read back from there. An
+  engine added later therefore draws and names itself correctly in a report
+  without either package being edited.
+
+Both constraints are enforced by tests, because both were violated in practice —
+an orchestrator import inside `report/` once crashed generation at the end of a
+twenty-hour run.
+
+## 4. Vector-search internals, side by side
+
+The original three engines solve the same problem with materially different
+plumbing.
 This is what the benchmark is actually measuring.
 
 ```mermaid
@@ -160,7 +233,7 @@ Consequences that show up in the results:
 - **`ef_construction` is only tunable in pgvector**, so build-quality tradeoffs
   are not symmetric.
 
-## 4. Benchmark data flow
+## 5. Benchmark data flow
 
 ```mermaid
 sequenceDiagram
@@ -205,7 +278,7 @@ sequenceDiagram
     U->>R: report.md · report.html · charts/*.svg
 ```
 
-## 5. Results pipeline
+## 6. Results pipeline
 
 ```mermaid
 flowchart LR
