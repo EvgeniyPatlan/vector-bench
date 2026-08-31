@@ -49,11 +49,19 @@ ExecStart=/bin/sh -c 'exec ./run-benchmark.sh web $VB_WEB_ARGS'
 Restart=on-failure
 RestartSec=5s
 
-# A benchmark launched from the interface is a detached process group and
-# outlives this unit on purpose: restarting the interface must not kill a run
-# that is twenty hours in.
-KillMode=process
+# KillMode=process was here, on the theory that it spared a benchmark launched
+# from the interface. It did not: that run is a process inside the web
+# container, so it dies when the container does whatever systemd signals. What
+# it actually did was leave the `docker run` client alive after a stop, holding
+# the published port, so the next start failed with "port is in use".
+KillMode=mixed
 TimeoutStopSec=30s
+
+# Belt and braces around the same thing: the container is named for its port,
+# so a leftover from an unclean stop can be cleared deterministically. The
+# leading `-` means a missing container is not an error.
+ExecStartPre=-/usr/bin/docker rm -f vb-webui-8080
+ExecStopPost=-/usr/bin/docker rm -f vb-webui-8080
 
 # It needs the Docker socket and the checkout, and nothing else.
 NoNewPrivileges=true

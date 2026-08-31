@@ -380,12 +380,17 @@ journalctl -u vector-bench-web | grep -A2 'generated a password'
 `VB_WEB_ARGS` in that file chooses the exposure — loopback plus a tunnel, a
 public address behind TLS, or a private network. The examples are in the file.
 
-> **A run started from the interface outlives the service.** The unit uses
-> `KillMode=process` deliberately: restarting or stopping the web interface must
-> not kill a benchmark that is twenty hours in. The run keeps going and is still
-> there in Jobs when the interface comes back — though the log it was streaming
-> is not, since the process that was capturing it has gone. The run's own output
-> under `results/<run-id>/` is unaffected.
+> **Stopping the service stops any run it started.** A run launched from the
+> interface is a process *inside the web container*, so it goes when the
+> container does. An earlier version of this unit used `KillMode=process`
+> claiming to spare such a run; it could not, and all it actually did was leave
+> the `docker run` client alive holding the published port, so the next start
+> failed with "port is in use".
+>
+> Whatever the run wrote to `results/<run-id>/` up to that point is intact, and
+> `--resume` continues from the last completed unit. But treat restarting the
+> web service during a long run as ending it. To start a run that must survive
+> the interface, run it from a terminal — `tmux` and `./run-benchmark.sh run`.
 
 Without systemd, `tmux new -s web './run-benchmark.sh web --allow-control --auth'`
 survives a disconnect but not a reboot.

@@ -969,6 +969,10 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
 WEBUI_IMAGE = "vector-bench/webui:latest"
 
 
+def webui_container_name(port: int) -> str:
+    return f"vb-webui-{int(port)}"
+
+
 def _webui_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost", "")
 
@@ -1101,8 +1105,13 @@ def cmd_web(args: argparse.Namespace) -> int:
     # Run as the invoking user, not root. The repo is a bind mount owned by that
     # user: as root, git refuses the working copy as "dubious ownership" and
     # every file the server writes lands root-owned on the host.
+    # Named for the port, not the pid. A stable name is what lets a service
+    # unit clear a leftover container before starting and after stopping; a
+    # pid-derived one is different every time and so cannot be cleaned up by
+    # anything but luck. The port keeps two instances from colliding.
+    container = webui_container_name(args.port)
     command = [
-        "docker", "run", "--rm", "--name", f"vb-webui-{os.getpid()}",
+        "docker", "run", "--rm", "--name", container,
         "--publish", f"{args.host}:{args.port}:8080",
         "--volume", f"{VB_ROOT}:{VB_ROOT}",
         "--workdir", VB_ROOT,
@@ -1137,6 +1146,15 @@ def cmd_web(args: argparse.Namespace) -> int:
     command.append("--auth" if auth_enabled else "--no-auth")
     if args.behind_proxy:
         command.append("--behind-proxy")
+
+    # An unclean stop can leave the previous container running and holding the
+    # port. It is ours, it is named after this port, and nothing else should be
+    # using that name, so remove it rather than refusing to start.
+    for stale in docker_ctl.containers_publishing(args.port):
+        if stale == container:
+            print(f"removing a leftover {container} from an unclean stop")
+            docker_ctl.remove(container)
+            time.sleep(1)
 
     busy = _port_holder(args.host, args.port)
     if busy:
