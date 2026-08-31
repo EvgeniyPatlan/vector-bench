@@ -61,6 +61,13 @@ resources:
   # so this replaces the lists rather than adding to them.
   extras:
     mariadb_storage_engines: [InnoDB]
+    # Cleared, not inherited, and null rather than {} -- the profile override
+    # merges dict-into-dict, so an empty map is a no-op and leaves the tuned
+    # values in place. The tuned pass gives MHNSW and VIDX M=[6,16] so the
+    # headline run has real points below recall 0.90; this profile exists to
+    # sweep M across its whole range, and inheriting that would silently cut
+    # its five values to two, which is exactly what it did.
+    m_values_by_engine: null
     pgvector_ef_construction: [200]
     valkey_ef_construction: [200]
     mongodb_quantization: [none]

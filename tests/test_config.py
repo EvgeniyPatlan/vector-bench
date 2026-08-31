@@ -4483,3 +4483,23 @@ class TestGraphDegreeCanBeSweptWhereItIsTheOnlyKnob:
                      "m_values_by_engine": {"mongodb": [6, 8, 16]}}}
         assert self._m("mongodb", p) == [[6]]
 
+    def test_a_profile_can_clear_an_inherited_per_engine_sweep(self):
+        """The tuned pass pins M=[6,16] for MHNSW and VIDX. A profile whose
+        whole purpose is sweeping M has to be able to say no -- and it has to
+        say it with null, because the override merges dict-into-dict and an
+        empty map leaves the inherited values untouched."""
+        from orchestrator.config import (load_profile, load_resources,
+                                         merge_resource_overrides)
+        profile = load_profile("m-sweep")
+        resources = merge_resource_overrides(load_resources("tuned"), profile)
+        assert resources["extras"]["m_values_by_engine"] is None
+
+    def test_the_tuned_pass_still_pins_it(self):
+        from orchestrator.config import (load_profile, load_resources,
+                                         merge_resource_overrides)
+        profile = load_profile("tuned-complete")
+        resources = merge_resource_overrides(load_resources("tuned"), profile)
+        by_engine = resources["extras"]["m_values_by_engine"]
+        assert by_engine["mariadb123"] == [6, 16]
+        assert "pgvector" not in by_engine
+
