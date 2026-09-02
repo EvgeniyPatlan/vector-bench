@@ -49,7 +49,11 @@ fi
 # script reuses an existing clone and just re-applies the overlay, so this costs
 # well under a second.
 case "${1:-}" in
-  run|render)
+  # `generate` belongs here too: it runs ann-benchmarks' own dataset code out of
+  # the working copy, and without this it failed on a fresh checkout with
+  # "ann-benchmarks working copy missing" -- telling you to run by hand the
+  # thing this line exists to run for you.
+  run|render|generate)
     "$VB_ROOT/scripts/prepare-harness.sh" >/dev/null || {
       echo "failed to prepare the ann-benchmarks working copy" >&2; exit 1; }
     ;;

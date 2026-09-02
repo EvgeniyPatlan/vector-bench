@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vector-bench</title>
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>vector-bench</h1>
+  <span id="context" class="context"></span>
+  <nav class="tabs" id="tabs" hidden></nav>
+  <span class="badge" id="control-badge"></span>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="side-group">
+      <div class="side-head">Set up &amp; operate</div>
+      <ul id="section-list" class="side-list"></ul>
+    </div>
+    <div class="side-group" id="runs-group">
+      <button type="button" class="side-head toggle" id="runs-toggle"
+              aria-expanded="true" aria-controls="runs-body">
+        <span class="caret" aria-hidden="true">▾</span>
+        <span>Runs</span>
+        <span class="count" id="runs-count"></span>
+      </button>
+      <div id="runs-body">
+        <input type="search" id="run-filter" placeholder="filter…" autocomplete="off">
+        <ul id="run-list" class="side-list"></ul>
+      </div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <section id="panel-setup" class="panel" hidden></section>
+    <section id="panel-status" class="panel" hidden></section>
+    <section id="panel-datasets" class="panel" hidden></section>
+    <section id="panel-import" class="panel" hidden></section>
+    <section id="panel-overview" class="panel" hidden></section>
+    <section id="panel-explore" class="panel" hidden>
+      <div class="viewbar">
+        <label class="viewpick">View
+          <select id="view-pick"></select>
+        </label>
+        <span id="view-hint" class="muted"></span>
+      </div>
+      <div id="view-controls" class="chart-controls"></div>
+      <div id="chart" class="chart"></div>
+      <div id="chart-note" class="muted"></div>
+      <div id="filters" class="facets"></div>
+      <div id="table-wrap" class="table-wrap"></div>
+    </section>
+    <section id="panel-report" class="panel" hidden></section>
+    <section id="panel-profiles" class="panel" hidden></section>
+    <section id="panel-engines" class="panel" hidden></section>
+    <section id="panel-jobs" class="panel" hidden></section>
+  </main>
+</div>
+
+<script src="/vendor/uPlot.iife.min.js"></script>
+<script src="/fields.js"></script>
+<script src="/app.js"></script>
+<script src="/overview.js"></script>
+<script src="/explore.js"></script>
+<script src="/jobstart.js"></script>
+<script src="/control.js"></script>
+<script src="/engines.js"></script>
+<script src="/datasets.js"></script>
+<script src="/status.js"></script>
+<script src="/setup.js"></script>
+<script src="/import.js"></script>
+</body>
+</html>

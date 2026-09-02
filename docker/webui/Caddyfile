@@ -1,0 +1,11 @@
+# Caddy obtains and renews a certificate for this name automatically, so the
+# UI never has to speak TLS itself and never has to be given a public port.
+{$VB_WEB_DOMAIN} {
+	encode zstd gzip
+
+	# The UI marks its cookies Secure because it is started with
+	# --behind-proxy; this is the half that makes that true.
+	reverse_proxy webui:8080 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

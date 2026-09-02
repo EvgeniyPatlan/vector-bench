@@ -18,11 +18,14 @@ rather than the whole sweep.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import sys
 import traceback
 import time
@@ -34,6 +37,7 @@ sys.path.insert(0, VB_ROOT)
 from harness import datasets as datasets_mod  # noqa: E402
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
 from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
+from orchestrator import engines as engines_mod  # noqa: E402
 from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources,
                                  merge_resource_overrides, resolve_resources)
@@ -41,23 +45,17 @@ from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 
 GB = 1024 ** 3
 
-# The original three-way comparison. Kept as a name because the docs and the
-# profiles still refer to it, but it is no longer what a run defaults to --
-# see KNOWN_ENGINES.
-ALL_ENGINES = ("mariadb", "alisql", "pgvector")
-# These arrived after the first three and were opt-in while they were being
-# brought up: a second MariaDB version is another hour of compiling, and
-# Percona Search is two processes, a replica set and a JVM.
-EXTRA_ENGINES = ("mariadb123", "mongodb", "valkey")
-# What `run` measures when nobody says otherwise. This defaulted to the
-# original three long after the other three had become part of the study, so
-# `run --profile smoke` proved three engines and `run --profile tuned-complete`
-# would have measured three over forty hours -- both reporting success, because
-# an engine nobody asked for cannot fail. A default that silently drops half
-# the comparison is worse than one that fails on a missing image, which is what
-# this now does if the extras were never built.
-KNOWN_ENGINES = ALL_ENGINES + EXTRA_ENGINES
-
+# The original three-way comparison, and the engines that arrived after it.
+# Both are read from config/engines/*.yml rather than listed here: a name in one
+# place and a config in another is how an engine ends up half-registered.
+ALL_ENGINES = engines_mod.engines_in_group("original")
+EXTRA_ENGINES = engines_mod.engines_in_group("extra")
+# What `run` measures when nobody says otherwise. This once defaulted to the
+# original three long after the other three had joined the study, so
+# `run --profile smoke` proved three engines and a forty-hour run would have
+# measured three -- both reporting success, because an engine nobody asked for
+# cannot fail.
+KNOWN_ENGINES = engines_mod.known_engines()
 
 
 # Docker's own rule for container and volume names. The run id becomes both, so
@@ -179,6 +177,22 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return _script("fetch-datasets.sh", *fetch_args)
 
 
+def cmd_generate(args: argparse.Namespace) -> int:
+    """Build a dataset ann-benchmarks constructs rather than publishes.
+
+    `fetch` cannot retrieve these: they are assembled from a source corpus and
+    then have their ground truth computed by brute force, which is hours of
+    work and tens of GB rather than a download.
+    """
+    if args.list:
+        return _script("generate-dataset.sh", "--list")
+    if not args.dataset:
+        print("which dataset? try: ./run-benchmark.sh generate --list",
+              file=sys.stderr)
+        return 2
+    return _script("generate-dataset.sh", args.dataset)
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile)
     resources = merge_resource_overrides(
@@ -204,6 +218,33 @@ def _dir_size(path: str) -> int:
             except OSError:
                 pass
     return total
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Package a run for someone who does not have this checkout."""
+    from orchestrator.export import bundle_filename, write_bundle
+
+    run_dir = os.path.abspath(args.run_dir)
+    if not os.path.isdir(run_dir):
+        candidate = os.path.join(VB_ROOT, "results", args.run_dir)
+        if not os.path.isdir(candidate):
+            print(f"run directory not found: {args.run_dir}", file=sys.stderr)
+            return 1
+        run_dir = candidate
+
+    run_id = os.path.basename(run_dir.rstrip(os.sep))
+    out = args.output or os.path.join(os.getcwd(), bundle_filename(run_id))
+    ok, detail = write_bundle(run_dir, out)
+    if not ok:
+        print(detail, file=sys.stderr)
+        return 1
+
+    size = os.path.getsize(detail)
+    print(f"{detail}  ({size / 1024 / 1024:.1f} MB)")
+    print("  contains the report, the raw records and a README explaining what "
+          "it is.\n  The recipient needs nothing installed to read "
+          "report/report.html.")
+    return 0
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
@@ -428,6 +469,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "bench": docker_ctl.image_id(
                         engine_cfg.get("image", {}).get("bench", "")),
                 },
+                presentation=engines_mod.presentation(engine),
             )
             for warning in resolved.warnings:
                 print(f"  ! {warning}")
@@ -780,9 +822,9 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     )
     return True
 
-def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
-                         datasets: List[str], passes: List[str],
-                         phases: List[str]) -> None:
+def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
+                        datasets: List[str], passes: List[str],
+                        phases: List[str]) -> Dict[str, Any]:
     """Estimate ingest time before the run starts.
 
     ann-benchmarks reloads the whole dataset for every M value, and the
@@ -790,10 +832,14 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
     multiplies quietly: a seven-value M grid over four datasets is days of pure
     loading. Showing the number up front is the difference between choosing that
     and discovering it six hours in.
+
+    Returns the breakdown rather than printing it, so the CLI and the web UI
+    cannot report different numbers for the same plan.
     """
     m_count = max(1, len(profile.get("ann", {}).get("m_values", [16])))
-    total_h = 0.0
-    rows_per_pass: List[str] = []
+    ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
+    per_engine: Dict[str, float] = {}
+    unknown: List[str] = [d for d in datasets if d not in _DATASET_ROWS]
 
     for engine in engines:
         engine_h = 0.0
@@ -805,19 +851,36 @@ def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
             if "ann" in phases:
                 engine_h += (rows / effective) * m_count / 3600
             if "ops" in phases:
-                ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
                 engine_h += (rows / effective) * ops_m / 3600
-        engine_h *= len(passes)
-        total_h += engine_h
-        rows_per_pass.append(f"{engine} ~{engine_h:.1f} h")
+        per_engine[engine] = round(engine_h * len(passes), 2)
 
+    total_h = round(sum(per_engine.values()), 2)
+    return {
+        "total_hours": total_h,
+        "per_engine_hours": per_engine,
+        "m_values": m_count,
+        "ops_m_values": ops_m,
+        "passes": len(passes),
+        "phases": list(phases),
+        "datasets_without_estimate": unknown,
+        "long_run": total_h > 12,
+    }
+
+
+def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
+                         datasets: List[str], passes: List[str],
+                         phases: List[str]) -> None:
+    estimate = estimate_load_hours(profile, engines, datasets, passes, phases)
+    total_h = estimate["total_hours"]
     if total_h < 1:
         return
+    rows_per_pass = [f"{engine} ~{hours:.1f} h"
+                     for engine, hours in estimate["per_engine_hours"].items()]
     print(f"\nestimated ingest time (loading only, before any queries):")
     print("  " + "  |  ".join(rows_per_pass))
-    print(f"  total ~{total_h:.1f} h across {len(passes)} pass(es), "
-          f"{m_count} M value(s)")
-    if total_h > 12:
+    print(f"  total ~{total_h:.1f} h across {estimate['passes']} pass(es), "
+          f"{estimate['m_values']} M value(s)")
+    if estimate["long_run"]:
         print(f"  ! This is a long run. Each M value costs a full reload of every "
               f"dataset,\n    and MHNSW/VIDX build incrementally at a few hundred "
               f"rows/s. Reduce\n    ann.m_values or the dataset list to cut it "
@@ -903,6 +966,257 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
     raise ValueError(f"unknown phase: {phase}")
 
 
+WEBUI_IMAGE = "vector-bench/webui:latest"
+
+
+def webui_container_name(port: int) -> str:
+    return f"vb-webui-{int(port)}"
+
+
+def _webui_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost", "")
+
+
+def _webui_reachable_host(host: str) -> str:
+    """The address to talk to a server published on `host`."""
+    return "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+
+
+def _socket_group(socket_path: str) -> Optional[str]:
+    """The name of the group owning the Docker socket.
+
+    Read rather than assumed: it is `docker` on most installs and is not on all
+    of them, and telling someone to add themselves to a group that does not
+    exist wastes the one instruction they were given.
+    """
+    try:
+        import grp
+        return grp.getgrgid(os.stat(socket_path).st_gid).gr_name
+    except (OSError, KeyError, ImportError):
+        return None
+
+
+def _no_docker_message() -> str:
+    user = getpass.getuser()
+    socket_path = os.environ.get("DOCKER_HOST", "").replace("unix://", "") \
+        or "/var/run/docker.sock"
+    lines = [f"cannot reach the Docker daemon as {user!r}.",
+             "  Check with:  docker info"]
+
+    if os.path.exists(socket_path):
+        group = _socket_group(socket_path)
+        gid = os.stat(socket_path).st_gid
+        named = group or f"the group with gid {gid}"
+        lines += [
+            f"  {socket_path} is owned by {named}"
+            + (f" (gid {gid})" if group else "") + ".",
+            f"  A service user gets the groups it holds in /etc/group, so if "
+            f"{user!r} is not in it, nothing this runs can speak to Docker:",
+            f"      id {user}",
+        ]
+        if group:
+            lines.append(f"      sudo usermod -aG {group} {user}")
+            lines.append(f"      sudo systemctl restart vector-bench-web")
+    else:
+        lines.append(f"  {socket_path} does not exist. Is Docker installed and "
+                     f"running?  systemctl status docker")
+    return "\n".join(lines)
+
+
+def _outbound_address() -> Optional[str]:
+    """This machine's address on the network it routes through.
+
+    Opening a UDP socket to a documentation address asks the routing table
+    which interface would be used; nothing is sent and nothing listens there.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("192.0.2.1", 1))  # TEST-NET-1, RFC 5737
+            return probe.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _port_holder(host: str, port: int) -> Optional[str]:
+    """A description of what holds this port, or None if it is free.
+
+    Docker's own message for a taken port names an endpoint id and a network
+    driver, which tells an operator nothing about what to do next.
+    """
+    probe = _webui_reachable_host(host)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex((probe, port)) != 0:
+            return None
+
+    for container in docker_ctl.containers_publishing(port):
+        return f" by container {container}"
+    return ""
+
+
+def _webui_responds(host: str, port: int) -> bool:
+    import urllib.error
+    import urllib.request
+    url = f"http://{_webui_reachable_host(host)}:{port}/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            return response.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """Serve the web UI.
+
+    In a container by default, following the report generator: the host keeps
+    its python3-and-pyyaml guarantee. The repo is mounted at its own absolute
+    path because the orchestrator inside the container hands host paths to the
+    Docker daemon -- a container-only path would resolve to nothing on the host
+    and silently mount an empty directory.
+    """
+    auth_enabled = args.auth
+    if not _webui_loopback(args.host) and not args.no_auth:
+        auth_enabled = True
+    if args.auth and args.no_auth:
+        print("--auth and --no-auth are contradictory", file=sys.stderr)
+        return 2
+
+    if args.no_container:
+        from webui.server import serve
+        return serve(VB_ROOT, args.host, args.port, args.allow_control,
+                     auth_enabled=auth_enabled,
+                     password=os.environ.get("VB_WEB_PASSWORD"),
+                     behind_proxy=args.behind_proxy)
+
+    # Ask whether Docker answers at all before asking what images it has.
+    # image_exists() cannot tell "no such image" from "cannot reach the daemon",
+    # so a permission problem on the socket used to be reported as a missing
+    # image -- which sends you off to rebuild something you already have.
+    if not docker_ctl.docker_available():
+        print(_no_docker_message(), file=sys.stderr)
+        return 1
+
+    if not docker_ctl.image_exists(WEBUI_IMAGE):
+        print(f"{WEBUI_IMAGE} not found; build it with:\n"
+              f"  ./scripts/build-images.sh --engine webui", file=sys.stderr)
+        return 1
+
+    # Run as the invoking user, not root. The repo is a bind mount owned by that
+    # user: as root, git refuses the working copy as "dubious ownership" and
+    # every file the server writes lands root-owned on the host.
+    # Named for the port, not the pid. A stable name is what lets a service
+    # unit clear a leftover container before starting and after stopping; a
+    # pid-derived one is different every time and so cannot be cleaned up by
+    # anything but luck. The port keeps two instances from colliding.
+    container = webui_container_name(args.port)
+    command = [
+        "docker", "run", "--rm", "--name", container,
+        "--publish", f"{args.host}:{args.port}:8080",
+        "--volume", f"{VB_ROOT}:{VB_ROOT}",
+        "--workdir", VB_ROOT,
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--env", "PYTHONUNBUFFERED=1",
+        # No home directory exists for that uid inside the image.
+        "--env", "HOME=/tmp",
+    ]
+    if args.allow_control:
+        # Launching runs means driving the host's Docker daemon. A non-root user
+        # reaches the socket only through its group, which is read from the
+        # socket itself rather than assumed to be called "docker".
+        socket_path = "/var/run/docker.sock"
+        command += ["--volume", f"{socket_path}:{socket_path}"]
+        try:
+            command += ["--group-add", str(os.stat(socket_path).st_gid)]
+        except OSError:
+            print(f"warning: cannot stat {socket_path}; launching runs from the "
+                  f"UI may fail with a permission error", file=sys.stderr)
+
+    if os.environ.get("VB_WEB_PASSWORD"):
+        command += ["--env", "VB_WEB_PASSWORD"]
+
+    command += [WEBUI_IMAGE, "--root", VB_ROOT, "--host", "0.0.0.0", "--port", "8080",
+                # The container binds every interface; only the publish address
+                # decides who can reach it, and only this side knows it.
+                "--published-host", args.host]
+    if args.allow_control:
+        command.append("--allow-control")
+    # The container always binds 0.0.0.0 -- publishing decides who reaches it --
+    # so the auth decision is made here from the published address, not there.
+    command.append("--auth" if auth_enabled else "--no-auth")
+    if args.behind_proxy:
+        command.append("--behind-proxy")
+
+    # An unclean stop leaves the previous container running and holding the
+    # port. Match any of ours on it, not just the name this invocation would
+    # choose: containers made before the naming changed are called after the
+    # pid that started them, so an exact-name check walked straight past them
+    # and every restart then failed with "port is already in use".
+    stale = [name for name in docker_ctl.containers_publishing(args.port)
+             if name.startswith("vb-webui-")]
+    for name in stale:
+        print(f"removing a leftover {name} from an unclean stop")
+        docker_ctl.remove(name)
+    if stale:
+        time.sleep(1)
+
+    busy = _port_holder(args.host, args.port)
+    if busy:
+        print(f"port {args.port} is already in use{busy}.\n"
+              f"  Use a different one:  ./run-benchmark.sh web --port {args.port + 1}",
+              file=sys.stderr)
+        return 1
+
+    mode = "control enabled" if args.allow_control else "read-only"
+    scheme = "https" if args.behind_proxy else "http"
+    url = f"{scheme}://{args.host}:{args.port}"
+    print(f"starting the web UI ({mode}, auth {'on' if auth_enabled else 'off'}) …",
+          flush=True)
+
+    # The URL is announced by a watcher once the server actually answers, not
+    # before the container is started. Printing it up front meant a failure --
+    # a port clash, a missing mount -- arrived underneath a line claiming
+    # success, which is the opposite of what an error message is for.
+    ready = threading.Event()
+
+    def announce() -> None:
+        deadline = time.time() + 30
+        while time.time() < deadline and not ready.is_set():
+            if _webui_responds(args.host, args.port):
+                # "http://0.0.0.0:8085" is not an address anyone can open.
+                # Bound to everything means the useful answer is the address
+                # other machines would actually type.
+                if args.host in ("0.0.0.0", "", "::"):
+                    outbound = _outbound_address()
+                    if outbound:
+                        print(f"\n  {scheme}://{outbound}:{args.port}"
+                              f"   (share this one)")
+                    print(f"  {scheme}://127.0.0.1:{args.port}"
+                          f"   (on this machine)")
+                else:
+                    print(f"\n  {url}")
+                if not args.allow_control:
+                    print("  read-only; add --allow-control to edit profiles "
+                          "and launch runs")
+                print("  Ctrl-C to stop\n", flush=True)
+                return
+            time.sleep(0.4)
+
+    watcher = threading.Thread(target=announce, daemon=True)
+    watcher.start()
+    try:
+        code = subprocess.call(command)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        ready.set()
+
+    if code != 0:
+        print(f"\nthe web UI container exited with {code}; see the error above.",
+              file=sys.stderr)
+    return code
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     run_dir = os.path.abspath(args.run_dir)
     if not os.path.isdir(run_dir):
@@ -945,6 +1259,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--datasets", default=None)
     f.set_defaults(func=cmd_fetch)
 
+    g = sub.add_parser("generate",
+                       help="build a dataset that is not published for download")
+    g.add_argument("dataset", nargs="?", default=None)
+    g.add_argument("--list", action="store_true",
+                   help="datasets that must be generated rather than fetched")
+    g.set_defaults(func=cmd_generate)
+
     r = sub.add_parser("render", help="regenerate ann-benchmarks configs")
     r.add_argument("--profile", default="quick")
     r.add_argument("--engines", default=None)
@@ -983,6 +1304,32 @@ def build_parser() -> argparse.ArgumentParser:
                           "not by corpus, so a machine that measured two "
                           "corpora under one configuration reports both.")
     rep.set_defaults(func=cmd_report)
+
+    w = sub.add_parser("web", help="serve the configuration and report web UI")
+    w.add_argument("--port", type=int, default=8080)
+    w.add_argument("--host", default="127.0.0.1",
+                   help="host interface to publish on; loopback by default, "
+                        "reach a remote rig over an SSH port-forward")
+    w.add_argument("--allow-control", action="store_true",
+                   help="enable profile editing and run launching "
+                        "(mounts the Docker socket)")
+    w.add_argument("--no-container", action="store_true",
+                   help="run the server directly on the host instead")
+    w.add_argument("--auth", action="store_true",
+                   help="require a password (implied by a non-loopback --host)")
+    w.add_argument("--no-auth", action="store_true",
+                   help="publish on a non-loopback address with no password. "
+                        "Only for a network you already trust")
+    w.add_argument("--behind-proxy", action="store_true",
+                   help="TLS is terminated in front; marks cookies Secure")
+    w.set_defaults(func=cmd_web)
+
+    e = sub.add_parser("export", help="package a run to send to someone")
+    e.add_argument("--run-dir", required=True,
+                   help="results/<run-id>, or just the run id")
+    e.add_argument("--output", default=None,
+                   help="path for the .tar.gz (default: ./vector-bench-<run-id>.tar.gz)")
+    e.set_defaults(func=cmd_export)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
     c.add_argument("--run-id", default=None,

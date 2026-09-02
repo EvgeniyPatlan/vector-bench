@@ -1,0 +1,61 @@
+# TLS deployment: Caddy in front, the UI on an internal network.
+#
+# The UI itself never gets a public port. Caddy terminates TLS with a real
+# certificate and proxies to it, which is the half of "expose it remotely" that
+# a password does not solve -- without TLS the password and the session cookie
+# cross the network in cleartext.
+#
+#   cp .env.example .env && edit it
+#   docker compose -f docker/webui/compose.yml --env-file docker/webui/.env up -d
+#
+# For a machine with no public DNS name, prefer a WireGuard or Tailscale network
+# and drop Caddy: the UI still wants --auth, but the transport is already
+# encrypted.
+
+services:
+  webui:
+    image: vector-bench/webui:latest
+    # Same absolute path inside and out: the orchestrator hands host paths to
+    # the Docker daemon, so a container-only path would resolve to nothing.
+    working_dir: ${VB_ROOT:?set VB_ROOT to the absolute path of the checkout}
+    command:
+      - "--root"
+      - "${VB_ROOT}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--allow-control"
+      - "--behind-proxy"
+    user: "${VB_UID:?run: id -u}:${VB_GID:?run: id -g}"
+    group_add:
+      # gid of the docker socket: stat -c '%g' /var/run/docker.sock
+      - "${VB_DOCKER_GID:?}"
+    environment:
+      # Leave unset to have one generated and printed once into the log.
+      VB_WEB_PASSWORD: "${VB_WEB_PASSWORD:-}"
+    volumes:
+      - "${VB_ROOT}:${VB_ROOT}"
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      VB_WEB_DOMAIN: "${VB_WEB_DOMAIN:?the hostname Caddy should get a certificate for}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - webui
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

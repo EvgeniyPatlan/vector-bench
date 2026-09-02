@@ -107,7 +107,8 @@ class Manifest:
 
     def set_engine(self, engine: str, sources_dir: str,
                    image_runtime: str, image_bench: str,
-                   image_ids: Dict[str, str]) -> None:
+                   image_ids: Dict[str, str],
+                   presentation: Optional[Dict[str, Any]] = None) -> None:
         source = _read_json(os.path.join(sources_dir, f"{engine}.source.json")) or {}
         build = _read_json(os.path.join(sources_dir, f"{engine}.image.json")) or {}
         self.data["engines"][engine] = {
@@ -117,6 +118,13 @@ class Manifest:
                 "runtime": {"ref": image_runtime, "id": image_ids.get("runtime", "unknown")},
                 "bench": {"ref": image_bench, "id": image_ids.get("bench", "unknown")},
             },
+            # Label, colour, marker and line style, so a report can name and draw
+            # an engine the way its config defined it without reading that
+            # config. The report container mounts report/ and harness/ only --
+            # importing the orchestrator from there once crashed generation at
+            # the end of a twenty-hour run -- so what it needs travels here,
+            # exactly as ann_fingerprint does.
+            "presentation": presentation or {},
         }
         self.save()
 

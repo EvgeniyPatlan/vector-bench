@@ -19,6 +19,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+# Defaults; the manifest's per-engine `presentation.label` overrides them, so an
+# engine added after this file was written names itself correctly.
 ENGINE_LABEL = {
     "mariadb": "MariaDB 11.8 (MHNSW)",
     "mariadb123": "MariaDB 12.3 (MHNSW)",
@@ -27,6 +29,13 @@ ENGINE_LABEL = {
     "mongodb": "Percona Search for MongoDB (mongot)",
     "valkey": "Valkey (valkey-search)",
 }
+
+
+def adopt_presentation(manifest: Dict[str, Any]) -> None:
+    for name, info in (manifest.get("engines") or {}).items():
+        label = ((info or {}).get("presentation") or {}).get("label")
+        if label:
+            ENGINE_LABEL[name] = label
 
 
 def _fmt_bytes(value: Optional[float]) -> str:
@@ -993,6 +1002,53 @@ figure { margin: 1.4rem 0; overflow-x: auto; }
 figure svg { max-width: 100%; height: auto; display: block; }
 figcaption { color: var(--muted); font-size: .85rem; margin-top: .4rem; }
 .note { color: var(--muted); font-size: .9rem; font-style: italic; }
+
+/* ---------------------------------------------------------------------------
+   Print / Save as PDF.
+
+   The browser's own PDF export is the whole mechanism -- no extra dependency,
+   and it works on the standalone file as well as in the app. What it needs is
+   for the page to stop being a screen: one light palette whatever the reader's
+   theme, and page breaks that do not fall through a chart or a table.
+   --------------------------------------------------------------------------- */
+@media print {
+  /* A dark theme prints as a wall of ink, and the reader's theme is not a
+     property of the document being archived. */
+  :root, :root[data-theme="dark"], :root[data-theme="light"] {
+    --bg: #ffffff; --fg: #111111; --muted: #444444; --border: #bbbbbb;
+    --accent: #14507d; --card: #f6f6f6; --warn-bg: #fff8e8; --warn-br: #b8860b;
+    --code-bg: #f2f2f2;
+  }
+  body { background: #fff; color: #111; font-size: 10.5pt; }
+  .wrap { max-width: none; margin: 0; padding: 0; }
+
+  /* Charts and tables are the content; splitting one across a page break makes
+     it unreadable rather than merely untidy. */
+  figure, svg, img, table, .tablewrap, .warn, .note { break-inside: avoid; page-break-inside: avoid; }
+  h1, h2, h3 { break-after: avoid; page-break-after: avoid; }
+  h2 { break-before: page; page-break-before: page; }
+  h1 + p, h2:first-of-type { break-before: auto; page-break-before: auto; }
+
+  /* Nothing scrolls on paper, so a wide table has to fit instead. Without a
+     fixed layout it keeps its natural width and simply runs off the right of
+     the page, taking the last column with it. */
+  .tablewrap { overflow: visible !important; }
+  table { width: 100%; table-layout: fixed; font-size: 8.5pt; }
+  /* On screen cells never wrap and the wrapper scrolls. On paper there is
+     nowhere to scroll, so nowrap is what pushed the last column off the page
+     -- table-layout alone cannot rescue a cell that refuses to break. */
+  th, td { white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+           padding: .35rem .5rem; }
+  th { position: static; }
+  svg { max-width: 100% !important; height: auto !important; }
+
+  a { color: inherit; text-decoration: none; }
+  /* The environment and validity sections carry the caveats; keep their
+     emphasis rather than flattening them into the body text. */
+  .warn { border-left: 3px solid #b8860b; background: #fff8e8; }
+}
+
+@page { margin: 16mm 14mm; }
 """
 
 

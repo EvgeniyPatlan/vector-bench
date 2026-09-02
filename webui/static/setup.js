@@ -1,0 +1,314 @@
+"use strict";
+
+const SU = { plan: null, march: "", engines: [], profiles: [], profile: null };
+
+function stepHead(index, step) {
+  return el("div", { class: "step-head" },
+    el("span", { class: `step-num ${step.done ? "done" : ""}` },
+      step.done ? "✓" : String(index + 1)),
+    el("div", {},
+      el("div", { class: "step-title" }, step.title),
+      el("div", { class: "muted" }, step.summary)));
+}
+
+// -- step 1: images ----------------------------------------------------
+
+function imagesStep(step) {
+  const { engines, march } = step.detail;
+  const missing = engines.filter((e) => !e.bench_built);
+  const box = el("div", {});
+
+  box.append(el("table", {},
+    el("thead", {}, el("tr", {}, ...["", "engine", "tag", "image", "-march"]
+      .map((h) => el("th", {}, h)))),
+    el("tbody", {}, ...engines.map((e) => el("tr", {},
+      // A built engine gets no control at all. It used to get a disabled one,
+      // which stayed ticked from before the build and could not be un-ticked:
+      // a dead switch stuck in the on position.
+      el("td", {}, e.bench_built ? "" : el("input", {
+        type: "checkbox",
+        checked: SU.engines.includes(e.name),
+        onchange: (ev) => {
+          SU.engines = ev.target.checked
+            ? [...new Set([...SU.engines, e.name])]
+            : SU.engines.filter((n) => n !== e.name);
+          renderSetupBody();
+        },
+      })),
+      el("td", {}, el("span", {
+        class: "pill", style: `border-color:${e.color};color:${e.color}`,
+      }, e.name)),
+      el("td", {}, e.tag || "—"),
+      el("td", {}, el("span", { class: `pill ${e.bench_built ? "ok" : "bad"}` },
+        e.bench_built ? "built" : "missing")),
+      el("td", {}, e.march || "—"))))));
+
+  if (march.mixed) {
+    box.append(el("div", { class: "warn" },
+      el("strong", {}, "These images do not agree on -march: "),
+      march.values.join(", ")
+      + ". Every engine compiles SIMD distance kernels, so a comparison across "
+      + "these measures compiler flags as much as implementations. Rebuild them "
+      + "on one value before measuring anything."));
+  }
+
+  if (!missing.length) {
+    return box;
+  }
+
+  const pinned = march.agreed;
+  const value = SU.march || pinned || "x86-64-v3";
+  box.append(el("div", { class: "row" },
+    el("label", { class: "muted" }, "-march ",
+      el("input", {
+        id: "setup-march", value, size: 14,
+        oninput: (ev) => { SU.march = ev.target.value.trim(); renderSetupBody(); },
+      })),
+    el("button", {
+      class: "action secondary",
+      onclick: () => { SU.march = "native"; renderSetupBody(); },
+    }, "native"),
+    el("span", { class: "muted" },
+      "native only when this machine is also the benchmark host")));
+
+  if (pinned && value !== pinned) {
+    box.append(el("div", { class: "warn" },
+      `Images already here were built with -march=${pinned}. Building with `
+      + `${value} would make the comparison a comparison of compiler flags. `
+      + "Match it, or rebuild everything on the new value."));
+  }
+
+  // The extras are opt-in for the same reason `build` leaves them out of its
+  // own default: each is another hour of compiling or another process to stand
+  // up, and nothing needs them to produce a result.
+  const missingOriginal = missing.filter((e) => e.group === "original");
+  const chosen = SU.engines.length ? SU.engines : missingOriginal.map((e) => e.name);
+  const missingExtra = missing.filter((e) => e.group === "extra");
+
+  box.append(
+    el("p", { class: "muted" },
+      "pgvector takes about ten minutes; MariaDB about forty; AliSQL 1.5–3 hours, "
+      + "and looks stalled while it compiles a bundled DuckDB it does not use."),
+    missingExtra.length
+      ? el("p", { class: "muted" },
+          `${missing.length} engines have no bench image. `,
+          el("strong", {}, missingOriginal.map((e) => e.name).join(", ")),
+          " are ticked by default — they are the original comparison and enough "
+          + "to produce a result. ",
+          el("strong", {}, missingExtra.map((e) => e.name).join(", ")),
+          " are left out unless you tick them: each is another image to compile "
+          + "or another process to stand up.")
+      : null,
+    commandPreview("build", chosen.length
+      ? ["--engines", chosen.join(","), "--march", value]
+      : ["--march", value]),
+    el("div", { class: "row" },
+      el("button", {
+        class: "action", disabled: !chosen.length,
+        onclick: () => startJob({ kind: "build", engines: chosen, march: value },
+                                document.getElementById("setup-build-status")),
+        // Name what it will build. A count here read as a count of what is
+        // missing -- "Build the 3 missing" under "0 of 6 engines have a bench
+        // image" -- which is two numbers on one page disagreeing.
+      }, chosen.length <= 3
+        ? `Build ${chosen.join(", ")}`
+        : `Build ${chosen.length} engines`),
+      el("span", { id: "setup-build-status" })));
+  return box;
+}
+
+// -- step 2: datasets --------------------------------------------------
+
+function datasetsStep(step) {
+  const d = step.detail;
+  const box = el("div", {});
+  if (d.present.length) {
+    box.append(el("p", { class: "muted" }, "Here: " + d.present.join(", ")));
+  }
+  if (!d.smoke_dataset_present) {
+    box.append(
+      el("p", { class: "muted" },
+        `${d.smoke_dataset} is what the smoke profile uses — 217 MB, the `
+        + "smallest thing that proves the pipeline on real data."),
+      commandPreview("fetch", ["--datasets", d.smoke_dataset]),
+      el("div", { class: "row" },
+        el("button", {
+          class: "action",
+          onclick: () => startJob({ kind: "fetch", datasets: [d.smoke_dataset] },
+                                  document.getElementById("setup-fetch-status")),
+        }, "Download it"),
+        el("span", { id: "setup-fetch-status" })));
+  }
+  box.append(el("p", { class: "muted" },
+    el("a", { href: "#/control/datasets" }, "Datasets"),
+    " has the rest, and the ones that must be generated rather than downloaded."));
+  return box;
+}
+
+// -- step 3: smoke -----------------------------------------------------
+
+function smokeStep(step) {
+  const box = el("div", {});
+  if (step.detail.run) {
+    box.append(el("p", { class: "muted" },
+      "Already proved by ",
+      el("a", { href: `#/run/${step.detail.run.dir_name}/overview` },
+        step.detail.run.dir_name),
+      ". Run it again after rebuilding images."));
+  }
+  box.append(
+    el("p", { class: "muted" },
+      "Exercises every stage for every engine on a small corpus: images start, "
+      + "vector DDL is accepted, the index is actually used, records are written "
+      + "and the report renders. About 45 minutes per resource pass."),
+    el("div", { class: "warn" },
+      "Do not skip it. It is far cheaper than discovering a broken image eight "
+      + "hours into a real run."),
+    commandPreview("run", ["--profile", "smoke"]),
+    el("div", { class: "row" },
+      el("button", {
+        class: "action",
+        onclick: () => startJob({ kind: "run", profile: "smoke" },
+                                document.getElementById("setup-smoke-status")),
+      }, "Run the smoke profile"),
+      el("span", { id: "setup-smoke-status" })));
+  return box;
+}
+
+// -- step 4: measure ---------------------------------------------------
+
+function measureStep() {
+  const box = el("div", {},
+    el("p", { class: "muted" },
+      "The smoke profile proves the pipeline; it measures nothing — its grids "
+      + "are far too sparse to draw a curve from. This starts a real one."));
+
+  if (!S.control) {
+    box.append(el("p", { class: "muted" },
+      "Read-only. Restart with --allow-control to launch a run."));
+    return box;
+  }
+
+  // Anything but smoke: that is the step above, and re-running it here would
+  // look like a measurement without being one.
+  const choices = SU.profiles.filter((p) => p.name !== "smoke");
+  if (!choices.length) {
+    box.append(el("p", { class: "muted" }, "No profiles found in config/profiles/."));
+    return box;
+  }
+  if (!SU.profile || !choices.some((p) => p.name === SU.profile)) {
+    SU.profile = (choices.find((p) => p.name === "main") || choices[0]).name;
+  }
+  const chosen = choices.find((p) => p.name === SU.profile);
+
+  box.append(el("div", { class: "row" },
+    el("label", { class: "muted" }, "profile ",
+      el("select", {
+        onchange: (ev) => { SU.profile = ev.target.value; renderSetupBody(); },
+      }, ...choices.map((p) =>
+        el("option", { value: p.name, selected: p.name === SU.profile }, p.name)))),
+    chosen && chosen.description
+      ? el("span", { class: "muted" }, chosen.description) : null));
+
+  box.append(el("div", { class: "facet", id: "setup-estimate" }, "estimating…"));
+  box.append(commandPreview("run", ["--profile", SU.profile]));
+  box.append(el("div", { class: "row" },
+    el("button", {
+      class: "action",
+      onclick: () => {
+        if (!confirm(`Start ${SU.profile}? Read the estimate above first — a `
+                     + "real profile is hours to days, and nothing else may run "
+                     + "beside it.")) return;
+        startJob({ kind: "run", profile: SU.profile },
+                 document.getElementById("setup-run-status"));
+      },
+    }, `Launch ${SU.profile}`),
+    el("span", { id: "setup-run-status" }),
+    el("span", { class: "muted" },
+      "Narrow the engines, datasets or resource pass on "),
+    el("a", { href: "#/control/profiles" }, "Profiles & launch")));
+
+  // The same figure the CLI prints, from the same function.
+  post("/api/estimate", { profile: SU.profile }).then((est) => {
+    const target = document.getElementById("setup-estimate");
+    if (!target) return;
+    clear(target);
+    target.append(
+      el("strong", {}, `estimated ingest ~${est.total_hours.toFixed(1)} h`),
+      el("div", { class: "muted" },
+        `${est.passes} pass(es) · ${est.m_values} ann M value(s) · loading only, `
+        + "before any query runs"));
+    if (est.long_run) {
+      target.append(el("div", { class: "warn" },
+        "Every M value reloads the whole corpus. Cut ann.m_values or the "
+        + "dataset list to reduce it roughly proportionally."));
+    }
+  }).catch(() => {});
+
+  return box;
+}
+
+const BODIES = {
+  images: imagesStep, datasets: datasetsStep,
+  smoke: smokeStep, measure: measureStep,
+};
+
+function renderSetupBody() {
+  const panel = document.getElementById("panel-setup");
+  const open = document.getElementById("setup-march");
+  if (open) SU.march = open.value.trim();
+  clear(panel);
+
+  const plan = SU.plan;
+  panel.append(el("h2", {}, "Setup"));
+
+  if (plan.ready) {
+    panel.append(el("div", { class: "ready" },
+      "This machine can measure: every engine image is built, a corpus is here, "
+      + "and the smoke profile has passed."));
+  } else {
+    panel.append(el("p", { class: "muted" },
+      "Four things stand between a fresh checkout and a number you can trust. "
+      + "Each one below says what it needs and does it."));
+  }
+
+  if (plan.disk && plan.disk.enough === false) {
+    panel.append(el("div", { class: "warn" },
+      `${fmtBytes(plan.disk.free_bytes)} free. A full run wants about `
+      + `${fmtBytes(plan.disk.wanted_bytes)}; a long one that fills the disk `
+      + "fails at the end, having spent the time."));
+  }
+
+  if (!S.control) {
+    panel.append(el("p", { class: "muted" },
+      "Read-only: the steps below show what is missing but cannot act. "
+      + "Restart with --allow-control."));
+  }
+
+  plan.steps.forEach((step, i) => {
+    const section = el("section", {
+      class: "step" + (step.done ? " done" : "")
+        + (step.id === plan.next ? " next" : ""),
+    }, stepHead(i, step));
+    // Only the step you are on, and anything unfinished after it, needs its
+    // controls open; a finished step is a tick, not a form.
+    if (!step.done || step.id === plan.next) {
+      if (S.control || step.id === "measure") section.append(BODIES[step.id](step));
+    }
+    panel.append(section);
+  });
+}
+
+window.renderSetup = async function renderSetup() {
+  SU.plan = await api("/api/setup");
+  if (!SU.profiles.length) {
+    SU.profiles = (await api("/api/profiles").catch(() => ({ profiles: [] }))).profiles || [];
+  }
+  // Drop anything that has since been built. Selection means "build this", and
+  // an engine that now has an image is not a thing to build.
+  const step = SU.plan.steps.find((s) => s.id === "images");
+  const buildable = new Set((step ? step.detail.engines : [])
+    .filter((e) => !e.bench_built).map((e) => e.name));
+  SU.engines = SU.engines.filter((name) => buildable.has(name));
+  renderSetupBody();
+};

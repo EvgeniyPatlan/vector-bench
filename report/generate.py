@@ -27,13 +27,10 @@ for candidate in (VB_ROOT, "/opt", os.path.dirname(os.path.abspath(__file__))):
         sys.path.insert(0, candidate)
 
 from report import charts, loaders  # noqa: E402
-from report.render import render_html, render_markdown  # noqa: E402
+from report.render import (adopt_presentation as render_adopt_presentation,  # noqa: E402
+                           render_html, render_markdown)
 
-ENGINE_LABEL = {
-    "mariadb": "MariaDB (MHNSW)",
-    "alisql": "AliSQL (VIDX)",
-    "pgvector": "PostgreSQL (pgvector)",
-}
+from report.render import ENGINE_LABEL  # noqa: E402  (one table, not two)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -389,6 +386,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     run_dir = os.path.abspath(args.run_dir)
     manifest = load_manifest(run_dir)
+    # Engine colours and labels come from the run that produced the numbers, so
+    # an engine added after this code was written still names and draws itself.
+    charts.adopt_presentation(manifest)
+    render_adopt_presentation(manifest)
     run_id = manifest.get("run_id", os.path.basename(run_dir))
 
     annb_dir = args.annb_results or os.path.join(os.path.dirname(run_dir), "annb")

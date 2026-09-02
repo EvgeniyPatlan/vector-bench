@@ -117,3 +117,47 @@ capabilities:
   prefilter: true
   # createSearchIndex returns before the index exists.
   async_index_build: true
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+#
+# These used to be six dictionaries keyed by engine name, spread across
+# ann_pass, ops_pass, cli, charts and render. Adding an engine meant finding all
+# six, and missing one produced a failure hours later rather than at load. They
+# live here because everything else about an engine already does.
+runtime:
+  # Which harness driver drives it. A new *architecture* needs a new
+  # driver in harness/drivers/; a new variant of this family does not.
+  # Presentation and iteration order. Discovery is by directory, which is
+  # alphabetical, and alphabetical is not the order this comparison is read
+  # in -- the original three come first.
+  order: 50
+  driver: MongoDriver
+  # Class name ann-benchmarks expects in the generated config.yml.
+  ann_constructor: PerconaSearch
+  port: 27017
+  # Where the server keeps its data inside the image.
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/mongot
+  credentials:
+    user: "bench"
+    password: "bench"
+  # Opt-in engines are not in the original three-way comparison.
+  group: extra
+  # Readiness probe, run inside the server container until it succeeds.
+  # Not a ping: mongod answers one while still SECONDARY, and a load that
+  # starts before the election completes fails on its first write. This
+  # checks both processes -- mongod answers well before mongot's JVM does,
+  # and an index created in that window never gets an initial sync queued.
+  probe:
+    - "sh"
+    - "-c"
+    - "mongosh --quiet --port 27017 -u bench -p bench --authenticationDatabase admin --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true && (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null"
+  chart:
+    # A distinct hue: the only engine whose index lives in a separate
+    # process, so it should not read as a variant of anything else.
+    color: "#9467bd"
+    marker: "v"
+    linestyle: "-"
+    label: "Percona Search (mongot)"
+    # The table has room for the full name; the chart legend does not.
+  label: "Percona Search for MongoDB (mongot)"

@@ -84,6 +84,12 @@ estimated ingest time (loading only, before any queries):
 
 Read it. It is the cheapest part of the whole exercise.
 
+The web UI shows the same figure on its Profiles & launch page, updating as you
+change the engine list, the dataset list or the resource pass — so you can find
+an affordable scope before committing rather than after. It is the same
+calculation, not a second one: both call `estimate_load_hours()`, so they cannot
+disagree about the same plan. See [08-web-ui.md](08-web-ui.md).
+
 ---
 
 ## 3. Choosing a scope

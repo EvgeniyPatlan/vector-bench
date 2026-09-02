@@ -1,16 +1,26 @@
 # vector-bench
 
-Benchmark framework comparing **built-in vector search** across three relational
-databases, all using an HNSW index:
+Benchmark framework comparing **built-in vector search** across six databases,
+all using an HNSW index:
 
-| Engine | Version | Implementation |
-| --- | --- | --- |
-| MariaDB | 11.8.8 LTS | MHNSW (`sql/vector_mhnsw.cc`) |
-| AliSQL | 8.0.44-2 | VIDX (`sql/vidx/vidx_hnsw.cc`) |
-| PostgreSQL | 17 + pgvector 0.8.x | pgvector HNSW |
+| Engine key | Engine | Version | Implementation |
+| --- | --- | --- | --- |
+| `mariadb` | MariaDB | 11.8.8 LTS | MHNSW (`sql/vector_mhnsw.cc`) |
+| `alisql` | AliSQL | 8.0.44-2 | VIDX (`sql/vidx/vidx_hnsw.cc`) |
+| `pgvector` | PostgreSQL | 17 + pgvector 0.8.6 | pgvector HNSW |
+| `mariadb123` | MariaDB | 12.3.2 | MHNSW, a second version |
+| `mongodb` | Percona Search for MongoDB | mongot 1.70.3 | Lucene HNSW in a sidecar process |
+| `valkey` | Valkey + valkey-search | 9.1 | HNSW, entirely in memory |
 
-All three run HNSW, so the comparison isolates **implementation quality** rather
-than algorithm choice.
+The first three are the original comparison and what `build` produces by
+default; the rest are opt-in, because each is another image to compile or
+another process to stand up. `run` measures all six unless told otherwise.
+
+Every one runs HNSW, so the comparison isolates **implementation quality**
+rather than algorithm choice. They are not otherwise alike — one keeps the
+index in a separate JVM process, one keeps everything in RAM — and
+[docs/05-methodology.md](docs/05-methodology.md) records the asymmetries no
+configuration removes.
 
 ---
 
@@ -20,6 +30,7 @@ than algorithm choice.
 - [What you get](#what-you-get)
 - [Step by step](#step-by-step)
 - [Commands](#commands)
+- [The web UI](docs/08-web-ui.md)
 - [Running the engines by hand](#running-the-engines-by-hand)
 - [Things that will ruin your results](#things-that-will-ruin-your-results)
 - [Documentation](#documentation)
@@ -110,7 +121,7 @@ Each engine produces two images: `<engine>-runtime` (the server alone, usable by
 hand) and `<engine>-bench` (runtime plus the Python stack the harness needs).
 
 ```bash
-./run-benchmark.sh build --march native          # all three
+./run-benchmark.sh build --march native          # the original three
 # or one at a time — start AliSQL first, it is the long pole:
 ./run-benchmark.sh build --engines alisql   --march native
 ./run-benchmark.sh build --engines mariadb  --march native
@@ -156,13 +167,13 @@ mistaken for a complete dataset.
 ### 4. Verify before measuring
 
 ```bash
-python3 -m pytest tests/ -q          # 73 unit tests, ~2 s
+python3 -m pytest tests/ -q          # 777 unit tests, ~30 s
 ./tests/verify-alisql-traps.sh       # 8 engine-behaviour checks against a live server
 ./run-benchmark.sh run --profile smoke
 ```
 
 The smoke profile takes ~30 minutes per resource pass and exercises every stage
-for all three engines. **Do not skip it** — far cheaper than discovering a broken image eight
+for every engine. **Do not skip it** — far cheaper than discovering a broken image eight
 hours into a full run.
 
 There is also a one-minute synthetic cycle needing no dataset download:
@@ -205,6 +216,25 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
   results/<run-id>/report/records.jsonl | sort -k5 -rn | head
 ```
 
+### 7. Or use the browser
+
+```bash
+./run-benchmark.sh build --engine webui     # once, ~1 min
+./run-benchmark.sh web                      # http://127.0.0.1:8080
+```
+
+A Status page saying whether the machine can measure yet, an index of every run,
+the manifest as a readable page, and an explorer over `records.jsonl` that leads
+with the five things this framework measures. The generated `report.html` is
+still there, unchanged, in its own tab.
+
+`--allow-control` additionally allows downloading datasets, building images,
+adding an engine variant, editing `config/profiles/*.yml` with validation and an
+ingest estimate, launching a run, and watching any of it live. Every button shows
+the command it runs. Nothing may run alongside a benchmark. It is off by default, and the server binds loopback only — reach a remote
+rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
+[docs/08-web-ui.md](docs/08-web-ui.md).
+
 ---
 
 ## Commands
@@ -213,10 +243,13 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 | --- | --- |
 | `build` | Export sources at pinned tags, build runtime + bench images |
 | `fetch` | Download datasets |
+| `generate` | Build a dataset that is not published for download (dbpedia-openai-*) |
 | `run` | Execute a benchmark run |
 | `report` | Regenerate the report from an existing run directory |
+| `web` | Serve the web UI: run index, interactive explorer, profile editor, launcher |
 | `render` | Regenerate the ann-benchmarks configs for a profile |
 | `sources` | Export sources only, without building |
+| `export` | Package a run as a .tar.gz to send to someone |
 | `clean` | Remove containers, networks and volumes left by a run |
 
 ### `run` options
@@ -224,7 +257,7 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--profile` | `quick` | `dev`, `smoke`, `quick`, **`main`**, `full`, or your own |
-| `--engines` | all three | e.g. `mariadb,alisql` |
+| `--engines` | every engine | e.g. `mariadb,alisql` |
 | `--datasets` | from profile | Override the profile's dataset list |
 | `--resource-pass` | `both` | `normalized`, `tuned`, or `both` |
 | `--phases` | `both` | `ann` (recall/QPS), `ops` (build/concurrency/filtered/churn) |
@@ -244,7 +277,8 @@ jq -r 'select(.phase=="recall_qps" and .recall_at_k>0.95)
 | `full` | all four, both passes | ~272 h | the complete space, rarely run whole |
 | `mariadb-blog` | dbpedia-openai-1000k, 1536 dims | ~72 h | reproducing MariaDB's published big-vector benchmark |
 
-Times are measured ingest only, three engines, before any query runs. `full`
+Times are measured ingest only, the original three engines, before any query
+runs. `full`
 describes the measurement space rather than recommending it. Narrow with
 `--datasets` and `--resource-pass`; see
 [docs/07-planning-a-run.md](docs/07-planning-a-run.md) for what each cut costs
@@ -283,7 +317,7 @@ SET mhnsw_ef_search = 100;
 SELECT id FROM items ORDER BY VEC_DISTANCE_COSINE(v, VEC_FromText('[0.1,0.2,0.3]')) LIMIT 10;
 ```
 
-[docs/03-running-manually.md](docs/03-running-manually.md) covers all three
+[docs/03-running-manually.md](docs/03-running-manually.md) covers the original three
 engines this way — start, connect, create, insert, search, confirm the index was
 used, and measure recall by hand. It is standalone and needs nothing else here.
 
@@ -314,7 +348,7 @@ with it. Check after your first run:
 jq '.host.cpu | {model, has_avx512, hybrid}' results/<run-id>/run-manifest.json
 ```
 
-**All three engines can silently fall back to a full table scan**, which returns
+**Every engine can silently fall back to a full table scan**, which returns
 exact results slowly — indistinguishable in the output from "very accurate but
 slow". Every driver runs `EXPLAIN` per configuration and records whether the
 index was used; anything that was not appears in the report's Validity section.
@@ -337,6 +371,7 @@ on a value its vendor plainly intended you to change.
 | [05-methodology.md](docs/05-methodology.md) | What is measured, how, fairness policy, known asymmetries |
 | [06-new-machine.md](docs/06-new-machine.md) | Moving the framework to another machine |
 | [07-planning-a-run.md](docs/07-planning-a-run.md) | **Read before a long run.** Measured ingest rates, what each profile costs, how to scope, resumption |
+| [08-web-ui.md](docs/08-web-ui.md) | The browser front end: run index, record explorer, profile editing, launching and live monitoring |
 
 ---
 
@@ -386,13 +421,14 @@ vector-bench/
 ├── run-benchmark.sh          single entrypoint
 ├── config/profiles/          dev · smoke · quick · full — what to measure
 ├── config/resources/         normalized · tuned — how much machine
-├── config/engines/           per-engine build, server flags, SQL dialect
+├── config/engines/           per-engine build, flags, SQL dialect, runtime
 ├── docker/                   multi-stage Dockerfiles + entrypoints
 ├── overlay/ann-benchmarks/   our algorithm modules (alisql is new)
 ├── harness/                  ops harness: drivers, workloads, metrics
 ├── orchestrator/             host-side: containers, limits, manifest
 ├── report/                   charts, Markdown and self-contained HTML
-├── docs/                     the six documents above
+├── webui/                    web UI: HTTP server, JSON API, static front end
+├── docs/                     the documents above
 ├── tests/                    unit tests + live engine-behaviour checks
 └── sources/ work/ datasets/ results/     generated, gitignored
 ```

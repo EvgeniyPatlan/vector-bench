@@ -39,17 +39,25 @@ python3 -c 'import yaml' && echo "pyyaml ok"
 
 ## 2. Get the code across
 
+> **Check what the remote actually has first.** Work done on a branch, or on a
+> machine that has not pushed, is not on the remote — and a clone will silently
+> give you an older tree that is missing it. Two commands settle it:
+>
+> ```bash
+> git ls-remote --heads origin          # which branches exist there at all
+> git fetch origin && git status -sb    # how far this checkout is from them
+> ```
+
 ### Option A — via a git remote
 
 ```bash
-# on the source machine
-cd ~/AI_WORK/VECTOR_RESEARCH/vector-bench
-git remote add origin <your-repo-url>
-git push -u origin master
+# on the source machine: push the branch you actually want
+git push -u origin HEAD
 
 # on the target
 git clone <your-repo-url> vector-bench
 cd vector-bench
+git checkout <branch>                 # if it is not the default branch
 ```
 
 ### Option B — direct copy, no remote needed
@@ -65,6 +73,10 @@ Either way, confirm the scripts survived the trip with their permissions:
 ```bash
 chmod +x run-benchmark.sh scripts/*.sh tests/*.sh
 ```
+
+Option B copies the working tree, branch and all, and needs nothing pushed
+anywhere — which makes it the shorter path when the work you want is not on the
+remote yet.
 
 ---
 
@@ -117,13 +129,56 @@ be mistaken for a complete dataset.
 
 ---
 
-## 5. Verify before measuring
+## 5. The web interface (optional)
+
+One more image, about a minute, and the rest of this document becomes something
+you can drive from a browser instead of a terminal.
 
 ```bash
-python3 -m pytest tests/ -q                     # 73 unit tests, ~2 s
-./tests/verify-alisql-traps.sh                  # 8 engine-behaviour checks
-./run-benchmark.sh run --profile smoke          # ~30 min, all three engines
+./scripts/build-images.sh --engine webui
+./run-benchmark.sh web --allow-control
 ```
+
+It binds `127.0.0.1`, so reach a headless machine through SSH rather than
+exposing it:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 you@target      # from your laptop
+```
+
+Then open `http://127.0.0.1:8080`. Its **Setup** page is this document's
+sections 3, 4, 6 and 7 as a checklist that does each step — build the images, fetch a
+corpus, run the smoke gate, then measure — and checks that every image agrees on
+`-march`.
+
+That command runs in the foreground and dies with your SSH session. On a
+machine you connect to, install it as a service instead — the unit and its
+settings file are in `docker/webui/`, and the steps are in
+[08-web-ui.md](08-web-ui.md):
+
+```bash
+sudo cp docker/webui/vector-bench-web.service /etc/systemd/system/
+sudo systemctl enable --now vector-bench-web
+```
+
+To expose it properly rather than tunnelling, see the same document: binding a
+non-loopback address turns password auth on by itself, and
+`docker/webui/compose.yml` puts Caddy in front for TLS.
+
+---
+
+## 6. Verify before measuring
+
+```bash
+python3 -m pytest tests/ -q                     # 777 unit tests, ~30 s
+./tests/verify-alisql-traps.sh                  # 8 engine-behaviour checks
+./run-benchmark.sh run --profile smoke          # ~45 min/pass, every engine
+```
+
+A dozen of those tests draw a chart and skip unless matplotlib is installed.
+That is expected: matplotlib lives in the bench images, not on the host, and
+this framework does not put a scientific Python stack on the machine it
+measures. Skipped is the right outcome; failed would not be.
 
 **Do not skip the smoke profile.** It exercises every stage end to end and is
 far cheaper than discovering a broken image eight hours into a full run.
@@ -137,7 +192,7 @@ There is also a one-minute synthetic cycle that needs no dataset download:
 
 ---
 
-## 6. Measure
+## 7. Measure
 
 ```bash
 ./run-benchmark.sh run --profile main
@@ -161,7 +216,7 @@ Resumable after an interruption:
 
 ---
 
-## 7. Check the environment the report recorded
+## 8. Check the environment the report recorded
 
 After the first run, confirm the target is what you think it is:
 
@@ -183,7 +238,7 @@ without it do not transfer to one with it.
 
 ---
 
-## 8. Bringing results back
+## 9. Bringing results back
 
 ```bash
 rsync -avz user@target:~/vector-bench/results/<run-id>/ ./results/<run-id>/
@@ -192,11 +247,26 @@ rsync -avz user@target:~/vector-bench/results/<run-id>/ ./results/<run-id>/
 The run directory is self-contained: manifest, raw records, charts and both
 report formats. `report.html` inlines its charts and needs no network.
 
+Copied runs appear in the web UI with no further step: run discovery is any
+directory under `results/` holding a manifest. With no shell on the receiving
+box, the UI's **Import a run** page takes the `.tar.gz` that
+`./run-benchmark.sh export` produces, and can rename it on the way in — two
+machines running the same profile on the same day produce the same run id.
+
 To regenerate the report locally from copied results:
 
 ```bash
 ./run-benchmark.sh report --run-dir results/<run-id>
 ```
+
+> **Regenerating a copied run is not the same as viewing it.** The recall
+> measurements live in `results/annb/`, a sibling of the run directory rather
+> than part of it, and scoring them needs the dataset file. Neither is included
+> by the rsync above. Without them the regenerated report loses its recall
+> section; with unrelated ann results present it reads those instead, since
+> nothing ties them to this run. The web UI's Report tab checks both and warns
+> before the button does anything. Viewing the copied `report.html` is
+> unaffected — it is self-contained.
 
 ---
 

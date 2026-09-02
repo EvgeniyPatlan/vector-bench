@@ -7,7 +7,7 @@
 #   <engine>-bench    runtime + the ann-benchmarks Python stack
 #
 # Usage:
-#   scripts/build-images.sh [--engine mariadb|mariadb123|alisql|pgvector|all]
+#   scripts/build-images.sh [--engine mariadb|mariadb123|alisql|pgvector|webui|all]
 #                           [--target runtime|bench|all]
 #                           [--march x86-64-v3|native|...]
 #                           [--jobs N] [--no-cache] [--pull]
@@ -179,11 +179,21 @@ open(out, "a").write("\n")
 PY
 }
 
+build_webui() {
+  # Not an engine: no source tree, no -march, no config/engines entry. Built
+  # from docker/webui with the repo excluded, since the repo is bind-mounted at
+  # run time rather than copied in.
+  info "building vector-bench/webui"
+  docker build --tag vector-bench/webui:latest "$VB_DOCKER/webui"
+  ok "vector-bench/webui:latest"
+}
+
 case "$ENGINE" in
   # `all` stays the three baseline engines. Extra versions such as mariadb123
   # are opt-in, because each is another hour of compiling that nobody asked for
   # by typing "all".
   all)        build_engine mariadb; build_engine alisql; build_engine pgvector ;;
+  webui)      build_webui ;;
   mariadb123) build_engine mariadb123 ;;
   # Nothing is compiled: the runtime image is the published PSMDB image plus
   # mongot copied out of its own image, both pinned by digest.

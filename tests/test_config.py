@@ -25,6 +25,24 @@ from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources, resolve_resources,
                                  server_args)
 
+# Charts are drawn inside a bench image, which carries matplotlib; the host is
+# promised nothing beyond python3 and PyYAML. A test that renders one therefore
+# skips on a machine set up from the documented prerequisites, rather than
+# failing there and making a clean install look broken.
+def _can_draw() -> bool:
+    """Whether a chart can actually be drawn, not whether a file is on the path.
+
+    find_spec() answers the second question, and a matplotlib that is present
+    but unimportable would pass it and then fail the test anyway.
+    """
+    from report.charts import have_matplotlib
+    return have_matplotlib()
+
+
+needs_matplotlib = pytest.mark.skipif(
+    not _can_draw(),
+    reason="draws a chart; matplotlib lives in the bench images, not on the host")
+
 ENGINES = ("mariadb", "alisql", "pgvector")
 PROFILES = ("smoke", "quick", "full")
 PASSES = ("normalized", "tuned")
@@ -244,7 +262,8 @@ class TestOverlayModules:
         assert os.path.exists(path), f"missing overlay module for {engine}"
         source = open(path).read()
         assert f"class {constructor}" in source
-        assert ann_pass.CONSTRUCTORS[engine] == constructor
+        from orchestrator import engines as engines_mod
+        assert engines_mod.get(engine).ann_constructor == constructor
 
 
 class TestAnnResultGuard:
@@ -668,30 +687,43 @@ class TestEngineDataPlacement:
 
     def test_every_engine_has_a_declared_data_mount(self):
         """Covers extra versions too, not just the baseline three."""
-        from orchestrator.ann_pass import DATA_MOUNT
+        from orchestrator import engines as engines_mod
+        mounts = {name: e.data_mount for name, e in engines_mod.registry().items()}
         from orchestrator.cli import KNOWN_ENGINES
-        assert set(DATA_MOUNT) == set(KNOWN_ENGINES)
-        assert all(p.startswith("/var/lib/") for p in DATA_MOUNT.values())
+        assert set(mounts) == set(KNOWN_ENGINES)
+        assert all(p.startswith("/var/lib/") for p in mounts.values())
 
-    def test_every_registry_covers_every_known_engine(self):
-        """Adding an engine means touching five tables; this is the guard.
+    def test_every_engine_declares_everything_a_run_needs(self):
+        """These used to be six dicts an engine could be missing from.
 
-        mariadb123 was added as a distinct engine because ann-benchmarks keys
-        results on the algorithm name, so a retagged `mariadb` would silently
-        return 11.8.8's numbers for a 12.3 build.
+        They are one registry now, read from config/engines/*.yml, so the
+        failure this guards against is an incomplete `runtime:` block rather
+        than a table someone forgot to edit. Either way it must fail here and
+        not four hours into a run.
+
+        mariadb123 is a distinct engine because ann-benchmarks keys results on
+        the algorithm name, so a retagged `mariadb` would silently return
+        11.8.8's numbers for a 12.3 build.
         """
-        from orchestrator.ann_pass import CONSTRUCTORS, DATA_MOUNT
-        from orchestrator.ops_pass import (DB_CREDENTIALS, DEFAULT_PORTS,
-                                           PROBES, SERVER_DATA_MOUNT)
+        from orchestrator import engines as engines_mod
         from orchestrator.cli import KNOWN_ENGINES
-        for name, table in (("CONSTRUCTORS", CONSTRUCTORS),
-                            ("DATA_MOUNT", DATA_MOUNT),
-                            ("DEFAULT_PORTS", DEFAULT_PORTS),
-                            ("PROBES", PROBES),
-                            ("DB_CREDENTIALS", DB_CREDENTIALS),
-                            ("SERVER_DATA_MOUNT", SERVER_DATA_MOUNT)):
-            missing = set(KNOWN_ENGINES) - set(table)
-            assert not missing, f"{name} is missing {sorted(missing)}"
+        registry = engines_mod.registry()
+        assert set(registry) == set(KNOWN_ENGINES)
+        for name, engine in registry.items():
+            assert engine.driver, f"{name}: no driver"
+            assert engine.ann_constructor, f"{name}: no ann_constructor"
+            assert engine.port, f"{name}: no port"
+            assert engine.data_mount, f"{name}: no data_mount"
+            assert engine.probe, f"{name}: no readiness probe"
+            assert engine.label, f"{name}: no label"
+
+    def test_every_engine_names_a_driver_the_harness_has(self):
+        from orchestrator import engines as engines_mod
+        from harness.drivers.postgres import _driver_classes
+        available = set(_driver_classes())
+        for name, engine in engines_mod.registry().items():
+            assert engine.driver in available, \
+                f"{name} names driver {engine.driver!r}, which does not exist"
 
     def test_a_second_mariadb_version_is_a_distinct_engine(self):
         from orchestrator.config import load_engine
@@ -826,6 +858,74 @@ class TestCleanup:
                             lambda _n: {"engine_state": str(tmp_path / "none")})
         args = type("A", (), {"run_id": None, "force": True})()
         assert cli.cmd_clean(args) == 0
+
+
+class TestFreshCheckoutBootstraps:
+    """A checkout where nothing has been built yet still has to work.
+
+    `sources/` exists as soon as any engine image has been built, which hid two
+    things: prepare-harness.sh wrote its provenance record into that directory
+    without creating it, and run-benchmark.sh did not run prepare-harness for
+    `generate` at all. Together they made `generate` on a new machine fail
+    telling you to run by hand the script the entrypoint exists to run for you.
+    """
+
+    def test_generate_prepares_the_working_copy(self):
+        source = open(os.path.join(VB_ROOT, "run-benchmark.sh")).read()
+        block = source.split("case \"${1:-}\" in")[1].split("esac")[0]
+        assert "prepare-harness.sh" in block
+        for command in ("run", "render", "generate"):
+            assert command in block.split(")")[0], \
+                f"{command} does not trigger prepare-harness"
+
+    def test_prepare_harness_creates_the_directory_it_writes_to(self):
+        source = open(os.path.join(VB_ROOT, "scripts", "prepare-harness.sh")).read()
+        creates = [line for line in source.splitlines()
+                   if line.startswith("mkdir -p") and "VB_SOURCES" in line]
+        assert creates, "sources/ is written to but never created"
+
+
+class TestHarnessIsolation:
+    """The ops harness container mounts harness/ only.
+
+    There is a matching guard below for report/, written after an
+    orchestrator import there crashed generation at the end of a 20-hour run.
+    harness/ had no such guard, so the same mistake was made again: resolving
+    an engine's driver through config/engines/*.yml from inside the harness
+    raised ModuleNotFoundError right after the server came up. The orchestrator
+    reads the config and passes --driver instead.
+    """
+
+    def test_harness_does_not_import_the_orchestrator(self):
+        import glob
+        pattern = os.path.join(VB_ROOT, "harness", "**", "*.py")
+        for path in glob.glob(pattern, recursive=True):
+            for line in open(path).read().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                assert "import orchestrator" not in stripped, f"{path}: {stripped}"
+                assert "from orchestrator" not in stripped, f"{path}: {stripped}"
+
+    def test_harness_imports_with_nothing_else_present(self, tmp_path):
+        """Import it the way the container does: harness/ and nothing else."""
+        import shutil
+        import subprocess
+        import sys
+        shutil.copytree(os.path.join(VB_ROOT, "harness"), tmp_path / "harness")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, '.'); "
+             "from harness.drivers.postgres import _driver_table; "
+             "print(sorted(_driver_table()))"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr[-800:]
+        assert "mariadb" in result.stdout
+
+    def test_the_orchestrator_names_the_driver_it_wants(self):
+        """The engine config is read on the host and passed in."""
+        src = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
+        assert '"--driver"' in src
 
 
 class TestReportNarrowing:
@@ -1331,10 +1431,18 @@ class TestHarnessAcceptsEveryOrchestratedEngine:
         missing = set(KNOWN_ENGINES) - set(known_engines())
         assert not missing, f"the harness cannot drive: {sorted(missing)}"
 
-    def test_choices_are_not_hardcoded_in_the_parser(self):
+    def test_the_parser_does_not_keep_its_own_engine_list(self):
+        """The two lists cannot disagree if the harness does not keep one.
+
+        It used to constrain --engine to a literal, then to the driver table.
+        Now the orchestrator validates the name against config/engines/*.yml
+        and passes --driver, so there is nothing here to fall out of step.
+        """
         source = open(os.path.join(VB_ROOT, "harness", "main.py")).read()
-        assert 'choices=known_engines()' in source, \
-            "--engine choices must come from the driver table, not a literal"
+        parser = source.split("def parse_args")[1].split("\ndef ")[0]
+        assert "choices=" not in parser.split("--engine")[1].split("p.add_argument")[0], \
+            "--engine must not be constrained to a list the harness maintains"
+        assert '"--driver"' in parser, "the orchestrator must be able to name the driver"
 
     def test_every_engine_resolves_to_a_driver_class(self):
         from harness.drivers.postgres import _driver_table
@@ -1911,10 +2019,10 @@ class TestMongoAnnModule:
         """A config naming a class the module does not define fails only once
         the image is built and the corpus is loaded."""
         import ast
-        from orchestrator.ann_pass import CONSTRUCTORS
+        from orchestrator import engines as engines_mod
         tree = ast.parse(open(self.MODULE).read())
         classes = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
-        assert CONSTRUCTORS["mongodb"] in classes
+        assert engines_mod.get("mongodb").ann_constructor in classes
 
     def test_fit_waits_for_the_index_rather_than_timing_the_call(self):
         source = open(self.MODULE).read()
@@ -2462,13 +2570,13 @@ class TestMongotForcesAuthentication:
     """
 
     def test_the_credentials_registry_is_not_empty_for_mongodb(self):
-        from orchestrator.ops_pass import DB_CREDENTIALS
-        user, password = DB_CREDENTIALS["mongodb"]
+        from orchestrator import engines as engines_mod
+        user, password = engines_mod.get("mongodb").credentials
         assert user and password
 
     def test_the_readiness_probe_authenticates(self):
-        from orchestrator.ops_pass import PROBES
-        probe = " ".join(PROBES["mongodb"])
+        from orchestrator import engines as engines_mod
+        probe = " ".join(engines_mod.get("mongodb").probe)
         assert "-u" in probe and "authenticationDatabase" in probe
 
     def test_the_driver_builds_an_authenticated_uri(self):
@@ -2885,8 +2993,8 @@ class TestBothProcessesAreWaitedFor:
     def test_the_readiness_probe_checks_both(self):
         """A probe that passes on mongod alone reports the server ready while
         the process that answers every search query is still booting."""
-        from orchestrator.ops_pass import PROBES
-        probe = " ".join(PROBES["mongodb"])
+        from orchestrator import engines as engines_mod
+        probe = " ".join(engines_mod.get("mongodb").probe)
         assert "isWritablePrimary" in probe
         assert "8080" in probe, "the probe does not check mongot at all"
 
@@ -4314,9 +4422,11 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
             plt.close("all")
         return captured["ax"]
 
+    @needs_matplotlib
     def test_the_axis_is_logit(self):
         assert self._axes().get_xscale() == "logit"
 
+    @needs_matplotlib
     def test_the_highest_point_is_inside_the_axis(self):
         """A logit axis cannot reach 1.0, and a right edge sitting on the best
         measurement clips the marker that matters most."""
@@ -4324,6 +4434,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         assert ax.get_xlim()[1] > 0.9996
         assert ax.get_xlim()[1] < 1.0
 
+    @needs_matplotlib
     def test_a_high_recall_engine_gets_real_width(self):
         """The complaint this fixes: MariaDB 12.3 spanning a sliver."""
         ax = self._axes()
@@ -4335,6 +4446,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         share = (engine[1] - engine[0]) / (span[1] - span[0])
         assert share > 0.30, f"only {share:.0%} of the axis"
 
+    @needs_matplotlib
     def test_the_ticks_are_readable_recall_values(self):
         """Logit's default labels are 1-10^-n, which nobody reads as recall."""
         ax = self._axes()
@@ -4342,6 +4454,7 @@ class TestTheRecallAxisDoesNotCrushHighRecallEngines:
         assert "0.99" in labels
         assert not any("10" in l and "^" in l for l in labels)
 
+    @needs_matplotlib
     def test_the_floor_still_narrows_the_view(self):
         assert self._axes(recall_floor=0.95).get_xlim()[0] == 0.95
 
@@ -4617,6 +4730,7 @@ class TestTwoGraphDegreesAreTwoLines:
         assert "key[:3]" not in block
         assert "key[3]" not in block
 
+    @needs_matplotlib
     def test_churn_still_renders_with_the_wider_key(self):
         import tempfile
         import matplotlib
@@ -4764,17 +4878,20 @@ class TestMemoryChartsCompareShapesNotClocks:
             plt.close("all")
         return captured.get("ax")
 
+    @needs_matplotlib
     def test_every_measurement_starts_at_zero(self):
         ax = self._axis(phase="ann")
         for line in ax.get_lines():
             assert min(line.get_xdata()) < 1.0
 
+    @needs_matplotlib
     def test_the_axis_is_not_mostly_empty(self):
         """The second measurement is five days later in wall clock; the axis
         must span one measurement, not the gap between two."""
         ax = self._axis(phase="ann")
         assert ax.get_xlim()[1] < 1000, "axis still spans the wall-clock gap"
 
+    @needs_matplotlib
     def test_the_phases_are_separate_charts(self):
         """The ann phase loads a corpus and sweeps a grid; ops loads it again
         and runs four workloads. Different durations, different questions."""
@@ -4783,6 +4900,7 @@ class TestMemoryChartsCompareShapesNotClocks:
         assert any("ann" in str(l) for l in ann)
         assert not any("ann" in str(l) for l in ops)
 
+    @needs_matplotlib
     def test_a_repeated_phase_says_so_in_the_legend(self):
         labels = [str(l.get_label()) for l in self._axis(phase="ann").get_lines()]
         assert any("2 measurements" in l for l in labels)

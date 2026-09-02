@@ -20,12 +20,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import docker_ctl
+from . import engines as engines_mod
 from .config import ResolvedResources, server_args
 from .manifest import utcnow
 
-DEFAULT_PORTS = {"mariadb": 3306, "mariadb123": 3306,
-                 "alisql": 3306, "pgvector": 5432, "mongodb": 27017,
-                 "valkey": 6379}
 
 # How much of the server's own log to keep beside the measurements. Generous,
 # because the lines that matter are the ones written while something was going
@@ -37,80 +35,11 @@ SERVER_LOG_TAIL = 20000
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
 # start would charge initialisation time to the first measurement.
-PROBES = {
-    "mariadb": [
-        "sh", "-c",
-        "/opt/mariadb/bin/mariadb -ubench -pbench "
-        "--socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1",
-    ],
-    "mariadb123": [
-        "sh", "-c",
-        "/opt/mariadb/bin/mariadb -ubench -pbench "
-        "--socket=/var/run/vbench/mariadb.sock -e 'SELECT 1' >/dev/null 2>&1",
-    ],
-    # Not a ping: mongod answers one while still SECONDARY, and a load that
-    # starts before the election completes fails on its first write. mongot
-    # readiness is checked separately, when the index is created.
-    "mongodb": [
-        "sh", "-c",
-        # Both processes. mongod answers well before mongot's JVM does, and an
-        # index created in that window never gets an initial sync queued.
-        "mongosh --quiet --port 27017 -u bench -p bench "
-        "--authenticationDatabase admin --eval "
-        "'db.hello().isWritablePrimary' 2>/dev/null | grep -q true "
-        "&& (exec 3<>/dev/tcp/127.0.0.1/8080) 2>/dev/null",
-    ],
-    # PING alone would pass before the module finished loading, and a Valkey
-    # without valkey-search accepts writes and then fails every FT.SEARCH.
-    "valkey": [
-        "sh", "-c",
-        "valkey-cli MODULE LIST 2>/dev/null | grep -qi search",
-    ],
-    "alisql": [
-        "sh", "-c",
-        "/opt/alisql/bin/mysql -ubench -pbench "
-        "--socket=/var/run/vbench/alisql.sock -e 'SELECT 1' >/dev/null 2>&1",
-    ],
-    # pg_isready alone is not enough: it reports "accepting connections" while
-    # the official entrypoint is still in its bootstrap phase and before
-    # POSTGRES_DB has been created, so a probe based on it passes seconds too
-    # early and the first query fails with "database ann does not exist".
-    "pgvector": ["sh", "-c",
-                 "psql -U postgres -d ann -tAc 'SELECT 1' >/dev/null 2>&1"],
-}
 
 # Database account per engine. PostgreSQL's bootstrap superuser is `postgres`;
 # the MySQL-family images create a `bench` account from their --init-file
 # (--skip-grant-tables is unusable because on MySQL 8 it disables networking).
-DB_CREDENTIALS = {
-    "mariadb": ("bench", "bench"),
-    "mariadb123": ("bench", "bench"),
-    "alisql": ("bench", "bench"),
-    "pgvector": ("postgres", ""),
-    # The only engine here that must run with auth on. mongot refuses to parse
-    # a config without SCRAM or x509, so mongod runs authenticated and every
-    # client authenticates with it.
-    "mongodb": ("bench", "bench"),
-    # No AUTH: the container is on an isolated network, and requirepass would
-    # add a round trip to every measured command.
-    "valkey": ("", ""),
-}
 
-SERVER_DATA_MOUNT = {
-    # Where the client can read the server's data directory, for exact on-disk
-    # index sizing. PostgreSQL reports its own index size through pg_relation_size,
-    # so it needs no shared mount.
-    "mariadb": "/server-data/data",
-    "mariadb123": "/server-data/data",
-    "alisql": "/server-data/data",
-    "pgvector": None,
-    # mongot's Lucene segments are files belonging to another process, so the
-    # client has to read them directly to size the index at all.
-    "mongodb": "/server-data/mongot",
-    # In-memory: there is no index on disk for the client to measure, so index
-    # size is taken from used_memory instead.
-    "valkey": None,
-}
 
 
 # The ops client loads the corpus once (unlike the ann client, which loads it
@@ -151,7 +80,7 @@ class OpsRun:
         self.volume = f"{safe}-data"
         self.server_name = f"{safe}-srv"
         self.client_name = f"{safe}-cli"
-        self.port = int(engine_cfg.get("port", DEFAULT_PORTS[engine]))
+        self.port = int(engine_cfg.get("port", engines_mod.get(engine).port))
 
     # ------------------------------------------------------------------
 
@@ -209,7 +138,7 @@ class OpsRun:
               f"mem={self.resolved.server_memory_bytes / 1024**3:.1f}GB")
         print(f"[ops] server flags: {' '.join(flags)}")
         docker_ctl.start(spec)
-        docker_ctl.wait_healthy(self.server_name, PROBES[self.engine], timeout_s=300)
+        docker_ctl.wait_healthy(self.server_name, list(engines_mod.get(self.engine).probe), timeout_s=300)
         print(f"[ops] {self.engine} server ready")
 
     # ------------------------------------------------------------------
@@ -228,7 +157,7 @@ class OpsRun:
             f"{self.paths['ops_results']}:/results:rw",
         ]
         data_dir_arg: List[str] = []
-        mount_point = SERVER_DATA_MOUNT[self.engine]
+        mount_point = engines_mod.get(self.engine).server_data_mount
         if mount_point:
             # Read-only view of the server's data directory so index files can
             # be sized exactly, rather than inferred from a catalog that does
@@ -236,7 +165,7 @@ class OpsRun:
             volumes.append(f"{self.volume}:/server-data:ro")
             data_dir_arg = ["--server-data-dir", mount_point]
 
-        db_user, db_password = DB_CREDENTIALS[self.engine]
+        db_user, db_password = engines_mod.get(self.engine).credentials
 
         # The run directory is mounted at /results inside the client container,
         # so the harness must be given a container path. Passing the host path
@@ -247,6 +176,9 @@ class OpsRun:
         command = [
             "/opt/harness/main.py",
             "--engine", self.engine,
+            # Read from config/engines/*.yml here, because the harness container
+            # mounts harness/ only and cannot read it for itself.
+            "--driver", engines_mod.get(self.engine).driver,
             "--user", db_user,
             "--password", db_password,
             "--host", self.server_name,

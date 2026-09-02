@@ -43,7 +43,7 @@ cd vector-bench
 > sooner.
 
 The smoke profile takes about 30 minutes per resource pass and exercises every
-stage for all three engines. **Do not skip it.** It is far cheaper to discover a broken image
+stage for every engine. **Do not skip it.** It is far cheaper to discover a broken image
 or a missing dataset here than eight hours into a full run.
 
 When it finishes:
@@ -93,22 +93,33 @@ an interrupted run can resume without recomputing points it already has.
 
 ## 3. Commands
 
-| Command | Purpose |
-| --- | --- |
-| `build` | Export sources at pinned tags, build runtime + bench images |
-| `fetch` | Download datasets into `datasets/` |
-| `run` | Execute a benchmark run |
-| `report` | Regenerate the report from an existing run directory |
-| `render` | Regenerate the ann-benchmarks configs for a profile |
-| `sources` | Export sources only, without building |
-| `clean` | Remove containers, networks and volumes left by a run |
+| Command | Purpose | In the web UI |
+| --- | --- | --- |
+| `build` | Export sources at pinned tags, build runtime + bench images | Engines |
+| `fetch` | Download datasets into `datasets/` | Datasets |
+| `generate` | Build a dataset that is not published for download | Datasets |
+| `run` | Execute a benchmark run | Profiles & launch |
+| `report` | Regenerate the report from an existing run directory | Runs → Report |
+| `export` | Package a run as a `.tar.gz` to send to someone | Runs → Report |
+| `render` | Regenerate the ann-benchmarks configs for a profile | — |
+| `sources` | Export sources only, without building | — |
+| `web` | Serve the browser interface | — |
+| `clean` | Remove containers, networks and volumes left by a run | — |
+
+Everything in the third column can be driven from
+[the web UI](08-web-ui.md) instead, which shows the command it is about to run
+before it runs it. Its **Setup** page walks a fresh machine through the first
+three in order, and checks that every image agrees on `-march` — a mixed build
+compares compiler flags rather than implementations, and looks perfectly
+plausible in the report. The CLI remains the whole interface on a machine you have
+only SSH'd into.
 
 ### `run` options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--profile` | `quick` | `smoke`, `quick`, `full`, or your own in `config/profiles/` |
-| `--engines` | all three | e.g. `mariadb,alisql` |
+| `--engines` | every engine | e.g. `mariadb,alisql` |
 | `--datasets` | from profile | Override the profile's dataset list |
 | `--resource-pass` | `both` | `normalized`, `tuned`, or `both` |
 | `--phases` | `both` | `ann` (recall/QPS), `ops` (build/concurrency/filtered/churn) |
@@ -128,10 +139,55 @@ an interrupted run can resume without recomputing points it already has.
 | `--jobs` | Compile parallelism (default: all cores) |
 | `--no-cache` | Force a clean rebuild |
 
+### `generate` options
+
+`fetch` downloads datasets published as prebuilt HDF5. The `dbpedia-openai-*`
+family is not published that way: ann-benchmarks assembles it from a source
+corpus and then computes exact ground truth by brute force.
+
+```bash
+./run-benchmark.sh generate --list
+./run-benchmark.sh generate dbpedia-openai-1000k-angular
+```
+
+> **This is not a download.** The full 1M-row source is fetched whichever size
+> you pick (~6–10 GB); choosing a smaller variant only shrinks the ground-truth
+> computation and every later engine load. Budget hours and about 20 GB of
+> working space for the 1000k variant, and build a bench image first — the
+> generation runs inside one.
+
+### `export` options
+
+| Option | Meaning |
+| --- | --- |
+| `--run-dir` | `results/<run-id>`, or just the run id |
+| `--output` | Path for the archive (default `./vector-bench-<run-id>.tar.gz`) |
+
+Produces the run directory plus a README naming the machine the numbers belong
+to, its SIMD flags, what was measured and how to view it. A recipient with
+vector-bench extracts it into their `results/`; one without opens
+`report/report.html`, which is self-contained. Refuses a run with no readable
+manifest, because a result without the environment that produced it is not a
+result.
+
+### `web` options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--port` | `8080` | |
+| `--host` | `127.0.0.1` | Interface to publish on. Non-loopback implies `--auth` |
+| `--allow-control` | off | Allow editing profiles, adding engines, and starting work |
+| `--auth` | off on loopback | Require a password |
+| `--no-auth` | — | Publish without one. Only on a network you already trust |
+| `--behind-proxy` | off | TLS is terminated in front; marks cookies `Secure` |
+| `--no-container` | off | Run the server on the host instead of in a container |
+
+See [08-web-ui.md](08-web-ui.md).
+
 ## 4. `-march` — the one build flag that changes results
 
-All three engines compile SIMD distance kernels. `-march` decides which
-instructions those kernels get, and it is applied identically to all three:
+Every engine compiles SIMD distance kernels. `-march` decides which
+instructions those kernels get, and it is applied identically to all of them:
 
 ```bash
 ./run-benchmark.sh build --march x86-64-v3   # AVX2 + FMA. Portable. Default.
@@ -196,6 +252,39 @@ The knobs worth changing first:
 - `memory.server_limit_gb` in `config/resources/normalized.yml` — the single
   most consequential value, because an engine whose graph does not fit in cache
   behaves completely differently from one whose graph does.
+
+### Adding an engine
+
+`config/engines/*.yml` is the whole definition of an engine — how it is built,
+how it is started, the SQL it speaks, and a `runtime:` block with the port, data
+mounts, credentials, readiness probe, chart colour and label. `KNOWN_ENGINES` is
+whatever that directory holds; there is no list to keep in step with it.
+
+**A variant of a family already driven** — another MariaDB or MySQL fork,
+another Postgres build — is therefore configuration and a build, with no Python:
+
+```bash
+cp config/engines/mariadb.yml config/engines/perconaserver.yml
+$EDITOR config/engines/perconaserver.yml     # name, source tag, image names,
+                                             # runtime.ann_constructor
+./run-benchmark.sh build --engines perconaserver
+```
+
+The web UI's Engines page does exactly this, and validates it. Two collisions
+are worth knowing about because neither crashes:
+
+- **`runtime.ann_constructor` must be unique.** ann-benchmarks keys its result
+  files on that name, so two engines sharing one share a results tree and the
+  second reports the first's recall numbers. This is precisely why `mariadb123`
+  exists as its own constructor rather than a retagged `mariadb`.
+- **`image.runtime` and `image.bench` must be unique**, or two builds overwrite
+  each other.
+
+**A new architecture** — something none of the existing drivers speak — needs
+code as well: a driver in `harness/drivers/` registered in `_driver_classes()`,
+an ann-benchmarks module under `overlay/`, and a Dockerfile. The engine config
+names its driver by class name, and a name nothing implements is refused at load
+rather than four hours into a run.
 
 ## 8. Reading the output
 

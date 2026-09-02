@@ -92,8 +92,9 @@ a legitimate result rather than a measurement fault. The row count is part of
 the ground-truth cache key so a subset run cannot poison a full run's cache.
 
 This is where integrated vector search is supposed to beat standalone vector
-stores, and where the three engines' query planners diverge most (pre-filter vs
-post-filter vs iterative scan).
+stores, and where the engines' query planners diverge most: the SQL engines
+post-filter, Percona Search pre-filters, pgvector can iterate its index scan,
+and Valkey's planner chooses per query.
 
 ### 2.5 Churn (ops harness)
 

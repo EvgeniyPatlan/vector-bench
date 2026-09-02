@@ -20,28 +20,10 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from . import docker_ctl
+from . import engines as engines_mod
 from .config import ResolvedResources, server_args
 
-# Constructor class names, as ann-benchmarks expects them in config.yml.
-CONSTRUCTORS = {"mariadb": "MariaDB", "mariadb123": "MariaDB123",
-                "alisql": "AliSQL", "pgvector": "PGVector",
-                "mongodb": "PerconaSearch", "valkey": "ValkeySearch"}
 
-# Where each engine's data directory lives inside its image. The ops path
-# mounts a volume here; the ann path binds a host directory for the same reason.
-DATA_MOUNT = {
-    "mariadb": "/var/lib/vbench",
-    "mariadb123": "/var/lib/vbench",
-    "alisql": "/var/lib/vbench",
-    "pgvector": "/var/lib/postgresql",
-    # Both processes write under one root: mongod's dbpath and mongot's Lucene
-    # segments. Sizing the index means reading mongot's directory, because
-    # collStats cannot see another process's files.
-    "mongodb": "/var/lib/vbench",
-    # Nothing durable is written, but the server still wants a working
-    # directory and the mount keeps the container's layout uniform.
-    "valkey": "/var/lib/vbench",
-}
 
 # ann-benchmarks raises this when every configuration is already done.
 # See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
@@ -237,7 +219,7 @@ def render_config(engine: str, profile: Dict[str, Any],
         "float": {
             "any": [{
                 "base_args": ["@metric"],
-                "constructor": CONSTRUCTORS[engine],
+                "constructor": engines_mod.get(engine).ann_constructor,
                 "disabled": False,
                 "docker_tag": f"vector-bench/{engine}-bench",
                 "module": f"ann_benchmarks.algorithms.{engine}",
@@ -380,7 +362,7 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             f"{paths['work_annb']}:/home/app:rw",
             f"{paths['datasets']}:/home/app/data:rw",
             f"{annb_results_dir(paths, resource_pass, resolved)}:/home/app/results:rw",
-            f"{state_dir}:{DATA_MOUNT[engine]}:rw",
+            f"{state_dir}:{engines_mod.get(engine).data_mount}:rw",
         ],
         command=command,
         detach=False,
