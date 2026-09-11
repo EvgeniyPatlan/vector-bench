@@ -449,11 +449,13 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
              "it, so their container limit is a cache budget. Valkey's is the "
              "dataset. It has no buffer pool to size and no index on disk, and "
              "its index size below is resident memory rather than a file."],
-            ["Valkey's planner chooses its filtering strategy per query",
-             "It picks between pre-filtering and filtering inline during the "
-             "search. The MySQL family and pgvector post-filter and Percona "
-             "Search pre-filters, so the filtered section compares three "
-             "strategies rather than one implemented three ways."],
+            ["Valkey applies the predicate during the graph walk",
+             "Its documentation describes a per-query planner that can "
+             "pre-filter instead. This run did not observe that: its latency "
+             "rises when the predicate narrows, which is what walking the "
+             "graph costs and the opposite of what pre-filtering costs. The "
+             "filtered section derives each engine's strategy from that "
+             "measurement rather than from its documentation."],
             ["Valkey is installed from packages, not built from source",
              "Percona ships prebuilt packages, so it carries installed package "
              "versions instead of a tag, a commit and a `-march`, and the "
@@ -763,6 +765,41 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
     )
 
 
+def _filter_strategy_table(summary: Dict[str, Any]) -> str:
+    """Which filtering strategy each engine used, from its own latency.
+
+    Every engine's documentation says what it does. This says what it did. A
+    pre-filter compares only the qualifying vectors, so a narrower predicate
+    is less work; anything that walks the graph pays more, because it has to
+    travel further to find k survivors. The direction separates them without
+    anyone being taken at their word -- which matters, because the report
+    asserted for weeks that one engine pre-filtered when its own numbers said
+    otherwise.
+    """
+    strategies = summary.get("filter_strategies") or []
+    if not strategies:
+        return ""
+    parts = [
+        "\n#### What each engine actually did\n\n",
+        "Derived from how median latency moves as the predicate narrows, not "
+        "from what the engine documents. **A pre-filter gets faster** — fewer "
+        "qualifying vectors is less work. Anything that applies the predicate "
+        "during or after the graph walk gets slower, because it has to travel "
+        "further to find k survivors.\n",
+    ]
+    rows = [[_label(s["engine"]),
+             f"{s['wide']:.0%} → {s['narrow']:.0%}",
+             f"{s['wide_p50']:,.1f} → {s['narrow_p50']:,.1f} ms",
+             f"{s['ratio']}x",
+             _fmt(s.get("narrow_recall"), 4),
+             s["observed"]]
+            for s in strategies]
+    parts.append(_md_table(
+        ["Engine", "Selectivity", "Median latency", "Change",
+         "Recall at the narrow end", "Observed strategy"], rows))
+    return "".join(parts)
+
+
 def _churn_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("churn", []),
@@ -896,6 +933,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "post-filtering, not a harness fault.\n\n",
         (_filtered_table(summary) if summary.get("filtered")
          else _not_measured("filtered", profile)),
+        _filter_strategy_table(summary),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.startswith("filtered-"):

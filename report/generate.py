@@ -108,6 +108,7 @@ def summarize(records: List[Dict[str, Any]],
         "silent_ann_failures": [],
         "qps_inversions": [],
         "contended_phases": [],
+        "filter_strategies": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
     }
@@ -290,6 +291,56 @@ def summarize(records: List[Dict[str, Any]],
             per_engine[engine] = entry
         if per_engine:
             summary["per_dataset"][dataset] = per_engine
+
+    # Which filtering strategy each engine actually used, derived from how its
+    # latency moves when the predicate narrows.
+    #
+    # A pre-filter compares only the qualifying vectors, so a ten-times
+    # narrower predicate is roughly ten times less work. Anything that walks
+    # the graph and applies the predicate during or after the walk pays more,
+    # because it has to travel further to find k survivors. The direction of
+    # the change separates them, and it is the one thing here that does not
+    # depend on trusting a vendor's description.
+    #
+    # This exists because the report asserted for weeks that Valkey "chooses
+    # its filtering strategy per query", taken from its documentation. The run
+    # showed 18.2 ms at 10% selectivity and 120.6 ms at 1% -- six times more
+    # work for a tenth of the candidates, which is inline filtering and not a
+    # planner choosing to pre-filter.
+    by_engine: Dict[Any, List[Dict[str, Any]]] = {}
+    for r in records:
+        if (r.get("phase") == "filtered" and r.get("selectivity")
+                and r.get("latency_p50_ms")):
+            by_engine.setdefault((r.get("engine"), r.get("dataset")),
+                                 []).append(r)
+    for (engine, dataset), points in sorted(by_engine.items(), key=lambda kv: str(kv[0])):
+        if len(points) < 2:
+            continue
+        points.sort(key=lambda r: r["selectivity"])
+        narrow, wide = points[0], points[-1]
+        ratio = narrow["latency_p50_ms"] / wide["latency_p50_ms"]
+        span = wide["selectivity"] / narrow["selectivity"]
+        # Recall is what separates "gives up" from "keeps looking": an engine
+        # that returns quickly because it stopped early shows it here.
+        collapsed = (narrow.get("recall_at_k") or 1) < 0.5
+        if ratio < 0.9:
+            observed = "pre-filter"
+        elif collapsed:
+            observed = "post-filter, abandons the query"
+        elif ratio < 10:
+            observed = "filters during the graph walk"
+        else:
+            observed = "post-filter, exhaustive"
+        summary["filter_strategies"].append({
+            "engine": engine, "dataset": dataset,
+            "narrow": narrow["selectivity"], "wide": wide["selectivity"],
+            "narrow_p50": narrow["latency_p50_ms"],
+            "wide_p50": wide["latency_p50_ms"],
+            "narrow_recall": narrow.get("recall_at_k"),
+            "ratio": round(ratio, 2), "span": round(span, 1),
+            "observed": observed,
+        })
+    summary["filter_strategies"].sort(key=lambda s: s["ratio"])
 
     # Build-cost and concurrency headlines.
     for phase, key in (("index_build", "build"), ("concurrency", "concurrency"),

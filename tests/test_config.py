@@ -5100,3 +5100,69 @@ class TestTheChurnBudgetFitsAHealthyEngine:
         block = source.split("if inserted < len(new_ids):")[1].split("break")[0]
         assert "recall" not in block.split("notes=")[0].split("extra=")[0]
 
+
+class TestFilterStrategyIsMeasuredNotQuoted:
+    """The report asserted for weeks that Valkey "chooses its filtering
+    strategy per query", taken from its documentation. The run said otherwise:
+    18.2 ms at 10% selectivity and 120.6 ms at 1%, six times more work for a
+    tenth of the candidates. That is what walking the graph costs and the
+    opposite of what pre-filtering costs, and the number was sitting in the
+    records the whole time."""
+
+    def _rows(self, engine, wide_p50, narrow_p50, narrow_recall=0.98):
+        return [{"phase": "filtered", "engine": engine, "dataset": "d",
+                 "selectivity": 0.1, "latency_p50_ms": wide_p50,
+                 "recall_at_k": 0.98, "qps": 10.0},
+                {"phase": "filtered", "engine": engine, "dataset": "d",
+                 "selectivity": 0.01, "latency_p50_ms": narrow_p50,
+                 "recall_at_k": narrow_recall, "qps": 5.0}]
+
+    def _observed(self, *args, **kw):
+        from report.generate import summarize
+        found = summarize(self._rows(*args, **kw))["filter_strategies"]
+        return found[0]["observed"]
+
+    def test_faster_on_a_narrower_predicate_is_a_pre_filter(self):
+        """Percona Search: 13.5 ms to 8.4 ms. Fewer qualifying vectors is
+        less work, which only a pre-filter gets."""
+        assert self._observed("mongodb", 13.55, 8.40, 0.8666) == "pre-filter"
+
+    def test_slower_on_a_narrower_predicate_is_not(self):
+        """Valkey: 18.2 ms to 120.6 ms."""
+        assert self._observed("valkey", 18.16, 120.56, 0.9996) == \
+            "filters during the graph walk"
+
+    def test_far_slower_is_an_exhaustive_post_filter(self):
+        assert self._observed("mariadb", 49.33, 1875.91, 0.9724) == \
+            "post-filter, exhaustive"
+
+    def test_flat_latency_with_collapsed_recall_is_giving_up(self):
+        """pgvector returns in the same time at either selectivity because it
+        stops early. Without checking recall that reads as a pre-filter."""
+        assert self._observed("pgvector", 4.41, 4.27, 0.1034) == \
+            "post-filter, abandons the query"
+
+    def test_recall_is_what_separates_fast_from_abandoned(self):
+        """Same latencies, healthy recall: not the same finding."""
+        assert self._observed("other", 4.41, 4.27, 0.98) != \
+            "post-filter, abandons the query"
+
+    def test_one_selectivity_cannot_be_classified(self):
+        """A single point has no direction, and guessing from it is how the
+        wrong claim got in."""
+        from report.generate import summarize
+        rows = self._rows("valkey", 18.16, 120.56)[:1]
+        assert summarize(rows)["filter_strategies"] == []
+
+    def test_it_reaches_the_report(self):
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert "_filter_strategy_table(summary)" in source
+        assert "What each engine actually did" in source
+
+    def test_no_asymmetry_claims_a_planner_the_run_did_not_see(self):
+        """The asymmetries section describes structural differences. It must
+        not carry a vendor's description of behaviour the run measured and
+        contradicted."""
+        source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
+        assert "chooses its filtering strategy per query" not in source
+
