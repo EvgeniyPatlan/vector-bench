@@ -880,7 +880,10 @@ class ValkeyDriver(EngineDriver):
         caps.update({
             "ef_construction_tunable": True,
             "in_memory_only": True,
-            "hybrid_filter_planner": True,
+            # Documented but not observed -- see config/engines/valkey.yml.
+            # None rather than True: this lands in the records, and a True
+            # there reads as something the run measured.
+            "hybrid_filter_planner": None,
             "backfill_seconds": round(self._backfill_seconds, 3),
         })
         return caps

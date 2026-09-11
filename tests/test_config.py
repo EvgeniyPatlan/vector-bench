@@ -5166,3 +5166,33 @@ class TestFilterStrategyIsMeasuredNotQuoted:
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         assert "chooses its filtering strategy per query" not in source
 
+    def test_no_engine_records_a_planner_as_measured_fact(self):
+        """capabilities land in the records, so a `true` there is read as
+        something the run established. Valkey's filtering planner is a vendor
+        claim the run contradicted, and recording it as true is how it reached
+        the report."""
+        import yaml
+        path = os.path.join(VB_ROOT, "config", "engines", "valkey.yml")
+        caps = yaml.safe_load(open(path))["capabilities"]
+        assert caps["hybrid_filter_planner"] is None
+
+    def test_the_driver_agrees_with_the_config(self):
+        source = open(os.path.join(VB_ROOT, "harness", "drivers",
+                                   "valkey.py")).read()
+        assert '"hybrid_filter_planner": None' in source
+
+    def test_the_lab_wrapper_cleans_up_after_itself(self):
+        """It starts a server and a client outside any run. Leaving either
+        behind would collide with the next run's container names."""
+        script = open(os.path.join(VB_ROOT, "scripts",
+                                   "valkey-lab.sh")).read()
+        assert "trap cleanup EXIT INT TERM" in script
+        assert "docker rm -f" in script
+
+    def test_the_lab_pins_noeviction(self):
+        """Under any other policy a full Valkey drops keys, and vectors
+        vanishing mid-probe looks exactly like a bad index."""
+        script = open(os.path.join(VB_ROOT, "scripts",
+                                   "valkey-lab.sh")).read()
+        assert "maxmemory-policy noeviction" in script
+

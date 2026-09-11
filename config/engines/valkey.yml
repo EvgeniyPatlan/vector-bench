@@ -18,9 +18,14 @@
 #     flat from one client to thirty-two while pgvector reaches 21.7x, so this
 #     is the most directly testable claim in the set.
 #
-#   * Its query planner chooses between pre-filtering and inline filtering per
-#     query. That is a third filtering strategy: the SQL engines post-filter
-#     and Percona Search pre-filters.
+#   * Its documentation describes a query planner that chooses between
+#     pre-filtering and inline filtering per query. The run of 2026-08-25 did
+#     not observe that: filtered latency rose from 18.2 ms at 10% selectivity
+#     to 120.6 ms at 1%, which is what walking the graph costs and the inverse
+#     of what pre-filtering costs. scripts/probe-valkey-filter.py exists to
+#     find out whether the planner is reachable from a plain FT.SEARCH at all.
+#     The report derives each engine's strategy from its own latency rather
+#     than from this note.
 #
 # THE TRAP THIS CONFIG EXISTS TO AVOID
 #
@@ -139,8 +144,11 @@ capabilities:
   ef_construction_normalized: 200
   # Documented lock-free read path with a reader thread pool.
   reader_thread_pool: true
-  # The query planner chooses per query rather than committing to one strategy.
-  hybrid_filter_planner: true
+  # Documented, not observed. It is recorded as null rather than true because
+  # this field lands in the records, and a `true` there reads as a measured
+  # fact -- which is exactly how the claim survived into the report for weeks.
+  # See the note at the top of this file.
+  hybrid_filter_planner: null
   # Nothing is written to disk, so the on-disk footprint comparison does not
   # include it and index size is measured as resident bytes.
   in_memory_only: true
