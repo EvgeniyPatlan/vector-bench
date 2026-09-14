@@ -150,6 +150,10 @@ class ContainerSpec:
     detach: bool = True
     # Set only when the container must reach the internet (dataset fetch).
     allow_network: bool = False
+    # Allocate a TTY and keep stdin open. Only the lab shell wants this: a
+    # measurement container must never depend on a terminal, or the same
+    # command behaves differently under nohup than it does by hand.
+    interactive: bool = False
 
 
 def _spec_args(spec: ContainerSpec) -> List[str]:
@@ -158,6 +162,8 @@ def _spec_args(spec: ContainerSpec) -> List[str]:
         args.append("-d")
     else:
         args.append("--rm")
+    if spec.interactive:
+        args.append("-it")
     if spec.network:
         args += ["--network", spec.network]
     if spec.cpuset:
@@ -267,6 +273,25 @@ def run_foreground(spec: ContainerSpec, timeout: int = 24 * 3600,
     finally:
         if process.poll() is None:
             process.kill()
+
+
+def run_interactive(spec: ContainerSpec) -> int:
+    """Hand the terminal to a container and wait.
+
+    Deliberately separate from run_foreground, which pipes stdout so it can
+    stream, filter and archive every line. That piping is what a measurement
+    needs and exactly what an interactive prompt cannot have: with stdout on a
+    pipe there is no TTY, so no readline, no job control and no way to answer a
+    password prompt. Nothing here is captured, because nothing typed at a
+    prompt is a measurement.
+    """
+    spec.detach = False
+    spec.interactive = True
+    remove(spec.name)
+    try:
+        return subprocess.call(_spec_args(spec))
+    finally:
+        remove(spec.name)
 
 
 def remove(name: str) -> None:
@@ -480,6 +505,21 @@ def remove_tree_as_root(path: str, image: str) -> bool:
     if os.getuid() == 0:
         shutil.rmtree(path, ignore_errors=True)
         return not os.path.exists(path)
+
+    # Try it directly first. The directory is only root-owned once a server has
+    # actually written into it; when setup failed before that -- a missing
+    # image, a server that never came up -- it is an empty directory this
+    # process made, and spawning a container to delete it needs the very image
+    # whose absence caused the failure. That path then fails and warns that a
+    # corpus is still on disk, which is both alarming and untrue.
+    #
+    # Not ignore_errors: a silent failure here is what leaves a full corpus
+    # behind. If it does not work, fall through to the container.
+    try:
+        shutil.rmtree(path)
+        return True
+    except OSError:
+        pass
 
     parent, name = os.path.dirname(path), os.path.basename(path)
     spec = ContainerSpec(

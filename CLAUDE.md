@@ -37,6 +37,7 @@ python3 -m pytest tests/ -q                 # ~777 tests, ~30 s. The fast inner 
 ./run-benchmark.sh clean --run-id <run-id>
 ./run-benchmark.sh web [--allow-control]    # web UI; --no-container for host mode
 ./run-benchmark.sh generate <dataset>       # datasets fetch cannot download
+./run-benchmark.sh lab --engine valkey probe-valkey-filter.py   # diagnose, don't measure
 ./run-benchmark.sh export --run-dir <id>    # bundle a run to send to someone
 ```
 

@@ -85,15 +85,31 @@ class OpsRun:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "OpsRun":
-        docker_ctl.create_network(self.network, internal=True)
-        # Backed by a directory under VB_ROOT rather than Docker's data-root,
-        # so the corpus lands on the filesystem the checkout is on. See
-        # docker_ctl.create_volume.
-        docker_ctl.create_volume(
-            self.volume,
-            device=os.path.join(self.paths["engine_state"], "ops", self.volume),
-        )
-        self._start_server()
+        try:
+            docker_ctl.create_network(self.network, internal=True)
+            # Backed by a directory under VB_ROOT rather than Docker's
+            # data-root, so the corpus lands on the filesystem the checkout is
+            # on. See docker_ctl.create_volume.
+            docker_ctl.create_volume(
+                self.volume,
+                device=os.path.join(self.paths["engine_state"], "ops",
+                                    self.volume),
+            )
+            self._start_server()
+        except BaseException:
+            # `with` calls __exit__ only if __enter__ *returned*. Setup happens
+            # in three steps and the last two can fail -- a missing image, or a
+            # server that never becomes healthy inside five minutes -- and
+            # every failure after the first step leaves behind a network, a
+            # volume, a root-owned directory under state/ops and sometimes a
+            # server container, with nothing saying so. Reproduced by asking
+            # for an engine whose image is not built.
+            #
+            # BaseException, not Exception: the widest window here is
+            # wait_healthy's five-minute poll, and the likeliest thing to
+            # arrive during it is the operator's Ctrl-C.
+            self.teardown()
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
@@ -242,6 +258,97 @@ class OpsRun:
                 sampler.stop()
                 print(f"[ops] captured {sampler.samples} memory samples "
                       f"-> {os.path.basename(memory_timeseries)}")
+
+    def run_script(self, script: str, args: List[str],
+                   interactive: bool = False,
+                   client_memory_bytes: Optional[int] = None,
+                   timeout_s: int = 4 * 3600) -> int:
+        """Run one script from scripts/ against the running server.
+
+        The diagnostic counterpart to run_harness. Same two-container shape,
+        same server flags, same cpuset and memory -- because a probe that
+        answers a question about a run has to run against the configuration
+        that run used. The first version of this was a standalone shell script
+        that started its own Valkey with hand-written flags, and it was already
+        drifting: a 32 GB default where the run gives 101 GB, and
+        maxmemory-policy re-specified by hand next to the copy in
+        config/engines/valkey.yml. Two places to state one fact is how a probe
+        ends up disproving something the run never did.
+
+        What is deliberately *not* here is anywhere to write a measurement.
+        run_harness mounts the run directory at /results; this mounts no
+        writable path at all. A lab script generates its own vectors and its
+        own ground truth, and those numbers must never be able to reach a
+        report and sit in a table beside corpus numbers looking like a
+        measurement.
+        """
+        image = self.engine_cfg.get("image", {}).get(
+            "bench", f"vector-bench/{self.engine}-bench"
+        )
+        if not docker_ctl.image_exists(image):
+            raise docker_ctl.DockerError(
+                f"image {image} not found. Build it first:\n"
+                f"  ./run-benchmark.sh build --engines {self.engine}"
+            )
+
+        db_user, db_password = engines_mod.get(self.engine).credentials
+        volumes = [
+            # Mounted rather than baked into the image, so editing a probe and
+            # re-running it costs nothing. The whole point of the lab is a
+            # turnaround measured in seconds.
+            f"{self.paths['harness']}:/opt/harness:ro",
+            f"{self.paths['scripts']}:/opt/scripts:ro",
+            # Read-only, and only so a script *can* use the real corpus. Most
+            # generate their own; the ones that need dbpedia should not have to
+            # be run from inside a benchmark to reach it.
+            f"{self.paths['datasets']}:/datasets:ro",
+        ]
+
+        env = {
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONPATH": "/opt",
+            "VB_ENGINE": self.engine,
+            "VB_DB_USER": db_user,
+            "VB_DB_PASSWORD": db_password,
+            "VB_HOST": self.server_name,
+            "VB_PORT": str(self.port),
+        }
+
+        if interactive:
+            entrypoint, command = "bash", []
+        else:
+            # --host and --port are passed for every script, so the contract a
+            # lab script signs is those two flags. Credentials go through the
+            # environment instead: an engine that needs them differs per
+            # engine, and a script that does not take --user must still be
+            # runnable.
+            entrypoint = "python3"
+            command = [f"/opt/scripts/{script}",
+                       "--host", self.server_name,
+                       "--port", str(self.port), *args]
+
+        spec = docker_ctl.ContainerSpec(
+            name=self.client_name,
+            image=image,
+            network=self.network,
+            cpuset=self.resolved.client_cpuset,
+            memory_bytes=client_memory_bytes or self.resolved.client_memory_bytes,
+            entrypoint=entrypoint,
+            workdir="/opt",
+            env=env,
+            volumes=volumes,
+            command=command,
+            detach=False,
+        )
+
+        try:
+            if interactive:
+                return docker_ctl.run_interactive(spec)
+            return docker_ctl.run_foreground(spec, timeout=timeout_s)
+        finally:
+            # Same reasoning as run_harness: the server's half of the story is
+            # worth most precisely when the client's half ended badly.
+            self._save_server_log()
 
     def _save_server_log(self) -> None:
         """Archive what the server said, not only what the client saw.

@@ -20,7 +20,7 @@ something else is going on:
 open question, and the one the benchmark cannot answer because it always
 deletes first. (3) says whether it is about size, and where.
 
-    python3 verify-valkey-churn.py --host valkey-srv --rows 100000
+    ./run-benchmark.sh lab --engine valkey verify-valkey-churn.py --rows 100000
 
 Start at a tenth of the corpus. The failure is index-size dependent -- it does
 not happen at 20,000 rows and does at 990,000 -- so if a tenth comes back

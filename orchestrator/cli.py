@@ -9,6 +9,7 @@ Subcommands mirror the stages of a run so each can be repeated in isolation:
     run       execute a benchmark run (the main command)
     report    generate charts and the report from an existing run
     clean     remove containers, networks and volumes left by a run
+    lab       run one script against one engine, recording nothing
 
 `run` is resumable: it records completed (engine, dataset, pass, phase) units in
 the run directory and skips them on a re-run, so an interruption costs one unit
@@ -18,6 +19,7 @@ rather than the whole sweep.
 from __future__ import annotations
 
 import argparse
+import ast
 import getpass
 import json
 import os
@@ -102,6 +104,7 @@ def paths_for(run_id: str) -> Dict[str, str]:
         "root": VB_ROOT,
         "sources": os.path.join(VB_ROOT, "sources"),
         "harness": os.path.join(VB_ROOT, "harness"),
+        "scripts": os.path.join(VB_ROOT, "scripts"),
         "datasets": os.path.join(VB_ROOT, "datasets"),
         "work_annb": os.path.join(VB_ROOT, "work", "ann-benchmarks"),
         "results": results,
@@ -1232,6 +1235,217 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# lab
+# ---------------------------------------------------------------------------
+
+#: Where a lab session's server log and volume live. Under state/, never under
+#: results/: results/ is the namespace a report reads, and a lab session's
+#: numbers come from vectors it made up.
+LAB_DIRNAME = "lab"
+
+
+def lab_paths(session: str) -> Dict[str, str]:
+    """Paths for a lab session — the same shape OpsRun wants, minus results.
+
+    `ops_results` is the run directory in a real run, which is what makes the
+    harness's records land somewhere permanent. Here both it and `run_dir`
+    point into state/, so the only thing a session leaves behind is the
+    server's log and its data volume, and the latter goes at teardown.
+    """
+    base = os.path.join(VB_ROOT, "state", LAB_DIRNAME, session)
+    paths = paths_for(session)
+    paths.update({"run_dir": base, "ops_results": base})
+    return paths
+
+
+def lab_scripts() -> List[tuple]:
+    """The scripts `lab` can run, with the first line of each docstring."""
+    directory = os.path.join(VB_ROOT, "scripts")
+    found = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".py"):
+            continue
+        summary = ""
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                tree = ast.parse(fh.read())
+            summary = (ast.get_docstring(tree) or "").split("\n")[0]
+        except (OSError, SyntaxError):
+            pass
+        found.append((name, summary))
+    return found
+
+
+def _lab_script_problem(script: str) -> Optional[str]:
+    """Reject anything that is not a script in scripts/, before Docker sees it.
+
+    A path separator here would mount-escape via the container's own view of
+    /opt/scripts, and a missing file would only be discovered after the engine
+    had been started -- which for the MySQL family is several minutes of an
+    operator's time to learn they made a typo.
+    """
+    if os.path.basename(script) != script:
+        return (f"'{script}': name a script in scripts/, not a path. "
+                f"The directory is mounted for you.")
+    if not script.endswith(".py"):
+        return f"'{script}': lab scripts are Python; this is not a .py file."
+    directory = os.path.join(VB_ROOT, "scripts")
+    path = os.path.join(directory, script)
+    if not os.path.isfile(path):
+        names = ", ".join(name for name, _ in lab_scripts()) or "(none yet)"
+        return f"no such script: scripts/{script}\navailable: {names}"
+    # isfile() follows symlinks, so a link in scripts/ would be accepted and
+    # run while looking like a file in the repo. Nothing puts one there today;
+    # the check costs a line and means the name an operator reads is the file
+    # that runs.
+    if os.path.realpath(path) != os.path.join(os.path.realpath(directory),
+                                              script):
+        return (f"scripts/{script} is a link to "
+                f"{os.path.realpath(path)}; lab runs files in scripts/, so "
+                f"that the name in the command is the code that runs.")
+    return None
+
+
+#: lab's own options. Listed rather than read off the parser at call time,
+#: which would mean either module-level mutable state or reaching into
+#: argparse's privates; a test asserts this matches the subparser exactly, so a
+#: flag added and forgotten here fails rather than quietly going unmentioned.
+_LAB_OPTIONS = frozenset({
+    "-h", "--help", "--engine", "--resource-pass", "--shell", "--list",
+    "--client-memory-gb", "--force", "--timeout",
+})
+
+
+def measurement_in_progress() -> List[str]:
+    """Running containers that belong to a measurement rather than a utility.
+
+    The web UI, the pruner, the chown and rm helpers are all vector-bench
+    containers a lab session may safely sit beside, and they are exactly the
+    ones named `vb-*`. Everything else carries a run id in its name, which is
+    what makes it part of a measurement -- see ann_pass's
+    `{run_id}-annb-{engine}-{dataset}` and OpsRun's `-srv`/`-cli` pair.
+    """
+    return sorted(name for name in docker_ctl.running_containers()
+                  if not name.startswith("vb-"))
+
+
+def cmd_lab(args: argparse.Namespace) -> int:
+    """Start one engine and run one script against it. Nothing is recorded.
+
+    This exists because the questions a run raises cannot be answered by
+    another run. Valkey's filtered search came back six times slower at 1%
+    selectivity than at 10%, and settling whether that was the engine or our
+    query took four query shapes against a populated index -- five minutes of
+    work reachable, before this, only by hand-starting containers or by paying
+    for a forty-hour profile.
+    """
+    if args.list:
+        for name, summary in lab_scripts():
+            print(f"  {name:<28} {summary}")
+        return 0
+
+    if not args.script and not args.shell:
+        print("name a script (see --list), or pass --shell", file=sys.stderr)
+        return 2
+
+    if not args.engine:
+        print(f"--engine is required; one of: {', '.join(KNOWN_ENGINES)}",
+              file=sys.stderr)
+        return 2
+    if args.engine not in KNOWN_ENGINES:
+        print(f"unknown engine: {args.engine}\nknown: {', '.join(KNOWN_ENGINES)}",
+              file=sys.stderr)
+        return 2
+
+    # Not when --shell: the script is ignored below, and refusing an
+    # invocation over an argument nothing reads is its own small confusion.
+    if args.script and not args.shell:
+        problem = _lab_script_problem(args.script)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
+
+    # argparse.REMAINDER takes everything after the script name, which is what
+    # lets a script have any flags it likes -- and also means a lab flag typed
+    # after the script name silently becomes the script's problem. Saying so
+    # costs a line and saves reading a stranger's argparse error.
+    misplaced = sorted(set(args.script_args) & _LAB_OPTIONS)
+    if misplaced:
+        print(f"note: {', '.join(misplaced)} came after the script name, so "
+              f"it is being passed to\n      {args.script} rather than to "
+              f"lab. Put lab's own flags before the script name.",
+              file=sys.stderr)
+
+    if not docker_ctl.docker_available():
+        print("cannot talk to the Docker daemon", file=sys.stderr)
+        return 1
+
+    # A lab session takes the same cores and the same memory the resource pass
+    # hands a run, because that is the whole point of it. Started beside a live
+    # run, it therefore contends with one -- and the damage lands on the run,
+    # whose numbers are the ones being kept. This is the command most likely to
+    # be typed into a second terminal while the first is measuring, since it
+    # exists to answer questions a run raises, so the invariant is checked here
+    # rather than trusted.
+    busy = measurement_in_progress()
+    if busy and not args.force:
+        # The flag is spelled out in position because everything after the
+        # script name goes to the script: `lab ... probe.py --force` hands
+        # --force to the probe, which dies on it, and the guard stays up.
+        print(f"a measurement is running: {', '.join(busy)}\n"
+              f"lab would take the same cores and memory and spoil it. Wait "
+              f"for it to finish, or,\nif those containers are not a "
+              f"measurement you care about:\n\n"
+              f"  ./run-benchmark.sh lab --engine {args.engine} --force "
+              f"{args.script or '--shell'}\n", file=sys.stderr)
+        return 5
+
+    session = f"lab-{args.engine}-{time.strftime('%Y%m%d-%H%M%S')}"
+    paths = lab_paths(session)
+    os.makedirs(paths["run_dir"], exist_ok=True)
+
+    info = sysinfo_mod.collect()
+    engine_cfg = load_engine(args.engine)
+    resources = load_resources(args.resource_pass)
+    resolved = resolve_resources(resources, args.engine, info)
+
+    print(f"=== vector-bench lab: {args.engine} ===")
+    print(f"session   : {session}")
+    print(f"pass      : {args.resource_pass} (same server flags a run of this "
+          f"pass would use)")
+    print(f"what      : {'interactive shell' if args.shell else args.script}")
+    print(f"logs      : {os.path.relpath(paths['run_dir'], VB_ROOT)}")
+    print("note      : nothing here is recorded. No records are written and "
+          "no report can read this.\n")
+
+    client_memory = (int(args.client_memory_gb * GB)
+                     if args.client_memory_gb else None)
+
+    try:
+        with ops_pass.OpsRun(args.engine, engine_cfg, resolved,
+                             args.resource_pass, paths, session,
+                             dataset="lab", tag="lab") as run:
+            if args.shell:
+                print(f"[lab] the server is reachable as host "
+                      f"'{run.server_name}' on port {run.port}")
+                print(f"[lab] harness importable; scripts in /opt/scripts\n")
+                return run.run_script("", [], interactive=True,
+                                      client_memory_bytes=client_memory)
+            return run.run_script(args.script, args.script_args,
+                                  client_memory_bytes=client_memory,
+                                  timeout_s=args.timeout)
+    except KeyboardInterrupt:
+        # OpsRun.__exit__ has already torn the pair down by the time this is
+        # caught; saying so is the difference between a clean stop and an
+        # operator hunting for a container that is not there.
+        print("\n[lab] interrupted; containers removed", file=sys.stderr)
+        return 130
+    except docker_ctl.DockerError as exc:
+        print(f"[lab] {exc}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -1330,6 +1544,46 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--output", default=None,
                    help="path for the .tar.gz (default: ./vector-bench-<run-id>.tar.gz)")
     e.set_defaults(func=cmd_export)
+
+    lab = sub.add_parser(
+        "lab", help="run one diagnostic script against one engine, recording nothing",
+        description=(
+            "Start one engine exactly as a run of the given resource pass would "
+            "start it, run one script from scripts/ against it, and tear "
+            "everything down -- including on Ctrl-C. Nothing is recorded: no "
+            "records are written and no report can read a lab session. It is "
+            "for answering a question a run raised, not for producing a "
+            "measurement."),
+        epilog=("examples:\n"
+                "  ./run-benchmark.sh lab --list\n"
+                "  ./run-benchmark.sh lab --engine valkey probe-valkey-filter.py --rows 200000\n"
+                "  ./run-benchmark.sh lab --engine valkey --shell"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    lab.add_argument("script", nargs="?", default=None,
+                     help="a .py file in scripts/; it must accept --host and --port")
+    lab.add_argument("script_args", nargs=argparse.REMAINDER,
+                     help="everything after the script name is passed to it")
+    lab.add_argument("--engine", default=None,
+                     help=f"one of: {', '.join(KNOWN_ENGINES)}")
+    # tuned, not normalized: the long profiles that raise these questions run
+    # tuned, and a probe started under a different budget than the run it is
+    # investigating can disprove something the run never did.
+    lab.add_argument("--resource-pass", default="tuned",
+                     choices=("normalized", "tuned"),
+                     help="server flags and limits to start the engine with "
+                          "(default: tuned)")
+    lab.add_argument("--shell", action="store_true",
+                     help="a prompt in the bench container instead of a script")
+    lab.add_argument("--list", action="store_true",
+                     help="list the scripts lab can run")
+    lab.add_argument("--client-memory-gb", type=float, default=None,
+                     help="override the client container limit; raise it for "
+                          "scripts that hold a million vectors")
+    lab.add_argument("--force", action="store_true",
+                     help="start even though a measurement is running")
+    lab.add_argument("--timeout", type=int, default=4 * 3600,
+                     help="seconds before the script's container is killed")
+    lab.set_defaults(func=cmd_lab)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")
     c.add_argument("--run-id", default=None,

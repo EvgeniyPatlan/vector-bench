@@ -31,12 +31,13 @@ If one form is fast, the fix is a one-line change in the driver and the run's
 Valkey filtered numbers are ours, not the engine's. If all four are slow, 8.2
 QPS is what valkey-search does here and the result stands as measured.
 
-Usage, inside the bench image against a running server container:
+Run it with the lab, which starts Valkey with the flags a tuned run gives it
+and tears everything down afterwards:
 
-    python3 probe-valkey-filter.py --host valkey-srv --rows 200000
+    ./run-benchmark.sh lab --engine valkey probe-valkey-filter.py --rows 200000
 
 200,000 rows is enough for the shapes to separate and loads in seconds. Add
---rows 990000 to confirm at the size the run used.
+--rows 990000 --client-memory-gb 16 to confirm at the size the run used.
 """
 
 from __future__ import annotations

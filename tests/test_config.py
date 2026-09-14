@@ -1085,12 +1085,28 @@ class TestRootOwnedCleanup:
     disk; the only visible symptom was `du: Permission denied`.
     """
 
+    @staticmethod
+    def _unremovable(monkeypatch):
+        """What a root-owned tree does to a non-root rmtree.
+
+        Simulated rather than created, because creating one needs root. The
+        tests used a plain writable directory and so never reached the
+        container path they were asserting on -- which only became visible when
+        removal learned to try rmtree first.
+        """
+        import shutil
+
+        def deny(path, *a, **kw):
+            raise PermissionError(13, "Permission denied", str(path))
+        monkeypatch.setattr(shutil, "rmtree", deny)
+
     def test_uses_a_container_when_not_root(self, tmp_path, monkeypatch):
         from orchestrator import docker_ctl
         target = tmp_path / "vol"
         target.mkdir()
         seen = {}
         monkeypatch.setattr(os, "getuid", lambda: 1000)
+        self._unremovable(monkeypatch)
         monkeypatch.setattr(docker_ctl, "run_foreground",
                             lambda spec, **kw: seen.setdefault("spec", spec))
         docker_ctl.remove_tree_as_root(str(target), "vector-bench/mariadb-runtime")
@@ -1104,8 +1120,26 @@ class TestRootOwnedCleanup:
         target = tmp_path / "vol"
         target.mkdir()
         monkeypatch.setattr(os, "getuid", lambda: 1000)
+        self._unremovable(monkeypatch)
         monkeypatch.setattr(docker_ctl, "run_foreground", lambda spec, **kw: 0)
         assert docker_ctl.remove_tree_as_root(str(target), "img") is False
+
+    def test_a_directory_this_process_owns_needs_no_container(self, tmp_path,
+                                                              monkeypatch):
+        """Teardown after a failed setup has to delete an empty directory
+        without the engine image -- because the missing image is what failed.
+        Going through a container there warns that a corpus is still on disk,
+        which is alarming and untrue."""
+        from orchestrator import docker_ctl
+        target = tmp_path / "vol"
+        target.mkdir()
+        monkeypatch.setattr(os, "getuid", lambda: 1000)
+
+        def fail(*a, **kw):
+            raise AssertionError("spawned a container to delete its own dir")
+        monkeypatch.setattr(docker_ctl, "run_foreground", fail)
+        assert docker_ctl.remove_tree_as_root(str(target), "img") is True
+        assert not target.exists()
 
     def test_missing_path_is_already_clean(self, tmp_path):
         from orchestrator import docker_ctl
@@ -5181,18 +5215,188 @@ class TestFilterStrategyIsMeasuredNotQuoted:
                                    "valkey.py")).read()
         assert '"hybrid_filter_planner": None' in source
 
-    def test_the_lab_wrapper_cleans_up_after_itself(self):
-        """It starts a server and a client outside any run. Leaving either
-        behind would collide with the next run's container names."""
-        script = open(os.path.join(VB_ROOT, "scripts",
-                                   "valkey-lab.sh")).read()
-        assert "trap cleanup EXIT INT TERM" in script
-        assert "docker rm -f" in script
 
-    def test_the_lab_pins_noeviction(self):
-        """Under any other policy a full Valkey drops keys, and vectors
-        vanishing mid-probe looks exactly like a bad index."""
-        script = open(os.path.join(VB_ROOT, "scripts",
-                                   "valkey-lab.sh")).read()
-        assert "maxmemory-policy noeviction" in script
+class TestTheLabAnswersQuestionsWithoutProducingMeasurements:
+    """`lab` starts a real engine outside a run so a probe can question it.
+
+    That makes it the one command that produces numbers nothing validates, and
+    every test here guards the boundary between it and the measurement path.
+    """
+
+    def test_a_session_writes_nothing_a_report_could_read(self):
+        """A lab script invents its own vectors and its own ground truth. If
+        those could land in results/ they would eventually appear in a table
+        beside corpus numbers, indistinguishable from a measurement."""
+        from orchestrator.cli import lab_paths
+        paths = lab_paths("lab-valkey-20260914-120000")
+        results = os.path.join(VB_ROOT, "results")
+        for key in ("run_dir", "ops_results"):
+            assert not os.path.abspath(paths[key]).startswith(results + os.sep)
+
+    def test_the_client_container_has_no_writable_mount(self):
+        """Belt to the previous test's braces: not a path chosen carefully,
+        but no writable path offered at all."""
+        import inspect
+        from orchestrator.ops_pass import OpsRun
+        source = inspect.getsource(OpsRun.run_script)
+        mounts = [line for line in source.splitlines()
+                  if ':/opt/' in line or ':/datasets' in line]
+        assert mounts, "run_script mounts nothing; the test is looking at the wrong thing"
+        assert all(':ro"' in line for line in mounts), mounts
+
+    def test_the_server_is_started_by_the_same_code_a_run_uses(self):
+        """The predecessor was a shell script that started its own Valkey with
+        hand-written flags -- a 32 GB default where a tuned run gives 101 GB,
+        and maxmemory-policy restated next to the copy in the engine config. A
+        probe run under different flags than the run it investigates can
+        disprove something the run never did."""
+        from orchestrator.ops_pass import OpsRun
+        assert hasattr(OpsRun, "run_script")
+        # _start_server is not overridden or bypassed: one server path.
+        assert "_start_server" not in \
+            __import__("inspect").getsource(OpsRun.run_script)
+
+    def test_no_server_flag_is_restated_in_the_orchestrator(self):
+        """Engine server flags live in config/engines/*.yml and nowhere else.
+        Valkey's noeviction pin is the one that matters here: under any other
+        policy a full server drops keys, and vectors vanishing mid-probe looks
+        exactly like a bad index."""
+        for name in ("cli.py", "ops_pass.py"):
+            source = open(os.path.join(VB_ROOT, "orchestrator", name)).read()
+            # The dashes, so that prose about the flag is not mistaken for a
+            # use of it -- the comment explaining this rule says the word.
+            assert "--maxmemory-policy" not in source
+            assert "--maxmemory " not in source
+
+    def test_a_script_name_cannot_reach_outside_scripts(self):
+        from orchestrator.cli import _lab_script_problem
+        assert _lab_script_problem("../../etc/shadow.py")
+        assert _lab_script_problem("/etc/shadow.py")
+        assert _lab_script_problem("build-images.sh")
+        assert _lab_script_problem("does-not-exist.py")
+        assert _lab_script_problem("probe-valkey-filter.py") is None
+
+    def test_every_lab_script_accepts_what_the_lab_passes(self):
+        """--host and --port are passed to every script, so they are the
+        contract. A script that does not take them dies on argparse after the
+        engine has already been started and the corpus loaded."""
+        from orchestrator.cli import lab_scripts
+        for name, _summary in lab_scripts():
+            source = open(os.path.join(VB_ROOT, "scripts", name)).read()
+            assert '"--host"' in source, name
+            assert '"--port"' in source, name
+
+    def test_it_refuses_before_it_starts_anything(self):
+        """Validation order matters more here than usual: for the MySQL family
+        a server takes minutes to come up, and learning about a typo then is
+        several minutes of an operator's time."""
+        from orchestrator.cli import build_parser, cmd_lab
+        parser = build_parser()
+        for argv, code in (
+                (["lab", "probe-valkey-filter.py"], 2),          # no --engine
+                (["lab", "--engine", "redis", "x.py"], 2),       # unknown engine
+                (["lab", "--engine", "valkey"], 2),              # nothing to run
+                (["lab", "--engine", "valkey", "nope.py"], 2)):  # no such script
+            assert cmd_lab(parser.parse_args(argv)) == code, argv
+
+    def test_setup_rolls_back_when_it_fails_part_way(self):
+        """`with` calls __exit__ only if __enter__ returned. Setup creates a
+        network, then a volume, then starts a server, and the last two can
+        fail -- a missing image, or a server that never becomes healthy. Asking
+        for an engine whose image is not built left a network, a volume and a
+        root-owned directory behind, and printed nothing about any of them."""
+        import inspect
+        from orchestrator.ops_pass import OpsRun
+        source = inspect.getsource(OpsRun.__enter__)
+        assert "self.teardown()" in source
+        # BaseException, not Exception: the widest window is wait_healthy's
+        # five-minute poll, and the likeliest thing to arrive during it is the
+        # operator's Ctrl-C -- which is not an Exception.
+        assert "except BaseException" in source
+
+    def test_the_bind_directory_goes_without_needing_the_image(self):
+        """Teardown deletes the volume's host directory through a container,
+        because the engine wrote it as root. In the rollback above that image
+        is the one that was missing, so the container cannot be made; an empty
+        directory this process created must not need it."""
+        import inspect
+        from orchestrator.docker_ctl import remove_tree_as_root
+        source = inspect.getsource(remove_tree_as_root)
+        direct = source.index("shutil.rmtree(path)")
+        via_container = source.index("ContainerSpec(")
+        assert direct < via_container, "the container path must be the fallback"
+        assert "ignore_errors" not in source[direct:via_container], \
+            "a silent failure here is what leaves a full corpus on disk"
+
+    def test_a_symlink_in_scripts_is_not_run_as_if_it_were_the_file(self):
+        from orchestrator.cli import _lab_script_problem
+        directory = os.path.join(VB_ROOT, "scripts")
+        link = os.path.join(directory, "_test_link.py")
+        try:
+            os.symlink("/etc/hostname", link)
+        except OSError:
+            pytest.skip("cannot create a symlink here")
+        try:
+            problem = _lab_script_problem("_test_link.py")
+            assert problem and "link" in problem
+        finally:
+            os.unlink(link)
+
+    def test_it_refuses_to_start_beside_a_measurement(self, monkeypatch):
+        """A lab session takes the cores and memory the pass gives a run, so
+        started beside one it contends with it -- and the damage lands on the
+        run, whose numbers are the ones being kept."""
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "docker_available", lambda: True)
+        monkeypatch.setattr(cli.docker_ctl, "running_containers",
+                            lambda: ["full-20260825-valkey-m16-post-srv"])
+        argv = ["lab", "--engine", "valkey", "probe-valkey-filter.py"]
+        assert cli.cmd_lab(cli.build_parser().parse_args(argv)) == 5
+
+        # --force gets past it. Stubbed, because the alternative is a test that
+        # starts a real server -- which is what the first version of this did,
+        # and it ran for as long as the probe's default corpus takes.
+        started = []
+
+        class FakeRun:
+            def __init__(self, *a, **kw):
+                started.append(a[0])
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def run_script(self, *a, **kw):
+                return 0
+
+        monkeypatch.setattr(cli.ops_pass, "OpsRun", FakeRun)
+        # Before the script name. After it, argparse.REMAINDER hands --force to
+        # the probe and the guard correctly stays up -- which is why the
+        # refusal prints the flag in the position that works.
+        forced = ["lab", "--engine", "valkey", "--force",
+                  "probe-valkey-filter.py"]
+        assert cli.cmd_lab(cli.build_parser().parse_args(forced)) == 0
+        assert started == ["valkey"]
+
+    def test_the_web_ui_and_the_helpers_are_not_a_measurement(self, monkeypatch):
+        """vb-* containers are utilities -- the web UI is long-lived and would
+        otherwise block every lab invocation there is."""
+        from orchestrator import cli
+        monkeypatch.setattr(cli.docker_ctl, "running_containers",
+                            lambda: ["vb-webui-8080", "vb-prune-1234"])
+        assert cli.measurement_in_progress() == []
+
+    def test_the_misplacement_note_knows_every_flag_lab_has(self):
+        """Everything after the script name goes to the script, so a lab flag
+        typed there silently becomes the script's problem. The note that says
+        so is only useful if it knows the whole list."""
+        from orchestrator.cli import _LAB_OPTIONS, build_parser
+        lab = build_parser()._subparsers._group_actions[0].choices["lab"]
+        actual = {option for action in lab._actions
+                  for option in action.option_strings}
+        assert actual == set(_LAB_OPTIONS)
+
+    def test_listing_scripts_needs_neither_docker_nor_an_engine(self):
+        from orchestrator.cli import build_parser, cmd_lab, lab_scripts
+        assert cmd_lab(build_parser().parse_args(["lab", "--list"])) == 0
+        assert dict(lab_scripts())["probe-valkey-filter.py"].startswith("Find out why")
 

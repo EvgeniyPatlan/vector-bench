@@ -105,6 +105,7 @@ an interrupted run can resume without recomputing points it already has.
 | `sources` | Export sources only, without building | — |
 | `web` | Serve the browser interface | — |
 | `clean` | Remove containers, networks and volumes left by a run | — |
+| `lab` | Run one diagnostic script against one engine, recording nothing | — |
 
 Everything in the third column can be driven from
 [the web UI](08-web-ui.md) instead, which shows the command it is about to run
@@ -169,6 +170,62 @@ vector-bench extracts it into their `results/`; one without opens
 `report/report.html`, which is self-contained. Refuses a run with no readable
 manifest, because a result without the environment that produced it is not a
 result.
+
+### `lab` options
+
+Everything above produces measurements. `lab` is the one that does not: it
+starts a single engine, runs one script from `scripts/` against it, and removes
+both containers on the way out — including on Ctrl-C.
+
+```bash
+./run-benchmark.sh lab --list
+./run-benchmark.sh lab --engine valkey probe-valkey-filter.py --rows 200000
+./run-benchmark.sh lab --engine valkey --shell
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--engine` | required | Which engine to start |
+| `--resource-pass` | `tuned` | Server flags and limits, exactly as a run of that pass |
+| `--shell` | off | A prompt in the bench container instead of a script |
+| `--list` | — | The scripts `lab` can run, with what each one answers |
+| `--client-memory-gb` | from the pass | Raise it for a script holding a million vectors |
+| `--force` | off | Start even though a measurement is running |
+| `--timeout` | 4 h | Before the script's container is killed |
+
+Put lab's own flags **before** the script name. Everything after it goes to the
+script, so that a script can have any flags it likes — including ones lab also
+uses.
+
+It exists because the questions a run raises cannot be answered by another run.
+Valkey's filtered search came back six times *slower* at 1% selectivity than at
+10%; settling whether that was the engine or our query meant four query shapes
+against a populated index — five minutes of work that otherwise costs a
+forty-hour profile or a pair of hand-started containers.
+
+Two properties make the answers worth having:
+
+- **The server is started by the same code a run uses**, so it gets the pass's
+  flags, cpuset and memory from `config/engines/<e>.yml`. The predecessor was a
+  standalone shell script that started its own Valkey with hand-written flags,
+  and it had already drifted — 32 GB where a tuned run gives 101 GB. A probe run
+  under a different configuration can disprove something the run never did.
+- **Nothing is recorded.** No writable path is mounted, so a lab session cannot
+  write a record. A script here generates its own vectors and its own ground
+  truth; those numbers are for comparing shapes against each other and must
+  never reach a report and sit beside corpus numbers.
+- **It refuses to start beside a measurement.** A session takes the same cores
+  and memory the pass hands a run, so run concurrently it contends with one —
+  and the damage lands on the run, whose numbers are the ones being kept. This
+  is the command most likely to be typed into a second terminal while the first
+  is measuring, which is why the invariant is checked rather than trusted.
+  `--force` overrides it.
+
+A script is any `.py` file in `scripts/`; it is passed `--host` and `--port`, and
+receives credentials in `VB_DB_USER` / `VB_DB_PASSWORD`. The server's log is kept
+under `state/lab/<session>/`; the data volume goes at teardown. If a session is
+killed hard enough to strand its containers, `./run-benchmark.sh clean` removes
+them.
 
 ### `web` options
 
