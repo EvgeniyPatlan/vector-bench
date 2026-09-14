@@ -66,6 +66,15 @@ SHAPES = [
     ("no EF_RUNTIME", "@{tag}:[-inf ({t}]", ""),
     ("bounded range", "@{tag}:[0 {tmax}]", "EF_RUNTIME {ef}"),
     ("bounded, no EF_RUNTIME", "@{tag}:[0 {tmax}]", ""),
+    # RediSearch names the choice this probe is looking for and lets a query
+    # force it. valkey-search describes the same two strategies and documents
+    # no way to ask for one, so whether it inherited the keyword is a question
+    # about this build, not about the documentation. A shape that does not
+    # parse reports its error and costs one line of output.
+    ("ask for the pre-filter", "@{tag}:[-inf ({t}]",
+     "EF_RUNTIME {ef} HYBRID_POLICY ADHOC_BF"),
+    ("ask for batches", "@{tag}:[-inf ({t}]",
+     "EF_RUNTIME {ef} HYBRID_POLICY BATCHES"),
 ]
 
 

@@ -242,6 +242,60 @@ TOASTed vectors add a detoast to every distance comparison.
 
 ---
 
+## Valkey — valkey-search
+
+### Filtered search gets slower as the predicate narrows
+
+valkey-search describes two strategies for a hybrid query: **pre-filtering**
+(resolve the filter from the secondary index, then brute-force the survivors by
+distance) and **inline filtering** (walk the HNSW graph, testing the predicate
+as you go). Its documentation says the planner picks between them, and Google's
+Memorystore documentation — which runs this module — says pre-filtering is
+chosen "when the filtered search space is much smaller than the original".
+
+Measured, it does not. Latency rises as the predicate tightens, which is the
+signature of the graph walk: with one node in a hundred qualifying, the walk
+travels much further to find ten of them.
+
+| Selectivity | p50 | QPS |
+| --- | --- | --- |
+| unfiltered | — | 479 |
+| 10% | 18.16 ms | 53.5 |
+| 1% | 120.56 ms | 8.2 |
+
+9,900 vectors out of 990,000 is a search space where an exact scan takes a
+couple of milliseconds. It took 120.
+
+**There is no way to ask for the other strategy.** RediSearch exposes exactly
+this choice as `HYBRID_POLICY ADHOC_BF | BATCHES`; valkey-search's parser
+rejects the keyword outright:
+
+```
+Error parsing vector similarity parameters:
+`[KNN 10 @embedding $vec EF_RUNTIME 100 HYBRID_POLICY ADHOC_BF]`.
+Unexpected argument `HYBRID_POLICY`
+```
+
+Two things about our own query were ruled out before concluding that. Dropping
+`EF_RUNTIME` does not reach the pre-filter — it lowers search effort, and recall
+falls with it. Replacing the open `[-inf (threshold]` bound with a bounded
+`[0 max]` range, in case an unbounded side defeated cardinality estimation,
+changes nothing: 136.72 ms against 136.72 ms.
+
+Reproduce all of it in about five minutes:
+
+```bash
+./run-benchmark.sh lab --engine valkey probe-valkey-filter.py --rows 200000
+```
+
+The probe generates random vectors, so its *recall* is not comparable to a run's
+— random high-dimensional vectors are nearly equidistant and any HNSW graph over
+them is poor. Only the comparison between shapes, and the direction across
+selectivities, carries over. Both reproduce the run: 5.2x slower at 1% than at
+10% in the probe, 6.6x in the run.
+
+---
+
 ## Things that are true of all of them
 
 - **The optimizer can always decline the index.** Every one of them will fall
