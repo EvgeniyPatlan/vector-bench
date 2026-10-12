@@ -47,7 +47,32 @@ SCHEMA_VERSION = 1
 # `extra.ops_measurement_version` at all, so every reader must treat an absent
 # value as 1 — see IMPLICIT_OPS_MEASUREMENT_VERSION — rather than as "unknown"
 # and therefore comparable with anything.
-OPS_MEASUREMENT_VERSION = 2
+#
+# VERSION 3 separated the concurrency query pool from `ops.max_queries`. That
+# key caps the filtered and churn workloads, which answer each query once, and
+# main.yml holds it at 500 to bound their cost; the concurrency workload
+# cycles its shard for a fixed duration instead, so it was giving 32 clients
+# about fifteen queries each for thirty seconds. Every graph cache in the
+# comparison — MHNSW's per-TABLE_SHARE cache, VIDX's shared cache, pgvector's
+# shared_buffers — was being measured against a hot set small enough to hold
+# entirely, which is the one thing the concurrency chart exists to tell apart.
+# The pool now defaults to the whole test set, so a version 2 concurrency QPS
+# and a version 3 one are throughput over a 500-query and a 10,000-query
+# working set: the same workload over two different amounts of the corpus, and
+# not the same quantity. Hence a bump, and hence 3 is deliberately absent from
+# OPS_MEASUREMENT_EQUIVALENT_VERSIONS below.
+#
+# The recall that version 3 also added to concurrency records is new
+# information rather than a changed number and would not on its own have
+# earned a bump — a field that was None is now populated, and nothing a
+# version 2 reader already trusted moves. The pool is what earned it.
+#
+# The cost this scheme knowingly pays: the bump invalidates comparison across
+# every ops phase, including build cost and churn, which this change does not
+# touch. The version is per-run, not per-phase, because a record names the
+# harness that wrote it and splitting it per phase would mean four constants
+# and four ways to forget one.
+OPS_MEASUREMENT_VERSION = 3
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.

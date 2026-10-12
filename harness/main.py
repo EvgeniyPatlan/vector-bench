@@ -82,6 +82,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help=f"comma-separated subset of: {','.join(ALL_WORKLOADS)}")
     p.add_argument("--client-counts", default="1,2,4,8,16,32")
     p.add_argument("--concurrency-duration", type=float, default=20.0)
+    # Deliberately NOT --max-queries. That key exists to cap the cost of the
+    # filtered and churn workloads, which run one query at a time to
+    # completion, and main.yml sets it to 500 for exactly that reason. The
+    # concurrency workload cycles its shard for a fixed duration instead, so
+    # inheriting the cap gave 32 clients about fifteen queries each for thirty
+    # seconds and showed every graph cache in the comparison a hot set small
+    # enough to hold entirely. 0 means the whole test set.
+    p.add_argument("--concurrency-queries", type=int,
+                   default=concurrency_workload.WHOLE_TEST_SET,
+                   help="queries the concurrency clients draw from; "
+                        "0 (the default) means the whole test set")
     # Every figure here was a single sample until a Valkey point was
     # re-measured by accident and came back 21% higher. Concurrency is the
     # headline finding, the noisiest measurement, and the cheapest to repeat.
@@ -216,8 +227,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ef_search=args.ef_search,
                 client_counts=_ints(args.client_counts),
                 duration_s=args.concurrency_duration,
-                max_queries=args.max_queries,
+                max_queries=args.concurrency_queries,
                 repeats=args.concurrency_repeats,
+                indexed_rows=indexed_rows,
             )
 
         if "filtered" in workloads:

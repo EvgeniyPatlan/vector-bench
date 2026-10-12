@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 # Imported, never re-declared. The constant lives in the harness because ops
@@ -129,6 +130,7 @@ class Manifest:
         # up holding records at two versions.
         declared = (self.data.get("config") or {}).get(
             "ops_measurement_version")
+        self._warn_if_resuming_across_a_bump(declared)
         config: Dict[str, Any] = {
             "profile": profile,
             "resource_pass": resource_pass,
@@ -150,6 +152,58 @@ class Manifest:
         self.save()
         for warning in getattr(resolved, "warnings", []) or []:
             self.add_warning(warning)
+
+    def _warn_if_resuming_across_a_bump(self, declared: Any) -> None:
+        """Say so now, not at report time, when a resume straddles a bump.
+
+        The refusal downstream is correct and must stay: records measured
+        under two ops measurement versions are two different measurements and
+        cannot share a chart. But the operator learns about it from
+        `report/loaders.py`, which runs *after* the measuring — and the
+        measuring is the expensive half. Resuming a `main` run after a bump
+        means up to days of ingest before anything says the directory it is
+        filling cannot be reported as one. This is the only moment that knows
+        both numbers and still precedes the work: `cli.py` calls `set_config`
+        per (pass, engine) at :461, above the `(already complete)` checkpoint
+        skip at :484, so a resume reaches it even when every unit is skipped
+        and nothing is measured. If that call ever moves below the unit loop
+        this notice becomes useless, and no test will say so -- "checkpoint"
+        appears a dozen times either side of the call, so the obvious grep
+        for the ordering passes whatever the order is.
+
+        Deliberately not a failure. Finishing the run and generating one
+        report per version is a legitimate, and often the right, response --
+        the older records are not wrong, they are just not comparable. Making
+        this fatal would turn a directory that needs splitting into a run that
+        cannot continue.
+
+        Once per process, not once per (pass, engine): six engines across two
+        passes would print this twelve times, and a notice repeated twelve
+        times reads as a loop rather than as a warning.
+        """
+        if declared is None or declared == OPS_MEASUREMENT_VERSION:
+            return
+        if getattr(self, "_bump_warned", False):
+            return
+        self._bump_warned = True
+        print(
+            f"\n[manifest] WARNING: this run directory was measured under ops "
+            f"measurement version {declared!r}, and this code measures version "
+            f"{OPS_MEASUREMENT_VERSION!r}.\n"
+            f"[manifest] What that means: anything measured from here on is "
+            f"not comparable with what is already in {self.run_dir} — the two "
+            f"versions are different measurements, not two samples of one.\n"
+            f"[manifest] The run will proceed and the manifest keeps saying "
+            f"{declared!r}, which is the honest record of what it holds. But "
+            f"`report` will refuse the directory as a whole once it contains "
+            f"both, so plan on one report per version: generate the "
+            f"version-{declared!r} report before this run appends to it, or "
+            f"split the ops-*.jsonl files by extra.ops_measurement_version "
+            f"afterwards.\n"
+            f"[manifest] To re-measure everything under version "
+            f"{OPS_MEASUREMENT_VERSION!r} instead, start a fresh --run-id "
+            f"rather than resuming this one.\n",
+            file=sys.stderr, flush=True)
 
     def set_engine(self, engine: str, sources_dir: str,
                    image_runtime: str, image_bench: str,

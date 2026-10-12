@@ -3228,6 +3228,250 @@ class TestQuantizationReachesBothPaths:
         assert args.quantization == "scalar"
 
 
+class TestConcurrencyQueryPoolIsItsOwnProfileKey:
+    """`ops.max_queries` was capping a workload it was never written for.
+
+    It exists to bound the filtered and churn workloads, which answer each
+    query once to completion, and main.yml holds it at 500 for exactly that
+    reason. The concurrency workload instead cycles its shard for a fixed
+    duration, so sharing the key gave 32 clients about fifteen queries each
+    for thirty seconds -- and every graph cache in the comparison (MHNSW's
+    per-TABLE_SHARE cache, VIDX's shared cache, pgvector's shared_buffers)
+    was measured against a hot set small enough to hold entirely. Telling
+    those three designs apart is the only reason the concurrency chart exists.
+
+    `ops.concurrency_queries` separates them. Its default is the new
+    behaviour -- the whole test set -- and setting the key is the way back to
+    a small pool, which is the convention every switch in this framework
+    follows.
+    """
+
+    def _args(self, profile_name="main", override=None, engine="mariadb"):
+        from orchestrator.config import (load_profile, load_resources,
+                                         resolve_resources)
+        from orchestrator.ops_pass import harness_args
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        res = load_resources("normalized")
+        profile = load_profile(profile_name)
+        if override is not None:
+            profile.setdefault("ops", {})["concurrency_queries"] = override
+        return harness_args(profile, 16, engine,
+                            resolve_resources(res, engine, info),
+                            "normalized", res, storage_engine="InnoDB")
+
+    def _value(self, **kw):
+        args = self._args(**kw)
+        return args[args.index("--concurrency-queries") + 1]
+
+    def test_the_profile_key_reaches_argv(self):
+        """The value, not merely the flag. A flag emitted with a constant
+        beside it is indistinguishable from one wired to the profile unless
+        the number is checked."""
+        assert self._value(override=2500) == "2500"
+
+    def test_the_default_is_the_whole_test_set(self):
+        """Zero is the sentinel the harness reads as "all of them". No profile
+        in the repo sets the key yet, so this default is what every run gets
+        today, and it has to be the new behaviour rather than the old cap.
+
+        Every profile, discovered rather than listed: a hand-written list of
+        four covered less than half of them and missed `full` and `quick`,
+        which carry the most divergent `max_queries` (2,000 and 1,000) and are
+        therefore where an accidental inheritance would be least obvious.
+        """
+        from orchestrator.ops_pass import DEFAULT_CONCURRENCY_QUERIES
+        assert DEFAULT_CONCURRENCY_QUERIES == 0
+        names = available_profiles()
+        assert len(names) >= 9, names
+        for profile in names:
+            assert self._value(profile_name=profile) == "0", profile
+
+    def test_the_default_does_not_inherit_the_filtered_cap(self):
+        """The regression itself, stated as numbers. Those profiles really do
+        hold max_queries at those values, so a default that followed the key
+        would emit them here and nothing else in the suite would notice."""
+        from orchestrator.config import load_profile
+        for profile, capped in (("main", 500), ("full", 2000),
+                                ("quick", 1000)):
+            assert load_profile(profile)["ops"]["max_queries"] == capped, \
+                profile
+            assert self._value(profile_name=profile) != str(capped), profile
+
+    def test_the_harness_accepts_the_flag(self):
+        from harness.main import parse_args
+        base = ["--engine", "mariadb", "--dataset", "d", "--m", "16",
+                "--run-id", "r", "--host", "h", "--port", "3306",
+                "--output", "/tmp/out.jsonl"]
+        assert parse_args(base + ["--concurrency-queries", "2500"]) \
+            .concurrency_queries == 2500
+        # Absent, it is the workload's own sentinel rather than a second copy
+        # of the number that could drift from it.
+        from harness.workloads.concurrency import WHOLE_TEST_SET
+        assert parse_args(base).concurrency_queries == WHOLE_TEST_SET
+
+    def test_the_harness_passes_it_to_the_workload_and_not_max_queries(
+            self, monkeypatch, tmp_path):
+        """End to end through `main()`, with both flags set to different
+        numbers, because that is the only arrangement that can tell the new
+        wiring from the old. Asserting on the source text instead would be
+        satisfied by the string appearing in a comment.
+        """
+        from harness import main as harness_main
+        from harness.workloads import concurrency as concurrency_mod
+
+        from .fake_driver import loaded_driver, tiny_dataset
+
+        data = tiny_dataset()
+        driver = loaded_driver(data)
+        captured = {}
+
+        def fake_run(ctx, factory, dataset, index, **kw):
+            captured.update(kw)
+
+        monkeypatch.setattr(harness_main, "load_dataset",
+                            lambda directory, name: data)
+        monkeypatch.setattr(harness_main, "get_driver",
+                            lambda *a, **k: driver)
+        monkeypatch.setattr(concurrency_mod, "run", fake_run)
+
+        rc = harness_main.main([
+            "--engine", "fake", "--dataset", "tiny", "--m", "16",
+            "--run-id", "r", "--host", "h", "--port", "1",
+            "--output", str(tmp_path / "out.jsonl"),
+            "--workloads", "concurrency",
+            "--max-queries", "500",
+            "--concurrency-queries", "2500",
+        ])
+        assert rc == 0
+        assert captured["max_queries"] == 2500
+        # And the row count the engine actually holds travels with it, as it
+        # already does for filtered and churn: recall over a partly-loaded
+        # corpus has to be scored against that corpus.
+        assert captured["indexed_rows"] == driver.count_rows()
+
+    def test_the_workload_signature_takes_indexed_rows(self):
+        """Recall needs it, and the two workloads that already compute recall
+        already take it. Checked on the function rather than the source so a
+        matching string in a docstring cannot satisfy it."""
+        import inspect
+
+        from harness.workloads import churn, concurrency, filtered
+        for module in (concurrency, filtered, churn):
+            assert "indexed_rows" in inspect.signature(module.run).parameters, \
+                module.__name__
+
+
+class TestAResumeAcrossAVersionBumpSaysSoBeforeMeasuring:
+    """The refusal is right but it arrives after the expensive half.
+
+    A directory holding two ops measurement versions cannot honestly be
+    reported as one, and `report/loaders.py` refuses it. But the operator
+    learns that from the report, which runs after the measuring — so resuming
+    a `main` run under code that bumped the version meant up to days of ingest
+    before anything said the directory being filled could not be reported.
+
+    `set_config` is the one place that knows both numbers and still precedes
+    the work: it runs per (pass, engine) before the checkpoint skip, so a
+    resume reaches it even when every unit is skipped and nothing is measured.
+    """
+
+    def _manifest(self, tmp_path, declared):
+        """A run directory that already declares `declared`."""
+        from orchestrator.manifest import Manifest
+        run = str(tmp_path / "run")
+        m = Manifest(run, "run-1")
+        if declared is None:
+            m.data["config"].pop("ops_measurement_version", None)
+        else:
+            m.data["config"]["ops_measurement_version"] = declared
+        m.save()
+        # A second Manifest over the same directory is what --resume builds.
+        return Manifest(run, "run-1")
+
+    def _resume(self, tmp_path, declared):
+        m = self._manifest(tmp_path, declared)
+        m.set_config({}, "normalized", {"server_memory_bytes": 1})
+        return m
+
+    def test_a_stale_version_is_announced(self, tmp_path, capsys):
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        stale = OPS_MEASUREMENT_VERSION - 1
+        m = self._resume(tmp_path, stale)
+        err = capsys.readouterr().err
+        # Both numbers, each anchored so neither can be read off the other.
+        # A bare `str(stale) in err` is satisfied by the current version's
+        # digits whenever one is a substring of the other -- 2 and 12, say.
+        assert re.search(rf"\bversion {stale}\b", err), err
+        assert re.search(rf"\bversion {OPS_MEASUREMENT_VERSION}\b", err), err
+        # And the remedy, which is what makes it a warning rather than a
+        # complaint: one report per version.
+        assert "report" in err and "per version" in err, err
+        # The manifest still says what the directory actually holds.
+        assert m.data["config"]["ops_measurement_version"] == stale
+
+    def test_it_is_not_fatal(self, tmp_path, capsys):
+        """Finishing the run and splitting the records afterwards is a
+        legitimate response, and often the right one: the older records are
+        not wrong, only incomparable. A hard failure would turn a directory
+        that needs splitting into a run that cannot continue."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        m = self._resume(tmp_path, OPS_MEASUREMENT_VERSION - 1)
+        assert m.data["config"]["resource_pass"] == "normalized"
+        assert capsys.readouterr().err  # it did warn, it just did not raise
+
+    def test_a_matching_version_says_nothing(self, tmp_path, capsys):
+        """Every ordinary resume hits this path. A notice that fires on all of
+        them is the first thing an operator learns to scroll past."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        self._resume(tmp_path, OPS_MEASUREMENT_VERSION)
+        assert "WARNING" not in capsys.readouterr().err
+
+    def test_a_manifest_with_no_version_says_nothing(self, tmp_path, capsys):
+        """Absent is not stale. A run recorded before the key existed was
+        measured under a version this code cannot know, and `loaders.py` reads
+        a missing key as "nothing declared, check nothing" -- so there is no
+        disagreement to report."""
+        self._resume(tmp_path, None)
+        assert "WARNING" not in capsys.readouterr().err
+
+    def test_it_is_said_once_per_run_not_once_per_engine(self, tmp_path,
+                                                         capsys):
+        """set_config runs per (pass, engine). Six engines across two passes
+        would print this twelve times, and a notice repeated twelve times
+        reads as a loop rather than as a warning."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        m = self._manifest(tmp_path, OPS_MEASUREMENT_VERSION - 1)
+        for _ in range(12):
+            m.set_config({}, "normalized", {"server_memory_bytes": 1})
+        assert capsys.readouterr().err.count("WARNING") == 1
+
+    def test_the_notice_is_carried_by_set_config_itself(self):
+        """Not by a later populator, which is what makes it reachable by a
+        resume that measures nothing.
+
+        Deliberately a statement about where the code lives rather than about
+        cli.py's call order. The ordering fact -- `cli.py` calls set_config at
+        :461, above the `(already complete)` checkpoint skip at :484 -- is
+        recorded in `_warn_if_resuming_across_a_bump`'s docstring instead of
+        asserted here, because the obvious assertion for it is vacuous:
+        "checkpoint" appears twelve times before that call and fourteen times
+        after, so a grep of the tail passes however the file is reordered. A
+        guard whose own mutant cannot be injected is not a guard, and cli.py
+        is not this task's to pin.
+        """
+        import inspect
+
+        from orchestrator.manifest import Manifest
+        assert "_warn_if_resuming_across_a_bump" in \
+            inspect.getsource(Manifest.set_config)
+
+
 class TestResumeContinuesTheRightRun:
     """Checkpoints live inside the run directory.
 
@@ -5550,13 +5794,20 @@ class TestOpsVersionsNeverShareAChart:
     V_KEY = "ops_measurement_version"
 
     @staticmethod
-    def SIDE(version):
+    def SIDE(version, count=r"\d+"):
         """The line listing one version and how many records it has.
 
         Matched instead of a bare `"version N" in message`, which is satisfied
         by the trailer's "count as version 1" no matter what the listing does.
+
+        `count` binds a number to the version beside it, and callers that care
+        about the counts must pass it. Left unbound the pattern says only that
+        each side was listed with some number, which is exactly what a
+        listing with the two sides' counts swapped also satisfies -- and a
+        swap is the one fault the counts exist to expose, since telling a
+        stray file from the bulk of a run is the whole point of printing them.
         """
-        return re.compile(rf"^  version {version}: \d+ records?$",
+        return re.compile(rf"^  version {version}: {count} records?$",
                           re.MULTILINE)
 
     def _ops_file(self, run_dir, name, rows):
@@ -5643,7 +5894,16 @@ class TestOpsVersionsNeverShareAChart:
         assert "ops_measurement_version" in message
 
     def test_the_refusal_counts_the_records_on_each_side(self, tmp_path):
-        """So an operator can tell a stray file from the bulk of the run."""
+        """So an operator can tell a stray file from the bulk of the run.
+
+        Each count bound to its own version, because telling the stray from
+        the bulk is the entire reason the counts are printed and a swap
+        destroys exactly that. The assertion this replaced was
+        `"4 record" in message and "1 record" in message`, which never bound
+        a count to a version: a listing reading "version 1: 1 record" beside
+        "version 2: 4 records" -- pointing the operator at the wrong file --
+        contains both substrings and passed the whole suite.
+        """
         from report.loaders import MixedMeasurementVersions, load_ops_records
         run = str(tmp_path)
         self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
@@ -5653,7 +5913,8 @@ class TestOpsVersionsNeverShareAChart:
         with pytest.raises(MixedMeasurementVersions) as caught:
             load_ops_records(run)
         message = str(caught.value)
-        assert "4 record" in message and "1 record" in message
+        assert self.SIDE(1, 4).search(message), message
+        assert self.SIDE(2, 1).search(message), message
 
     def test_a_three_way_mix_names_every_version(self, tmp_path):
         from report.loaders import MixedMeasurementVersions, load_ops_records

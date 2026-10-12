@@ -20,9 +20,11 @@ anything — is calibrated in tests/test_fake_driver.py.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 
+import numpy
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,8 +38,54 @@ from harness.workloads import concurrency as concurrency_workload  # noqa: E402
 from harness.workloads import filtered as filtered_workload  # noqa: E402
 from harness.workloads.context import RunContext  # noqa: E402
 
-from .fake_driver import (K, N_QUERIES, N_ROWS, FakeDriver,  # noqa: E402
-                          index_spec, loaded_driver, tiny_dataset)
+from .fake_driver import (DIM, K, N_QUERIES, N_ROWS,  # noqa: E402
+                          FakeDriver, index_spec, loaded_driver,
+                          measure_recall, tiny_dataset)
+
+#: Queries in `wide_dataset`. 1,000 because that is the number §1.2's
+#: sharding claim is about, and because the recall comparison needs it — see
+#: the docstring there.
+N_WIDE_QUERIES = 1_000
+
+
+def wide_dataset(seed: int = 20261013) -> Dataset:
+    """`tiny_dataset`'s corpus with 1,000 queries instead of fifty.
+
+    Two things in this file need a query set far wider than `N_QUERIES`, and
+    both would be misleading without it.
+
+    **Sharding.** The claim is about 1,000 queries across 32 clients. At fifty
+    queries each shard is one or two elements long, every client finishes its
+    first pass almost immediately, and the disjointness that matters at 32
+    clients is not exercised at all.
+
+    **The recall comparison's error bar.** The fake keeps each true neighbour
+    independently with probability p(ef), so recall over `q` queries is the
+    mean of `q * k` Bernoulli draws. At p = 0.98 and q = 50 the standard error
+    is 0.0198: an assertion that two independent measurements agree within
+    0.01 would fail roughly half the time, and tuning the tolerance until it
+    passed would be tuning away the only discrimination the test has. At
+    q = 1,000 the standard error is 0.0014 and 0.01 is seven sigma. Measured
+    over twenty runs the two sides differ by at most 0.0032.
+
+    Query count is the only thing that moves: the corpus, the metric and the
+    exact-top-k ground truth are `tiny_dataset`'s, computed the same way, so
+    nothing about the fake's error model changes between the two.
+    """
+    base = tiny_dataset()
+    rng = numpy.random.default_rng(seed)
+    test = rng.random((N_WIDE_QUERIES, DIM), dtype=numpy.float32)
+    train = base.train
+    scores = ((test ** 2).sum(1)[:, None]
+              - 2.0 * (test @ train.T)
+              + (train ** 2).sum(1)[None, :])
+    # 100 columns, the width ann-benchmarks' HDF5 files ship.
+    neighbors = numpy.argsort(scores, axis=1)[:, :100].astype(numpy.int64)
+    ordered = numpy.take_along_axis(scores, neighbors, axis=1)
+    return Dataset(name=f"wide-{DIM}-euclidean", train=train, test=test,
+                   neighbors=neighbors,
+                   distances=numpy.sqrt(numpy.maximum(ordered, 0.0)),
+                   metric=ds.EUCLIDEAN)
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +96,11 @@ def dataset() -> Dataset:
 @pytest.fixture(scope="module")
 def angular_dataset() -> Dataset:
     return tiny_dataset(metric=ds.ANGULAR)
+
+
+@pytest.fixture(scope="module")
+def wide() -> Dataset:
+    return wide_dataset()
 
 
 @pytest.fixture
@@ -255,6 +308,483 @@ class TestConcurrencyWorkload:
             client_counts=(1, 8), duration_s=0.05, warmup=1, max_queries=4,
         )
         assert [r["clients"] for r in written(ctx)] == [1]
+
+
+#: p(ef) = 98 / (98 + 2) = 0.98 exactly, so the recall these tests compare is
+#: a real measurement of a real error model rather than the 1.0 a perfect fake
+#: returns. An assertion that two 1.0s agree is satisfied by a hardcoded 1.0;
+#: this one is not. Near the top of the range on purpose, because the sampling
+#: error of a mid-range p swamps the 0.01 tolerance — see `wide_dataset`.
+EF_SEARCH_98 = 98
+EF_HALF_98 = 2.0
+
+#: Long enough, on an idle machine, for every client to finish one pass over
+#: its shard at 1, 4 and 16 clients.
+#:
+#: The margin here is SMALL, and an earlier version of this comment claimed it
+#: was five times larger than it is. Measured by bisection, full coverage at
+#: 16 clients needs about 0.20s on this machine and about 0.30s on the
+#: reviewer's, so the real headroom is 1.7x-2.5x. Aggregate throughput is not
+#: what binds: 1,000 queries at ~11,000 q/s is 0.09s of work however it is
+#: divided, and 1 and 4 clients cover the pool inside 0.10s. What binds is the
+#: SLOWEST thread finishing its own shard, and with seventeen threads on one
+#: GIL a thread can receive far less than its 1/16 share.
+#:
+#: That is why `run_until_pool_covered` escalates rather than trusting this
+#: number. An overstated margin is worse than none, because the next person
+#: reads it instead of measuring: at 0.5s flat, the coverage test failed 7
+#: times in 18 runs under deliberate oversubscription.
+WINDOW_S = 0.5
+
+#: Windows the coverage runs escalate through, each 4x the last.
+#:
+#: Escalation rather than a bigger constant, and rather than a looser
+#: assertion. "Every query was covered" is the only thing that discriminates a
+#: truncated or overlapping shard shape -- a wrong shape never reaches full
+#: coverage at ANY duration, because the queries it never sends stay unsent --
+#: so the assertion has to stay an equality. But it is also a claim that the
+#: machine finished a fixed amount of work inside a fixed wall-clock window,
+#: and under load a starved thread simply does not. Retrying longer separates
+#: the two: a correct implementation pays nothing on an idle machine and a
+#: retry on a busy one, while a broken one fails at 0.5s, at 2s and at 8s.
+COVERAGE_WINDOWS_S = (WINDOW_S, WINDOW_S * 4, WINDOW_S * 16)
+
+
+def run_until_pool_covered(ctx: RunContext, dataset: Dataset, driver,
+                           clients, max_queries: int, expected: int) -> None:
+    """The concurrency workload, retried longer until the pool is covered.
+
+    **Returns nothing on purpose.** The caller reads the records back from the
+    recorder itself, with `last_points`, and asserts on those. An earlier
+    version returned the rows it had just inspected, which made the helper and
+    the caller's assertion one code path: a mutant that overwrote
+    `recall_queries` with `expected` on the way out passed all 621 tests. A
+    helper that both decides when to stop and supplies the evidence for the
+    assertion cannot be checked by it.
+
+    See `COVERAGE_WINDOWS_S` for why this escalates rather than using one
+    longer window or one weaker assertion.
+    """
+    for duration in COVERAGE_WINDOWS_S:
+        concurrency_workload.run(
+            ctx, driver.clone, dataset, index_spec(dataset),
+            ef_search=EF_SEARCH_98, client_counts=clients,
+            duration_s=duration, warmup=2, max_queries=max_queries,
+            indexed_rows=N_ROWS)
+        if all(r["extra"]["recall_queries"] == expected
+               for r in last_points(ctx, len(clients))):
+            return
+
+
+def last_points(ctx: RunContext, count: int):
+    """The `count` most recent records, read back from the recorder.
+
+    A tail rather than the whole file because each escalation attempt appends,
+    so the earlier attempts' records sit above the ones that matter.
+    """
+    return written(ctx)[-count:]
+
+#: Per-query latency for the one test that needs a window too short to finish
+#: a pass. Without it that test is calibrated on this machine's speed in the
+#: dangerous direction: at zero latency a 0.05s window covered 679 of 1,000
+#: queries, so a machine only 1.5x faster would have completed the pass and
+#: failed an assertion that nothing was left over. With a 1ms floor per query
+#: one pass costs at least a second however fast the host is, and 0.05s covers
+#: about forty queries.
+SHORT_WINDOW_LATENCY_S = 0.001
+
+
+class TestConcurrencyRecordsRecall:
+    """A concurrency point without recall invites the comparison it cannot
+    support.
+
+    QPS and latency were recorded; the ids every query returned were thrown
+    away. Two engines at `ef_search=100` can sit at recall 0.98 and 0.80 —
+    which is the ordinary spread of these implementations at a shared ef, not
+    a pathology — and a throughput chart with no quality figure beside it
+    presents them as comparable when one is simply doing less work per query.
+    """
+
+    def _run(self, ctx, wide, driver, clients, **kw):
+        kw.setdefault("duration_s", WINDOW_S)
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=clients, warmup=2,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=N_ROWS, **kw)
+        return written(ctx)
+
+    def test_recall_equals_single_client_recall_at_every_client_count(
+            self, ctx, wide):
+        """The number has to come from somewhere independent of the workload.
+
+        `measure_recall` drives the driver directly, one query at a time, in
+        test-set order, and zips the results against the dataset's own
+        neighbours. The workload shards the query set across threads, records
+        only each shard's first pass, maps every result back through
+        `_shard_queries`'s offsets and scores it against
+        `cached_ground_truth`. Both estimate the same quantity — the fake's
+        p(ef) — by routes that share no code past `recall_at_k` itself, which
+        is what makes the agreement evidence rather than a tautology.
+
+        Four and sixteen clients are load-bearing, not thoroughness. At one
+        client the shard IS the query set and the offsets are `arange(n)`, so
+        every plausible way of getting the mapping wrong still produces the
+        right answer: the mutation below scores 0.9825 at one client and
+        0.0084 at four.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        # Measured before the workload runs, and never through it. The clones
+        # the workload uses are seeded independently of this driver's stream,
+        # so neither measurement perturbs the other.
+        single = measure_recall(driver, wide, K)
+        # Not 1.0 and not 0.0: a tolerance between two saturated numbers is
+        # satisfied by anything that also saturates.
+        assert 0.9 < single < 1.0, single
+
+        rows = self._run(ctx, wide, driver, (1, 4, 16))
+        assert [r["clients"] for r in rows] == [1, 4, 16]
+        for row in rows:
+            assert row["phase"] == records.PHASE_CONCURRENCY
+            assert abs(row["recall_at_k"] - single) < 0.01, (
+                f"{row['clients']} clients: {row['recall_at_k']} vs {single}")
+            # recall_at_k is an existing Record column, not an extra key, so
+            # the report reads it without a per-phase special case.
+            assert row["recall_at_k"] is not None
+
+    def test_recall_covers_every_query_in_the_pool(self, ctx, wide):
+        """How many queries the recall is over is part of the claim.
+
+        A window too short for one pass leaves most of the pool unmeasured,
+        and recall over 200 of 10,000 queries is a different statement from
+        recall over all of them. This also catches every way of mis-shaping a
+        shard that the recall assertion above cannot, and it is the only thing
+        that catches two of them. Shards truncated to five queries each still
+        score 0.98, because the queries they do send are answered correctly.
+        Worse, giving every client the SAME slice scores 0.979-0.982 and
+        passes the recall comparison deterministically — and a truncation to
+        100 or 300 queries passes it too, while coverage is out by 10x. Only
+        the count discriminates either one.
+
+        Which is exactly why the window escalates instead of the assertion
+        loosening. A wrong shard shape never reaches full coverage at any
+        duration; a starved thread on a loaded machine does, given longer.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        clients = (1, 4, 16)
+        run_until_pool_covered(
+            ctx, wide, driver, clients,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            expected=N_WIDE_QUERIES)
+        # Read back from the recorder, not handed over by the helper above.
+        rows = last_points(ctx, len(clients))
+        assert [r["clients"] for r in rows] == list(clients)
+        for row in rows:
+            assert row["extra"]["recall_queries"] == N_WIDE_QUERIES, (
+                f"{row['clients']} clients covered "
+                f"{row['extra']['recall_queries']} of {N_WIDE_QUERIES} "
+                f"even at {COVERAGE_WINDOWS_S[-1]}s")
+
+    def test_a_short_window_records_the_coverage_it_managed(self, ctx, wide):
+        """The honest answer to a window too short for a pass is a smaller
+        count, not a recall collapse. Padding the queries nobody ran with
+        empty result sets would report the window's length as the engine's
+        quality.
+
+        `latency_s` rather than a very short window, and the reason is the
+        direction of the risk. "Fewer than the whole pool" is an assertion
+        about the machine being slow enough, so calibrating it on this
+        machine's speed makes it fail on a faster one: at zero latency a
+        0.05s window covered 679 of 1,000 and a host 1.5x quicker would have
+        covered all of them. A 1ms floor per query puts one pass at a second
+        whatever the host does.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98,
+                              latency_s=SHORT_WINDOW_LATENCY_S)
+        rows = self._run(ctx, wide, driver, (1,), duration_s=0.05)
+        covered = rows[0]["extra"]["recall_queries"]
+        assert 0 < covered < N_WIDE_QUERIES, covered
+        # Recall over the part that ran is still the engine's recall, not a
+        # fraction of it scaled by how much of the pool was reached.
+        assert rows[0]["recall_at_k"] > 0.9, rows[0]["recall_at_k"]
+        # And the latency floor really was in force, so the window above is
+        # short for the reason this test says it is.
+        assert rows[0]["latency_p50_ms"] >= SHORT_WINDOW_LATENCY_S * 1000.0
+
+        # `query_reuse` is executed over DISTINCT-executed, and this is the
+        # only regime in which that distinction is observable. Inside one
+        # incomplete pass nothing is repeated, so the honest answer is exactly
+        # 1.0 — every query sent was a query not sent before.
+        #
+        # The sibling test asserting `pool x reuse == executed` cannot see
+        # this: it also asserts the window covered the pool, which makes
+        # distinct and pool the same number and the cross-check a restatement
+        # of itself. Dividing by `query_pool` instead passes there and reads
+        # 0.04 here.
+        assert rows[0]["extra"]["query_reuse"] == 1.0, (
+            rows[0]["extra"]["query_reuse"], covered)
+        assert rows[0]["queries_executed"] == covered
+
+    def test_a_recall_that_moves_between_windows_is_reported_as_a_bug(
+            self, ctx, wide, capsys):
+        """Recall is a property of the index and the ef, never of the window.
+
+        Two windows of one configuration disagreeing means the
+        query-to-truth mapping is wrong or the index moved underneath the
+        measurement, and in both cases the QPS recorded beside it is not the
+        quantity the record names. Staged by degrading the driver the second
+        window is handed, which is the only way to make the fake's recall
+        depend on which window it is in.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        # The healthy window's recall, measured independently of the workload.
+        healthy = measure_recall(driver, wide, K)
+        handed_out = []
+
+        def degrading_factory():
+            clone = driver.clone()
+            handed_out.append(clone)
+            # One for the metadata driver, one for the first window's client;
+            # everything after that is the second window.
+            if len(handed_out) > 2:
+                clone.ef_half = 400.0
+            return clone
+
+        concurrency_workload.run(
+            ctx, degrading_factory, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(1,),
+            duration_s=0.3, warmup=1, repeats=2,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=N_ROWS)
+
+        row = written(ctx)[0]
+        assert row["extra"]["repeats"] == 2
+        spread = row["extra"]["recall_spread"]
+        assert spread > concurrency_workload.RECALL_SPREAD_LIMIT, spread
+
+        # One window's recall, not an average of the two. The two windows
+        # measure `healthy` (about 0.98) and `healthy - spread` (about 0.21),
+        # and the record must carry one of those endpoints; their mean, about
+        # 0.59, is a third of the way from either and excluded by a margin of
+        # 0.38. Which endpoint is recorded is whichever window came out median
+        # by QPS, and that is genuinely not fixed -- the degraded driver draws
+        # far more filler rows per query, so it is usually the slower of the
+        # two but not reliably so. Asserting the healthy value specifically
+        # passed on this machine and failed under pytest on the same machine
+        # minutes later.
+        endpoints = (healthy, healthy - spread)
+        assert min(abs(row["recall_at_k"] - e) for e in endpoints) < 0.01, (
+            row["recall_at_k"], endpoints)
+        assert abs(row["recall_at_k"] - sum(endpoints) / 2) > 0.1, (
+            "the record carries the mean of the windows, not one of them")
+
+        err = capsys.readouterr().err
+        assert "BUG: recall varied" in err, err
+        # Actionable, not merely alarmed: it has to say which configuration
+        # and what the operator should doubt.
+        #
+        # Anchored on the whole number, because `"1 client" in err` against a
+        # message reading "at {clients} client(s)" is satisfied by 11, 21 and
+        # 31 clients too: reporting clients + 20 left every test in this file
+        # passing. The assertion claimed to check WHICH configuration and did
+        # not. The fourth instance of this species in this series, and the
+        # third in this file alone.
+        assert re.search(r"\bat 1 client\(s\)", err), err
+        assert "QPS" in err, err
+
+    def test_one_window_has_no_recall_spread_to_report(self, ctx, wide):
+        """None, not 0.0.
+
+        A single window has no spread in the same sense that it has no error
+        bar. Writing 0.0 claims the stronger thing — that two windows were
+        compared and agreed exactly — which is the entire evidence this field
+        exists to carry, and a reader cannot tell the two apart without
+        cross-checking `repeats`. `report/render.py` already draws that
+        distinction by hand for `qps_spread_pct`; this field does not make
+        anyone do it again.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        rows = self._run(ctx, wide, driver, (1,), duration_s=0.05)
+        extra = rows[0]["extra"]
+        assert extra["repeats"] == 1
+        # Present and null, which is how `scaling_efficiency` and
+        # `query_reuse` already express "not measurable here" in this same
+        # dict. `Record.to_dict` drops a None only among the Record's own
+        # columns; it does not reach inside `extra`, so a key omitted here
+        # would be omitted inconsistently with its neighbours.
+        assert "recall_spread" in extra
+        assert extra["recall_spread"] is None, extra["recall_spread"]
+        # And the recall itself is still there, so this is not a record that
+        # simply failed to measure anything.
+        assert rows[0]["recall_at_k"] > 0.9
+
+    def test_a_stable_recall_says_nothing(self, ctx, wide, capsys):
+        """A warning that always fires is noise, and the first thing an
+        operator learns to ignore. With p(ef) = 1 the fake is deterministic,
+        so two windows measure exactly the same recall and the spread is
+        exactly zero -- there is no tolerance being leaned on here."""
+        driver = loaded_driver(wide, ef_half=0.0, ef_search=EF_SEARCH_98)
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(1,),
+            duration_s=0.3, warmup=1, repeats=2,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=N_ROWS)
+        row = written(ctx)[0]
+        assert row["recall_at_k"] == 1.0
+        assert row["extra"]["recall_spread"] == 0.0
+        assert "BUG" not in capsys.readouterr().err
+
+    def test_a_subset_corpus_is_scored_against_the_subset(self, ctx, wide):
+        """`indexed_rows`, for the same reason filtered and churn take it.
+
+        A profile that loaded part of the training set would otherwise be
+        scored against neighbours pointing at rows the engine never received,
+        understating every engine at once — which reads as a result rather
+        than as a measurement fault.
+        """
+        rows_loaded = 500
+        driver = FakeDriver(dim=wide.dim, metric=wide.metric, ef_half=0.0,
+                            ef_search=EF_SEARCH_98)
+        driver.connect()
+        driver.create_schema(index_spec(wide))
+        driver.load(wide.train[:rows_loaded],
+                    ds.assign_tags(N_ROWS)[:rows_loaded])
+
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(1,), duration_s=WINDOW_S,
+            warmup=2, max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=rows_loaded)
+
+        # A perfect driver over the rows it holds. Against the full corpus's
+        # neighbours this would score far below 1.0, because most of the true
+        # top ten are rows 500..1999 that were never loaded.
+        assert written(ctx)[0]["recall_at_k"] == 1.0
+
+
+class TestConcurrencyQueryPoolIsItsOwn:
+    """`ops.max_queries` caps the filtered and churn workloads, which answer
+    each query once; main.yml holds it at 500 to bound their cost. The
+    concurrency workload cycles its shard for a fixed duration instead, so
+    sharing the key gave 32 clients about fifteen queries each for thirty
+    seconds and showed every graph cache in the comparison — MHNSW's
+    per-TABLE_SHARE cache, VIDX's shared cache, pgvector's shared_buffers — a
+    hot set small enough to hold entirely. That is the one thing the
+    concurrency chart exists to tell apart.
+    """
+
+    def test_shards_are_disjoint_and_cover_the_whole_pool(self, wide):
+        """At 32 clients, which is where it matters and where fifty queries
+        would have made every shard one or two elements long."""
+        pairs = concurrency_workload._shard_queries(wide.test, 32)
+        assert len(pairs) == 32
+        positions = [int(o) for _shard, offsets in pairs for o in offsets]
+        # Disjoint: no position handed to two clients, so no client can warm
+        # a cache for another and no result can overwrite another's.
+        assert len(positions) == len(set(positions))
+        # Complete: every query in the pool is somebody's.
+        assert set(positions) == set(range(N_WIDE_QUERIES))
+
+    def test_each_offset_names_the_query_beside_it(self, wide):
+        """The pairing itself, checked against the array rather than against
+        the expression that produced it. Recomputing `arange(c, n, clients)`
+        here would assert the implementation equals itself; comparing the
+        vectors proves the offset points at the query the client will send.
+        """
+        seen = 0
+        for shard, offsets in concurrency_workload._shard_queries(wide.test, 7):
+            # Non-empty first. `len(shard) == len(offsets)` holds as 0 == 0
+            # and the zip body never runs, so seven empty pairs passed this
+            # test while failing eleven of the other twelve in the file —
+            # which is the signature of a guard that is along for the ride.
+            assert len(shard) > 0
+            assert len(shard) == len(offsets)
+            for query, offset in zip(shard, offsets):
+                assert numpy.array_equal(query, wide.test[int(offset)])
+                seen += 1
+        # And every query was actually compared, not just the ones that
+        # happened to survive whatever shaping produced the shards.
+        assert seen == N_WIDE_QUERIES
+
+    def test_the_whole_test_set_is_the_default(self, ctx, wide):
+        """`WHOLE_TEST_SET` is a sentinel, not a cap. Read as a cap it leaves
+        the pool empty, every client count skipped by the too-few-queries
+        rule, and a silently empty concurrency chart — and the default is what
+        today's profiles get, since none of them set the key."""
+        assert concurrency_workload.WHOLE_TEST_SET == 0
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(2,), duration_s=0.05,
+            warmup=1, indexed_rows=N_ROWS)
+        rows = written(ctx)
+        assert len(rows) == 1
+        assert rows[0]["extra"]["query_pool"] == N_WIDE_QUERIES
+
+    def test_the_record_states_the_pool_and_how_hard_it_was_reused(
+            self, ctx, wide):
+        """So a reader can judge a cache-sensitive number. The same QPS over a
+        pool of 10,000 and a pool of fifteen are measurements of two different
+        things, and nothing in the record used to say which.
+
+        Over a deliberately small pool, which is both the case `query_reuse`
+        exists to expose and the one that leaves the assertion no timing
+        margin to get wrong: 200 queries across four clients is fifty each, so
+        the window completes about 38 passes and the "reuse is real" bound
+        would survive a machine thirty times slower.
+        """
+        pool = 200
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        run_until_pool_covered(ctx, wide, driver, (4,), max_queries=pool,
+                               expected=pool)
+        row = last_points(ctx, 1)[0]
+        extra = row["extra"]
+        assert extra["query_pool"] == pool
+        assert extra["recall_queries"] == pool
+        # Reuse is measured, not a rounded 1.0 standing in for "not recorded".
+        assert extra["query_reuse"] > 5.0, extra["query_reuse"]
+        # The three published numbers have to agree with each other, which is
+        # a property of the record rather than a restatement of the expression
+        # that produced any one of them. When the window covered the whole
+        # pool, pool x reuse is the executed count — and that fails loudly for
+        # any shard shape that does not cover the pool: truncated or
+        # overlapping shards put it out by five orders of magnitude.
+        implied = extra["query_reuse"] * extra["query_pool"]
+        # The only slack is `query_reuse`'s own two-decimal rounding: half a
+        # hundredth of a reuse, multiplied back up by the pool.
+        assert abs(implied - row["queries_executed"]) <= 0.01 * pool, (
+            implied, row["queries_executed"])
+
+    def test_a_cap_still_caps(self, ctx, wide):
+        """The way back. A profile that wants the old small hot set — to
+        reproduce an earlier run, say — sets the key and gets exactly it."""
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(2,), duration_s=0.05,
+            warmup=1, max_queries=120, indexed_rows=N_ROWS)
+        assert written(ctx)[0]["extra"]["query_pool"] == 120
+
+    def test_the_skip_rule_survives(self, ctx, wide):
+        """Kept, not removed: it cannot trigger on a real dataset any more,
+        but a profile that caps the pool by hand can still ask for more
+        clients than there are queries."""
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98)
+        concurrency_workload.run(
+            ctx, driver.clone, wide, index_spec(wide),
+            ef_search=EF_SEARCH_98, client_counts=(2, 9), duration_s=0.05,
+            warmup=1, max_queries=4, indexed_rows=N_ROWS)
+        assert [r["clients"] for r in written(ctx)] == [2]
 
 
 class TestFilteredWorkload:

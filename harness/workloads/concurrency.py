@@ -16,17 +16,36 @@ same graph at once", and single-client QPS cannot reveal any of them.
 Each client gets its own connection and a disjoint slice of the query set, so no
 two clients issue the same query at the same instant — otherwise part of what
 was measured would be one client hitting a cache another client just warmed.
+
+Two things this workload records that are easy to leave out, and both of which
+made the chart above misleading until they were added:
+
+1. **Recall.** The ids every query returned used to be discarded, so a
+   concurrency point had QPS and latency but no quality figure beside them.
+   Two engines at `ef_search=100` can sit at recall 0.98 and 0.80 — that is
+   the normal spread of these implementations at a shared ef, not a pathology
+   — and a throughput chart with no recall column presents them as comparable
+   when one is simply doing less work per query.
+
+2. **The size of the query pool.** The pool used to be whatever
+   `ops.max_queries` was, a key that exists to cap the cost of the filtered
+   and churn workloads (500 in `main.yml`). Each client cycles its own shard
+   for the whole window, so at 32 clients that is about fifteen queries per
+   client repeated for thirty seconds, and every graph cache in the
+   comparison sees a hot set small enough to hold entirely. `ops.
+   concurrency_queries` separates the two, defaulting to the whole test set.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy
 
-from ..datasets import Dataset
+from ..datasets import Dataset, cached_ground_truth, recall_at_k
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector, merge_collectors
 from ..metrics.records import PHASE_CONCURRENCY, Record
@@ -35,16 +54,36 @@ from .context import RunContext
 
 DriverFactory = Callable[[], EngineDriver]
 
+#: `max_queries` sentinel meaning "every query the dataset ships". The pool is
+#: a property of the dataset, not of the cap the filtered and churn workloads
+#: need, so the default asks for all of it rather than a number someone has to
+#: remember to raise.
+WHOLE_TEST_SET = 0
+
+#: How far two windows' recall may differ before the run says so on stderr.
+#: Recall is a property of the index and the ef, not of the window, so two
+#: windows of the same configuration measuring different recall means the
+#: offsets-to-truth mapping is wrong or the index moved underneath the
+#: measurement. Either way the QPS beside it is not what it claims to be.
+RECALL_SPREAD_LIMIT = 0.005
+
 
 class _Client(threading.Thread):
     """One benchmark client: own connection, own query slice, own latencies."""
 
     def __init__(self, driver_factory: DriverFactory, queries: numpy.ndarray,
+                 query_offsets: numpy.ndarray,
                  k: int, ef_search: int, index: IndexSpec, warmup: int,
                  ready: threading.Barrier, stop: threading.Event):
         super().__init__(daemon=True)
         self._factory = driver_factory
         self._queries = queries
+        # Where this client's queries sit in the full query array. Needed
+        # because recall scores a result against the ground truth of the query
+        # that produced it, and a shard is a strided view: `shards[1]` under
+        # four clients is queries 1, 5, 9, ... and its results belong against
+        # those rows of the truth, not against rows 0, 1, 2, ...
+        self._offsets = query_offsets
         self._k = k
         self._ef_search = ef_search
         self._index = index
@@ -52,6 +91,8 @@ class _Client(threading.Thread):
         self._ready = ready
         self._stop_event = stop
         self.collector = LatencyCollector(warmup=0)
+        #: Query position -> the ids that query returned, first pass only.
+        self.results: Dict[int, List[int]] = {}
         self.error: Optional[BaseException] = None
 
     def run(self) -> None:
@@ -88,8 +129,21 @@ class _Client(threading.Thread):
             while not self._stop_event.is_set():
                 q = self._queries[i % n]
                 started = time.perf_counter()
-                driver.query(q, self._k)
+                ids = driver.query(q, self._k)
                 self.collector.add(time.perf_counter() - started)
+                # Only the first pass over the shard. The window is a fixed
+                # duration, so a fast engine makes thousands of passes and
+                # keeping every result would grow without bound and charge the
+                # measurement for the allocation; every pass answers the same
+                # query, so later ones add no recall information. This bounds
+                # the memory to one result list per query however long the
+                # window runs.
+                #
+                # After `collector.add`, deliberately: the timer brackets the
+                # query alone, so recording the result cannot be charged to
+                # the latency the record reports.
+                if i < n:
+                    self.results[int(self._offsets[i])] = ids
                 i += 1
             self.collector.stop()
         except BaseException as exc:  # noqa: BLE001
@@ -105,7 +159,8 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         index: IndexSpec, ef_search: int,
         client_counts: Sequence[int] = (1, 2, 4, 8, 16, 32),
         duration_s: float = 20.0, warmup: int = 50,
-        max_queries: int = 10_000, repeats: int = 1) -> None:
+        max_queries: int = WHOLE_TEST_SET, repeats: int = 1,
+        indexed_rows: Optional[int] = None) -> None:
     """Measure QPS and latency at each client count.
 
     Each point runs for a fixed duration rather than a fixed query count, so a
@@ -124,8 +179,25 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
     it is the noisiest measurement here, and a point costs a minute. Repeating
     every point three times adds about a quarter of an hour per engine to a
     run that takes days.
+
+    `max_queries` caps the query pool; `WHOLE_TEST_SET` asks for all of it,
+    which is the default and what `ops.concurrency_queries` resolves to when a
+    profile does not set the key.
+
+    `indexed_rows` must be the number of rows actually loaded, exactly as the
+    filtered and churn workloads need it: a profile that loaded a subset of the
+    training set would otherwise have its recall scored against neighbours
+    pointing at rows the engine never received, understating every engine at
+    once in a way that reads as a result.
     """
-    queries = dataset.test[:max_queries]
+    queries = _query_pool(dataset.test, max_queries)
+
+    # Once per run, not once per window and not once per client count: the
+    # answer depends on the dataset, k and how many rows were loaded, none of
+    # which move across the sweep, and recomputing it over a subset corpus is
+    # minutes of brute force.
+    truth = cached_ground_truth(ctx.cache_dir, dataset, ctx.k,
+                                indexed_rows=indexed_rows)
 
     # One driver held open for metadata, so version/size lookups do not open and
     # discard a connection per data point.
@@ -153,29 +225,33 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                   f"{duration_s:.0f}s", flush=True)
             samples.append(_one_window(
                 driver_factory, queries, clients, ctx.k, ef_search, index,
-                warmup, duration_s))
+                warmup, duration_s, truth))
 
         # The median window, not an average of several: latency percentiles
         # from one measured window mean something, and the mean of several
-        # engines' percentiles means nothing.
+        # engines' percentiles means nothing. Recall rides inside the sample
+        # tuple rather than being selected by a second indexing expression, so
+        # "the recall of the median window" is true by construction and cannot
+        # drift into being some other window's recall.
         samples.sort(key=lambda s: s[0])
-        qps, merged = samples[len(samples) // 2]
+        qps, merged, recall, recall_queries = samples[len(samples) // 2]
         spread = ((samples[-1][0] - samples[0][0]) / qps * 100.0) if qps else 0.0
+
+        recall_spread = _check_recall_spread(samples, clients)
+
+        # How many times the average query was repeated inside the window.
+        # A cache-sensitive throughput number cannot be judged without it: the
+        # same QPS over a pool of 10,000 and a pool of 15 are measurements of
+        # two different things.
+        executed = merged.get("queries_executed") or 0
+        reuse = (executed / recall_queries) if recall_queries else None
 
         if clients == 1:
             baseline_qps = qps
         efficiency = (qps / (clients * baseline_qps)) if baseline_qps else None
 
-        eff_text = f"{efficiency:.2f}" if efficiency is not None else "n/a"
-        spread_text = f" spread={spread:.1f}%" if len(samples) > 1 else ""
-        print(
-            f"[concurrency] {common['engine']:>8} clients={clients:>3} "
-            f"qps={qps:11,.1f} "
-            f"p50={merged['latency_p50_ms']:7.3f}ms "
-            f"p95={merged['latency_p95_ms']:7.3f}ms "
-            f"p99={merged['latency_p99_ms']:7.3f}ms "
-            f"efficiency={eff_text}{spread_text}"
-        )
+        _print_point(common["engine"], clients, ctx.k, qps, recall, merged,
+                     efficiency, spread, len(samples))
 
         ctx.recorder.write(Record(
             **common,
@@ -183,6 +259,11 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             ef_search=ef_search,
             clients=clients,
             qps=round(qps, 2),
+            # An existing Record field, not a new one: this is the same
+            # quantity the recall/QPS path and the filtered and churn
+            # workloads already report, so it belongs in the column the report
+            # already reads rather than in `extra`.
+            recall_at_k=round(recall, 6) if recall is not None else None,
             **merged,
             extra={
                 "scaling_efficiency": round(efficiency, 4) if efficiency is not None else None,
@@ -191,24 +272,169 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 "repeats": len(samples),
                 # Every sample, so a reader can see the spread rather than
                 # trust a summary of it.
-                "qps_samples": [round(q, 1) for q, _ in samples],
+                "qps_samples": [round(q, 1) for q, *_ in samples],
                 "qps_spread_pct": round(spread, 1),
+                # How many distinct queries the recall above covers. A window
+                # too short for one pass over a shard leaves part of the pool
+                # unmeasured, and a recall over 200 of 10,000 queries is a
+                # different claim from one over all of them.
+                "recall_queries": recall_queries,
+                "recall_spread": (round(recall_spread, 6)
+                                  if recall_spread is not None else None),
+                # The pool the clients drew from and how hard they reused it,
+                # so a reader can see what the engines' caches were shown.
+                "query_pool": len(queries),
+                "query_reuse": round(reuse, 2) if reuse is not None else None,
             },
         ))
 
 
+def _query_pool(test: numpy.ndarray, max_queries: int) -> numpy.ndarray:
+    """The queries the clients may draw from.
+
+    `WHOLE_TEST_SET` is a sentinel, not a cap: treating it as one leaves the
+    pool empty, every client count skipped by the rule below and a silently
+    empty concurrency chart. The whole point of `ops.concurrency_queries` is
+    that the pool stops being whatever `ops.max_queries` happened to be — a
+    key that exists to bound the filtered and churn workloads' cost — so the
+    default has to mean "all of them" rather than a number a profile has to
+    remember to raise.
+
+    MUST RETURN A PREFIX OF `test`, and this is load-bearing rather than
+    incidental. `run()` scores results with `truth[offsets]`, where `offsets`
+    are positions into the pool this returns and `truth` is indexed by
+    position into the full test set. Those two agree only while position *i*
+    of the pool is position *i* of `test`. Narrow the pool any other way — a
+    random sample, a stratified draw, every other query — and recall is
+    silently computed against the wrong rows: the mapping failure
+    `_shard_queries` warns about, one level up and with nothing in the record
+    to show it happened. A non-prefix pool therefore has to translate its own
+    positions back to test-set positions and hand those to `_shard_queries`.
+    """
+    if max_queries <= WHOLE_TEST_SET:
+        return test
+    return test[:max_queries]
+
+
+def _shard_queries(queries: numpy.ndarray,
+                   clients: int) -> List[Tuple[numpy.ndarray, numpy.ndarray]]:
+    """Each client's query slice, paired with those queries' positions.
+
+    The slice and the offsets are built in one place and returned together
+    because they are two spellings of one fact: `queries[c::clients]` is a
+    strided view and `arange(c, n, clients)` is where its elements came from.
+    Let them drift apart and recall is scored against the wrong rows of the
+    ground truth — client 1 of 4 answering queries 1, 5, 9, ... while its
+    results are compared against the neighbours of queries 0, 1, 2, ... That
+    produces a plausible-looking low recall rather than an error, which is the
+    exact failure mode this repository opens by warning about, and it would be
+    read as the engine's ANN quality.
+
+    Strided rather than contiguous blocks, which is the older decision this
+    preserves: two clients handed adjacent slices of a sorted query set warm
+    each other's caches, and part of what the window measured would be that
+    rather than the engine.
+    """
+    n = len(queries)
+    return [(queries[c::clients], numpy.arange(c, n, clients))
+            for c in range(clients)]
+
+
+def _window_recall(results: Dict[int, List[int]], truth: numpy.ndarray,
+                   k: int) -> Tuple[Optional[float], int]:
+    """Recall over the queries this window actually executed, and how many.
+
+    Only the queries present in `results` are scored. A window shorter than
+    one pass over a shard leaves the rest of the pool unexecuted, and padding
+    those with empty result sets would report a recall collapse that is the
+    window's length rather than the engine's quality.
+    """
+    offsets = sorted(results)
+    if not offsets:
+        return None, 0
+    returned = [results[offset] for offset in offsets]
+    want = truth[numpy.array(offsets, dtype=numpy.int64)]
+    return recall_at_k(returned, want, k), len(offsets)
+
+
+def _print_point(engine: str, clients: int, k: int, qps: float,
+                 recall: Optional[float], merged: Dict[str, float],
+                 efficiency: Optional[float], qps_spread: float,
+                 windows: int) -> None:
+    """The operator's one line per data point.
+
+    Separate from `run` because it is presentation, and because every one of
+    these figures is optional in a different way: efficiency is undefined
+    until the one-client baseline exists, recall is None when no query
+    completed, and a spread means nothing from a single window. Formatting
+    that beside the measurement is what pushed `run` past the length this
+    repository asks of a function.
+    """
+    eff_text = f"{efficiency:.2f}" if efficiency is not None else "n/a"
+    spread_text = f" spread={qps_spread:.1f}%" if windows > 1 else ""
+    recall_text = f"{recall:.4f}" if recall is not None else "n/a"
+    print(
+        f"[concurrency] {engine:>8} clients={clients:>3} "
+        f"qps={qps:11,.1f} "
+        f"recall@{k}={recall_text} "
+        f"p50={merged['latency_p50_ms']:7.3f}ms "
+        f"p95={merged['latency_p95_ms']:7.3f}ms "
+        f"p99={merged['latency_p99_ms']:7.3f}ms "
+        f"efficiency={eff_text}{spread_text}"
+    )
+
+
+def _check_recall_spread(samples: Sequence[Tuple],
+                         clients: int) -> Optional[float]:
+    """How far the windows' recall figures spread, complaining if too far.
+
+    None, not 0.0, for a single window. A lone sample has no spread in the
+    same sense that it has no error bar, and 0.0 would claim the stronger
+    thing — that two windows were compared and agreed exactly, which is
+    precisely the evidence this field exists to carry. `report/render.py`
+    already draws that distinction for `qps_spread_pct` by consulting
+    `repeats`; this keeps the recall field honest without a reader having to.
+    """
+    recalls = [s[2] for s in samples if s[2] is not None]
+    if len(recalls) < 2:
+        return None
+    spread = max(recalls) - min(recalls)
+    if spread > RECALL_SPREAD_LIMIT:
+        # Loud, and on stderr, because this is not measurement noise. Recall
+        # is a property of the index and the ef, so two windows of one
+        # configuration disagreeing about it means either the query-to-truth
+        # mapping is wrong or the index moved underneath the measurement — and
+        # in both cases the QPS recorded beside it is not measuring what the
+        # record says it is.
+        print(
+            f"[concurrency] BUG: recall varied by {spread:.4f} across "
+            f"{len(recalls)} windows at {clients} client(s), above the "
+            f"{RECALL_SPREAD_LIMIT} limit. Recall cannot depend on the "
+            f"window, so either the query-to-ground-truth mapping is wrong "
+            f"or the index changed under the measurement; the QPS recorded "
+            f"beside it is suspect.",
+            file=sys.stderr, flush=True)
+    return spread
+
+
 def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
                 ef_search: int, index: IndexSpec, warmup: int,
-                duration_s: float):
-    """One warm-up and one measured window. Returns (qps, latency stats)."""
-    shards = [queries[c::clients] for c in range(clients)]
+                duration_s: float, truth: numpy.ndarray):
+    """One warm-up and one measured window.
+
+    Returns `(qps, latency stats, recall, queries recall covers)`. Recall is
+    computed here, inside the window that produced the results, so the median
+    window's throughput and the recall reported beside it are the same
+    window's numbers rather than two independently chosen ones.
+    """
+    shards = _shard_queries(queries, clients)
     ready = threading.Barrier(clients + 1)
     stop = threading.Event()
 
     workers = [
-        _Client(driver_factory, shards[c], k, ef_search, index,
+        _Client(driver_factory, shard, offsets, k, ef_search, index,
                 warmup, ready, stop)
-        for c in range(clients)
+        for shard, offsets in shards
     ]
     for w in workers:
         w.start()
@@ -239,4 +465,13 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
             f"first error: {failures[0]}")
 
     merged = merge_collectors([w.collector for w in workers], wall)
-    return merged.pop("qps"), merged
+
+    # One dict across every client. The shards are disjoint and the offsets
+    # are absolute positions, so no two clients can write the same key and the
+    # merge cannot lose a result.
+    results: Dict[int, List[int]] = {}
+    for w in workers:
+        results.update(w.results)
+    recall, recall_queries = _window_recall(results, truth, k)
+
+    return merged.pop("qps"), merged, recall, recall_queries
