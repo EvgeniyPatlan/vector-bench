@@ -20,6 +20,97 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 SCHEMA_VERSION = 1
 
+# Bump this in any change that alters what an ops number *means* — the shape of
+# the record is `SCHEMA_VERSION`'s business, this is the measurement's. A
+# concurrency figure measured with a per-client warmup is not the same quantity
+# as one measured without; until this constant existed nothing in the record
+# said which it was, so two such figures were indistinguishable and the report
+# had no way to keep them off one series.
+#
+# It is the ops counterpart of ANN_MEASUREMENT_VERSION
+# (`orchestrator/ann_pass.py`), which does the same job for the recall/QPS path
+# by feeding the fingerprint that keeps a 16 GB curve out of a 64 GB report.
+# The two are separate numbers on purpose: a fix to the churn workload must not
+# invalidate every recall curve ever measured.
+#
+# WHY IT IS NOT BESIDE ITS ANN COUNTERPART, which is the obvious place and the
+# first thing a reader will want to "fix": ops records are written from inside
+# the harness container, which bind-mounts `harness/` and nothing else.
+# `harness/` importing `orchestrator` raises ModuleNotFoundError seconds after
+# the server comes up and kills the run — it has happened, and
+# tests/test_config.py::TestHarnessIsolation exists to stop it happening again.
+# So the constant the ops writer needs lives on the harness side of that
+# boundary, and `orchestrator/manifest.py` imports it from here. That is the one
+# direction this dependency is allowed to point.
+#
+# Version 1 is implicit. Records written before this constant existed carry no
+# `extra.ops_measurement_version` at all, so every reader must treat an absent
+# value as 1 — see IMPLICIT_OPS_MEASUREMENT_VERSION — rather than as "unknown"
+# and therefore comparable with anything.
+OPS_MEASUREMENT_VERSION = 2
+
+#: Key under `Record.extra` that `Recorder.write` stamps the version into.
+#: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.
+OPS_MEASUREMENT_VERSION_KEY = "ops_measurement_version"
+
+#: What an ops record with no recorded version was measured by.
+IMPLICIT_OPS_MEASUREMENT_VERSION = 1
+
+#: The first version that was ever written into a record. It changed nothing
+#: measured -- it exists because version 1 was never written down, and a
+#: version nobody records cannot be compared against a later one.
+#:
+#: Distinct from OPS_MEASUREMENT_VERSION, which is whatever the harness is
+#: stamping today and moves on every bump. This one never moves: it names a
+#: historical fact about version 2, not the current state of the code.
+FIRST_RECORDED_OPS_MEASUREMENT_VERSION = 2
+
+# Versions that denote the SAME measurement, despite being different numbers.
+# A version 1 number and a version 2 number are the same quantity, so a run
+# holding both needs a report per version, not a re-measurement.
+# `docs/05-methodology.md` says exactly this and `tests/test_config.py` pins
+# the two together -- the refusal text used to tell operators to re-measure
+# data the docs call comparable, on the only version pair that occurs today.
+#
+# DERIVED from the two constants above rather than written as a literal, and
+# that is the whole safety property. A set spelled `frozenset({1, 2})` is an
+# extension point whose only lock is a comment asking people not to use it:
+# `{1, 2, 4}` would be a one-character edit asserting that version 4 measures
+# what version 1 did, and a subset-style test cannot see a set growing. Built
+# this way, a third member cannot be added without first naming a third
+# concept and saying in its own docstring why that version changed nothing --
+# which is the deliberateness the comment used to merely request.
+#
+# So: a bump that changes what a number means -- the per-client warmup, a
+# different filtered predicate -- simply cannot appear here, and the refusal
+# gives every pair this set does not cover the "two different measurements"
+# wording.
+OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({
+    IMPLICIT_OPS_MEASUREMENT_VERSION,
+    FIRST_RECORDED_OPS_MEASUREMENT_VERSION,
+})
+
+
+def ops_versions_measure_the_same_thing(versions: Iterable[Any]) -> bool:
+    """Whether every version given denotes the same measurement.
+
+    False for anything unrecognised, including a malformed value, so the
+    general "these are different measurements" wording is what an unknown
+    version gets. Saying two numbers are comparable is a claim; saying they
+    may not be is the safe default.
+    """
+    found = list(versions)
+    if not found:
+        return False
+    for version in found:
+        # A hand-edited manifest can hold a list or a dict here, and `in`
+        # against a frozenset hashes what it is given.
+        if not isinstance(version, int) or isinstance(version, bool):
+            return False
+        if version not in OPS_MEASUREMENT_EQUIVALENT_VERSIONS:
+            return False
+    return True
+
 # Phases a record can belong to. Used by the report generator to route records
 # to the right chart without inspecting which fields happen to be populated.
 PHASE_RECALL = "recall_qps"       # ann-benchmarks Pareto point
@@ -95,6 +186,44 @@ class Record:
         return {k: v for k, v in asdict(self).items() if v is not None and v != {}}
 
 
+def stamp_measurement_version(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of a record dict carrying the version that measured it.
+
+    Applied in `Recorder.write`, not in `RunContext.record_defaults`. The
+    defaults dict is the obvious home — it is the choke point every workload's
+    provenance already travels through, and it exists precisely so a new
+    workload cannot drop a field. But four of the workloads build their record
+    as `Record(**common, ..., extra={...})`, so an `extra` key in `common`
+    raises `TypeError: got multiple values for keyword argument 'extra'`.
+    Merging the two would mean editing every workload, and then a fifth
+    workload added later would still be free to forget.
+
+    `Recorder.write` is the only point every ops record provably passes
+    through, which is why the ALL_PHASES check lives there too. Stamping here
+    makes "every ops record carries the version" true by construction rather
+    than by convention.
+
+    Takes and returns a plain dict, and copies both it and its `extra` rather
+    than writing into either. Note what that does and does not protect: the
+    `Record` the caller still holds is protected by `to_dict()`, which goes
+    through `dataclasses.asdict` and therefore deep-copies `extra` before this
+    function ever sees it — not by anything here. What the copy here buys is
+    that this function is safe for any caller, including a future `to_dict`
+    that stops deep-copying to save the allocation. `TestOpsMeasurementVersion`
+    guards both halves separately, because an earlier version of that test
+    asserted the record was untouched and could not fail: asdict was doing the
+    work and a stamp written straight into `payload` passed it.
+    """
+    extra = dict(payload.get("extra") or {})
+    # Unconditional, not setdefault. A record reaching this Recorder was
+    # produced by this code, so this code's version is the honest answer; a
+    # caller-supplied value would be a claim about someone else's measurement,
+    # and a merge tool replaying old records through a new Recorder would
+    # relabel them as new ones if it were allowed to carry its own version in.
+    extra[OPS_MEASUREMENT_VERSION_KEY] = OPS_MEASUREMENT_VERSION
+    return {**payload, "extra": extra}
+
+
 class Recorder:
     """Append-only JSON-lines writer, safe for use from multiple threads."""
 
@@ -107,7 +236,10 @@ class Recorder:
     def write(self, record: Record) -> None:
         if record.phase not in ALL_PHASES:
             raise ValueError(f"unknown phase: {record.phase}")
-        line = json.dumps(record.to_dict(), sort_keys=True)
+        # After to_dict(), which drops an empty `extra`, so the stamp survives
+        # that filter instead of being removed by it.
+        line = json.dumps(stamp_measurement_version(record.to_dict()),
+                          sort_keys=True)
         with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()

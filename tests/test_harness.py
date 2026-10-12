@@ -421,3 +421,180 @@ class TestProgress:
             else:
                 os.environ["VB_PROGRESS_INTERVAL"] = old
             importlib.reload(prog)
+
+
+# ---------------------------------------------------------------------------
+# Ops measurement version
+# ---------------------------------------------------------------------------
+
+class TestOpsMeasurementVersion:
+    """Every ops record must say which measurement path produced it.
+
+    `ANN_MEASUREMENT_VERSION` already does this for the recall/QPS path, where
+    it feeds the fingerprint that keeps a 16 GB curve out of a 64 GB report.
+    The ops path had no equivalent, so a harness change that altered what a
+    number means left no trace in the number: a concurrency figure measured
+    before the change and one measured after were indistinguishable in the
+    record, and the report drew them as one series.
+
+    The stamp is applied by `Recorder.write` rather than by
+    `RunContext.record_defaults` -- the choke point every workload's provenance
+    already passes through -- because four of the workloads pass `extra=` to
+    `Record()` explicitly and an `extra` key in the defaults dict collides with
+    that keyword. `Recorder.write` is the only point every ops record provably
+    passes through, which is why `ALL_PHASES` is enforced there too.
+    """
+
+    def _written(self, tmp_path, record):
+        path = str(tmp_path / "ops.jsonl")
+        with records.Recorder(path) as recorder:
+            recorder.write(record)
+        return list(records.read_records(path))[0]
+
+    def test_the_constant_starts_at_two(self):
+        # Today's behaviour is implicitly 1: a record written before the
+        # constant existed carries no version at all, so 1 is the value every
+        # reader must infer for it and the first explicit value is 2.
+        assert records.OPS_MEASUREMENT_VERSION >= 2
+        assert records.IMPLICIT_OPS_MEASUREMENT_VERSION == 1
+        assert records.OPS_MEASUREMENT_VERSION_KEY == "ops_measurement_version"
+
+    def test_every_phase_carries_the_version(self, tmp_path):
+        """ALL_PHASES, not a sample: a new phase must not be able to opt out."""
+        for phase in records.ALL_PHASES:
+            got = self._written(tmp_path, records.Record(
+                run_id="r", engine="e", phase=phase, dataset="d", timestamp="t"))
+            assert got["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+                records.OPS_MEASUREMENT_VERSION, phase
+
+    def test_a_workload_supplied_extra_is_kept_beside_the_version(self, tmp_path):
+        # build.py writes extra={**driver.capabilities(), 'separable_build': ...}.
+        # The stamp must neither replace that dict nor be shadowed by it.
+        got = self._written(tmp_path, records.Record(
+            run_id="r", engine="e", phase=records.PHASE_BUILD, dataset="d",
+            timestamp="t", extra={"separable_build": False,
+                                  "incremental_index": True}))
+        assert got["extra"]["separable_build"] is False
+        assert got["extra"]["incremental_index"] is True
+        assert got["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+            records.OPS_MEASUREMENT_VERSION
+
+    def test_the_version_is_not_a_default_a_record_can_preset(self, tmp_path):
+        """The stamp is unconditional, not setdefault.
+
+        The version says which code produced the number. A record that arrives
+        already claiming one is making a claim about a measurement this
+        Recorder did not take -- a merge or replay tool feeding old records
+        through a new Recorder, say -- and honouring it would relabel this
+        run's own output. `setdefault` here passes every other test in this
+        class, so this is the only one that pins it.
+        """
+        got = self._written(tmp_path, records.Record(
+            run_id="r", engine="e", phase=records.PHASE_BUILD, dataset="d",
+            timestamp="t",
+            extra={records.OPS_MEASUREMENT_VERSION_KEY: 999}))
+        assert got["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+            records.OPS_MEASUREMENT_VERSION
+        assert got["extra"][records.OPS_MEASUREMENT_VERSION_KEY] != 999
+
+    def test_the_stamp_leaves_the_payload_it_was_given_alone(self):
+        """A direct unit test of the function, which is where the copy is.
+
+        The previous version of this guard asserted that `Recorder.write` left
+        the caller's `Record` untouched and could not fail: `to_dict()` goes
+        through `dataclasses.asdict`, which deep-copies `extra`, so the stamp
+        never sees the caller's dict however it is written. asdict was doing
+        the work the test credited to this code -- a stamp written straight
+        into `payload` passed the whole suite.
+
+        What is genuinely this function's contract is that it copies rather
+        than writes, which is what makes it safe for a caller that has not
+        been through asdict. The sibling test below pins the deep copy itself.
+        """
+        payload = {"phase": records.PHASE_BUILD,
+                   "extra": {"separable_build": False}}
+        stamped = records.stamp_measurement_version(payload)
+        assert payload == {"phase": records.PHASE_BUILD,
+                           "extra": {"separable_build": False}}
+        assert stamped["extra"] is not payload["extra"]
+        assert stamped["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+            records.OPS_MEASUREMENT_VERSION
+
+    def test_to_dict_hands_back_a_private_extra(self):
+        """The deep copy `Recorder.write` relies on for the caller's Record.
+
+        Not decoration: `to_dict` is a hot path that builds a dict per record
+        and `asdict`'s recursive copy is the obvious thing to replace with a
+        comprehension over `__dataclass_fields__`. Doing so would make the
+        stamp -- and `attach_peak_rss`, and anything else that edits a record
+        dict -- reach back into the live `Record`.
+        """
+        shared = {"separable_build": False}
+        record = records.Record(
+            run_id="r", engine="e", phase=records.PHASE_BUILD, dataset="d",
+            timestamp="t", extra=shared)
+        as_dict = record.to_dict()
+        assert as_dict["extra"] is not shared
+        as_dict["extra"]["scribbled"] = True
+        assert shared == {"separable_build": False}
+        assert record.extra == {"separable_build": False}
+
+    def test_an_empty_extra_still_produces_the_key(self, tmp_path):
+        # Record.to_dict() drops `extra` when it is empty, so the stamp has to
+        # survive that filter rather than be applied before it. Asserted on the
+        # value, not just membership -- a key present with the wrong number is
+        # the failure that matters.
+        got = self._written(tmp_path, records.Record(
+            run_id="r", engine="e", phase=records.PHASE_INGEST, dataset="d",
+            timestamp="t"))
+        assert got["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+            records.OPS_MEASUREMENT_VERSION
+
+    def test_write_many_stamps_every_record(self, tmp_path):
+        path = str(tmp_path / "ops.jsonl")
+        with records.Recorder(path) as recorder:
+            recorder.write_many([
+                records.Record(run_id="r", engine="e", phase=p, dataset="d",
+                               timestamp="t")
+                for p in (records.PHASE_INGEST, records.PHASE_CHURN)
+            ])
+        loaded = list(records.read_records(path))
+        assert len(loaded) == 2
+        assert all(r["extra"][records.OPS_MEASUREMENT_VERSION_KEY]
+                   == records.OPS_MEASUREMENT_VERSION for r in loaded)
+
+    def test_a_real_workloads_records_carry_it(self, tmp_path):
+        """Through the actual path, including the files this change cannot edit.
+
+        build.py writes two records: an ingest record with no `extra` at all
+        and a build record with an explicit `extra`. Both must come out
+        stamped, which is the whole claim -- the version reaches records
+        written by workload modules that know nothing about it.
+        """
+        from harness.workloads import build as build_workload
+        from harness.workloads.context import RunContext
+
+        from .fake_driver import K, FakeDriver, index_spec, tiny_dataset
+
+        dataset = tiny_dataset()
+        recorder = records.Recorder(str(tmp_path / "ops-fake.jsonl"))
+        try:
+            ctx = RunContext(run_id="t1a", resource_pass="normalized",
+                             recorder=recorder, engine="fake", engine_tag="none",
+                             march="x86-64-v3", k=K,
+                             cache_dir=str(tmp_path / "cache"))
+            driver = FakeDriver(dim=dataset.dim, metric=dataset.metric)
+            driver.connect()
+            build_workload.run(ctx, driver, dataset, index_spec(dataset))
+        finally:
+            recorder.close()
+
+        written = list(records.read_records(str(tmp_path / "ops-fake.jsonl")))
+        assert [r["phase"] for r in written] == [records.PHASE_INGEST,
+                                                 records.PHASE_BUILD]
+        for r in written:
+            assert r["extra"][records.OPS_MEASUREMENT_VERSION_KEY] == \
+                records.OPS_MEASUREMENT_VERSION, r["phase"]
+        # The build record's own extra is still there, so the stamp did not
+        # displace what build.py wrote.
+        assert written[1]["extra"]["separable_build"] is False

@@ -15,6 +15,13 @@ import platform
 import subprocess
 from typing import Any, Dict, List, Optional
 
+# Imported, never re-declared. The constant lives in the harness because ops
+# records are written from inside the harness container, which mounts harness/
+# only and must not import orchestrator; the orchestrator has the whole repo and
+# can read across. A second copy here would drift from the one that does the
+# stamping, and the manifest would then disagree with its own records.
+from harness.metrics.records import OPS_MEASUREMENT_VERSION
+
 MANIFEST_NAME = "run-manifest.json"
 
 
@@ -65,7 +72,11 @@ class Manifest:
             "host": {},
             "engines": {},
             "phases": [],
-            "config": {},
+            # Stamped at creation and never again -- see set_config. A run was
+            # measured under the version it was measured under, and this is the
+            # only moment at which "the code running now" and "the code that
+            # produced the records in this directory" are the same thing.
+            "config": {"ops_measurement_version": OPS_MEASUREMENT_VERSION},
             "warnings": [],
         }
         self.save()
@@ -96,12 +107,47 @@ class Manifest:
 
     def set_config(self, profile: Dict[str, Any], resource_pass: str,
                    resolved: Any, extra: Optional[Dict[str, Any]] = None) -> None:
-        self.data["config"] = {
+        # Carried forward from whatever this directory already said, never
+        # re-stamped, and never invented for a manifest that does not have it.
+        #
+        # This method is called unconditionally per (pass, engine) in
+        # `cli.py`, *before* the checkpoint skip -- so `run --resume --run-id
+        # <old-run>` reaches it even when every unit is skipped and nothing is
+        # measured. Writing the current constant here therefore rewrote an
+        # archived run's manifest to a version its records were never measured
+        # under, and the report then refused that run forever. Re-stamping is
+        # the provenance bug; the refusal was right.
+        #
+        # Absent stays absent for the same reason. A run recorded before this
+        # key existed was measured under some version this code cannot know,
+        # and `report/loaders.py` reads a missing key as "nothing is declared,
+        # check nothing" -- which is correct, where inventing today's constant
+        # would be a claim about a measurement nobody here witnessed.
+        #
+        # A resume that *does* bump the version and then measures something new
+        # is still caught, by the other half of the check: the directory ends
+        # up holding records at two versions.
+        declared = (self.data.get("config") or {}).get(
+            "ops_measurement_version")
+        config: Dict[str, Any] = {
             "profile": profile,
             "resource_pass": resource_pass,
             "resolved_resources": resolved.as_dict() if hasattr(resolved, "as_dict") else resolved,
             **(extra or {}),
         }
+        # After the splat either way, so a caller's `extra` cannot smuggle a
+        # version in. It describes the code that produced the numbers, not a
+        # caller's opinion of it.
+        config.pop("ops_measurement_version", None)
+        if declared is not None:
+            config["ops_measurement_version"] = declared
+        self.data["config"] = config
+        # Persisted here rather than left to the next populator's save(). Every
+        # other method on this class saves, and set_config did not only because
+        # set_engine always happened to follow it — so a run that died between
+        # the two left a manifest with no config block at all, and the report
+        # refuses a manifest it cannot read a resource pass out of.
+        self.save()
         for warning in getattr(resolved, "warnings", []) or []:
             self.add_warning(warning)
 

@@ -150,9 +150,26 @@ Every run writes `results/<run-id>/run-manifest.json` containing:
 - CPU model, flags (`avx512f`, `avx2`, `avx_vnni`, …), core topology, hybrid-core
   detection result, total RAM, kernel version, Docker version.
 - Start/end timestamps per phase.
+- The ops measurement version (`config.ops_measurement_version`), which is also
+  written into every ops record as `extra.ops_measurement_version`.
 
 A result without its manifest is not a result. The report generator refuses to
 emit a report for a run directory with no manifest.
+
+The ops measurement version is bumped whenever a change to `harness/` alters what
+an ops number means, as distinct from `SCHEMA_VERSION`, which describes only the
+record's shape; records carrying no version at all were measured under version 1.
+**Version 2 measures exactly what version 1 measured** — it is simply the first
+value the scheme writes down, so a version 1 number and a version 2 number are
+directly comparable and nothing needs re-measuring to get one. That pair is
+listed in `OPS_MEASUREMENT_EQUIVALENT_VERSIONS` (`harness/metrics/records.py`),
+which is what the refusal below reads so that it never tells an operator to
+re-measure numbers this page calls comparable. The report refuses
+to draw records from two versions on one chart, naming both versions and the
+records involved, exactly as `ann_fingerprint` keeps a 16 GB recall curve out of a
+report whose manifest says 64 GB. A version already recorded in a manifest is
+carried forward untouched rather than re-stamped, so resuming an old run does not
+relabel measurements it did not take.
 
 ## 6. What would change the conclusions
 

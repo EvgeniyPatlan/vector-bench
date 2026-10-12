@@ -18,6 +18,24 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import numpy
 
+# The measurement-version machinery moved to its own module when this file
+# reached 793 of its 800 allowed lines. Imported as a module and called through
+# it, so there is exactly one place to patch when a test needs to stand the
+# guard down -- binding the functions here as well would give every reader its
+# own copy of the reference and a patch would reach only some of them.
+from report import measurement_versions as _versions
+
+# Re-exported, not re-implemented: `from report.loaders import ...` is how the
+# existing callers and tests reach these. New code should import
+# `report.measurement_versions` directly.
+from report.measurement_versions import (  # noqa: F401
+    MixedMeasurementVersions,
+    declared_ops_version,
+    ops_measurement_version,
+    ops_measurement_versions,
+    refuse_mixed_measurement_versions,
+)
+
 
 def knn_recall(dataset_distances: numpy.ndarray, run_distances: numpy.ndarray,
                count: int, epsilon: float = 1e-3) -> float:
@@ -152,7 +170,12 @@ def _pass_from_path(path: str, annb_dir: str) -> Optional[str]:
 
 
 def load_ops_records(run_dir: str) -> List[Dict[str, Any]]:
-    """Read every ops-harness JSONL file in a run directory."""
+    """Read every ops-harness JSONL file in a run directory.
+
+    Raises MixedMeasurementVersions if the directory holds records from more
+    than one ops measurement version, or records a version behind the manifest
+    sitting above them. See refuse_mixed_measurement_versions.
+    """
     from harness.metrics.records import read_records
 
     out: List[Dict[str, Any]] = []
@@ -179,6 +202,12 @@ def load_ops_records(run_dir: str) -> List[Dict[str, Any]]:
             for r in records:
                 r["engine"] = engine
         out.extend(records)
+    # After the relabelling above, so the records the refusal names carry the
+    # engine the operator will see in the filename rather than the driver's own
+    # name. Before anything else in the report has run.
+    _versions.refuse_mixed_measurement_versions(
+        out, source=run_dir,
+        declared=_versions.declared_ops_version(run_dir))
     return out
 
 

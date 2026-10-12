@@ -27,6 +27,7 @@ for candidate in (VB_ROOT, "/opt", os.path.dirname(os.path.abspath(__file__))):
         sys.path.insert(0, candidate)
 
 from report import charts, loaders  # noqa: E402
+from report import measurement_versions as versions  # noqa: E402
 from report.render import (adopt_presentation as render_adopt_presentation,  # noqa: E402
                            render_html, render_markdown)
 
@@ -450,46 +451,55 @@ def main(argv: Optional[List[str]] = None) -> int:
         datasets_dir = "/datasets"
     out_dir = args.output_dir or os.path.join(run_dir, "report")
     chart_dir = os.path.join(out_dir, "charts")
-    os.makedirs(chart_dir, exist_ok=True)
-    # Every chart is redrawn from the records on each run, so anything already
-    # here is from a previous one. Left in place they accumulate: narrowing a
-    # report to one corpus with --datasets leaves the other corpus's charts
-    # sitting beside the new ones, named after a dataset the report no longer
-    # covers. Nothing references them, which is exactly what makes them
-    # dangerous -- a stale file that nothing points at is one somebody opens
-    # by hand and believes.
-    removed = 0
-    for name in os.listdir(chart_dir):
-        if name.endswith((".png", ".svg")):
-            try:
-                os.remove(os.path.join(chart_dir, name))
-                removed += 1
-            except OSError:
-                pass
-    if removed:
-        print(f"[report] cleared {removed} chart(s) from the previous report")
 
     print(f"[report] run       : {run_id}")
     print(f"[report] ann-bench : {annb_dir}")
     print(f"[report] datasets  : {datasets_dir}")
     print(f"[report] output    : {out_dir}")
 
+    # Loaded before anything is created or deleted under out_dir. The chart
+    # cleanup below used to run first, so a regeneration that then refused --
+    # or simply found no records -- left the previous report as a page of
+    # broken images with index.html still pointing at the files it had just
+    # removed. A report that cannot be rebuilt should leave the one that
+    # already works alone.
     records: List[Dict[str, Any]] = []
-    if args.from_records:
-        # A run directory is routinely copied off the machine that produced it,
-        # and the ann-benchmarks HDF5 tree is not copied with it. The merged
-        # records file is self-contained, so a report can be rebuilt from an
-        # archived run without re-running anything.
-        with open(args.from_records) as fh:
-            records = [json.loads(line) for line in fh if line.strip()]
-        print(f"[report] records from {args.from_records}: {len(records)}")
-    else:
-        records += loaders.load_ops_records(run_dir)
-        print(f"[report] ops records: {len(records)}")
+    try:
+        if args.from_records:
+            # A run directory is routinely copied off the machine that produced
+            # it, and the ann-benchmarks HDF5 tree is not copied with it. The
+            # merged records file is self-contained, so a report can be rebuilt
+            # from an archived run without re-running anything.
+            with open(args.from_records) as fh:
+                records = [json.loads(line) for line in fh if line.strip()]
+            print(f"[report] records from {args.from_records}: {len(records)}")
+            # The same guard load_ops_records applies, because this path does
+            # not go through it. records.jsonl is written by this generator and
+            # read back by the web UI, so a mixed set admitted here does not
+            # just draw one bad chart -- it is persisted below as the file
+            # webui/records.py prefers over the raw ops records, and every
+            # later reader inherits it.
+            # `declared` as well, so this path gets the whole guard and not
+            # half of it. The manifest that will be printed above these numbers
+            # is run_dir's, whatever file the records came out of -- so it is
+            # run_dir's declared version they have to agree with.
+            versions.refuse_mixed_measurement_versions(
+                records, source=args.from_records,
+                declared=versions.declared_ops_version(run_dir))
+        else:
+            records += loaders.load_ops_records(run_dir)
+            print(f"[report] ops records: {len(records)}")
 
-        annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
-        records += annb
-        print(f"[report] ann-benchmarks records: {len(annb)}")
+            annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
+            records += annb
+            print(f"[report] ann-benchmarks records: {len(annb)}")
+    except versions.MixedMeasurementVersions as exc:
+        # Reported the way this module reports every other refusal to produce a
+        # report -- a message and a non-zero exit, not a traceback. The message
+        # is multi-line and names what to do; a stack trace above it would bury
+        # that.
+        print(f"[report] {exc}", file=sys.stderr)
+        return 2
 
     if args.datasets:
         wanted = {d.strip() for d in args.datasets.split(",") if d.strip()}
@@ -509,6 +519,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not records:
         print("[report] no records found — nothing to report", file=sys.stderr)
         return 1
+
+    # Only now, with records in hand and every refusal behind us, is the output
+    # directory touched. Every chart is redrawn from the records on each run, so
+    # anything already here is from a previous one. Left in place they
+    # accumulate: narrowing a report to one corpus with --datasets leaves the
+    # other corpus's charts sitting beside the new ones, named after a dataset
+    # the report no longer covers. Nothing references them, which is exactly
+    # what makes them dangerous -- a stale file that nothing points at is one
+    # somebody opens by hand and believes.
+    os.makedirs(chart_dir, exist_ok=True)
+    removed = 0
+    for name in os.listdir(chart_dir):
+        if name.endswith((".png", ".svg")):
+            try:
+                os.remove(os.path.join(chart_dir, name))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"[report] cleared {removed} chart(s) from the previous report")
 
     memory = loaders.load_memory_series(run_dir)
 
