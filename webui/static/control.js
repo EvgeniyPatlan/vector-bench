@@ -38,13 +38,43 @@ async function refreshEstimate() {
     clear(box);
     const per = Object.entries(est.per_engine_hours || {})
       .map(([e, h]) => `${e} ~${h.toFixed(1)}h`).join("  |  ");
+    // total_hours is ingest and stays ingest, which is why this line still says
+    // so. The run figure is worst_case_total_hours, below.
     box.append(el("strong", {}, `estimated ingest ~${est.total_hours.toFixed(1)} h`),
       el("div", { class: "muted" },
         `${est.passes} pass(es) · ${est.m_values} ann M value(s) · ${est.ops_m_values} ops M value(s)`),
       per ? el("div", { class: "muted" }, per) : null);
+    // Query time, term by term. A term whose worst case is a budget rather
+    // than a duration shows both figures: printing one number for a ceiling
+    // claims a certainty the estimate does not have.
+    const terms = est.query_terms || [];
+    for (const t of terms) {
+      let figure;
+      if (!t.quantified) figure = "cost not quantified";
+      else if (Math.abs(t.worst_hours - t.typical_hours) < 0.05) figure = `~${t.typical_hours.toFixed(1)} h`;
+      else figure = `~${t.typical_hours.toFixed(1)} h typical, ~${t.worst_hours.toFixed(1)} h worst case`;
+      box.append(el("div", { class: "muted" }, `${t.name} ${figure} — ${t.basis}`));
+    }
+    box.append(el("strong", {},
+      `estimated run ~${est.typical_total_hours.toFixed(1)} h typical, `
+      + `~${est.worst_case_total_hours.toFixed(1)} h worst case`),
+      el("div", { class: "muted" },
+        "Plan against the worst case: a run longer than it is a bug."));
+    if (terms.length && !est.query_worst_case_is_a_ceiling) {
+      box.append(el("div", { class: "warn" },
+        "Not yet a ceiling: nothing caps "
+        + terms.filter((t) => !t.bounded).map((t) => t.name).join(", ")
+        + ", so a run can exceed the worst case until that is fixed."));
+    }
     if (est.datasets_without_estimate.length) {
       box.append(el("div", { class: "warn" },
         `no measured ingest rate for: ${est.datasets_without_estimate.join(", ")}`));
+    }
+    if (est.query_costs_not_modelled.length) {
+      box.append(el("div", { class: "warn" },
+        "Neither figure includes these — they cost a number of queries and "
+        + `there is no measured query rate for ${est.engines_without_query_rate.join(", ")}: `
+        + est.query_costs_not_modelled.join("; ")));
     }
     if (est.long_run) {
       box.append(el("div", { class: "warn" },

@@ -182,7 +182,9 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~272 h of ingest before a single query runs. Before proposing a run,
+--resource-pass both` is ~726 h of ingest before a single query runs, and ~903 h of run time
+in the worst case once querying is counted — all six engines, which is what that command
+measures when `--engines` is omitted. Before proposing a run,
 check `docs/07-planning-a-run.md` and the estimate the run prints. Prefer `dev` → `smoke` when
 validating framework changes; long profiles are the user's call, not a default.
 

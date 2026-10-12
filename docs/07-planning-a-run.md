@@ -54,16 +54,30 @@ everything else.
 ## 2. What each profile actually costs
 
 Ingest time only, before any query runs. Three engines, from the measured rates
-above.
+above — hand arithmetic, kept because it shows where the cost comes from. **The
+live figures are in the next table**, and two rows here no longer agree with any
+method:
 
 | Profile | Datasets | Passes | Ingest |
 | --- | --- | --- | ---: |
 | `dev` | tiny synthetic | 1 | ~1 min |
 | `smoke` | fashion-mnist | 1 | ~30 min |
-| `quick` | fashion-mnist, glove-100 | 1 | ~14 h |
+| `quick` | fashion-mnist, glove-100 | 1 | ~35 h † |
 | `main` | glove-100, sift-128 | 1 | **~46 h (~2 days)** |
 | `full` | all four | 2 | **~272 h (~11 days)** |
-| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) |
+| `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) ‡ |
+
+† **Corrected.** This row said ~14 h, which was not a measurement of anything:
+it was the same hand arithmetic as the rows around it against an M grid
+`quick` no longer has. It sweeps `ann.m_values: [8, 16, 32]` and every M value
+reloads the whole corpus, so the hand method now gives ~35 h and the estimator
+says ~36 h.
+
+‡ **Measured, but for one load per engine, not for the run.** The 10.5 h is the
+real figure from §6 — 3.3 h MariaDB, 6.6 h AliSQL, ~0.5 h pgvector — and it is
+one load each. The profile runs the recall phase and the ops phase, and each
+loads the corpus for its own M value, so the run pays it about twice: the
+estimator says ~21 h.
 
 `full` describes the complete measurement space. It is not a recommendation.
 Running it end to end is a deliberate decision to spend a fortnight, and
@@ -73,28 +87,93 @@ dimensions it is ~19 h of loading per phase.
 **`main` is the profile to run.** It was sized from these measurements to
 answer the questions the smoke run raised without spending a fortnight.
 
-A run prints its own estimate before starting:
+### Ingest is not the run
+
+The table above is loading only, and so was the only estimate this framework
+printed for most of its life. **Querying is not free**, and for a profile like
+`smoke` it is most of the cost: half an hour of loading against a churn budget
+that can run for two. What the estimator prints now is both, the same three
+engines:
+
+| Profile | Passes | Ingest | Query, typical | Query, worst case | Run, worst case |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `dev` | 1 | ~0.0 h | ~0.0 h | ~0.0 h | **~0.0 h** |
+| `smoke` | 1 | ~0.3 h | ~0.0 h | ~2.0 h | **~2.3 h** |
+| `quick` | 1 | ~36.2 h | ~1.8 h | ~8.2 h | **~44.4 h** |
+| `main` | 1 | ~51.1 h | ~3.6 h | ~8.4 h | **~59.5 h** |
+| `full` | 2 | ~532.0 h | ~37.4 h | ~100.8 h | **~632.8 h** |
+| `mariadb-blog` | 1 | ~21.3 h | ~1.2 h | ~1.8 h | **~23.1 h** |
+
+The ingest column differs from the table above it because that one was computed
+by hand from §1's three headline rates, while the estimator uses the measured
+per-`(engine, dataset)` figures in `_MEASURED_ROWS_PER_S` and scales for corpus
+size and dimensionality. The estimator is the live number; §8 explains why it
+changes when someone measures a rate.
+
+**Plan against the worst case.** A run longer than the printed worst case is a
+bug, and that is the point of printing it. Two things to understand about what
+it is:
+
+* It is a bound over **the configuration, not the machine.** Where a cost is a
+  budget — `ops.churn_budget_s`, half an hour per churn step — the worst case
+  is that budget, whatever the engine does inside it. Where it is a modelled
+  duration, it is modelled from rates measured on one machine and yours will
+  differ. The typical figure is what the configuration should cost; the worst
+  case is what it cannot be made to exceed by an engine behaving badly.
+* It is honest about its holes, and prints them. Filtered search runs a fixed
+  number of queries at a rate nothing here has measured, with nothing capping
+  the loop, so it is listed with its shape and no duration — and the run figure
+  says, in as many words, that it is not yet a ceiling. The recall sweep, the
+  churn re-measurements and the concurrency warm-ups are named under the total
+  for the same reason. A dataset with no measured ingest rate has always been
+  reported this way; this is the same treatment for query time.
+
+A run prints all of it before starting:
 
 ```
 estimated ingest time (loading only, before any queries):
-  mariadb ~12.1 h  |  alisql ~33.1 h  |  pgvector ~0.6 h
-  total ~45.8 h across 1 pass(es), 2 M value(s)
-  ! This is a long run...
+  mariadb ~13.2 h  |  alisql ~37.2 h  |  pgvector ~0.7 h
+  total ~51.1 h across 1 pass(es), 2 M value(s)
+  ! This is a long run. Each M value costs a full reload of every dataset,
+    and MHNSW/VIDX build incrementally at a few hundred rows/s. Reduce
+    ann.m_values or the dataset list to cut it roughly proportionally.
+
+estimated query time (the parts the profile puts a clock on):
+  concurrency windows  ~0.4 h
+                         6 client count(s) x 30s per ops unit, fixed by the profile not by the engine
+  filtered search      cost not quantified
+                         2 selectivities x 500 queries = 1,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured and with no budget anywhere in the run to cap it
+  churn re-insert      ~3.2 h typical, ~8.0 h worst case
+                         e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
+  subtotal ~3.6 h typical, ~8.4 h worst case
+
+estimated run time ~54.7 h typical, ~59.5 h worst case
+  ! Not yet a ceiling: nothing caps filtered search, so a run can exceed the worst case until that is fixed.
+  Plan against it all the same: it is the largest figure this configuration justifies.
+  ! Neither figure includes the costs below. They are a number of queries, and
+    there is no measured query rate for mariadb, alisql, pgvector to multiply them by:
+      recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set
+      churn re-measurement: ops.max_queries before churn and again after each churn fraction
+      churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
+      concurrency warm-up: 50 queries per client before each measured window
 ```
 
 Read it. It is the cheapest part of the whole exercise.
 
-The web UI shows the same figure on its Profiles & launch page, updating as you
-change the engine list, the dataset list or the resource pass — so you can find
-an affordable scope before committing rather than after. It is the same
-calculation, not a second one: both call `estimate_load_hours()`, so they cannot
+The web UI shows the same breakdown on its Profiles & launch page — ingest, each
+query term, and the worst-case total — updating as you change the engine list,
+the dataset list or the resource pass, so you can find an affordable scope before
+committing rather than after. It is the same calculation, not a second one: both
+call `estimate_load_hours()` in `orchestrator/estimate.py`, so they cannot
 disagree about the same plan. See [08-web-ui.md](08-web-ui.md).
 
 ---
 
 ## 3. Choosing a scope
 
-Measured options, all three engines:
+Measured options, all three engines. **Ingest only** — add query time from the
+second table in §2, which the estimator prints for whatever scope you actually
+ask for.
 
 | Scope | Ingest |
 | --- | ---: |
@@ -390,5 +469,5 @@ An earlier version of the estimator used rates guessed from a 60,000-row smoke
 run and was optimistic by 2.7× against the first real 1.18M-row load. That is
 worse than having no estimate at all, because it invites you to start something
 you would not have started. If your measured rates diverge from these, update
-`_INGEST_ROWS_PER_S` in `orchestrator/cli.py` — the estimate is only as honest
+`_INGEST_ROWS_PER_S` in `orchestrator/estimate.py` — the estimate is only as honest
 as the numbers behind it.
