@@ -1271,10 +1271,16 @@ class TestTheFloorStillWritesARecord:
             below, because the failure is a dead ops unit rather than a wrong
             number.
 
-        `ops.churn_budget_s` shares the hole verbatim and is deliberately
-        UNCHANGED: its enforcement lives in `harness/workloads/churn.py`,
-        which is T4a's file, and fixing the emission without the enforcement
-        would move the failure rather than remove it.
+        `ops.churn_budget_s` shared the hole verbatim and T4a closed it, both
+        halves at once: the emission here, through the same `_budget_arg`, and
+        the enforcement in `churn.run`, which converts a non-positive budget
+        into an infinite deadline. Both halves were needed -- fixing the
+        emission alone would have moved the failure out of argparse and into a
+        workload whose first deadline check fires immediately, which is the
+        shape that made every filtered point record ZERO queries. The last
+        assertion below is churn's end of that, kept in this test rather than
+        moved because the two keys must not drift apart again: a reader adding
+        a third budget key should find both of them pinned in one place.
         """
         from harness.main import parse_args
         from orchestrator import ops_pass
@@ -1312,14 +1318,15 @@ class TestTheFloorStillWritesARecord:
                 "--output", "/tmp/o", "--filtered-budget", "None"])
         assert caught.value.code == 2
 
-        # churn's hole, named rather than fixed.
+        # churn's hole, fixed by T4a: both halves, emission and enforcement.
         churn = ops_pass.harness_args(
             {"name": "t", "k": 10,
              "ops": {"workloads": ["churn"], "churn_budget_s": None}},
             16, "mariadb", None, "normalized", resources)
-        assert churn[churn.index("--churn-budget") + 1] == "None", (
-            "churn_budget_s: null still emits 'None'; that is T4a's to fix "
-            "and this test exists so the fix is not mistaken for done")
+        assert churn[churn.index("--churn-budget") + 1] == "0", (
+            "churn_budget_s: null must emit '0' (no cap), not the string "
+            "'None' that argparse rejects with SystemExit(2); T4a fixed the "
+            "emission here and the enforcement in churn.run")
 
 
 # ---------------------------------------------------------------------------

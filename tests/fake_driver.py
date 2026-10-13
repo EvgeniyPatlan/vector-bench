@@ -24,6 +24,11 @@ behaviour in milliseconds:
   number — see `load()`,
 * tombstones that cost recall until `maintain()` runs (`tombstone_penalty`), so
   the churn workload has something to measure degrading,
+* the three PR 4 churn hooks, each able to consume a controllable amount of
+  time (`index_sync_s`, `maintain_latency_s`) and each recording that it was
+  called, in order, in `churn_hook_calls` — the hooks all report seconds, and
+  a fake that returns instantly makes "the hook ran and was fast" and "the
+  hook never ran" the same recorded 0.0,
 * post-filtering over the top-`ef` candidate list only, so short result sets
   and the correlated-filter failure mode arise from the model rather than
   being faked per test,
@@ -110,6 +115,9 @@ class FakeDriver(EngineDriver):
                  latency_s: float = 0.0, latency_jitter: float = 0.0,
                  load_latency_s: float = 0.0,
                  tombstone_penalty: float = 1.0,
+                 index_sync_s: float = 0.0,
+                 maintain_latency_s: float = 0.0,
+                 maintain_description: Optional[str] = None,
                  uses_vector_index: bool = True,
                  capabilities: Optional[Dict[str, Any]] = None,
                  version: str = "fake-engine 0.1",
@@ -122,6 +130,27 @@ class FakeDriver(EngineDriver):
         self.latency_jitter = float(latency_jitter)
         self.load_latency_s = float(load_latency_s)
         self.tombstone_penalty = float(tombstone_penalty)
+        # PR 4's churn hooks. Each of the two timed ones spends a settable
+        # amount of wall clock, because the value the workload records is
+        # `round(seconds, 3)` and an instant hook records 0.0 -- which is also
+        # what a hook that was never called records, and what a hook returning
+        # the wrong thing records. A test that wants to prove the call
+        # happened sets a duration and asserts the recorded number is it.
+        self.index_sync_s = float(index_sync_s)
+        self.maintain_latency_s = float(maintain_latency_s)
+        # None keeps `maintain()`'s pre-PR-4 return value, the reclaimed row
+        # COUNT, which `tests/test_fake_driver.py:274` and
+        # `tests/test_t3b_drivers.py:1999` assert on. Set it to a string and
+        # `maintain()` returns that instead, which is the `Optional[str]`
+        # shape PR 4 §4.1 gives the hook and the only shape `churn.run`
+        # treats as a repair path.
+        self.maintain_description = maintain_description
+        # Declared from the same knob, because the two must not disagree: a
+        # record carrying `maintenance: "..."` beside `repair_path: "none"`
+        # would say in one key that a repair ran and in another that this
+        # engine has none, and a report reading either would be right.
+        self.repair_path = ("none" if maintain_description is None
+                            else "fake_maintain")
         self.uses_vector_index = bool(uses_vector_index)
         # Deliberately one key, not the three the base class defaults to: a
         # test should see exactly which capability the workload under test
@@ -160,6 +189,14 @@ class FakeDriver(EngineDriver):
         self.create_schema_calls = 0
         self.create_index_calls = 0
         self.drop_schema_calls = 0
+        # Every churn hook call, in order, as (hook, argument) pairs. A list
+        # and not three counters for the reason `iterative_scan_calls` is a
+        # list: PR 4 §4.2 fixes the ORDER of these calls against the
+        # measurements between them -- `prepare_churn` before the baseline,
+        # `wait_index_synced` after the re-insert, `maintain` between the two
+        # records -- and "each was called once" cannot tell that sequence from
+        # any other permutation of it.
+        self.churn_hook_calls: List[tuple] = []
 
     # -- lifecycle ------------------------------------------------------
 
@@ -183,6 +220,9 @@ class FakeDriver(EngineDriver):
             latency_s=self.latency_s, latency_jitter=self.latency_jitter,
             load_latency_s=self.load_latency_s,
             tombstone_penalty=self.tombstone_penalty,
+            index_sync_s=self.index_sync_s,
+            maintain_latency_s=self.maintain_latency_s,
+            maintain_description=self.maintain_description,
             uses_vector_index=self.uses_vector_index,
             capabilities=self._capabilities, version=self._version,
             tag_columns=self._tag_columns,
@@ -258,13 +298,64 @@ class FakeDriver(EngineDriver):
             self._store.rows = replace(
                 rows, tombstoned=(rows.tombstoned | victims))
 
-    def maintain(self) -> int:
+    def prepare_churn(self) -> None:
+        """Record that the workload asked, and change nothing.
+
+        Deliberately not modelled, for the reason `set_iterative_scan` is not:
+        the real hook turns off pgvector's autovacuum, and a fake that invented
+        a recall effect for it would invite a test to assert a number this fake
+        made up. What a test may assert is that the workload called it once and
+        called it before the baseline measurement, which is what the call log
+        is for.
+        """
+        self.churn_hook_calls.append(("prepare_churn", None))
+
+    def wait_index_synced(self, expected_rows: int) -> float:
+        """Spend `index_sync_s` seconds and report having spent them.
+
+        The spending is the point. `churn.run` records this return value as
+        `extra.index_sync_s` rounded to three decimals, so against a hook that
+        returns instantly the record reads 0.0 whether the hook ran, never
+        ran, or returned the wrong thing -- and `0.0` is a number three
+        separate bugs produce. A test sets `index_sync_s=0.25` and asserts the
+        record says 0.25.
+
+        `time.sleep` rather than a returned constant, so the number is a real
+        elapsed time measured the way a driver measures one, and a workload
+        that recorded a hard-coded value instead of the hook's would disagree
+        with it.
+        """
+        self.churn_hook_calls.append(("wait_index_synced", int(expected_rows)))
+        started = time.perf_counter()
+        if self.index_sync_s > 0.0:
+            time.sleep(self.index_sync_s)
+        return time.perf_counter() - started
+
+    def maintain(self):
         """Reclaim tombstoned rows, as an index maintenance pass would.
 
-        Returns the number of rows purged. Not part of `EngineDriver`: it is
-        the lever a test needs to show that the recall a churned index lost is
-        the tombstones' fault and comes back when they go.
+        Returns the number of rows purged, unless `maintain_description` is
+        set, in which case it returns that string. Both shapes are needed and
+        neither can replace the other: the count is what
+        `tests/test_fake_driver.py` and `tests/test_t3b_drivers.py` assert on
+        and predates PR 4, while PR 4 §4.1 types the hook `Optional[str]` --
+        "a short description of what ran" -- and `churn.run` writes that
+        description into a record a human reads. A count under that key would
+        be a number presented as prose.
+
+        That is also why the default stays the count rather than becoming a
+        description: a `FakeDriver` nobody configured must not grow a repair
+        path, or every existing churn test would start recording a second
+        record per fraction.
+
+        `maintain_latency_s` is spent here for the same reason
+        `wait_index_synced` spends its own: `churn.run` times this call and
+        records `extra.maintenance_s`, and an instant reclaim records 0.0,
+        which is what a maintenance step that never ran also records.
         """
+        self.churn_hook_calls.append(("maintain", None))
+        if self.maintain_latency_s > 0.0:
+            time.sleep(self.maintain_latency_s)
         with self._store.lock:
             rows = self._store.rows
             purged = int(rows.tombstoned.sum())
@@ -274,7 +365,9 @@ class FakeDriver(EngineDriver):
                 tags=rows.tags[keep], ctags=rows.ctags[keep],
                 tombstoned=rows.tombstoned[keep],
             )
-            return purged
+        if self.maintain_description is not None:
+            return self.maintain_description
+        return purged
 
     def count_rows(self) -> int:
         """Live rows only — a tombstone is invisible to `SELECT count(*)`."""

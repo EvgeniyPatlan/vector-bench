@@ -50,6 +50,23 @@ INDEX_NAME = "vector_index"
 READY_POLL_S = float(os.environ.get("VB_MONGOT_POLL_INTERVAL", "2"))
 READY_TIMEOUT_S = float(os.environ.get("VB_MONGOT_READY_TIMEOUT", "43200"))
 
+#: How often `wait_index_synced` asks mongot whether it has the newest row,
+#: and how long it asks for before giving up. Shorter than READY_TIMEOUT_S by
+#: an order of magnitude on purpose: that one waits out a build of the whole
+#: index, this one waits for one document to travel a change stream mongot is
+#: already following. An hour of it means something is wrong, and a churn that
+#: hangs for twelve is a lost night rather than a slow measurement.
+SYNC_POLL_S = float(os.environ.get("VB_MONGOT_SYNC_INTERVAL", "2"))
+SYNC_TIMEOUT_S = float(os.environ.get("VB_MONGOT_SYNC_TIMEOUT", "3600"))
+
+#: How many hits the sync probe asks for. Not 1, and the reason is the churn
+#: sequence itself: the re-inserted rows carry the SAME vectors as the rows
+#: just deleted, so while mongot is still absorbing the deletes the old id
+#: sits at distance 0 from the probe vector too and can take the only slot.
+#: Ten is enough that a handful of un-absorbed duplicates cannot crowd the
+#: row out, and small enough to be a cheap question to ask every two seconds.
+SYNC_PROBE_LIMIT = 10
+
 SIMILARITY = {"angular": "cosine", "euclidean": "euclidean"}
 
 
@@ -68,6 +85,22 @@ def encode_vector(vector) -> Any:
     return Binary(payload, 9)
 
 
+def decode_vector(packed) -> numpy.ndarray:
+    """The inverse of `encode_vector`, for reading a stored vector back.
+
+    `wait_index_synced` needs it: the only way to ask mongot whether it holds
+    a particular document is to search for that document's own vector, and the
+    only copy of that vector the driver can still reach is the one in mongod.
+
+    The two header bytes are dropped rather than checked. A subtype 9 payload
+    this driver did not write cannot arise here -- the probe reads back a
+    document this process inserted through `encode_vector` one call earlier --
+    and a length that is not a multiple of four makes `frombuffer` raise,
+    which is the loud failure a silent reshape would not be.
+    """
+    return numpy.frombuffer(bytes(packed)[2:], dtype="<f4")
+
+
 class MongoDriver(EngineDriver):
     name = "mongodb"
     # Neither of the framework's two modes. The graph is not maintained on
@@ -83,6 +116,16 @@ class MongoDriver(EngineDriver):
         self._index: Optional[IndexSpec] = None
         self._num_candidates: int = 100
         self._ready_seconds: float = 0.0
+        # The highest id `insert_rows` has written, which is what the sync
+        # probe looks for. None until something has been written through that
+        # path, which is a state the probe reports rather than guesses at.
+        self._newest_inserted_id: Optional[int] = None
+        # Why `index_sync_s` came out the way it did, for the churn record.
+        # Read by `harness/workloads/churn.py` through `getattr`, the same way
+        # it already reads Valkey's `write_batch_used`: an optional attribute
+        # the engines with nothing to say simply do not have. A zero with no
+        # reason beside it is what H1's acceptance criterion refuses.
+        self.index_sync_note: Optional[str] = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -258,9 +301,123 @@ class MongoDriver(EngineDriver):
              "embedding": encode_vector(vectors[i])}
             for i in range(len(ids))
         ], ordered=False)
+        # Recorded after the write returns, so the id the sync probe looks for
+        # is one mongod has definitely accepted. Tracked here and not in
+        # `load`: the probe exists for churn's re-insert, and `load` writes
+        # from several threads through clients of their own, where "the newest
+        # id" is whichever thread finished last rather than a fact about the
+        # corpus.
+        if len(ids):
+            self._newest_inserted_id = max(int(i) for i in ids)
 
     def count_rows(self) -> int:
         return int(self._coll.count_documents({}))
+
+    # -- churn ----------------------------------------------------------
+
+    def wait_index_synced(self, expected_rows: int) -> float:
+        """Wait until mongot's index holds the row most recently written.
+
+        **The premise this exists for is not verified here.** `insert_rows`
+        hands the documents to mongod and returns; mongot learns about them
+        from a change stream, in another process, on its own schedule, and
+        nothing in that path blocks. So a churn re-measurement could score a
+        partially synced index -- high latency and low recall, reported as a
+        property of the engine. Confirming the lag and its size needs a live
+        server and is the human task H1; what is implemented here is the wait,
+        against the only question mongot answers honestly, which is whether a
+        search finds a given document.
+
+        **The probe searches for the newest row's own vector, rather than
+        filtering on its id.** `$vectorSearch.filter` only accepts paths the
+        index declares as filter fields -- `tag` and `ctag`, not `_id` -- so
+        "restricted to the newest inserted id" cannot be a predicate. A
+        document is at distance 0 from itself, so once mongot holds it, it is
+        in the top few hits for its own vector; until then it is in none.
+
+        `expected_rows` is not what is waited on, and that is deliberate
+        rather than an oversight: a document count is mongod's answer, and
+        mongod was synchronous all along. It is printed in the heartbeat so
+        the log says which churn step the wait belongs to.
+
+        Returns seconds waited. A zero always comes with a reason, in
+        `index_sync_note` and in the log: either nothing has been written
+        through `insert_rows` yet, or mongot already had the row at the first
+        poll. A timeout returns the time spent and warns -- the measurement
+        that follows is of an index that was still catching up, which is worth
+        publishing with that caveat and not worth hanging a run over.
+        """
+        newest = self._newest_inserted_id
+        if newest is None:
+            self.index_sync_note = (
+                "nothing has been written through insert_rows, so there was "
+                "no document to wait for")
+            print(f"[mongot] index sync: {self.index_sync_note}", flush=True)
+            return 0.0
+
+        probe = self._probe_vector(newest)
+        started = time.time()
+        last_report = started
+        polls = 0
+        while True:
+            polls += 1
+            if newest in self._probe_hits(probe):
+                waited = time.time() - started
+                self.index_sync_note = (
+                    f"mongot returned row {newest:,} for its own vector "
+                    f"after {waited:.1f}s ({polls} poll(s))")
+                if polls == 1:
+                    self.index_sync_note += (
+                        "; the first poll already found it, so this is an "
+                        "upper bound on the lag and not a measurement of it")
+                print(f"[mongot] index sync: {self.index_sync_note}",
+                      flush=True)
+                return waited
+            waited = time.time() - started
+            if waited > SYNC_TIMEOUT_S:
+                self.index_sync_note = (
+                    f"mongot had not returned row {newest:,} after "
+                    f"{waited:.0f}s; what follows measures an index that was "
+                    f"still catching up")
+                print(f"[mongot] WARNING: {self.index_sync_note}", flush=True)
+                return waited
+            if time.time() - last_report >= PROGRESS_INTERVAL_S:
+                print(f"[mongot] waiting for row {newest:,} to appear in the "
+                      f"index ({expected_rows:,} rows expected), "
+                      f"{waited:.0f}s elapsed", flush=True)
+                last_report = time.time()
+            time.sleep(SYNC_POLL_S)
+
+    def _probe_vector(self, row_id: int) -> numpy.ndarray:
+        """The stored vector of `row_id`, read back out of mongod.
+
+        Raises if the document is not there. That is the right failure: the
+        caller has just written it, so its absence means the write did not
+        land and every number taken after this one would describe a corpus
+        nobody loaded.
+        """
+        doc = self._coll.find_one({"_id": int(row_id)}, {"embedding": 1})
+        if doc is None or doc.get("embedding") is None:
+            raise RuntimeError(
+                f"mongod has no embedding for row {row_id}, which "
+                f"insert_rows had just written")
+        return decode_vector(doc["embedding"])
+
+    def _probe_hits(self, vector) -> List[int]:
+        """Ids mongot returns for `vector`, or an empty list if it cannot say.
+
+        The exception is swallowed here and nowhere else in this hook, for the
+        reason the wait exists: mongot returns an error while the index is
+        rebuilding or unreachable, and a poll that raised would turn "not
+        caught up yet" -- the state being waited for -- into a dead run.
+        """
+        try:
+            return [int(d["_id"]) for d in self._coll.aggregate(
+                self._pipeline(vector, SYNC_PROBE_LIMIT))]
+        except Exception as exc:
+            print(f"[mongot] index sync probe failed, treating it as "
+                  f"not-yet-synced: {type(exc).__name__}: {exc}", flush=True)
+            return []
 
     # -- query ----------------------------------------------------------
 
