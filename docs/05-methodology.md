@@ -73,6 +73,70 @@ differently under concurrency and that difference is the point.
 
 Reported as: absolute QPS curve, and **scaling efficiency** = `QPS(n) / (n × QPS(1))`.
 
+**Only the queries that finished inside the window are counted.** The window is
+a closed interval: it opens at the instant the clients' barrier releases and
+closes at the instant recorded immediately *before* the stop flag is set — not
+when a client later notices the flag, which is the whole point. QPS is the
+queries completing inside that interval divided by its length. Every client
+finishes the query it is holding when the window closes, so counting those put
+one query per client in the numerator that the denominator never covered.
+
+The relative error is that one query over the ones a client did finish:
+`1 ÷ queries-completed-per-client`, which in record fields is
+`extra.inflight_discarded ÷ queries_executed` and is about **per-query latency ÷
+window length**. The client count cancels — each client contributes one spurious
+query and roughly `window ÷ latency` real ones — so it is the same at 1 client as
+at 32, measured flat at 2.564% across 1, 2, 4, 8, 16 and 32 clients over a
+two-second window of 50 ms queries. What it depends on is a **slow engine over a
+short window**: 0.005% for a 1.4 ms query in a 30-second window, 2.5% for a
+50 ms query in two seconds, whatever the concurrency. The uncorrected figure also
+reported more queries in flight on average than there were clients to hold them,
+which no client count can do. `extra.inflight_discarded` counts the queries
+dropped at the close; `extra.prewindow_discarded` counts those dropped at the
+open, and is zero by construction because the window opens at the barrier release
+and no measured query can precede it, so **a non-zero value there means the
+window's two ends disagree about when it began**. Recall is scored over the same
+trimmed set, so `extra.recall_queries` and `queries_executed` always describe the
+same queries. A window in which nothing finished at all — a configuration whose
+queries outlast `ops.concurrency_duration_s` — records a QPS of 0, no latency
+figures, and says so on stderr while it runs.
+
+**Recall is recorded beside the throughput**, as `recall_at_k` on every
+concurrency record. The sentence above — "a fixed `ef_search` chosen to put all
+engines at comparable recall" — is an intention, and until the ids were kept
+nothing in the run checked it. Two engines at `ef_search=100` can sit at recall
+0.98 and 0.80, which is the ordinary spread of these implementations at a shared
+ef rather than a pathology, and a throughput curve with no quality figure beside
+it presents them as comparable while one is doing materially less work per
+query. Each client records the ids from the first pass over its own shard — one
+result list per query however long the window runs — and those are scored against
+the same ground truth every other phase uses, recomputed over the loaded row
+count when a profile loads a subset. `extra.recall_queries` says how many
+distinct queries the figure covers; a window too short for one pass reports the
+coverage it managed rather than padding the rest into a recall collapse. With
+`concurrency_repeats > 1` the recall is the median window's, and
+`extra.recall_spread` carries the difference between windows: recall is a
+property of the index and the ef, so a spread above 0.005 means the mapping or
+the index moved and the run says so on stderr.
+
+**The query pool is its own profile key.** `ops.concurrency_queries` defaults to
+`0`, meaning the whole test set — 10,000 queries for glove-100 and sift-128.
+It used to be `ops.max_queries`, which exists to bound the *filtered* and *churn*
+workloads: those answer each query once to completion, and `main.yml` holds the
+key at 500 for exactly that reason. The concurrency workload instead cycles its
+shard for a fixed duration, so at 32 clients each client was repeating about
+fifteen queries for thirty seconds and every graph cache in the comparison was
+measured against a hot set small enough to hold entirely — erasing the
+difference the chart exists to show. `extra.query_pool` and
+`extra.query_reuse` (executed ÷ distinct) record what the caches were actually
+shown. Setting the key is the way back to a small pool for reproducing an
+earlier run.
+
+Each client's shard is `queries[c::clients]`, a strided slice rather than a
+contiguous block, so no two clients hold adjacent queries and part of the window
+is not one client warming a cache for another. The shards are disjoint and
+together cover the pool exactly.
+
 ### 2.4 Filtered / hybrid search (ops harness)
 
 Vector search with a scalar `WHERE` predicate, at three selectivities: ~1%, ~10%,
@@ -150,9 +214,63 @@ Every run writes `results/<run-id>/run-manifest.json` containing:
 - CPU model, flags (`avx512f`, `avx2`, `avx_vnni`, …), core topology, hybrid-core
   detection result, total RAM, kernel version, Docker version.
 - Start/end timestamps per phase.
+- The ops measurement version (`config.ops_measurement_version`), which is also
+  written into every ops record as `extra.ops_measurement_version`.
 
 A result without its manifest is not a result. The report generator refuses to
 emit a report for a run directory with no manifest.
+
+The ops measurement version is bumped whenever a change to `harness/` alters what
+an ops number means, as distinct from `SCHEMA_VERSION`, which describes only the
+record's shape; records carrying no version at all were measured under version 1.
+**Version 2 measures exactly what version 1 measured** — it is simply the first
+value the scheme writes down, so a version 1 number and a version 2 number are
+directly comparable and nothing needs re-measuring to get one. That pair is
+listed in `OPS_MEASUREMENT_EQUIVALENT_VERSIONS` (`harness/metrics/records.py`),
+which is what the refusal below reads so that it never tells an operator to
+re-measure numbers this page calls comparable.
+
+**Version 3 is not comparable with either**, and is deliberately absent from that
+set. It separated the concurrency query pool from `ops.max_queries` (§2.3), so a
+version 2 concurrency figure is throughput over a 500-query working set and a
+version 3 figure is throughput over the whole 10,000, measured against caches
+that behave differently at the two sizes. That is the same workload over two
+different amounts of the corpus, not two measurements of one quantity, and the
+engines whose caches differ most are exactly the ones the difference moves.
+Concurrency recall also arrives in version 3, but a field that was absent
+becoming populated is new information rather than a changed number and would not
+on its own have earned a bump. Version 3 also counts only the queries that
+finish inside each concurrency window (§2.3), and that correction is part of what
+version 3 means rather than a fourth version — no run has ever been measured at
+version 3, because the value was introduced and then extended inside the same
+change set, so there is no version 3 figure anywhere for a trimmed one to be
+incomparable with. The magnitude says the same thing from the other side: the
+correction moves a figure by roughly `per-query latency ÷ window length`, which
+at `main`'s 30-second windows and the p50s these engines actually record is
+about 0.005% — well inside the window-to-window spread
+`ops.concurrency_repeats` exists to expose.
+
+The bump invalidates comparison across the other
+ops phases too — build cost, filtered, churn — none of which version 3 changes;
+the version names the harness that wrote the record rather than the phase, which
+is the cost of having one constant instead of four that can each be forgotten.
+
+The report refuses
+to draw records from two versions on one chart, naming both versions and the
+records involved, exactly as `ann_fingerprint` keeps a 16 GB recall curve out of a
+report whose manifest says 64 GB. A version already recorded in a manifest is
+carried forward untouched rather than re-stamped, so resuming an old run does not
+relabel measurements it did not take.
+
+**A resume across a bump says so before it measures anything.** The refusal
+above is correct but it arrives at report time, which is after the expensive
+half: resuming a `main` run under newer code meant up to days of ingest before
+anything mentioned that the directory could not be reported as one. `set_config`
+now prints a warning naming both versions and the remedy — one report per
+version — at the start of the resume, once per run. It is not fatal: finishing
+the run and splitting the `ops-*.jsonl` files by
+`extra.ops_measurement_version` afterwards is legitimate, and the older records
+are not wrong, only incomparable.
 
 ## 6. What would change the conclusions
 

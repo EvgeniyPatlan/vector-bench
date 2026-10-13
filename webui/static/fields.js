@@ -78,7 +78,12 @@ const VIEWS = [
     label: "Concurrency scaling",
     phase: "concurrency",
     x: "clients",
-    ys: ["qps", "latency_p99_ms", "latency_p95_ms", "latency_p50_ms"],
+    // recall_at_k belongs here as much as it does in the filtered view below:
+    // every concurrency record carries it, and a throughput curve with no
+    // quality axis available presents two engines at one ef_search as
+    // comparable when they can sit 0.18 apart.
+    ys: ["qps", "recall_at_k", "latency_p99_ms", "latency_p95_ms",
+         "latency_p50_ms"],
     logY: false,
     filters: ["dataset", "engine", "m", "resource_pass", "storage_engine"],
     hint: "Does throughput grow with clients, or flatten?",

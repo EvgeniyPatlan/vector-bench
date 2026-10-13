@@ -47,12 +47,33 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
 
 
 def load_records(run_dir: str) -> Tuple[List[Dict[str, Any]], str]:
-    """Records for a run, with the source they came from."""
+    """Records for a run, with the source they came from.
+
+    Raises report.loaders.MixedMeasurementVersions when the run holds ops
+    records from more than one measurement version. The server turns that into
+    a 500 naming the fault, which is the right answer for a run that cannot
+    honestly be plotted: `series()` below groups by engine and would otherwise
+    draw two different measurements as one line.
+
+    The merged file needs the check as much as the raw records do -- more, in
+    fact. It is preferred here whenever it exists, which is true of almost
+    every archived run, so a mixed set that reached records.jsonl would make
+    this the one reader that never consults the guard at all.
+    """
+    from report import measurement_versions as versions
+    from report.loaders import load_ops_records
+
     merged = os.path.join(run_dir, RECORDS_NAME)
     if os.path.isfile(merged):
-        return _read_jsonl(merged), "records.jsonl"
+        rows = _read_jsonl(merged)
+        # `declared` too: the UI shows this run's manifest beside these
+        # numbers, so records a version behind it are mislabelled here exactly
+        # as they would be in a rendered report.
+        versions.refuse_mixed_measurement_versions(
+            rows, source=merged,
+            declared=versions.declared_ops_version(run_dir))
+        return rows, "records.jsonl"
 
-    from report.loaders import load_ops_records
     return load_ops_records(run_dir), "ops-*.jsonl"
 
 

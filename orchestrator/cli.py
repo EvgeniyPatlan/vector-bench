@@ -44,6 +44,13 @@ from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
                                  load_profile, load_resources,
                                  merge_resource_overrides, resolve_resources)
 from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
+# The cost estimate lives in its own module; these are re-exported because
+# `webui/control.py` and `tests/test_config.py` import them from here and the
+# split must not be visible to either. Import them from orchestrator.estimate
+# in new code. `_INGEST_ROWS_PER_S` keeps its underscore despite being read
+# across modules because tests/test_config.py imports it by that name.
+from orchestrator.estimate import (_INGEST_ROWS_PER_S,  # noqa: E402,F401
+                                   estimate_load_hours, print_load_estimate)
 
 GB = 1024 ** 3
 
@@ -420,7 +427,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                   f"ground truth)", file=sys.stderr)
         return 3
 
-    _print_load_estimate(profile, engines, datasets, passes, phases)
+    print_load_estimate(profile, engines, datasets, passes, phases)
 
     if _check_free_disk(paths, engines, datasets, passes) and not args.force:
         print("  Re-run with --force to start anyway.", file=sys.stderr)
@@ -565,6 +572,81 @@ def _ops_storage_engines(engine: str, profile: Dict[str, Any],
     )
 
 
+def _yaml_mode_name(value: Any) -> str:
+    """The name a YAML scalar was written as, for keywords YAML 1.1 steals.
+
+    `iterative_scan: [off, relaxed_order]` does not parse to the strings it
+    looks like: YAML 1.1 reads a bare `off` as boolean False, so the list comes
+    back as `[False, "relaxed_order"]`. `str(False)` is "False", which is not a
+    pgvector mode and would reach the server as
+    `SET hnsw.iterative_scan = False`.
+    """
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def _ops_iterative_scan(engine: str, profile: Dict[str, Any],
+                        resources: Dict[str, Any],
+                        resource_pass: str) -> Optional[str]:
+    """The pgvector iterative-scan mode the ops phase should pin, or None.
+
+    `ops.pgvector_iterative_scan` has been declared by `main`, `full` and the
+    tuned extras for as long as it has existed, the whole plumbing chain to
+    `SET hnsw.iterative_scan` is built, and the report renders a column for
+    it -- but nothing ever passed it. Across the archived results, 58 pgvector
+    ops files and 69 filtered records, every one reads `iterative_scan: null`.
+    So three config files declared two modes, the report printed a column, and
+    the dimension never ran.
+
+    Pinning the FIRST declared value rather than looping is deliberate on both
+    counts. Explicit, because pgvector's own default is `off`: pinning it
+    changes no measured number today while making the record say `off` instead
+    of null, and the repo's standard is that a vendor default left in place
+    judges the vendor on a value it plainly intended you to set. First rather
+    than all, because looping here would multiply ops *units* -- `_run_unit`
+    reloads the corpus per unit, so varying a filtered-query setting would
+    re-run build, concurrency and churn and double pgvector's ingest to do it.
+    The loop belongs inside `harness/workloads/filtered.py`, which sets the
+    mode per selectivity against one loaded index; that is T3c's, not this
+    call site's.
+
+    A profile that declares nothing still passes nothing, so the engine keeps
+    its own default and the record keeps saying so.
+
+    One new way for a run to die, named so nobody is surprised by it: a `SET`
+    is now issued where none ever was, and nothing catches around it, so a mode
+    this server rejects costs the whole ops unit -- `harness/main.py` wraps
+    concurrency, filtered and churn in one `except`, so the two workloads
+    either side of filtered are lost with it. The unit is checkpointed, so
+    `--resume` retries exactly that one. The validation below is what keeps the
+    risk to "pgvector removed a mode its own config still declares" rather than
+    "someone made a typo". Making that call fail soft belongs to whoever owns
+    `harness/`.
+    """
+    if engine != "pgvector":
+        return None
+    extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
+    declared = (extras.get("pgvector_iterative_scan")
+                or (profile.get("ops", {}) or {}).get("pgvector_iterative_scan"))
+    if not declared:
+        return None
+    mode = _yaml_mode_name(list(declared)[0])
+    # Validated against the engine's own declaration rather than a list here:
+    # the driver interpolates this into a SET statement, so an unrecognised
+    # value would reach the server verbatim.
+    valid = {_yaml_mode_name(m) for m in
+             (load_engine(engine).get("capabilities", {}) or {})
+             .get("iterative_scan_modes", [])}
+    if valid and mode not in valid:
+        print(f"[ops] ignoring unknown pgvector iterative_scan mode {mode!r}; "
+              f"known modes are {', '.join(sorted(valid))}", file=sys.stderr)
+        return None
+    return mode
+
+
 def _read_manifest_config(run_dir: str) -> Dict[str, Any]:
     """The run's `config` block, or an empty dict if it cannot be read."""
     try:
@@ -645,106 +727,6 @@ def generate_report(paths: Dict[str, str], engines: List[str],
     return rc
 
 
-# Measured ingest rates, rows/s, on a Xeon Gold 6230.
-#
-# These were originally guessed at 400/150/5600 from a 60k-row smoke run. A
-# real 1.18M-row load measured MariaDB at 147 rows/s average — 2.7x slower —
-# because HNSW insert cost rises as the graph grows and rises again with M
-# (glove-100: ~320 rows/s at M=8, ~70 at M=32). An estimate that is optimistic
-# by 3x is worse than none, so these are the observed mid-grid numbers.
-_INGEST_ROWS_PER_S = {"mariadb": 150, "mariadb123": 110, "alisql": 55,
-                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000}
-_DATASET_ROWS = {
-    "fashion-mnist-784-euclidean": 60_000,
-    "glove-100-angular": 1_183_514,
-    "sift-128-euclidean": 1_000_000,
-    "gist-960-euclidean": 1_000_000,
-    "glove-25-angular": 1_183_514,
-    "deep-image-96-angular": 9_990_000,
-    # MariaDB's big-vector benchmark corpus. At 1536 dimensions the per-row
-    # cost is far above the others, so the row count alone understates it —
-    # see _DIM_PENALTY below.
-    "dbpedia-openai-1000k-angular": 1_000_000,
-    "dbpedia-openai-500k-angular": 500_000,
-    "dbpedia-openai-100k-angular": 100_000,
-}
-
-# Ingest rate falls with dimensionality: every graph traversal during insert
-# costs distance computations proportional to the vector width. The reference
-# rates above were measured on 100-dim data, so wider datasets are scaled down.
-# Sublinear because SIMD amortises part of it.
-_REFERENCE_DIMS = 100
-# The reference rates are for a ~1M-row corpus; smaller ones ingest faster.
-_REFERENCE_ROWS = 1_000_000
-_DATASET_DIMS = {
-    "fashion-mnist-784-euclidean": 784,
-    "glove-100-angular": 100,
-    "sift-128-euclidean": 128,
-    "gist-960-euclidean": 960,
-    "glove-25-angular": 25,
-    "deep-image-96-angular": 96,
-    "dbpedia-openai-1000k-angular": 1536,
-    "dbpedia-openai-500k-angular": 1536,
-    "dbpedia-openai-100k-angular": 1536,
-}
-
-
-# Rates measured directly, per (engine, dataset), on a Xeon Gold 6230. These
-# beat any model and are used whenever available.
-_MEASURED_ROWS_PER_S = {
-    ("mariadb", "fashion-mnist-784-euclidean"): 745,
-    ("alisql", "fashion-mnist-784-euclidean"): 150,
-    ("pgvector", "fashion-mnist-784-euclidean"): 5655,
-    ("mariadb", "glove-100-angular"): 147,
-    # Measured on dbpedia-openai-1000k (990k x 1536, M=16). The formula-based
-    # fallback predicted ~19 h for MariaDB and ~52 h for AliSQL against actuals
-    # of 3.3 h and 6.6 h, so it was 6-8x pessimistic at this dimensionality:
-    # _dim_penalty overcharges for width once the per-row cost is dominated by
-    # graph traversal rather than by the distance computation itself.
-    ("mariadb", "dbpedia-openai-1000k-angular"): 74,
-    ("mariadb123", "dbpedia-openai-1000k-angular"): 51,
-    ("alisql", "dbpedia-openai-1000k-angular"): 43,
-    # The three that do not maintain the graph on the write path. Their rates
-    # are the load alone; the index build is separate and is not what this
-    # estimate is for. Two to three orders of magnitude above the InnoDB
-    # engines, which is the point.
-    ("pgvector", "dbpedia-openai-1000k-angular"): 617,
-    ("valkey", "dbpedia-openai-1000k-angular"): 30122,
-    ("mongodb", "dbpedia-openai-1000k-angular"): 71182,
-}
-
-
-def _dim_penalty(dataset: str) -> float:
-    dims = _DATASET_DIMS.get(dataset, _REFERENCE_DIMS)
-    return max(1.0, (dims / _REFERENCE_DIMS) ** 0.6)
-
-
-def _size_penalty(dataset: str) -> float:
-    """How much slower ingest is on this corpus because the graph is bigger.
-
-    HNSW insert cost grows with the number of nodes already indexed, and on
-    these engines that dominates dimensionality outright. Measured on one
-    machine with MariaDB: 60k rows at 784 dims ran at 745 rows/s while 1.18M
-    rows at 100 dims ran at 147 — twenty times the rows and nearly eight times
-    *fewer* dimensions, and still five times slower.
-
-    An earlier version scaled only by dimensionality, using a rate measured at
-    1.18M rows, and was therefore ~17x too pessimistic on a 60k dataset. The
-    reference rates below correspond to a 1M-row corpus.
-    """
-    rows = _DATASET_ROWS.get(dataset, _REFERENCE_ROWS)
-    return max(0.05, (rows / _REFERENCE_ROWS) ** 0.55)
-
-
-def _effective_rate(engine: str, dataset: str) -> float:
-    """Rows/s for this engine on this corpus: measured if known, else modelled."""
-    measured = _MEASURED_ROWS_PER_S.get((engine, dataset))
-    if measured:
-        return float(measured)
-    base = _INGEST_ROWS_PER_S.get(engine, 300)
-    return base / (_dim_penalty(dataset) * _size_penalty(dataset))
-
-
 # Datasets ann-benchmarks constructs locally rather than publishing as HDF5.
 # `fetch` cannot retrieve these; scripts/generate-dataset.sh builds them.
 _GENERATED_DATASET_PREFIXES = ("dbpedia-openai-",)
@@ -752,7 +734,6 @@ _GENERATED_DATASET_PREFIXES = ("dbpedia-openai-",)
 
 def _is_generated(dataset: str) -> bool:
     return dataset.startswith(_GENERATED_DATASET_PREFIXES)
-
 
 
 # What one engine leaves on disk for one dataset, as a multiple of the corpus
@@ -825,71 +806,6 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     )
     return True
 
-def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
-                        datasets: List[str], passes: List[str],
-                        phases: List[str]) -> Dict[str, Any]:
-    """Estimate ingest time before the run starts.
-
-    ann-benchmarks reloads the whole dataset for every M value, and the
-    incrementally-building engines ingest at a few hundred rows per second. That
-    multiplies quietly: a seven-value M grid over four datasets is days of pure
-    loading. Showing the number up front is the difference between choosing that
-    and discovering it six hours in.
-
-    Returns the breakdown rather than printing it, so the CLI and the web UI
-    cannot report different numbers for the same plan.
-    """
-    m_count = max(1, len(profile.get("ann", {}).get("m_values", [16])))
-    ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
-    per_engine: Dict[str, float] = {}
-    unknown: List[str] = [d for d in datasets if d not in _DATASET_ROWS]
-
-    for engine in engines:
-        engine_h = 0.0
-        for dataset in datasets:
-            rows = _DATASET_ROWS.get(dataset)
-            if not rows:
-                continue
-            effective = _effective_rate(engine, dataset)
-            if "ann" in phases:
-                engine_h += (rows / effective) * m_count / 3600
-            if "ops" in phases:
-                engine_h += (rows / effective) * ops_m / 3600
-        per_engine[engine] = round(engine_h * len(passes), 2)
-
-    total_h = round(sum(per_engine.values()), 2)
-    return {
-        "total_hours": total_h,
-        "per_engine_hours": per_engine,
-        "m_values": m_count,
-        "ops_m_values": ops_m,
-        "passes": len(passes),
-        "phases": list(phases),
-        "datasets_without_estimate": unknown,
-        "long_run": total_h > 12,
-    }
-
-
-def _print_load_estimate(profile: Dict[str, Any], engines: List[str],
-                         datasets: List[str], passes: List[str],
-                         phases: List[str]) -> None:
-    estimate = estimate_load_hours(profile, engines, datasets, passes, phases)
-    total_h = estimate["total_hours"]
-    if total_h < 1:
-        return
-    rows_per_pass = [f"{engine} ~{hours:.1f} h"
-                     for engine, hours in estimate["per_engine_hours"].items()]
-    print(f"\nestimated ingest time (loading only, before any queries):")
-    print("  " + "  |  ".join(rows_per_pass))
-    print(f"  total ~{total_h:.1f} h across {estimate['passes']} pass(es), "
-          f"{estimate['m_values']} M value(s)")
-    if estimate["long_run"]:
-        print(f"  ! This is a long run. Each M value costs a full reload of every "
-              f"dataset,\n    and MHNSW/VIDX build incrementally at a few hundred "
-              f"rows/s. Reduce\n    ann.m_values or the dataset list to cut it "
-              f"roughly proportionally.")
-    print()
-
 
 def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
               engine_cfg: Dict[str, Any], resources: Dict[str, Any],
@@ -954,6 +870,8 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                     harness_args = ops_pass.harness_args(
                         profile, m, engine, resolved, resource_pass, resources,
                         build_mode=build_mode, storage_engine=storage,
+                        iterative_scan=_ops_iterative_scan(
+                            engine, profile, resources, resource_pass),
                     )
                     with ops_pass.OpsRun(engine, engine_cfg, resolved,
                                          resource_pass, paths, run_id,

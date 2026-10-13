@@ -703,6 +703,12 @@ def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
     )
 
 
+#: The mark a client-bound concurrency point carries, in the table and on the
+#: chart. One symbol for one meaning, as the filtered chart already does for a
+#: short result set.
+CLIENT_BOUND_MARK = "○"
+
+
 # The tuned pass measures MariaDB on both InnoDB and MyISAM, so an engine name
 # alone does not identify a row. Without this column the two appeared as
 # unexplained duplicates, and the largest result in the tuned-complete run --
@@ -722,22 +728,165 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
         repeats = extra.get("repeats") or 1
         spread = ("—" if repeats < 2
                   else f"±{extra.get('qps_spread_pct', 0):.1f}% (n={repeats})")
+        # A pool is five figures on the real datasets; `_fmt` groups a float
+        # and prints an int bare, and "10000" beside a QPS of "5,100" reads as
+        # a different kind of number.
+        pool = extra.get("query_pool")
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
             _storage(r),
             str(r.get("clients", "—")),
             _fmt(r.get("qps"), 0),
             spread,
+            # Beside the throughput it qualifies, which is the whole reason
+            # the workload keeps the ids. Two engines at one `ef_search` can
+            # sit at 0.98 and 0.80, and a throughput table with no quality
+            # column presents them as comparable while one is doing
+            # materially less work per query.
+            _fmt(r.get("recall_at_k"), 4),
             _fmt(r.get("latency_p50_ms"), 3),
             _fmt(r.get("latency_p95_ms"), 3),
             _fmt(r.get("latency_p99_ms"), 3),
             _fmt(eff, 2) if eff is not None else "—",
+            # What the engines' caches were actually shown. A reader comparing
+            # a version-2 report to a version-3 one needs these two to see why
+            # the throughput moved: the same QPS over a pool of 500 and a pool
+            # of 10,000 are measurements of two different things.
+            _fmt(float(pool) if pool is not None else None, 0),
+            _fmt(extra.get("query_reuse"), 2, "x"),
+            _client_cpu_cell(extra),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread", "p50 (ms)",
-         "p95 (ms)", "p99 (ms)", "Scaling efficiency"],
+        ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread",
+         "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
+         "Scaling efficiency", "Query pool", "Reuse", "Client CPU"],
         rows,
-    )
+    ) + _concurrency_notes(summary)
+
+
+def _client_cpu_cell(extra: Dict[str, Any]) -> str:
+    """The client container's utilisation, marked when it was the ceiling.
+
+    An em dash means no counter was readable, not that the clients were idle;
+    `client_bound` is None in the same case for the same reason, and the
+    footnote says so. Writing 0.00 there would be the silent version of the
+    fault this column exists to expose.
+    """
+    util = extra.get("client_cpu_util")
+    if util is None:
+        return "—"
+    text = _fmt(util, 2)
+    return f"{text} {CLIENT_BOUND_MARK}" if extra.get("client_bound") else text
+
+
+#: What the four columns the concurrency table grew actually mean, as prose
+#: rather than as longer headers: each is a sentence about how the number was
+#: taken, and the failure they guard against is a reader comparing two cells
+#: that were not measuring the same thing. A module constant so
+#: `_concurrency_notes` below stays short enough to read as the handful of
+#: conditionals it is.
+_CONCURRENCY_NOTES = (
+        "\n**Recall@k** is the median window's, scored over the queries that "
+        "window executed (`extra.recall_queries`) — the same set its QPS "
+        "counts. It is recorded because a fixed `ef_search` is an *intention* "
+        "that all engines sit at comparable recall, and two of these "
+        "implementations at one `ef_search` can differ by 0.18.\n",
+        "\n**Query pool** is how many distinct queries the clients drew from "
+        "and **Reuse** is how many times the average query was answered "
+        "inside the window. A small pool measures every graph cache against a "
+        "hot set it can hold entirely, which erases the difference this "
+        "section exists to show, so the two figures are what make one run's "
+        "throughput comparable with another's.\n",
+        "\n**QPS counts only the queries that both began and ended inside the "
+        "window.** `extra.inflight_discarded` records how many were dropped "
+        "at the close — at most one per client, the query each was holding "
+        "when the clock stopped. Their share of the uncorrected figure is "
+        "about per-query latency ÷ window length, so the correction is a few "
+        "per cent for a slow engine over a short window and 0.005% for a "
+        "1.4 ms query over thirty seconds.\n",
+        f"\n**Client CPU** is the *client* container's own cgroup CPU over the "
+        f"window divided by (window × the size of its cpuset): 1.00 means the "
+        f"harness saturated every CPU it was given. "
+        f"{CLIENT_BOUND_MARK} marks a point above 0.80, drawn hollow on the "
+        f"chart as well. The clients are Python threads serializing vectors, "
+        f"so a hollow point's throughput is bounded by this harness as well as "
+        f"by the engine and **is not evidence about where the engine "
+        f"saturates**. The reverse does not follow, and the reason is "
+        f"structural rather than a matter of where the limit was set: **a "
+        f"CPU-utilisation threshold cannot see an interpreter-lock ceiling, "
+        f"because the lock prevents the very CPU consumption the threshold "
+        f"looks for.** Threads waiting their turn to hold it are not running, "
+        f"so they cost nothing the counter can measure, and the harness stops "
+        f"scaling while its utilisation stays flat. Its signature is "
+        f"throughput falling with more clients while this column does not "
+        f"move: measured against the synthetic driver, this harness flattens "
+        f"at 2.06 cores — 0.51 of a four-CPU container at 4, 8, 16 and 32 "
+        f"clients alike — while its throughput peaks at two clients and "
+        f"halves by thirty-two. So **an unmarked point is not a guarantee "
+        f"that the engine was the limit**; a flat Client CPU column beside a "
+        f"falling QPS curve is the case to re-measure with the clients as "
+        f"processes rather than threads.\n",
+)
+
+
+def _client_cpu_gap_note(unmeasured: int, total: int) -> str:
+    """Said when SOME points lack a client-CPU figure, never when all do.
+
+    The distinction is the whole content of the note.
+
+    A run measured end to end by a harness older than this column has no gap
+    to report. Every point lacks the figure for one uniform reason, the column
+    is an unbroken row of em dashes that says so by itself, and the honest
+    statement about it is nothing. Printed anyway, the paragraph lands on every
+    report of every pre-existing run directory and trains a reader to skip the
+    footnote — after which it is also unread on the run where it matters.
+
+    A run where some points carry the figure and others do not is a different
+    thing: the counter was readable and then was not, so the harness lost a
+    measurement part-way through a sweep and the points either side of it were
+    not measured the same way. That is a fault, and it stays loud.
+    """
+    if not unmeasured or unmeasured >= total:
+        return ""
+    return (
+        f"\n**{unmeasured} of {total} points have no client-CPU figure (em "
+        f"dash), while the rest do.** The harness container's cgroup CPU "
+        f"counter was readable for some windows of this run and not for "
+        f"others, so the measurement was lost part-way through rather than "
+        f"never taken — and whether the clients were the ceiling at those "
+        f"points is unknown rather than known to be no. Treat the marked and "
+        f"unmarked points in this section as having been measured "
+        f"differently.\n")
+
+
+def _concurrency_notes(summary: Dict[str, Any]) -> str:
+    """The fixed footnote, plus whatever this run has to say for itself."""
+    rows = summary.get("concurrency", []) or []
+    bound = [r for r in rows if (r.get("extra") or {}).get("client_bound")]
+    unmeasured = [r for r in rows
+                  if (r.get("extra") or {}).get("client_cpu_util") is None]
+    early = [r for r in rows
+             if ((r.get("extra") or {}).get("prewindow_discarded") or 0) > 0]
+
+    parts = list(_CONCURRENCY_NOTES)
+    if bound:
+        where = ", ".join(sorted(
+            f"{_label(r.get('engine', '?'))} at {r.get('clients')} clients"
+            for r in bound))
+        parts.append(
+            f"\nClient-bound points in this run: {where}. Re-measure these "
+            f"with more client CPUs before reading them as engine ceilings.\n")
+    parts.append(_client_cpu_gap_note(len(unmeasured), len(rows)))
+    if early:
+        parts.append(
+            f"\n**{len(early)} point(s) report `extra.prewindow_discarded` "
+            f"above zero.** That count is zero by construction — the window "
+            f"opens at the instant the clients' barrier releases and no "
+            f"measured query can precede it — so a non-zero value means the "
+            f"window's two ends disagree about when it began, and the QPS "
+            f"above is suspect. This is a framework fault, not an engine "
+            f"result.\n")
+    return "".join(parts)
 
 
 def _filtered_table(summary: Dict[str, Any]) -> str:

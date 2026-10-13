@@ -37,6 +37,22 @@ class RunContext:
 
         Centralised so a new workload cannot accidentally omit the provenance
         that makes a number interpretable.
+
+        One piece of provenance is deliberately *not* here, and a reader
+        looking for it will look here first: `extra.ops_measurement_version`.
+        It cannot be, because this dict is splatted into `Record(**common,
+        ...)` and build, concurrency, filtered and churn each pass `extra=`
+        explicitly alongside it — so an `extra` key here is a duplicate
+        keyword argument. The failure is worse than it sounds for being
+        partial: build.py's ingest record passes no `extra` and writes fine,
+        and the index_build record immediately after it raises TypeError, so
+        the run dies one record into the first phase with a file that already
+        looks like it is working.
+
+        It is stamped in `Recorder.write` instead
+        (`harness/metrics/records.py`), which is the only point every ops
+        record provably passes through and is already where the ALL_PHASES
+        check lives.
         """
         return {
             "run_id": self.run_id,

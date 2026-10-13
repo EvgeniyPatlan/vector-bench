@@ -413,6 +413,29 @@ def _quantization(profile: Dict[str, Any], resources: Dict[str, Any],
     return str((profile.get("ann", {}) or {}).get("mongodb_quantization", "none"))
 
 
+#: What `ops.concurrency_queries` means when a profile does not set it: every
+#: query the dataset ships (10,000 for glove-100 and sift-128). The harness
+#: reads 0 as a sentinel, not as a cap — see `_query_pool` in
+#: harness/workloads/concurrency.py. The default is the new behaviour and the
+#: way back is to set the key, which is the convention every switch here
+#: follows.
+DEFAULT_CONCURRENCY_QUERIES = 0
+
+
+def _concurrency_queries(ops: Dict[str, Any]) -> int:
+    """How many queries the concurrency clients may draw from.
+
+    Its own function rather than an inline `.get` because the value does not
+    come from `ops.max_queries` and the reason is not obvious: that key caps
+    the filtered and churn workloads, which answer each query once, and
+    main.yml holds it at 500 to bound their cost. The concurrency workload
+    cycles its shard for a fixed duration, so sharing the key gave 32 clients
+    fifteen queries each and measured every engine's cache against a hot set
+    that fitted in it.
+    """
+    return int(ops.get("concurrency_queries", DEFAULT_CONCURRENCY_QUERIES))
+
+
 def harness_args(profile: Dict[str, Any], m: int, engine: str,
                  resolved: ResolvedResources,
                  resource_pass: str, resources: Dict[str, Any],
@@ -441,6 +464,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--client-counts", ",".join(str(c) for c in ops.get("client_counts", [1])),
         "--concurrency-duration", str(ops.get("concurrency_duration_s", 20)),
         "--concurrency-repeats", str(ops.get("concurrency_repeats", 1)),
+        "--concurrency-queries", str(_concurrency_queries(ops)),
         "--selectivities", ",".join(str(s) for s in ops.get("selectivities", [0.1])),
         "--churn-fractions", ",".join(str(c) for c in ops.get("churn_fractions", [0.1])),
     ]

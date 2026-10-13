@@ -187,6 +187,33 @@ def make_records(run_id: str) -> List[Dict[str, Any]]:
             })
 
     # --- concurrency ---------------------------------------------------
+    #
+    # Every field the concurrency surfaces read, because a synthetic record
+    # that omits one renders an em dash and a reviewer reads that as a report
+    # bug rather than as a fixture gap. The three fields the report grew after
+    # this fixture was written -- recall, the query pool and the client's own
+    # CPU -- were all missing, so the synthetic report showed no recall column
+    # at all and nothing noticed.
+    #
+    # Recall at a fixed ef_search is a property of the index, not of the
+    # window, so it does NOT vary with the client count here: a fixture whose
+    # recall moved across a sweep would make the workload's own recall-spread
+    # check look like it was firing on nothing.
+    #
+    # 0.98 against 0.80 at one ef_search is the spread these implementations
+    # really show, and it is the reason the column exists.
+    recall_at_ef = {"mariadb": 0.9812, "alisql": 0.9975, "pgvector": 0.8043}
+    #: Share of the client container's CPU each client costs. Chosen so that
+    #: exactly one engine crosses the 0.80 limit and only at its top two
+    #: client counts: pgvector at 16 and 32. That renders both branches of
+    #: every surface the flag reaches — the hollow marker against the plain
+    #: one, the marked cell against the bare one, and the "client-bound points
+    #: in this run" note against its absence — which a fixture where
+    #: everything or nothing was bound could not.
+    cpu_per_client = {"mariadb": 0.012, "alisql": 0.014, "pgvector": 0.055}
+    CLIENT_CPUS = 4
+    DURATION_S = 20
+    QUERY_POOL = 10_000
     for engine in ENGINES:
         # Different saturation points, which is the whole point of the chart.
         knee = {"mariadb": 8, "alisql": 16, "pgvector": 4}[engine]
@@ -194,18 +221,48 @@ def make_records(run_id: str) -> List[Dict[str, Any]]:
         for clients in (1, 2, 4, 8, 16, 32):
             scale = clients / (1 + (clients / knee) ** 1.6)
             qps = base_qps * scale
+            executed = int(qps * DURATION_S)
+            # A window inside its first pass over the pool covers only what it
+            # executed; reuse is then below 1.0, which is legitimate and which
+            # the report has to be able to print.
+            distinct = min(QUERY_POOL, executed)
+            util = min(0.99, cpu_per_client[engine] * clients)
             records.append({
                 **base, "phase": "concurrency", "engine": engine,
                 "engine_version": f"{engine}-synthetic", "m": 16, "ef_search": 100,
                 "storage_engine": "heap" if engine == "pgvector" else "InnoDB",
                 "clients": clients, "qps": round(qps, 2),
+                "recall_at_k": recall_at_ef[engine],
                 "latency_mean_ms": round(clients * 1000.0 / qps, 4),
                 "latency_p50_ms": round(clients * 900.0 / qps, 4),
                 "latency_p95_ms": round(clients * 1700.0 / qps, 4),
                 "latency_p99_ms": round(clients * 2900.0 / qps, 4),
-                "queries_executed": int(qps * 20),
-                "extra": {"scaling_efficiency": round(scale / clients, 4),
-                          "duration_s": 20},
+                "queries_executed": executed,
+                "extra": {
+                    "scaling_efficiency": round(scale / clients, 4),
+                    "duration_s": DURATION_S,
+                    "warmup_queries_per_client": 50,
+                    # Three windows per point, so the Spread column renders a
+                    # real error bar rather than the "measured once" dash.
+                    "repeats": 3,
+                    "qps_samples": [round(qps * f, 1)
+                                    for f in (0.94, 1.0, 1.05)],
+                    "qps_spread_pct": 11.0,
+                    "recall_queries": distinct,
+                    "recall_spread": 0.0004,
+                    "query_pool": QUERY_POOL,
+                    "query_reuse": round(executed / distinct, 2),
+                    # One in-flight query per client, which is the most the
+                    # trimming can ever drop; zero before the window, which is
+                    # the only honest value for a correct implementation.
+                    "inflight_discarded": clients,
+                    "prewindow_discarded": 0,
+                    "client_cpu_seconds": round(
+                        util * DURATION_S * CLIENT_CPUS, 3),
+                    "client_cpus": CLIENT_CPUS,
+                    "client_cpu_util": round(util, 4),
+                    "client_bound": util > 0.80,
+                },
                 "timestamp": _timestamp(clients),
             })
 

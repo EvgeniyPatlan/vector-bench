@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -3227,6 +3228,250 @@ class TestQuantizationReachesBothPaths:
         assert args.quantization == "scalar"
 
 
+class TestConcurrencyQueryPoolIsItsOwnProfileKey:
+    """`ops.max_queries` was capping a workload it was never written for.
+
+    It exists to bound the filtered and churn workloads, which answer each
+    query once to completion, and main.yml holds it at 500 for exactly that
+    reason. The concurrency workload instead cycles its shard for a fixed
+    duration, so sharing the key gave 32 clients about fifteen queries each
+    for thirty seconds -- and every graph cache in the comparison (MHNSW's
+    per-TABLE_SHARE cache, VIDX's shared cache, pgvector's shared_buffers)
+    was measured against a hot set small enough to hold entirely. Telling
+    those three designs apart is the only reason the concurrency chart exists.
+
+    `ops.concurrency_queries` separates them. Its default is the new
+    behaviour -- the whole test set -- and setting the key is the way back to
+    a small pool, which is the convention every switch in this framework
+    follows.
+    """
+
+    def _args(self, profile_name="main", override=None, engine="mariadb"):
+        from orchestrator.config import (load_profile, load_resources,
+                                         resolve_resources)
+        from orchestrator.ops_pass import harness_args
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(40)),
+                                  "efficiency_cpus": [], "logical_cpus": 80,
+                                  "physical_cores": 40, "threads_per_core": 2,
+                                  "model": "Xeon"})()
+        info.total_ram_bytes = int(192 * 1024 ** 3)
+        res = load_resources("normalized")
+        profile = load_profile(profile_name)
+        if override is not None:
+            profile.setdefault("ops", {})["concurrency_queries"] = override
+        return harness_args(profile, 16, engine,
+                            resolve_resources(res, engine, info),
+                            "normalized", res, storage_engine="InnoDB")
+
+    def _value(self, **kw):
+        args = self._args(**kw)
+        return args[args.index("--concurrency-queries") + 1]
+
+    def test_the_profile_key_reaches_argv(self):
+        """The value, not merely the flag. A flag emitted with a constant
+        beside it is indistinguishable from one wired to the profile unless
+        the number is checked."""
+        assert self._value(override=2500) == "2500"
+
+    def test_the_default_is_the_whole_test_set(self):
+        """Zero is the sentinel the harness reads as "all of them". No profile
+        in the repo sets the key yet, so this default is what every run gets
+        today, and it has to be the new behaviour rather than the old cap.
+
+        Every profile, discovered rather than listed: a hand-written list of
+        four covered less than half of them and missed `full` and `quick`,
+        which carry the most divergent `max_queries` (2,000 and 1,000) and are
+        therefore where an accidental inheritance would be least obvious.
+        """
+        from orchestrator.ops_pass import DEFAULT_CONCURRENCY_QUERIES
+        assert DEFAULT_CONCURRENCY_QUERIES == 0
+        names = available_profiles()
+        assert len(names) >= 9, names
+        for profile in names:
+            assert self._value(profile_name=profile) == "0", profile
+
+    def test_the_default_does_not_inherit_the_filtered_cap(self):
+        """The regression itself, stated as numbers. Those profiles really do
+        hold max_queries at those values, so a default that followed the key
+        would emit them here and nothing else in the suite would notice."""
+        from orchestrator.config import load_profile
+        for profile, capped in (("main", 500), ("full", 2000),
+                                ("quick", 1000)):
+            assert load_profile(profile)["ops"]["max_queries"] == capped, \
+                profile
+            assert self._value(profile_name=profile) != str(capped), profile
+
+    def test_the_harness_accepts_the_flag(self):
+        from harness.main import parse_args
+        base = ["--engine", "mariadb", "--dataset", "d", "--m", "16",
+                "--run-id", "r", "--host", "h", "--port", "3306",
+                "--output", "/tmp/out.jsonl"]
+        assert parse_args(base + ["--concurrency-queries", "2500"]) \
+            .concurrency_queries == 2500
+        # Absent, it is the workload's own sentinel rather than a second copy
+        # of the number that could drift from it.
+        from harness.workloads.concurrency import WHOLE_TEST_SET
+        assert parse_args(base).concurrency_queries == WHOLE_TEST_SET
+
+    def test_the_harness_passes_it_to_the_workload_and_not_max_queries(
+            self, monkeypatch, tmp_path):
+        """End to end through `main()`, with both flags set to different
+        numbers, because that is the only arrangement that can tell the new
+        wiring from the old. Asserting on the source text instead would be
+        satisfied by the string appearing in a comment.
+        """
+        from harness import main as harness_main
+        from harness.workloads import concurrency as concurrency_mod
+
+        from .fake_driver import loaded_driver, tiny_dataset
+
+        data = tiny_dataset()
+        driver = loaded_driver(data)
+        captured = {}
+
+        def fake_run(ctx, factory, dataset, index, **kw):
+            captured.update(kw)
+
+        monkeypatch.setattr(harness_main, "load_dataset",
+                            lambda directory, name: data)
+        monkeypatch.setattr(harness_main, "get_driver",
+                            lambda *a, **k: driver)
+        monkeypatch.setattr(concurrency_mod, "run", fake_run)
+
+        rc = harness_main.main([
+            "--engine", "fake", "--dataset", "tiny", "--m", "16",
+            "--run-id", "r", "--host", "h", "--port", "1",
+            "--output", str(tmp_path / "out.jsonl"),
+            "--workloads", "concurrency",
+            "--max-queries", "500",
+            "--concurrency-queries", "2500",
+        ])
+        assert rc == 0
+        assert captured["max_queries"] == 2500
+        # And the row count the engine actually holds travels with it, as it
+        # already does for filtered and churn: recall over a partly-loaded
+        # corpus has to be scored against that corpus.
+        assert captured["indexed_rows"] == driver.count_rows()
+
+    def test_the_workload_signature_takes_indexed_rows(self):
+        """Recall needs it, and the two workloads that already compute recall
+        already take it. Checked on the function rather than the source so a
+        matching string in a docstring cannot satisfy it."""
+        import inspect
+
+        from harness.workloads import churn, concurrency, filtered
+        for module in (concurrency, filtered, churn):
+            assert "indexed_rows" in inspect.signature(module.run).parameters, \
+                module.__name__
+
+
+class TestAResumeAcrossAVersionBumpSaysSoBeforeMeasuring:
+    """The refusal is right but it arrives after the expensive half.
+
+    A directory holding two ops measurement versions cannot honestly be
+    reported as one, and `report/loaders.py` refuses it. But the operator
+    learns that from the report, which runs after the measuring — so resuming
+    a `main` run under code that bumped the version meant up to days of ingest
+    before anything said the directory being filled could not be reported.
+
+    `set_config` is the one place that knows both numbers and still precedes
+    the work: it runs per (pass, engine) before the checkpoint skip, so a
+    resume reaches it even when every unit is skipped and nothing is measured.
+    """
+
+    def _manifest(self, tmp_path, declared):
+        """A run directory that already declares `declared`."""
+        from orchestrator.manifest import Manifest
+        run = str(tmp_path / "run")
+        m = Manifest(run, "run-1")
+        if declared is None:
+            m.data["config"].pop("ops_measurement_version", None)
+        else:
+            m.data["config"]["ops_measurement_version"] = declared
+        m.save()
+        # A second Manifest over the same directory is what --resume builds.
+        return Manifest(run, "run-1")
+
+    def _resume(self, tmp_path, declared):
+        m = self._manifest(tmp_path, declared)
+        m.set_config({}, "normalized", {"server_memory_bytes": 1})
+        return m
+
+    def test_a_stale_version_is_announced(self, tmp_path, capsys):
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        stale = OPS_MEASUREMENT_VERSION - 1
+        m = self._resume(tmp_path, stale)
+        err = capsys.readouterr().err
+        # Both numbers, each anchored so neither can be read off the other.
+        # A bare `str(stale) in err` is satisfied by the current version's
+        # digits whenever one is a substring of the other -- 2 and 12, say.
+        assert re.search(rf"\bversion {stale}\b", err), err
+        assert re.search(rf"\bversion {OPS_MEASUREMENT_VERSION}\b", err), err
+        # And the remedy, which is what makes it a warning rather than a
+        # complaint: one report per version.
+        assert "report" in err and "per version" in err, err
+        # The manifest still says what the directory actually holds.
+        assert m.data["config"]["ops_measurement_version"] == stale
+
+    def test_it_is_not_fatal(self, tmp_path, capsys):
+        """Finishing the run and splitting the records afterwards is a
+        legitimate response, and often the right one: the older records are
+        not wrong, only incomparable. A hard failure would turn a directory
+        that needs splitting into a run that cannot continue."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        m = self._resume(tmp_path, OPS_MEASUREMENT_VERSION - 1)
+        assert m.data["config"]["resource_pass"] == "normalized"
+        assert capsys.readouterr().err  # it did warn, it just did not raise
+
+    def test_a_matching_version_says_nothing(self, tmp_path, capsys):
+        """Every ordinary resume hits this path. A notice that fires on all of
+        them is the first thing an operator learns to scroll past."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        self._resume(tmp_path, OPS_MEASUREMENT_VERSION)
+        assert "WARNING" not in capsys.readouterr().err
+
+    def test_a_manifest_with_no_version_says_nothing(self, tmp_path, capsys):
+        """Absent is not stale. A run recorded before the key existed was
+        measured under a version this code cannot know, and `loaders.py` reads
+        a missing key as "nothing declared, check nothing" -- so there is no
+        disagreement to report."""
+        self._resume(tmp_path, None)
+        assert "WARNING" not in capsys.readouterr().err
+
+    def test_it_is_said_once_per_run_not_once_per_engine(self, tmp_path,
+                                                         capsys):
+        """set_config runs per (pass, engine). Six engines across two passes
+        would print this twelve times, and a notice repeated twelve times
+        reads as a loop rather than as a warning."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        m = self._manifest(tmp_path, OPS_MEASUREMENT_VERSION - 1)
+        for _ in range(12):
+            m.set_config({}, "normalized", {"server_memory_bytes": 1})
+        assert capsys.readouterr().err.count("WARNING") == 1
+
+    def test_the_notice_is_carried_by_set_config_itself(self):
+        """Not by a later populator, which is what makes it reachable by a
+        resume that measures nothing.
+
+        Deliberately a statement about where the code lives rather than about
+        cli.py's call order. The ordering fact -- `cli.py` calls set_config at
+        :461, above the `(already complete)` checkpoint skip at :484 -- is
+        recorded in `_warn_if_resuming_across_a_bump`'s docstring instead of
+        asserted here, because the obvious assertion for it is vacuous:
+        "checkpoint" appears twelve times before that call and fourteen times
+        after, so a grep of the tail passes however the file is reordered. A
+        guard whose own mutant cannot be injected is not a guard, and cli.py
+        is not this task's to pin.
+        """
+        import inspect
+
+        from orchestrator.manifest import Manifest
+        assert "_warn_if_resuming_across_a_bump" in \
+            inspect.getsource(Manifest.set_config)
+
+
 class TestResumeContinuesTheRightRun:
     """Checkpoints live inside the run directory.
 
@@ -4853,17 +5098,25 @@ class TestChartsFromAPreviousReportAreCleared:
     which is what makes them dangerous: a stale file nothing points at is one
     somebody opens by hand and believes."""
 
-    def test_the_generator_clears_them(self):
+    # Anchored on the mkdir that immediately precedes the cleanup, not on
+    # `chart_dir = os.path.join`. The two were adjacent until the cleanup moved
+    # below the record load -- a refused or empty regeneration used to delete
+    # the previous report's charts and leave index.html pointing at them.
+    CLEANUP_ANCHOR = "os.makedirs(chart_dir, exist_ok=True)"
+
+    def _cleanup_block(self):
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
-        block = source.split("chart_dir = os.path.join")[1][:1200]
+        return source.split(self.CLEANUP_ANCHOR)[1][:1200]
+
+    def test_the_generator_clears_them(self):
+        block = self._cleanup_block()
         assert "os.remove" in block
         assert '.endswith((".png", ".svg"))' in block
 
     def test_only_generated_files_are_removed(self):
         """The directory is inside the run, and removing anything the report
         did not write would be destroying somebody else's data."""
-        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
-        block = source.split("chart_dir = os.path.join")[1][:1200]
+        block = self._cleanup_block()
         assert "listdir" in block and '.endswith' in block
         assert "rmtree" not in block
 
@@ -4871,6 +5124,16 @@ class TestChartsFromAPreviousReportAreCleared:
         source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
         body = source.split("def main")[1]
         assert body.index("cleared") < body.index("chart_paths")
+
+    def test_it_clears_only_once_a_report_is_certain(self):
+        """After every refusal, not before them. Deleting the working report's
+        charts and then exiting non-zero leaves broken images where a valid
+        report was."""
+        source = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        body = source.split("def main")[1]
+        assert body.index("loaders.load_ops_records") < body.index("cleared")
+        assert body.index("no records found") < body.index("cleared")
+        assert body.index("MixedMeasurementVersions") < body.index("cleared")
 
 
 class TestMemoryChartsCompareShapesNotClocks:
@@ -5400,3 +5663,1917 @@ class TestTheLabAnswersQuestionsWithoutProducingMeasurements:
         assert cmd_lab(build_parser().parse_args(["lab", "--list"])) == 0
         assert dict(lab_scripts())["probe-valkey-filter.py"].startswith("Find out why")
 
+
+
+class TestOpsMeasurementVersionIsDeclared:
+    """The ops counterpart of ANN_MEASUREMENT_VERSION, and where it lives.
+
+    `ANN_MEASUREMENT_VERSION` sits in `orchestrator/ann_pass.py` because the
+    recall/QPS path is launched from the host. The ops version cannot sit
+    beside it: ops records are written from inside the harness container, which
+    mounts `harness/` only, and `harness/` importing `orchestrator` kills a run
+    seconds after the server comes up -- the mistake TestHarnessIsolation
+    exists to catch. So the constant lives on the harness side of that
+    boundary and the orchestrator imports it from there, which is the one
+    direction the dependency is allowed to point.
+    """
+
+    # Anchored at the start of a line and on the exact name. A plain substring
+    # search for "OPS_MEASUREMENT_VERSION = " is satisfied by
+    # `IMPLICIT_OPS_MEASUREMENT_VERSION = 1`, so it kept passing with the
+    # constant itself deleted -- an assertion that looked like coverage.
+    DECLARATION = re.compile(r"^OPS_MEASUREMENT_VERSION\s*=", re.MULTILINE)
+
+    def _source(self, *parts):
+        return open(os.path.join(VB_ROOT, *parts)).read()
+
+    def test_the_constant_lives_in_the_harness(self):
+        assert self.DECLARATION.search(
+            self._source("harness", "metrics", "records.py"))
+
+    def test_it_is_not_beside_its_ann_counterpart(self):
+        """Putting it there is the obvious move and breaks the harness."""
+        assert "OPS_MEASUREMENT_VERSION" not in self._source(
+            "orchestrator", "ann_pass.py")
+
+    def test_the_orchestrator_imports_it_rather_than_redefining_it(self):
+        from harness.metrics import records as records_mod
+        from orchestrator import manifest as manifest_mod
+        assert (manifest_mod.OPS_MEASUREMENT_VERSION
+                == records_mod.OPS_MEASUREMENT_VERSION)
+        src = self._source("orchestrator", "manifest.py")
+        assert not self.DECLARATION.search(src), \
+            "a second copy drifts from the first"
+        assert "from harness.metrics.records import OPS_MEASUREMENT_VERSION" \
+            in src
+
+    def test_the_manifest_records_it(self, tmp_path):
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        from orchestrator.manifest import Manifest
+        m = Manifest(str(tmp_path / "run"), "run-1")
+        m.set_config({}, "normalized", {"server_memory_bytes": 1})
+        assert m.data["config"]["ops_measurement_version"] == \
+            OPS_MEASUREMENT_VERSION
+        # On disk, not just in memory: the report reads the file.
+        with open(m.path) as fh:
+            assert json.load(fh)["config"]["ops_measurement_version"] == \
+                OPS_MEASUREMENT_VERSION
+
+    def test_a_new_manifest_is_stamped_at_creation(self, tmp_path):
+        """Before set_config, because that is the only moment the code running
+        and the code that will produce the records are the same thing."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        from orchestrator.manifest import Manifest
+        m = Manifest(str(tmp_path / "run"), "run-1")
+        with open(m.path) as fh:
+            assert json.load(fh)["config"]["ops_measurement_version"] == \
+                OPS_MEASUREMENT_VERSION
+
+    def test_the_manifest_version_is_not_overridable_by_a_caller(self, tmp_path):
+        """set_config takes an `extra` dict from cli.py. The version describes
+        the code that produced the numbers, so it is not a caller's opinion."""
+        from harness.metrics.records import OPS_MEASUREMENT_VERSION
+        from orchestrator.manifest import Manifest
+        m = Manifest(str(tmp_path / "run"), "run-1")
+        m.set_config({}, "normalized", {}, extra={"ops_measurement_version": 99})
+        assert m.data["config"]["ops_measurement_version"] == \
+            OPS_MEASUREMENT_VERSION
+
+    def test_a_caller_cannot_smuggle_a_version_into_an_absent_key_manifest(
+            self, tmp_path):
+        """The case that makes the pop load-bearing, and the only one.
+
+        On a fresh manifest the carry-forward overwrites a smuggled value
+        anyway, so the test above passes with the pop deleted. On a manifest
+        that declares nothing -- every archived run -- there is nothing to
+        carry forward, and without the pop a caller's `extra` lands in the
+        manifest as though it had been measured under version 99.
+        """
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "run-manifest.json").write_text(json.dumps({
+            "run_id": "r", "config": {"resource_pass": "tuned"},
+            "engines": {}, "phases": [], "warnings": [],
+        }))
+        from orchestrator.manifest import Manifest
+        m = Manifest(str(run), "r")
+        m.set_config({}, "tuned", {}, extra={"ops_measurement_version": 99})
+        assert "ops_measurement_version" not in m.data["config"]
+        with open(m.path) as fh:
+            assert "ops_measurement_version" not in json.load(fh)["config"]
+
+    def test_set_config_still_carries_the_fingerprint(self, tmp_path):
+        """The new key sits beside ann_fingerprint, it does not displace it."""
+        from orchestrator.ann_pass import ann_fingerprint
+        from orchestrator.manifest import Manifest
+        resolved = {"server_memory_bytes": 1, "build_threads": 1,
+                    "server_cpu_count": 2}
+        m = Manifest(str(tmp_path / "run"), "run-1")
+        m.set_config({}, "tuned", resolved,
+                     extra={"ann_fingerprint": ann_fingerprint(resolved)})
+        assert m.data["config"]["ann_fingerprint"] == ann_fingerprint(resolved)
+        assert m.data["config"]["resource_pass"] == "tuned"
+
+
+class TestOpsVersionsNeverShareAChart:
+    """Two measurement versions in one report are refused, loudly.
+
+    `ann_fingerprint` keeps a 16 GB recall curve out of a 64 GB report by
+    narrowing the results tree to the configuration the manifest declares. The
+    ops path has no tree to narrow -- every ops record lands in the run
+    directory -- so the equivalent is a refusal at load time, before a single
+    chart is drawn.
+
+    Refusing rather than labelling is deliberate. A labelled chart still
+    invites the comparison it is labelled against, and the one outcome worse
+    than either is silently dropping the older half, which is what a plain
+    group-by would do. The refusal names both versions and names records from
+    each, so the operator can see what is in the directory.
+    """
+
+    V_KEY = "ops_measurement_version"
+
+    @staticmethod
+    def SIDE(version, count=r"\d+"):
+        """The line listing one version and how many records it has.
+
+        Matched instead of a bare `"version N" in message`, which is satisfied
+        by the trailer's "count as version 1" no matter what the listing does.
+
+        `count` binds a number to the version beside it, and callers that care
+        about the counts must pass it. Left unbound the pattern says only that
+        each side was listed with some number, which is exactly what a
+        listing with the two sides' counts swapped also satisfies -- and a
+        swap is the one fault the counts exist to expose, since telling a
+        stray file from the bulk of a run is the whole point of printing them.
+        """
+        return re.compile(rf"^  version {version}: {count} records?$",
+                          re.MULTILINE)
+
+    def _ops_file(self, run_dir, name, rows):
+        path = os.path.join(run_dir, name)
+        with open(path, "w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        return path
+
+    def _row(self, *, engine="mariadb", phase="index_build", version=None,
+             timestamp="2026-10-12T00:00:00Z", **kw):
+        row = {"run_id": "r", "engine": engine, "phase": phase,
+               "dataset": "glove-100-angular", "resource_pass": "normalized",
+               "timestamp": timestamp, "m": 16, "build_mode": "post", **kw}
+        if version is not None:
+            row["extra"] = {**row.get("extra", {}), self.V_KEY: version}
+        return row
+
+    def test_one_version_loads_normally(self, tmp_path):
+        from report.loaders import load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version=2), self._row(version=2, m=32)])
+        assert len(load_ops_records(run)) == 2
+
+    def test_records_without_the_key_are_version_one(self, tmp_path):
+        """Everything measured before this change is version 1 by definition,
+        and a directory of them is internally consistent."""
+        from report.loaders import load_ops_records, ops_measurement_versions
+        run = str(tmp_path)
+        self._ops_file(run, "ops-alisql-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="alisql"), self._row(engine="alisql",
+                                                              m=32)])
+        loaded = load_ops_records(run)
+        assert len(loaded) == 2
+        assert sorted(ops_measurement_versions(loaded)) == [1]
+
+    def test_two_versions_across_two_files_are_refused(self, tmp_path):
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="mariadb")])
+        self._ops_file(run, "ops-alisql-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="alisql", version=2)])
+        with pytest.raises(MixedMeasurementVersions):
+            load_ops_records(run)
+
+    def test_two_versions_inside_one_file_are_refused(self, tmp_path):
+        """A resumed run appends to the file it already wrote, so the two
+        versions need not be in separate files to collide."""
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version=2), self._row()])
+        with pytest.raises(MixedMeasurementVersions):
+            load_ops_records(run)
+
+    def test_the_refusal_names_both_versions_and_the_records(self, tmp_path):
+        """A refusal nobody can act on is an outage, not a guard."""
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="mariadb", phase="concurrency",
+                                  timestamp="2026-01-01T00:00:00Z")])
+        self._ops_file(run, "ops-pgvector-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="pgvector", phase="filtered",
+                                  version=2,
+                                  timestamp="2026-06-06T06:06:06Z")])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        message = str(caught.value)
+        # Both versions, by number, on their own listed side. A plain
+        # `"version 1" in message` is vacuous: the trailer always ends with
+        # "count as version 1", so it passed however badly the sides were
+        # listed. Anchor on the listing line itself.
+        assert self.SIDE(1).search(message), message
+        assert self.SIDE(2).search(message), message
+        # And a record from each side, identifiable enough to find in the file.
+        assert "mariadb" in message and "concurrency" in message
+        assert "pgvector" in message and "filtered" in message
+        assert "2026-01-01T00:00:00Z" in message
+        assert "2026-06-06T06:06:06Z" in message
+        # It must say what to do, not only that something is wrong.
+        assert "ops_measurement_version" in message
+
+    def test_the_refusal_counts_the_records_on_each_side(self, tmp_path):
+        """So an operator can tell a stray file from the bulk of the run.
+
+        Each count bound to its own version, because telling the stray from
+        the bulk is the entire reason the counts are printed and a swap
+        destroys exactly that. The assertion this replaced was
+        `"4 record" in message and "1 record" in message`, which never bound
+        a count to a version: a listing reading "version 1: 1 record" beside
+        "version 2: 4 records" -- pointing the operator at the wrong file --
+        contains both substrings and passed the whole suite.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(m=m) for m in (8, 16, 32, 48)])
+        self._ops_file(run, "ops-alisql-glove-100-angular-normalized-a.jsonl",
+                       [self._row(engine="alisql", version=2)])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        message = str(caught.value)
+        assert self.SIDE(1, 4).search(message), message
+        assert self.SIDE(2, 1).search(message), message
+
+    def test_a_three_way_mix_names_every_version(self, tmp_path):
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(), self._row(version=2), self._row(version=3)])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        for version in ("version 1", "version 2", "version 3"):
+            assert version in str(caught.value)
+
+    def test_records_older_than_their_own_manifest_are_refused(self, tmp_path):
+        """The 16-GB-curve-under-a-64-GB-manifest failure, on the ops side.
+
+        A single version in the directory is not enough: a run resumed under
+        code that bumped the version rewrites the manifest and then appends
+        nothing, leaving every record a version behind what the manifest above
+        it claims. Nothing in the records themselves disagrees, which is
+        exactly what made the ann version of this bug survive to publication.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        with open(os.path.join(run, "run-manifest.json"), "w") as fh:
+            json.dump({"run_id": "r", "config": {"resource_pass": "normalized",
+                                                 "ops_measurement_version": 2}},
+                      fh)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row()])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        message = str(caught.value)
+        assert self.SIDE(1).search(message), message
+        # The declared side has no records, so it is listed without a count.
+        assert "version 2: declared by the run manifest" in message
+        assert "no records measured under it" in message
+
+    def test_a_matching_manifest_loads(self, tmp_path):
+        from report.loaders import load_ops_records
+        run = str(tmp_path)
+        with open(os.path.join(run, "run-manifest.json"), "w") as fh:
+            json.dump({"run_id": "r",
+                       "config": {"ops_measurement_version": 2}}, fh)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version=2)])
+        assert len(load_ops_records(run)) == 1
+
+    def test_a_manifest_predating_the_key_is_not_checked_against(self, tmp_path):
+        """Every archived run in this project has such a manifest. Refusing
+        them would make regenerating an old report impossible."""
+        from report.loaders import load_ops_records
+        run = str(tmp_path)
+        with open(os.path.join(run, "run-manifest.json"), "w") as fh:
+            json.dump({"run_id": "r", "config": {"resource_pass": "tuned"}}, fh)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(), self._row(m=32)])
+        assert len(load_ops_records(run)) == 2
+
+    def test_an_unreadable_manifest_does_not_block_the_records(self, tmp_path):
+        from report.loaders import load_ops_records
+        run = str(tmp_path)
+        with open(os.path.join(run, "run-manifest.json"), "w") as fh:
+            fh.write("{not json")
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version=2)])
+        assert len(load_ops_records(run)) == 1
+
+    def test_recall_records_are_not_judged_by_the_ops_version(self):
+        """ann-benchmarks records come from the other measurement path and
+        carry ANN_MEASUREMENT_VERSION's concerns, not this one's. Counting
+        them as version 1 would refuse every mixed report there is."""
+        from harness.metrics.records import PHASE_RECALL
+        from report.loaders import refuse_mixed_measurement_versions
+        refuse_mixed_measurement_versions(
+            [{"phase": PHASE_RECALL, "engine": "mariadb", "extra": {}},
+             self._row(version=2)],
+            source="test")
+
+    def test_an_empty_set_is_not_a_conflict(self):
+        from report.loaders import refuse_mixed_measurement_versions
+        refuse_mixed_measurement_versions([], source="test")
+
+    def test_a_stringified_version_is_not_the_integer(self, tmp_path):
+        """The string "2" beside the integer 2 is two versions, not one.
+
+        This is the fixture that matters, and the obvious one does not work.
+        A value of "banana" cannot distinguish a loader that coerces with
+        `int()` from one that does not: the coercion raises, the record falls
+        into a second bucket anyway, and the refusal fires for the wrong
+        reason. Under the same mutant, "2" and 2 collapse into one bucket and
+        the directory LOADS -- so only this case sees it.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version="2"), self._row(version=2, m=32)])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        # And it says which is which, or the operator cannot see the quoting.
+        assert "'2'" in str(caught.value)
+
+    def test_a_garbage_version_is_refused_rather_than_dropped(self, tmp_path):
+        """Not a substitute for the test above -- see its docstring -- but a
+        truncated or hand-typed value must not silently join either side."""
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = str(tmp_path)
+        self._ops_file(run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                       [self._row(version="banana"), self._row(version=2)])
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(run)
+        assert "banana" in str(caught.value)
+
+    def test_an_unhashable_declared_version_does_not_crash_the_guard(
+            self, tmp_path):
+        """A hand-edited manifest can hold a list or a dict there.
+
+        `declared in groups` hashes it, so the guard against malformed
+        provenance died with TypeError: unhashable type -- which escapes as a
+        traceback rather than as the refusal it was computing.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        # Both JSON-expressible, because a real manifest is JSON on disk.
+        for broken in ([2], {"v": 2}):
+            run = str(tmp_path / f"r{id(broken)}")
+            os.makedirs(run)
+            with open(os.path.join(run, "run-manifest.json"), "w") as fh:
+                json.dump({"run_id": "r",
+                           "config": {"ops_measurement_version": broken}}, fh)
+            self._ops_file(
+                run, "ops-mariadb-glove-100-angular-normalized-a.jsonl",
+                [self._row(version=2)])
+            # Refused, not crashed: a manifest nobody can read a version out of
+            # is not a manifest that agrees with the records.
+            with pytest.raises(MixedMeasurementVersions):
+                load_ops_records(run)
+
+    def test_the_report_refuses_before_it_draws_anything(self):
+        """A refusal after twenty hours of measurement and ten minutes of
+        chart rendering is barely better than no refusal. The check hangs off
+        load_ops_records, which generate.main calls before it touches a
+        chart, a dataset or the ann tree."""
+        src = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        load_at = src.index("loaders.load_ops_records")
+        assert load_at < src.index("loaders.load_annb_results")
+        assert load_at < src.index("render_html(manifest")
+        assert load_at < src.index("summarize(records, manifest")
+
+    def test_it_refuses_before_it_deletes_the_previous_report(self):
+        """A refused regeneration must leave the working report alone.
+
+        The chart cleanup ran first, so a refusal left index.html pointing at
+        .png files that had just been removed -- a page of broken images where
+        a valid report used to be.
+        """
+        src = open(os.path.join(VB_ROOT, "report", "generate.py")).read()
+        assert (src.index("loaders.load_ops_records")
+                < src.index("cleared {removed} chart(s)"))
+        assert (src.index("no records found")
+                < src.index("cleared {removed} chart(s)"))
+
+
+class TestEveryReaderConsultsTheVersionGuard:
+    """All three paths into a report, not just the one.
+
+    `load_ops_records` is one of three ways records reach a chart. The other
+    two bypassed it: `generate --from-records` read a records file directly,
+    and `webui/records.py` prefers `report/records.jsonl` whenever it exists --
+    which is true of almost every archived run, so the web UI consulted the
+    guard for hardly any of them. Worse, the --from-records path then *wrote*
+    records.jsonl, laundering a mixed set into the exact file the web UI
+    prefers.
+    """
+
+    def _rows(self):
+        v1 = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+              "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+        v2 = dict(v1, engine="alisql", timestamp="2026-06-06T00:00:00Z",
+                  extra={"ops_measurement_version": 2})
+        return [v1, v2]
+
+    def _jsonl(self, path, rows):
+        with open(path, "w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+    def test_from_records_refuses_a_mixed_file(self, tmp_path, capsys):
+        from report import generate
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "run-manifest.json").write_text(json.dumps({"run_id": "r"}))
+        merged = tmp_path / "mixed.jsonl"
+        self._jsonl(str(merged), self._rows())
+        code = generate.main(["--run-dir", str(run),
+                              "--from-records", str(merged)])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "version 1" in err and "version 2" in err
+
+    def test_a_refused_from_records_run_writes_no_records_file(self, tmp_path):
+        """The laundering step: records.jsonl must not be created."""
+        from report import generate
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "run-manifest.json").write_text(json.dumps({"run_id": "r"}))
+        merged = tmp_path / "mixed.jsonl"
+        self._jsonl(str(merged), self._rows())
+        generate.main(["--run-dir", str(run), "--from-records", str(merged)])
+        assert not (run / "report" / "records.jsonl").exists()
+
+    def test_from_records_still_accepts_one_version(self, tmp_path):
+        from report.loaders import refuse_mixed_measurement_versions
+        rows = [r for r in self._rows() if r.get("extra")]
+        refuse_mixed_measurement_versions(rows, source="x")
+
+    def test_the_web_ui_refuses_a_mixed_merged_file(self, tmp_path):
+        from report.loaders import MixedMeasurementVersions
+        from webui import records as records_mod
+        run = tmp_path / "run"
+        (run / "report").mkdir(parents=True)
+        self._jsonl(str(run / "report" / "records.jsonl"), self._rows())
+        with pytest.raises(MixedMeasurementVersions):
+            records_mod.load_records(str(run))
+
+    def test_the_web_ui_still_reads_a_single_version_merged_file(self, tmp_path):
+        from webui import records as records_mod
+        run = tmp_path / "run"
+        (run / "report").mkdir(parents=True)
+        self._jsonl(str(run / "report" / "records.jsonl"),
+                    [r for r in self._rows() if r.get("extra")])
+        rows, source = records_mod.load_records(str(run))
+        assert source == "records.jsonl" and len(rows) == 1
+
+    def test_the_web_ui_falls_back_to_ops_records_and_checks_those_too(
+            self, tmp_path):
+        from report.loaders import MixedMeasurementVersions
+        from webui import records as records_mod
+        run = tmp_path / "run"
+        run.mkdir()
+        self._jsonl(
+            str(run / "ops-mariadb-d-normalized-a.jsonl"), self._rows())
+        with pytest.raises(MixedMeasurementVersions):
+            records_mod.load_records(str(run))
+
+
+class TestResumingDoesNotRewriteTheVersion:
+    """A run was measured under the version it was measured under.
+
+    `cli.py` calls `set_config` unconditionally per (pass, engine), *before*
+    the checkpoint skip. So `run --resume --run-id <archived-run>` reaches it
+    even when every unit is skipped and nothing whatsoever is measured. A
+    set_config that stamped the current constant therefore rewrote an archived
+    run's manifest to a version its records were never measured under, and the
+    report refused that run from then on -- permanently, and for a run nobody
+    had touched. Re-stamping is the provenance bug; the refusal was right.
+    """
+
+    def _manifest(self, run_dir, run_id="main-20260101-000000"):
+        from orchestrator.manifest import Manifest
+        return Manifest(str(run_dir), run_id)
+
+    def _write_manifest(self, run_dir, config):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run-manifest.json").write_text(json.dumps({
+            "run_id": "main-20260101-000000", "status": "completed",
+            "config": config, "engines": {}, "phases": [], "warnings": [],
+        }))
+
+    def test_a_declared_version_survives_a_resume(self, tmp_path):
+        """Even an older one. Especially an older one."""
+        self._write_manifest(tmp_path / "run",
+                             {"resource_pass": "tuned",
+                              "ops_measurement_version": 1})
+        m = self._manifest(tmp_path / "run")
+        m.set_config({}, "tuned", {"server_memory_bytes": 1})
+        assert m.data["config"]["ops_measurement_version"] == 1
+        with open(m.path) as fh:
+            assert json.load(fh)["config"]["ops_measurement_version"] == 1
+
+    def test_an_absent_version_stays_absent_on_a_resume(self, tmp_path):
+        """Every archived run in this project has such a manifest.
+
+        Inventing today's constant here is a claim about a measurement nobody
+        in this process witnessed. report/loaders.py reads a missing key as
+        "nothing is declared, check nothing", which is the honest answer.
+        """
+        self._write_manifest(tmp_path / "run", {"resource_pass": "tuned"})
+        m = self._manifest(tmp_path / "run")
+        m.set_config({}, "tuned", {"server_memory_bytes": 1})
+        assert "ops_measurement_version" not in m.data["config"]
+        with open(m.path) as fh:
+            assert "ops_measurement_version" not in json.load(fh)["config"]
+
+    def test_resuming_an_archived_run_still_reports(self, tmp_path):
+        """End to end, which is the behaviour that actually broke.
+
+        An archived run: ops records with no version, a manifest with no
+        version. Resume it, measure nothing, then load it the way the report
+        does. Before the fix this refused -- records v1 against a manifest
+        rewritten to 2.
+        """
+        from report.loaders import load_ops_records
+        run = tmp_path / "run"
+        self._write_manifest(run, {"resource_pass": "tuned"})
+        with open(run / "ops-mariadb-glove-100-angular-tuned-a.jsonl",
+                  "w") as fh:
+            for phase in ("ingest", "index_build", "concurrency"):
+                fh.write(json.dumps({
+                    "run_id": "main-20260101-000000", "engine": "mariadb",
+                    "phase": phase, "dataset": "glove-100-angular", "m": 16,
+                    "resource_pass": "tuned",
+                    "timestamp": "2026-01-01T00:00:00Z"}) + "\n")
+
+        self._manifest(run).set_config({}, "tuned", {"server_memory_bytes": 1})
+        assert len(load_ops_records(str(run))) == 3
+
+    def test_a_resume_that_bumps_and_measures_is_still_caught(self, tmp_path):
+        """The case the refusal is for must keep firing.
+
+        The manifest keeps saying 2 and the new records say 3, so the records
+        disagree with each other -- which the other half of the check sees
+        without needing the manifest to have been rewritten.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = tmp_path / "run"
+        self._write_manifest(run, {"resource_pass": "tuned",
+                                   "ops_measurement_version": 2})
+        with open(run / "ops-mariadb-glove-100-angular-tuned-a.jsonl",
+                  "w") as fh:
+            for version, m in ((2, 16), (3, 32)):
+                fh.write(json.dumps({
+                    "run_id": "main-20260101-000000", "engine": "mariadb",
+                    "phase": "index_build", "dataset": "glove-100-angular",
+                    "m": m, "resource_pass": "tuned",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "extra": {"ops_measurement_version": version}}) + "\n")
+
+        self._manifest(run).set_config({}, "tuned", {"server_memory_bytes": 1})
+        with pytest.raises(MixedMeasurementVersions) as caught:
+            load_ops_records(str(run))
+        assert "version 2" in str(caught.value)
+        assert "version 3" in str(caught.value)
+
+    def test_cli_still_calls_set_config_before_the_checkpoint_skip(self):
+        """Why the fix had to be in set_config rather than at the call site.
+
+        If this ever stops being true the comment in manifest.py is stale, but
+        the carry-forward remains correct either way -- so this test documents
+        the ordering rather than depending on it.
+        """
+        src = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        assert src.index("manifest.set_config(") < src.index("[skip]")
+
+
+class TestTheRefusalTellsTheOperatorSomethingTheyCanDo:
+    """Remediation advice that does not work is an outage with extra steps.
+
+    One tail served both branches and was wrong for one of them: for records
+    all at one version under a manifest declaring another, "move the files of
+    the versions you do not want out of the directory" leaves the directory
+    empty and the report exits with "no records found".
+    """
+
+    def _row(self, **kw):
+        row = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+               "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+        version = kw.pop("version", None)
+        row.update(kw)
+        if version is not None:
+            row["extra"] = {"ops_measurement_version": version}
+        return row
+
+    def _message(self, rows, declared=None):
+        from report.loaders import (MixedMeasurementVersions,
+                                    refuse_mixed_measurement_versions)
+        try:
+            refuse_mixed_measurement_versions(rows, source="RUN",
+                                              declared=declared)
+        except MixedMeasurementVersions as exc:
+            return str(exc)
+        raise AssertionError("no refusal")
+
+    def test_the_manifest_branch_names_the_key_that_is_wrong(self):
+        message = self._message([self._row()], declared=2)
+        assert "config.ops_measurement_version" in message
+        assert "run-manifest.json" in message
+
+    def test_the_manifest_branch_does_not_tell_them_to_drop_records(self):
+        """There is one version of them; dropping it leaves nothing.
+
+        Asserted against the mixed branch's actual remediation sentence rather
+        than the substring "move". That substring passed only because the text
+        happens to say "removing" rather than "remove", so a harmless reword
+        would have broken it while the real regression -- the mixed branch's
+        advice appearing here -- could slip past.
+        """
+        message = self._message([self._row()], declared=2)
+        assert "move or split them" not in message
+        assert "generate one report per version" not in message
+        assert "Dropping records cannot fix this" in message
+
+    def test_the_manifest_branch_says_the_records_agree(self):
+        """Otherwise the operator hunts for a disagreement that is not there."""
+        message = self._message([self._row()], declared=2)
+        assert "records agree with each other" in message
+
+    def test_the_declared_side_is_listed_even_though_it_has_no_records(self):
+        """The one line in the listing that nothing else covers.
+
+        Deleting it leaves a refusal whose headline names two versions and
+        whose listing shows one, which reads like the guard miscounted.
+        """
+        message = self._message([self._row()], declared=2)
+        assert "version 2: declared by the run manifest" in message
+        assert "no records measured under it" in message
+        # And it must not claim a count it does not have.
+        assert "version 2: 0 record" not in message
+
+    def test_the_mixed_records_branch_keeps_its_actionable_advice(self):
+        message = self._message([self._row(), self._row(version=2)])
+        assert "move or split them" in message
+        assert "--from-records" in message
+
+    def test_the_mixed_records_branch_does_not_assume_one_file_per_version(self):
+        """A resumed run appends, so one file can hold both versions and there
+        is no file to move. The advice has to cover that."""
+        message = self._message([self._row(), self._row(version=2)])
+        assert "one file can hold more than one" in message
+
+    def test_neither_branch_recommends_the_other_s_remedy(self):
+        mixed = self._message([self._row(), self._row(version=2)])
+        manifest = self._message([self._row()], declared=2)
+        assert "config.ops_measurement_version in run-manifest.json" \
+            not in mixed
+        assert "--from-records" not in manifest
+
+
+class TestVersionsOneAndTwoMeanTheSameMeasurement:
+    """The refusal must not contradict the methodology it enforces.
+
+    Version 2 changed nothing measured -- it exists because version 1 was never
+    written down. `docs/05-methodology.md` says so, because a reader who hits
+    the refusal needs to know it. The refusal text said the opposite: that two
+    versions "are two different measurements" and that records predating the
+    newer one "have to be re-measured". Versions 1 and 2 are the only pair that
+    can occur today, and an operator reaches it by resuming any archived run
+    and measuring one more unit -- so every operator who saw this guard was
+    told to re-measure data the docs call directly comparable.
+    """
+
+    def _message(self, rows, declared=None):
+        from report.loaders import (MixedMeasurementVersions,
+                                    refuse_mixed_measurement_versions)
+        try:
+            refuse_mixed_measurement_versions(rows, source="RUN",
+                                              declared=declared)
+        except MixedMeasurementVersions as exc:
+            return str(exc)
+        raise AssertionError("no refusal")
+
+    def _row(self, version=None, **kw):
+        row = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+               "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+        row.update(kw)
+        if version is not None:
+            row["extra"] = {"ops_measurement_version": version}
+        return row
+
+    def test_the_code_knows_which_versions_are_equivalent(self):
+        from harness.metrics.records import (
+            OPS_MEASUREMENT_EQUIVALENT_VERSIONS,
+            ops_versions_measure_the_same_thing)
+        assert set(OPS_MEASUREMENT_EQUIVALENT_VERSIONS) == {1, 2}
+        assert ops_versions_measure_the_same_thing([1, 2])
+        assert ops_versions_measure_the_same_thing([2])
+
+    def test_a_version_it_has_not_been_told_about_is_not_equivalent(self):
+        """Saying two numbers are comparable is a claim; the default is no."""
+        from harness.metrics.records import ops_versions_measure_the_same_thing
+        assert not ops_versions_measure_the_same_thing([1, 3])
+        assert not ops_versions_measure_the_same_thing([2, 99])
+        assert not ops_versions_measure_the_same_thing([])
+        # Malformed values must not blow up the membership test.
+        assert not ops_versions_measure_the_same_thing(["2"])
+        assert not ops_versions_measure_the_same_thing([[2]])
+        assert not ops_versions_measure_the_same_thing([{"v": 2}])
+
+    def test_the_docs_and_the_code_agree(self):
+        """Pinned together, because they drifted apart once already.
+
+        The docs assert engine behaviour and this repo keeps such assertions
+        executable. Deleting the claim from the methodology, or dropping 2 out
+        of the equivalence set, must break this.
+        """
+        from harness.metrics.records import (
+            OPS_MEASUREMENT_EQUIVALENT_VERSIONS)
+        doc = open(os.path.join(VB_ROOT, "docs",
+                                "05-methodology.md")).read()
+        assert "Version 2 measures exactly what version 1 measured" in doc
+        assert set(OPS_MEASUREMENT_EQUIVALENT_VERSIONS) == {1, 2}
+
+    # The demand, not the word. The carve-out sentence itself contains
+    # "need re-measuring" (negated), so a bare substring test on "re-measur"
+    # fails against correct text.
+    DEMANDS = ("have to be re-measured", "must be re-measured",
+               "they have to be re-measured before")
+
+    def test_the_mixed_branch_does_not_demand_re_measurement_for_1_and_2(self):
+        message = self._message([self._row(), self._row(version=2)])
+        for demand in self.DEMANDS:
+            assert demand not in message, demand
+        assert "denote the same measurement" in message
+        assert "none of these numbers need re-measuring" in message
+
+    def test_the_manifest_branch_does_not_demand_re_measurement_for_1_and_2(self):
+        """The exact path an operator reaches after resuming an archived run."""
+        message = self._message([self._row()], declared=2)
+        for demand in self.DEMANDS:
+            assert demand not in message, demand
+        assert "denote the same measurement" in message
+        assert "none of these numbers need re-measuring" in message
+
+    def test_the_mixed_branch_does_not_call_them_different_measurements(self):
+        message = self._message([self._row(), self._row(version=2)])
+        assert "two different measurements" not in message
+
+    def test_it_still_refuses(self):
+        """REFUSE is settled. The carve-out is about the wording, not the
+        verdict: the report prints one version above the numbers and cannot
+        print two."""
+        message = self._message([self._row(), self._row(version=2)])
+        assert "cannot go on one chart" in message
+        assert "a report of its own" in message
+
+    def test_a_bump_that_does_change_a_number_is_still_described_correctly(self):
+        """The general wording has to survive, or the next real bump ships with
+        text saying its numbers are comparable when they are not."""
+        message = self._message([self._row(version=2), self._row(version=3)])
+        assert "A measurement version changes what a number means" in message
+        assert "two different measurements" in message
+        assert "denote the same measurement" not in message
+
+    def test_a_real_bump_against_the_manifest_still_says_re_measure(self):
+        message = self._message([self._row(version=3)], declared=5)
+        assert "re-measured" in message
+        assert "changed what is measured" in message
+
+
+class TestTheManifestHalfReachesEveryReader:
+    """F6 made every reader consult the guard; this makes it the whole guard.
+
+    `generate --from-records` and `webui/records.py` called
+    refuse_mixed_measurement_versions without `declared`, so records that were
+    internally consistent but a version behind their own manifest were refused
+    on one path and accepted on the other two. The report then printed
+    version-2 provenance above version-1 numbers -- and --from-records is the
+    first thing an operator reaches for after being refused.
+    """
+
+    V1_ROW = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+              "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+
+    def _run(self, tmp_path, declared=2):
+        run = tmp_path / "run"
+        run.mkdir(parents=True, exist_ok=True)
+        config = {"resource_pass": "normalized"}
+        if declared is not None:
+            config["ops_measurement_version"] = declared
+        (run / "run-manifest.json").write_text(
+            json.dumps({"run_id": "r", "config": config}))
+        return run
+
+    def _jsonl(self, path, rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_from_records_checks_the_records_against_the_manifest(
+            self, tmp_path, capsys):
+        from report import generate
+        run = self._run(tmp_path)
+        merged = tmp_path / "v1.jsonl"
+        self._jsonl(merged, [self.V1_ROW])
+        code = generate.main(["--run-dir", str(run),
+                              "--from-records", str(merged)])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "run manifest declares version 2" in err
+
+    def test_a_refused_from_records_run_still_writes_nothing(self, tmp_path):
+        from report import generate
+        run = self._run(tmp_path)
+        merged = tmp_path / "v1.jsonl"
+        self._jsonl(merged, [self.V1_ROW])
+        generate.main(["--run-dir", str(run), "--from-records", str(merged)])
+        assert not (run / "report" / "records.jsonl").exists()
+
+    def test_from_records_accepts_records_that_match_the_manifest(
+            self, tmp_path):
+        from report.loaders import (declared_ops_version,
+                                    refuse_mixed_measurement_versions)
+        run = self._run(tmp_path)
+        row = dict(self.V1_ROW, extra={"ops_measurement_version": 2})
+        refuse_mixed_measurement_versions(
+            [row], source="x", declared=declared_ops_version(str(run)))
+
+    def test_from_records_ignores_a_manifest_that_declares_nothing(
+            self, tmp_path):
+        """Every archived run. This is the one that must not start refusing."""
+        from report import generate
+        run = self._run(tmp_path, declared=None)
+        merged = tmp_path / "v1.jsonl"
+        self._jsonl(merged, [self.V1_ROW])
+        # Not 2: it gets past the guard. (It still exits non-zero further on
+        # for want of a dataset, which is not this guard's business.)
+        assert generate.main(["--run-dir", str(run),
+                              "--from-records", str(merged)]) != 2
+
+    def test_the_web_ui_checks_the_records_against_the_manifest(self, tmp_path):
+        from report.loaders import MixedMeasurementVersions
+        from webui import records as records_mod
+        run = self._run(tmp_path)
+        self._jsonl(run / "report" / "records.jsonl", [self.V1_ROW])
+        with pytest.raises(MixedMeasurementVersions):
+            records_mod.load_records(str(run))
+
+    def test_the_web_ui_accepts_a_matching_merged_file(self, tmp_path):
+        from webui import records as records_mod
+        run = self._run(tmp_path)
+        self._jsonl(run / "report" / "records.jsonl",
+                    [dict(self.V1_ROW, extra={"ops_measurement_version": 2})])
+        rows, source = records_mod.load_records(str(run))
+        assert source == "records.jsonl" and len(rows) == 1
+
+    def test_the_web_ui_ignores_a_manifest_that_declares_nothing(self, tmp_path):
+        from webui import records as records_mod
+        run = self._run(tmp_path, declared=None)
+        self._jsonl(run / "report" / "records.jsonl", [self.V1_ROW])
+        rows, _source = records_mod.load_records(str(run))
+        assert len(rows) == 1
+
+    CALL = "refuse_mixed_measurement_versions("
+
+    def _call_args(self, src):
+        """The argument text of each call to the guard, definition excluded.
+
+        A paren-balanced scan rather than a file-wide count of "declared=".
+        The count version was vacuous for exactly the two files finding B was
+        about: each contains one call, so `calls - 1 == 0` and the assertion
+        reduced to `>= 0`.
+        """
+        found, i = [], 0
+        while True:
+            i = src.find(self.CALL, i)
+            if i < 0:
+                return found
+            if src[:i].rstrip().endswith("def"):
+                i += len(self.CALL)
+                continue
+            j, depth = i + len(self.CALL), 1
+            while depth:
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                j += 1
+            found.append(src[i + len(self.CALL):j - 1])
+            i = j
+
+    def test_every_reader_passes_declared(self):
+        """Checked on the call's own arguments, so half-arming it is caught.
+
+        The behavioural tests above are the real guard -- this one exists
+        because `declared` defaults to None, so omitting it is silent, and
+        because a fourth reader added later should fail here rather than ship
+        with half the check.
+        """
+        for parts in (("report", "loaders.py"), ("report", "generate.py"),
+                      ("webui", "records.py")):
+            src = open(os.path.join(VB_ROOT, *parts)).read()
+            args = self._call_args(src)
+            assert args, f"{parts}: no call to the guard found"
+            for one in args:
+                assert "declared=" in one, (parts, one)
+                assert "declared=None" not in one, (parts, one)
+                assert "declared_ops_version(" in one, (parts, one)
+
+
+class TestTheRefusalSurvivesItsOwnCallers:
+    """Two properties that were asserted in a comment and nowhere else."""
+
+    def _mixed_dir(self, tmp_path, with_corruption=False):
+        run = tmp_path / "run"
+        run.mkdir(parents=True, exist_ok=True)
+        base = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+                "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+        (run / "ops-mariadb-d-normalized-a.jsonl").write_text(
+            json.dumps(base) + "\n")
+        (run / "ops-alisql-d-normalized-a.jsonl").write_text(
+            json.dumps(dict(base, engine="alisql",
+                            extra={"ops_measurement_version": 2})) + "\n")
+        if with_corruption:
+            # read_records raises ValueError for damage before valid data, and
+            # load_ops_records swallows that per file and carries on.
+            (run / "ops-pgvector-d-normalized-a.jsonl").write_text(
+                '{"a": 1}\n{broken\n{"c": 3}\n')
+        return run
+
+    def test_the_refusal_is_raised_outside_the_per_file_handler(
+            self, tmp_path, capsys):
+        """Position, not class, is what lets it escape.
+
+        The loop's handler is `except Exception`, so a refusal raised inside it
+        would be swallowed and printed as an unreadable file. This directory
+        has a genuinely damaged file as well, so the handler definitely runs --
+        and the refusal still has to come out.
+        """
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = self._mixed_dir(tmp_path, with_corruption=True)
+        with pytest.raises(MixedMeasurementVersions):
+            load_ops_records(str(run))
+        assert "could not read" in capsys.readouterr().out
+
+    def test_a_caller_guarding_against_file_errors_does_not_swallow_it(
+            self, tmp_path):
+        """webui/setup.py, webui/importing.py and orchestrator/export.py all
+        wrap work in `except (OSError, ValueError)`. A refusal that subclassed
+        ValueError would vanish into the next such caller, reported as a
+        damaged file, and the report would be generated anyway."""
+        from report.loaders import MixedMeasurementVersions, load_ops_records
+        run = self._mixed_dir(tmp_path)
+        try:
+            load_ops_records(str(run))
+        except (OSError, ValueError) as exc:
+            raise AssertionError(
+                f"a caller's (OSError, ValueError) handler would swallow the "
+                f"refusal: {type(exc).__name__}")
+        except MixedMeasurementVersions:
+            pass
+        else:
+            raise AssertionError("no refusal")
+
+    def test_it_is_not_a_valueerror(self):
+        from report.loaders import MixedMeasurementVersions
+        assert not issubclass(MixedMeasurementVersions, ValueError)
+
+    def test_a_damaged_file_alone_is_still_just_a_damaged_file(self, tmp_path):
+        """The distinction is only worth having if the other side still holds:
+        one unreadable file must not become a refusal to report the run."""
+        from report.loaders import load_ops_records
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "ops-mariadb-d-normalized-a.jsonl").write_text(
+            '{"a": 1}\n{broken\n{"c": 3}\n')
+        assert load_ops_records(str(run)) == []
+
+
+class TestARefusedRegenerationLeavesTheOldReportAlone:
+    """Behavioural, not a source-index assertion.
+
+    The chart cleanup moving below the record load was checked by comparing
+    byte offsets in generate.py, which says nothing about what survives on
+    disk. This runs the generator against a run directory that already holds a
+    working report, refuses it, and looks at the files.
+    """
+
+    def _run_with_a_report(self, tmp_path, mixed=True):
+        run = tmp_path / "run"
+        (run / "report" / "charts").mkdir(parents=True)
+        (run / "run-manifest.json").write_text(json.dumps(
+            {"run_id": "r", "config": {"resource_pass": "normalized"}}))
+        (run / "report" / "charts" / "recall_glove.png").write_bytes(b"PNG")
+        (run / "report" / "charts" / "build_glove.svg").write_bytes(b"SVG")
+        (run / "report" / "index.html").write_text("<html>a report</html>")
+        (run / "report" / "records.jsonl").write_text('{"old": true}\n')
+
+        base = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+                "dataset": "d", "m": 16, "timestamp": "2026-01-01T00:00:00Z"}
+        rows = [base]
+        if mixed:
+            rows.append(dict(base, engine="alisql",
+                             extra={"ops_measurement_version": 2}))
+        (run / "ops-mariadb-d-normalized-a.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows))
+        return run
+
+    def test_the_charts_of_the_working_report_survive(self, tmp_path):
+        from report import generate
+        run = self._run_with_a_report(tmp_path)
+        assert generate.main(["--run-dir", str(run)]) == 2
+        charts = run / "report" / "charts"
+        assert (charts / "recall_glove.png").read_bytes() == b"PNG"
+        assert (charts / "build_glove.svg").read_bytes() == b"SVG"
+
+    def test_the_page_and_its_records_survive(self, tmp_path):
+        """index.html referencing deleted charts is the actual damage: a page
+        of broken images where a valid report used to be."""
+        from report import generate
+        run = self._run_with_a_report(tmp_path)
+        generate.main(["--run-dir", str(run)])
+        assert (run / "report" / "index.html").read_text() == \
+            "<html>a report</html>"
+        assert (run / "report" / "records.jsonl").read_text() == \
+            '{"old": true}\n'
+
+    def test_an_empty_run_does_not_clear_them_either(self, tmp_path):
+        """Same damage by a different route: no records at all also used to
+        clear the charts first and then exit non-zero."""
+        from report import generate
+        run = self._run_with_a_report(tmp_path, mixed=False)
+        (run / "ops-mariadb-d-normalized-a.jsonl").unlink()
+        assert generate.main(["--run-dir", str(run)]) == 1
+        assert (run / "report" / "charts" / "recall_glove.png").exists()
+        assert (run / "report" / "index.html").exists()
+
+
+class TestARefusalDescribesTheSetItIsAbout:
+    """Every sentence must be true of the records it is printed over.
+
+    The mismatch branch is written for a directory whose records agree with
+    each other and disagree only with the manifest above them. It used to be
+    chosen whenever the manifest matched no record group -- which is also true
+    when the records disagree among themselves and none of them matches the
+    manifest. Over v1 and v3 records under a manifest declaring v2 it then said
+    every record was version 1, that the records agreed, that there was only
+    one version of them and that removing it would leave nothing to report,
+    with version 3 listed three lines below; and because only the first side
+    reached the equivalence predicate, that none of the numbers needed
+    re-measuring -- a comparability claim across a real bump. Following its
+    remedy refused again, so it looped.
+    """
+
+    def _row(self, version=None, **kw):
+        row = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+               "dataset": "d", "m": 16, "resource_pass": "normalized",
+               "timestamp": "2026-01-01T00:00:00Z"}
+        row.update(kw)
+        if version is not None:
+            row["extra"] = {"ops_measurement_version": version}
+        return row
+
+    def _message(self, rows, declared=None):
+        from report.measurement_versions import (
+            MixedMeasurementVersions, refuse_mixed_measurement_versions)
+        try:
+            refuse_mixed_measurement_versions(rows, source="RUN",
+                                              declared=declared)
+        except MixedMeasurementVersions as exc:
+            return str(exc)
+        raise AssertionError("no refusal")
+
+    #: v1 and v3 records under a manifest declaring v2.
+    def _three_way(self):
+        return [self._row(), self._row(version=3, engine="alisql",
+                                       timestamp="2026-09-09T00:00:00Z")]
+
+    def test_it_does_not_claim_every_record_is_one_version(self):
+        message = self._message(self._three_way(), declared=2)
+        assert "every ops record here was measured under version" not in message
+        assert "3 different measurement versions" in message
+
+    def test_it_does_not_claim_the_records_agree(self):
+        message = self._message(self._three_way(), declared=2)
+        assert "records agree with each other" not in message
+
+    def test_it_does_not_claim_dropping_records_cannot_help(self):
+        """Here dropping one half IS the fix, so the opposite advice loops."""
+        message = self._message(self._three_way(), declared=2)
+        assert "Dropping records cannot fix this" not in message
+        assert "only one version of them" not in message
+        assert "move or split them" in message
+
+    def test_it_does_not_claim_comparability_across_a_real_bump(self):
+        """The worst of the four, and the one direction we agreed is never
+        claimed by accident: version 3 is a bump that changed a number."""
+        message = self._message(self._three_way(), declared=2)
+        assert "denote the same measurement" not in message
+        assert "none of these numbers need re-measuring" not in message
+        assert "two different measurements" in message
+
+    def test_it_still_names_the_manifest_as_wrong(self):
+        """The manifest is still wrong and still worth naming -- an operator
+        who splits the records and regenerates would otherwise be refused a
+        second time by a check the first message never mentioned."""
+        message = self._message(self._three_way(), declared=2)
+        assert "run manifest declares version 2" in message
+        assert "run-manifest.json is wrong as well" in message
+        assert "will refuse that half too" in message
+
+    def test_the_declared_version_is_listed_with_the_record_versions(self):
+        message = self._message(self._three_way(), declared=2)
+        assert "version 1: 1 record" in message
+        assert "version 3: 1 record" in message
+        assert "version 2: declared by the run manifest" in message
+
+    def test_following_the_remedy_actually_resolves_it(self, tmp_path):
+        """Non-working remediation is the defect class this class exists for.
+
+        Do what the message says -- keep one version, set the manifest to it --
+        and the run must load. Before the fix the stated remedy was to correct
+        the manifest to version 1, which left v1 and v3 records still mixed and
+        refused again.
+        """
+        from report.loaders import load_ops_records
+        run = tmp_path / "run"
+        run.mkdir()
+        (run / "run-manifest.json").write_text(json.dumps(
+            {"run_id": "r", "config": {"resource_pass": "normalized",
+                                       "ops_measurement_version": 2}}))
+        with open(run / "ops-mariadb-d-normalized-a.jsonl", "w") as fh:
+            for row in self._three_way():
+                fh.write(json.dumps(row) + "\n")
+
+        from report.measurement_versions import MixedMeasurementVersions
+        with pytest.raises(MixedMeasurementVersions):
+            load_ops_records(str(run))
+
+        # The remedy: one version left, manifest set to it.
+        with open(run / "ops-mariadb-d-normalized-a.jsonl", "w") as fh:
+            fh.write(json.dumps(self._row(version=3)) + "\n")
+        (run / "run-manifest.json").write_text(json.dumps(
+            {"run_id": "r", "config": {"resource_pass": "normalized",
+                                       "ops_measurement_version": 3}}))
+        assert len(load_ops_records(str(run))) == 1
+
+    def test_the_single_version_case_still_uses_the_mismatch_branch(self):
+        """The branch that was right must stay reachable."""
+        message = self._message([self._row()], declared=2)
+        assert "every ops record here was measured under version 1" in message
+        assert "records agree with each other" in message
+        assert "Dropping records cannot fix this" in message
+
+    def test_the_mismatch_branch_is_used_only_for_one_record_version(self):
+        """The tripwire, as a test: the headline written for a directory whose
+        records agree appears exactly when they do."""
+        agreeing = self._message([self._row(), self._row(m=32)], declared=2)
+        disagreeing = self._message(self._three_way(), declared=2)
+        headline = "every ops record here was measured under version"
+        assert headline in agreeing
+        assert headline not in disagreeing
+
+    def test_the_equivalence_claim_covers_the_declared_version_too(self):
+        """Records at 1 and 2 are equivalent, but a manifest declaring 3 puts a
+        real bump in the set being described -- so the conservative wording is
+        correct, and claiming "the same measurement" three lines above a
+        version 3 listing would not be."""
+        message = self._message([self._row(), self._row(version=2)],
+                                declared=3)
+        assert "denote the same measurement" not in message
+        assert "two different measurements" in message
+
+    def test_an_equivalent_pair_with_no_manifest_still_gets_the_carve_out(self):
+        """And the carve-out must not have been lost in the process."""
+        message = self._message([self._row(), self._row(version=2)])
+        assert "denote the same measurement" in message
+
+
+class TestTheEquivalenceSetCannotGrowByAccident:
+    """A correctness claim stored as data needs a lock, not a comment.
+
+    The set says "these versions measure the same thing", which is the one
+    claim this guard must never make by accident. Written as the literal
+    `frozenset({1, 2})` it was an extension point whose only protection was a
+    comment asking people not to use it: `{1, 2, 4}` is a one-character edit
+    asserting that version 4 measures what version 1 did, and the subset-style
+    assertions it had could not see a set growing at all -- measured, {1,2,4},
+    {1,2,5}, {1,2,7} and {1,2,4,5} all passed the entire suite.
+    """
+
+    def test_it_is_exactly_the_two_named_versions(self):
+        from harness.metrics.records import (
+            FIRST_RECORDED_OPS_MEASUREMENT_VERSION,
+            IMPLICIT_OPS_MEASUREMENT_VERSION,
+            OPS_MEASUREMENT_EQUIVALENT_VERSIONS)
+        assert set(OPS_MEASUREMENT_EQUIVALENT_VERSIONS) == {
+            IMPLICIT_OPS_MEASUREMENT_VERSION,
+            FIRST_RECORDED_OPS_MEASUREMENT_VERSION,
+        }
+        assert len(OPS_MEASUREMENT_EQUIVALENT_VERSIONS) == 2
+
+    def test_it_is_derived_from_those_names_rather_than_listed(self):
+        """The structural lock. A third member now requires naming a third
+        concept and saying in its docstring why that version changed nothing,
+        which is the deliberateness the comment used to merely request."""
+        src = open(os.path.join(VB_ROOT, "harness", "metrics",
+                                "records.py")).read()
+        body = src.split("OPS_MEASUREMENT_EQUIVALENT_VERSIONS = ")[1]
+        declaration = body[:body.index(")") + 1]
+        assert "IMPLICIT_OPS_MEASUREMENT_VERSION" in declaration
+        assert "FIRST_RECORDED_OPS_MEASUREMENT_VERSION" in declaration
+        # No bare integers, which is what makes a casual addition impossible.
+        assert not re.search(r"\b\d+\b", declaration), declaration
+
+    def test_the_recorded_version_name_does_not_track_the_current_one(self):
+        """If the set were derived from OPS_MEASUREMENT_VERSION it would follow
+        every bump, and a bump to 3 would silently claim v3 measures what v1
+        did -- the exact failure the derivation is meant to prevent."""
+        from harness.metrics import records as mod
+        assert mod.FIRST_RECORDED_OPS_MEASUREMENT_VERSION == 2
+        src = open(os.path.join(VB_ROOT, "harness", "metrics",
+                                "records.py")).read()
+        body = src.split("OPS_MEASUREMENT_EQUIVALENT_VERSIONS = ")[1]
+        declaration = body[:body.index(")") + 1]
+        # Anchored at the line start: "OPS_MEASUREMENT_VERSION," is a suffix of
+        # "IMPLICIT_OPS_MEASUREMENT_VERSION,", so a plain substring test reads
+        # the correct declaration as the broken one. Third time this family of
+        # names has sprung that trap in this change.
+        assert not re.search(r"^\s*OPS_MEASUREMENT_VERSION\s*,", declaration,
+                             re.MULTILINE), declaration
+
+    def test_a_bumped_current_version_leaves_the_set_alone(self):
+        """The scheme has to survive its own future: with the constant at 3,
+        v2+v3 gets the "different measurements" wording and v1+v2 keeps the
+        carve-out."""
+        from harness.metrics import records as mod
+        before = mod.OPS_MEASUREMENT_VERSION
+        try:
+            mod.OPS_MEASUREMENT_VERSION = 3
+            assert set(mod.OPS_MEASUREMENT_EQUIVALENT_VERSIONS) == {1, 2}
+            assert mod.ops_versions_measure_the_same_thing([1, 2])
+            assert not mod.ops_versions_measure_the_same_thing([2, 3])
+        finally:
+            mod.OPS_MEASUREMENT_VERSION = before
+
+
+class TestTheRefusalMachineryMovedWithoutLoss:
+    """report/loaders.py was 793 lines against this repo's 800 ceiling.
+
+    The refusal machinery moved to report/measurement_versions.py so the next
+    addition would not breach it, and so the change would be reviewed here
+    rather than inherited by unrelated work in the file.
+    """
+
+    def test_the_public_names_are_still_importable_from_loaders(self):
+        """`from report.loaders import ...` is how every existing caller and
+        test reaches them, including code this change does not own."""
+        from report import loaders, measurement_versions
+        for name in ("MixedMeasurementVersions", "declared_ops_version",
+                     "ops_measurement_version", "ops_measurement_versions",
+                     "refuse_mixed_measurement_versions"):
+            assert getattr(loaders, name) is getattr(measurement_versions,
+                                                     name), name
+
+    def test_both_files_are_within_the_line_ceiling(self):
+        for parts in (("report", "loaders.py"),
+                      ("report", "measurement_versions.py")):
+            path = os.path.join(VB_ROOT, *parts)
+            lines = len(open(path).read().splitlines())
+            assert lines <= 800, f"{parts}: {lines} lines"
+
+    def test_the_new_module_does_not_import_the_orchestrator(self):
+        """Covered by the report-wide glob too, asserted here so the reason
+        travels with the file: it runs in a bench image mounting report/ and
+        harness/ only."""
+        src = open(os.path.join(VB_ROOT, "report",
+                                "measurement_versions.py")).read()
+        for line in src.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "import orchestrator" not in stripped, stripped
+            assert "from orchestrator" not in stripped, stripped
+
+    def test_there_is_one_place_to_patch_the_guard(self, tmp_path):
+        """loaders calls through the module, not through a bound name.
+
+        Binding the functions into loaders as well would give each reader its
+        own reference, and standing the guard down in a test would reach some
+        readers and not others -- which is how a dead mutation looks like a
+        passing one.
+        """
+        from report import loaders, measurement_versions
+        run = tmp_path / "run"
+        run.mkdir()
+        base = {"run_id": "r", "engine": "mariadb", "phase": "index_build",
+                "dataset": "d", "timestamp": "t"}
+        with open(run / "ops-mariadb-d-normalized-a.jsonl", "w") as fh:
+            fh.write(json.dumps(base) + "\n")
+            fh.write(json.dumps(dict(
+                base, engine="alisql",
+                extra={"ops_measurement_version": 2})) + "\n")
+
+        with pytest.raises(measurement_versions.MixedMeasurementVersions):
+            loaders.load_ops_records(str(run))
+
+        honest = measurement_versions.refuse_mixed_measurement_versions
+        try:
+            measurement_versions.refuse_mixed_measurement_versions = (
+                lambda records, *, source, declared=None: None)
+            assert len(loaders.load_ops_records(str(run))) == 2
+        finally:
+            measurement_versions.refuse_mixed_measurement_versions = honest
+
+
+# ---------------------------------------------------------------------------
+# T1d: the concurrency surfaces (§1.1's recall column, §1.4's client CPU)
+# ---------------------------------------------------------------------------
+
+def _table_cells(table: str):
+    """A Markdown table as a list of rows of cells, separator row dropped.
+
+    Cells rather than a substring search, because "Recall@k" appears in four
+    of this report's tables and `recall_at_k` appears in the raw records: a
+    membership test against the whole fragment is satisfied by a table that
+    does not have the column, and a value test against the whole fragment is
+    satisfied by the value turning up in some other column.
+    """
+    rows = []
+    for line in table.strip().splitlines():
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(c and set(c) <= set("-: ") for c in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _concurrency_record(**over):
+    """One concurrency record as the workload writes it today."""
+    extra = {
+        "scaling_efficiency": 0.43, "duration_s": 30,
+        "warmup_queries_per_client": 50, "repeats": 3,
+        "qps_samples": [4800.0, 5820.0, 5100.0], "qps_spread_pct": 21.3,
+        "recall_queries": 10_000, "recall_spread": 0.0003,
+        "query_pool": 10_000, "query_reuse": 15.3,
+        "inflight_discarded": 32, "prewindow_discarded": 0,
+        "client_cpu_seconds": 48.0, "client_cpus": 4,
+        "client_cpu_util": 0.40, "client_bound": False,
+    }
+    extra.update(over.pop("extra", {}))
+    record = {"phase": "concurrency", "engine": "pgvector", "dataset": "d",
+              "resource_pass": "normalized", "storage_engine": "heap",
+              "m": 16, "ef_search": 100, "clients": 32, "qps": 5100.0,
+              "recall_at_k": 0.9812, "latency_p50_ms": 5.1,
+              "latency_p95_ms": 9.9, "latency_p99_ms": 14.2,
+              "queries_executed": 153_000}
+    record.update(over)
+    record["extra"] = extra
+    return record
+
+
+class TestTheConcurrencyTableCarriesItsQualityFigure:
+    """A concurrency point had QPS and latency and no recall beside it.
+
+    The workload has recorded `recall_at_k` on every concurrency record since
+    §1.1, and the table listed Engine, Dataset, Storage, Clients, QPS, Spread
+    and three percentiles -- so a record carrying 0.9812 rendered nowhere at
+    all. §1.1 exists so the report stops presenting two engines at one
+    `ef_search` as comparable when they sit at 0.98 and 0.80; without the
+    column it still did.
+    """
+
+    def _cells(self, *records):
+        from report.render import _concurrency_table
+        return _table_cells(_concurrency_table({"concurrency": list(records)}))
+
+    def test_the_recall_column_holds_the_records_recall(self):
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert "Recall@k" in header
+        assert body[0][header.index("Recall@k")] == "0.9812"
+
+    def test_a_point_with_no_recall_renders_a_dash_rather_than_a_zero(self):
+        rows = self._cells(_concurrency_record(recall_at_k=None))
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Recall@k")] == "—"
+
+    def test_the_pool_and_the_reuse_are_shown(self):
+        """A reader comparing a version-2 report with a version-3 one needs
+        both to see why the throughput moved: the same QPS over a pool of 500
+        and a pool of 10,000 are measurements of two different things."""
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Query pool")] == "10,000"
+        assert body[0][header.index("Reuse")] == "15.30x"
+
+    def test_the_client_cpu_column_holds_the_utilisation(self):
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Client CPU")] == "0.40"
+
+    def test_a_client_bound_point_is_marked_in_its_own_cell(self):
+        from report.render import CLIENT_BOUND_MARK
+        bound = _concurrency_record(
+            extra={"client_cpu_util": 0.93, "client_bound": True})
+        rows = self._cells(bound)
+        header, body = rows[0], rows[1:]
+        cell = body[0][header.index("Client CPU")]
+        assert cell == f"0.93 {CLIENT_BOUND_MARK}"
+
+    def test_an_unmeasured_client_cpu_is_a_dash_not_a_zero(self):
+        """None means no counter was readable, which is not the claim that the
+        clients were idle."""
+        rows = self._cells(_concurrency_record(
+            extra={"client_cpu_util": None, "client_bound": None}))
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Client CPU")] == "—"
+
+    def test_every_body_cell_is_filled(self):
+        """A column added to the header and not to the row shifts every cell
+        after it, which renders as a plausible table of wrong numbers."""
+        rows = self._cells(_concurrency_record(), _concurrency_record(clients=1))
+        header, body = rows[0], rows[1:]
+        assert len(body) == 2
+        for row in body:
+            assert len(row) == len(header), list(zip(header, row))
+
+
+class TestTheConcurrencyNotesExplainTheNewColumns:
+    def _notes(self, *records):
+        from report.render import _concurrency_notes
+        return _concurrency_notes({"concurrency": list(records)})
+
+    def test_the_in_flight_correction_is_named_without_a_column(self):
+        """T1c's `extra.inflight_discarded` had no reader at all.
+
+        It does not earn a column -- at most one query per client, 0.005% of a
+        30-second window's throughput -- but the correction it evidences has
+        to be stated or the QPS reads as the uncorrected one.
+        """
+        notes = self._notes(_concurrency_record())
+        assert "inflight_discarded" in notes
+        assert "began and ended inside the window" in notes
+
+    def test_the_client_cpu_definition_names_all_three_of_its_inputs(self):
+        notes = self._notes(_concurrency_record())
+        assert "cpuset" in notes
+        assert "not evidence about where the engine" in notes
+
+    def test_the_footnote_says_the_flag_is_sufficient_and_not_necessary(self):
+        """Measured, not supposed: against the synthetic driver this harness
+        flattens at 2.06 cores -- 0.51 of a four-CPU container -- while its
+        throughput peaks at two clients and halves by thirty-two. The flag
+        would not have fired on any of those points, because the binding
+        resource is one interpreter lock rather than the cpuset. A footnote
+        that only warned about marked points would let an unmarked one be read
+        as proof the engine was the limit."""
+        notes = self._notes(_concurrency_record())
+        assert "an unmarked point is not a guarantee" in notes.lower()
+        assert "2.06 cores" in notes
+
+    def test_the_footnote_says_WHY_the_flag_is_blind_to_a_gil_ceiling(self):
+        """The mechanism, not just the caveat.
+
+        A reader told only "an unmarked point may still be client-bound" notes
+        it and moves on. A reader told that the lock prevents the very CPU
+        consumption the threshold looks for -- so that a flat Client CPU column
+        beside a falling QPS curve IS the signature -- can act on it, and knows
+        that moving the 0.80 limit would not help. This sentence is the
+        difference, so it is pinned.
+        """
+        notes = self._notes(_concurrency_record())
+        assert "cannot see an interpreter-lock ceiling" in notes
+        assert "prevents the very CPU consumption the threshold looks for" \
+            in notes
+        # And the actionable form of it: what the reader should look for.
+        assert "flat Client CPU column beside a falling QPS curve" in notes
+
+    def test_a_client_bound_run_names_the_points(self):
+        notes = self._notes(
+            _concurrency_record(clients=16, extra={"client_cpu_util": 0.88,
+                                                   "client_bound": True}),
+            _concurrency_record(clients=4))
+        assert "Client-bound points in this run" in notes
+        assert "at 16 clients" in notes
+        assert "at 4 clients" not in notes
+
+    def test_a_clean_run_claims_nothing(self):
+        notes = self._notes(_concurrency_record())
+        assert "Client-bound points in this run" not in notes
+        assert "prewindow_discarded" not in notes
+        assert "no client-CPU figure" not in notes
+
+    def _unmeasured(self, **over):
+        return _concurrency_record(
+            extra={"client_cpu_util": None, "client_bound": None}, **over)
+
+    def test_some_points_without_a_client_cpu_figure_is_loud(self):
+        """A counter that was readable and then was not.
+
+        The harness lost a measurement part-way through a sweep, so the points
+        either side of it were not measured the same way. That is a fault and
+        it is named, with both counts, so a reader can see it is partial.
+        """
+        notes = self._notes(self._unmeasured(clients=16),
+                            _concurrency_record(clients=4),
+                            _concurrency_record(clients=8))
+        assert "1 of 3 points have no client-CPU figure" in notes
+        assert "readable for some windows of this run and not for others" \
+            in notes
+
+    def test_no_point_having_the_figure_says_nothing_at_all(self):
+        """A run measured end to end by a harness older than this column.
+
+        Every point lacks the figure for one uniform reason, the column is an
+        unbroken row of em dashes that says so by itself, and there is no gap
+        to report. Emitted anyway, this paragraph lands on every report of
+        every pre-existing run directory and trains a reader to skip the
+        footnote -- after which it is also unread on the run where the partial
+        case above actually matters.
+        """
+        notes = self._notes(self._unmeasured(clients=4),
+                            self._unmeasured(clients=8))
+        assert "no client-CPU figure" not in notes
+        # The definition of the column is still there; only the gap note goes.
+        assert "**Client CPU**" in notes
+
+    def test_a_record_predating_the_column_entirely_is_also_silent(self):
+        """Not just `client_cpu_util: None` -- the key absent altogether, which
+        is the shape a pre-T1d record actually has."""
+        old = _concurrency_record()
+        del old["extra"]["client_cpu_util"]
+        del old["extra"]["client_bound"]
+        assert "no client-CPU figure" not in self._notes(old)
+
+    def test_a_non_zero_prewindow_count_is_loud(self):
+        """Zero by construction: the window opens at the barrier release and
+        no measured query can precede it. A number there means the window's two
+        ends disagree about when it began, which is a framework fault and not
+        an engine result -- and until now nothing read the field."""
+        notes = self._notes(_concurrency_record(
+            extra={"prewindow_discarded": 7}))
+        assert "prewindow_discarded" in notes
+        assert "framework fault" in notes
+        # Anchored on the left. "1 point(s)" is a substring of "11 point(s)",
+        # and a count that renders eleven where one is meant would satisfy the
+        # bare membership test; it is exact here only because the fixture
+        # passes a single record.
+        assert "**1 point(s) report" in notes
+
+
+class TestTheConcurrencyChartMarksAClientBoundPoint:
+    """A client-bound point flattens the throughput curve and pulls the
+    efficiency curve away from linear, and neither movement is about the
+    engine. Hollowed the way the filtered chart hollows a short result set."""
+
+    def _axes(self, records):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+        from report import charts
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["axes"] = list(fig.axes)
+            captured["title"] = fig._suptitle.get_text()
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.concurrency(records, "d", d, "t")
+        finally:
+            charts._save = original
+            plt.close("all")
+        return captured
+
+    def _series(self, bound_at=()):
+        return [_concurrency_record(
+            clients=c, qps=1000.0 * c,
+            extra={"scaling_efficiency": 1.0 / c,
+                   "client_cpu_util": 0.95 if c in bound_at else 0.2,
+                   "client_bound": c in bound_at})
+                for c in (1, 2, 4, 8, 16, 32)]
+
+    @staticmethod
+    def _rings(ax):
+        """Where this panel's hollow rings actually sit, sorted by x.
+
+        `get_offsets()` rather than `len(collections)`. A count says that some
+        number of rings were drawn; it does not say they were drawn ON the
+        points, and a ring parked at the axis marks nothing at all on the one
+        chart whose purpose is to say whose ceiling the curve shows. A mutant
+        scattering every ring at y=0 passed the count assertions five times
+        out of five.
+        """
+        points = []
+        for collection in ax.collections:
+            points.extend([float(x), float(y)]
+                          for x, y in collection.get_offsets())
+        return sorted(points)
+
+    @needs_matplotlib
+    def test_a_bound_point_is_ringed_on_throughput_and_on_efficiency(self):
+        captured = self._axes(self._series(bound_at=(16, 32)))
+        throughput, _latency, efficiency = captured["axes"]
+        assert len(throughput.collections) == 2
+        assert len(efficiency.collections) == 2
+
+    @needs_matplotlib
+    def test_each_ring_sits_on_the_point_it_marks(self):
+        """The coordinates, not the count.
+
+        The throughput panel's rings belong at (clients, qps) and the
+        efficiency panel's at (clients, scaling_efficiency) -- two different
+        y values for the same two x values, so a ring taken from the wrong
+        series is caught as well as one parked at zero.
+        """
+        bound = (16, 32)
+        captured = self._axes(self._series(bound_at=bound))
+        throughput, _latency, efficiency = captured["axes"]
+        assert self._rings(throughput) == [[16.0, 16000.0], [32.0, 32000.0]]
+        assert self._rings(efficiency) == [[16.0, 1.0 / 16], [32.0, 1.0 / 32]]
+        # The two panels are not the same ring drawn twice: same x, different
+        # y, so a copy of one onto the other would fail one of the two.
+        assert self._rings(throughput) != self._rings(efficiency)
+
+    @needs_matplotlib
+    def test_a_ring_is_drawn_for_each_bound_point_and_no_other(self):
+        """One client count bound, not two: the ring count and the ring
+        positions both follow the flag rather than the series length."""
+        captured = self._axes(self._series(bound_at=(8,)))
+        throughput, _latency, efficiency = captured["axes"]
+        assert self._rings(throughput) == [[8.0, 8000.0]]
+        assert self._rings(efficiency) == [[8.0, 0.125]]
+
+    @needs_matplotlib
+    def test_an_unbound_series_is_ringed_nowhere(self):
+        captured = self._axes(self._series())
+        for ax in captured["axes"]:
+            assert self._rings(ax) == []
+
+    @needs_matplotlib
+    def test_the_ring_is_hollow(self):
+        """A filled marker would read as an ordinary emphasised point."""
+        captured = self._axes(self._series(bound_at=(32,)))
+        ring = captured["axes"][0].collections[0]
+        assert ring.get_facecolors().size == 0
+        assert ring.get_edgecolors().size > 0
+
+    @needs_matplotlib
+    def test_the_caption_says_what_the_ring_means(self):
+        """An unexplained symbol on a chart is read as a rendering artefact."""
+        captured = self._axes(self._series(bound_at=(32,)))
+        assert "○" in captured["title"]
+        assert "client CPU-bound" in captured["title"]
+
+
+class TestTheWebUiCanPlotConcurrencyRecall:
+    """`webui/static/fields.js` gives each view a CLOSED `ys` allowlist and
+    `explore.js` consumes it as closed, so a field absent from the list cannot
+    be plotted however many records carry it."""
+
+    def _view_ys(self, view_id):
+        path = os.path.join(VB_ROOT, "webui", "static", "fields.js")
+        with open(path) as fh:
+            source = fh.read()
+        # Scoped to this view's own object. The `filtered` view two entries
+        # below already lists recall_at_k, so a whole-file search for it
+        # passes whether or not the concurrency view was touched.
+        chunks = source.split('id: "')
+        chunk = next(c for c in chunks[1:] if c.startswith(view_id + '"'))
+        body = re.search(r"ys:\s*\[(.*?)\]", chunk, re.S)
+        assert body, f"the {view_id} view has no ys array"
+        return re.findall(r'"([a-z_0-9]+)"', body.group(1))
+
+    def test_the_concurrency_view_offers_recall(self):
+        assert "recall_at_k" in self._view_ys("concurrency")
+
+    def test_throughput_is_still_the_default_axis(self):
+        """`explore.js` picks `ys[0]` when nothing is chosen, so the order is
+        the default and reordering it would change what the tab opens on."""
+        assert self._view_ys("concurrency")[0] == "qps"
+
+    def test_the_allowlist_is_what_the_picker_is_built_from(self):
+        """Why one entry was enough, stated against the consumer rather than
+        assumed."""
+        path = os.path.join(VB_ROOT, "webui", "static", "explore.js")
+        with open(path) as fh:
+            source = fh.read()
+        assert "ys: view.ys.filter(" in source
+
+    def test_the_field_has_a_readers_label(self):
+        assert '"Recall@k"' in open(
+            os.path.join(VB_ROOT, "webui", "static", "fields.js")).read()
+
+
+class TestTheSyntheticRunExercisesTheConcurrencySurfaces:
+    """`tests/synthetic.py` is what `make-demo-report` renders for reviewing
+    layout before any real data exists. Its concurrency records carried
+    neither recall nor any of §1.1's and §1.4's extra keys, so a synthetic
+    report showed an em dash exactly where the new columns are -- which reads
+    as a report bug rather than as a fixture gap."""
+
+    def _points(self):
+        from .synthetic import make_records
+        return [r for r in make_records("synthetic-run")
+                if r.get("phase") == "concurrency"]
+
+    def test_every_point_carries_what_the_table_reads(self):
+        """Present AND populated.
+
+        Membership alone is satisfied by a key whose value is None, which is
+        exactly what renders the em dash this class exists to keep out of the
+        demo report -- so every key that has no legitimate null in a synthetic
+        run is checked for a value, not just for existence.
+        """
+        for row in self._points():
+            assert row["recall_at_k"] is not None, row["engine"]
+            for key in ("query_pool", "query_reuse", "recall_queries",
+                        "inflight_discarded", "prewindow_discarded",
+                        "client_cpu_seconds", "client_cpus",
+                        "client_cpu_util", "client_bound", "repeats",
+                        "qps_samples", "qps_spread_pct"):
+                assert key in row["extra"], (row["engine"], row["clients"], key)
+            # `prewindow_discarded` is legitimately 0 and `client_bound` is
+            # legitimately False, so those two are checked for not-None rather
+            # than for truthiness; everything else is a measured quantity that
+            # a fixture has no reason to leave null.
+            for key in ("query_pool", "query_reuse", "recall_queries",
+                        "client_cpu_seconds", "client_cpus",
+                        "client_cpu_util", "repeats", "qps_spread_pct",
+                        "inflight_discarded", "prewindow_discarded",
+                        "client_bound"):
+                assert row["extra"][key] is not None, (
+                    row["engine"], row["clients"], key)
+
+    def test_recall_does_not_depend_on_the_client_count(self):
+        """Recall is a property of the index and the ef, so a fixture whose
+        recall moved across the sweep would make the workload's own
+        recall-spread check look as though it were firing on nothing."""
+        by_engine = {}
+        for row in self._points():
+            by_engine.setdefault(row["engine"], set()).add(row["recall_at_k"])
+        assert by_engine, "no concurrency points in the synthetic run"
+        for engine, values in by_engine.items():
+            assert len(values) == 1, (engine, values)
+
+    def test_the_engines_differ_in_recall_at_one_ef_search(self):
+        """The whole reason the column exists: 0.98 against 0.80 is the
+        ordinary spread of these implementations at a shared ef."""
+        recalls = {r["engine"]: r["recall_at_k"] for r in self._points()}
+        assert max(recalls.values()) - min(recalls.values()) > 0.15, recalls
+
+    def test_both_branches_of_the_client_bound_flag_are_rendered(self):
+        flags = [(r["engine"], r["clients"])
+                 for r in self._points() if r["extra"]["client_bound"]]
+        assert flags, "no client-bound point, so the hollow marker is untested"
+        assert len(flags) < len(self._points()), "every point is bound"
+
+    def _rendered(self):
+        """The synthetic run's concurrency table, as header and body cells."""
+        from report.generate import summarize
+        from report.render import _concurrency_table
+        from .synthetic import make_records
+        summary = summarize(make_records("synthetic-run"), {})
+        rows = _table_cells(_concurrency_table(summary))
+        return rows[0], rows[1:]
+
+    def test_the_rendered_table_shows_the_recall_rather_than_a_dash(self):
+        """The fixture and the renderer, end to end. Either half alone passed
+        while the pair produced an em dash."""
+        header, body = self._rendered()
+        column = header.index("Recall@k")
+        values = {row[column] for row in body}
+        assert "—" not in values, values
+        assert "0.9812" in values, values
+        pool = header.index("Query pool")
+        assert {row[pool] for row in body} == {"10,000"}
+
+    def test_the_rendered_table_shows_the_client_cpu_rather_than_a_dash(self):
+        """The same end-to-end check for the column §1.4 adds, which the
+        Recall@k one did not reach.
+
+        Nulling `client_cpu_util` on every synthetic point while leaving
+        `client_bound` as computed turned all six Client CPU cells into em
+        dashes while the footnote went on naming two client-bound points -- a
+        demo report contradicting itself, with the whole class still green,
+        because the end-to-end assertion stopped at Recall@k and Query pool
+        and the field check above was membership-only. This is defect C
+        recurring inside the column the task added, so it is checked the same
+        way: the cells carry values, and at least one carries the mark.
+        """
+        from report.render import CLIENT_BOUND_MARK
+        header, body = self._rendered()
+        column = header.index("Client CPU")
+        cells = [row[column] for row in body]
+        assert "—" not in cells, cells
+        marked = [c for c in cells if CLIENT_BOUND_MARK in c]
+        assert marked, cells
+        # And the marked cells are the ones the footnote names, so the table
+        # and the prose below it cannot disagree about which points are bound.
+        bound_clients = {str(r["clients"]) for r in self._points()
+                         if r["extra"]["client_bound"]}
+        clients_column = header.index("Clients")
+        marked_clients = {row[clients_column] for row in body
+                          if CLIENT_BOUND_MARK in row[column]}
+        assert marked_clients == bound_clients, (marked_clients, bound_clients)
+
+    def test_the_rendered_notes_name_the_client_bound_points(self):
+        from report.generate import summarize
+        from report.render import _concurrency_table
+        from .synthetic import make_records
+        summary = summarize(make_records("synthetic-run"), {})
+        table = _concurrency_table(summary)
+        assert "Client-bound points in this run" in table
+        assert "at 32 clients" in table
+
+
+class TestEachConcurrencyPointIsRepeated:
+    """§1.5. Every figure in this framework was a single sample until a Valkey
+    point was re-measured by accident, five hours later on the same build, and
+    came back 21% higher at sixteen and thirty-two clients. Nothing else had
+    ever been repeated, so nothing else had an error bar, and two engines
+    differing by less than that were being presented as ordered."""
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_profile_repeats_each_point(self, name):
+        assert load_profile(name)["ops"]["concurrency_repeats"] == 3
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_query_pool_is_left_at_the_whole_test_set(self, name):
+        """`ops.concurrency_queries` defaults to every query the dataset ships.
+
+        Setting it is the way BACK to a small pool -- the state in which every
+        graph cache in the comparison was measured against a hot set it could
+        hold entirely -- so a profile that wants the current behaviour must
+        leave the key absent rather than "enable" it.
+        """
+        assert "concurrency_queries" not in load_profile(name)["ops"]
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_runner_already_passes_the_key(self, name):
+        """No code change was needed, and this is what says so.
+
+        `ops_pass.harness_args` has passed `--concurrency-repeats` since the
+        flag existed, defaulting to 1, and `harness/main.py` forwards it to
+        the workload's `repeats`. The profile key is the whole change.
+        """
+        from orchestrator.config import (load_resources, resolve_resources)
+        from orchestrator.ops_pass import harness_args
+        info = sysinfo.collect()
+        res = load_resources("normalized")
+        args = harness_args(load_profile(name), 16, "pgvector",
+                            resolve_resources(res, "pgvector", info),
+                            "normalized", res, storage_engine="heap")
+        assert args[args.index("--concurrency-repeats") + 1] == "3"
+        # And the pool stays the sentinel for "all of them".
+        from harness.workloads.concurrency import WHOLE_TEST_SET
+        assert (args[args.index("--concurrency-queries") + 1]
+                == str(WHOLE_TEST_SET))
+
+    def test_the_estimate_follows_the_profile_key(self):
+        """TE's `_concurrency_windows` already multiplies by the key, so the
+        printed estimate had to move without a line changing in
+        orchestrator/. Checked as a ratio against the same profile with the
+        key removed, so it measures the multiplication rather than restating
+        today's hours."""
+        from orchestrator.estimate import estimate_load_hours
+
+        def windows(profile):
+            e = estimate_load_hours(profile, ["pgvector"],
+                                    ["glove-100-angular"], ["normalized"],
+                                    ["ops"])
+            return next(t["typical_seconds"] for t in e["query_terms"]
+                        if t["name"] == "concurrency windows")
+
+        shipped = load_profile("main")
+        once = {**shipped, "ops": {k: v for k, v in shipped["ops"].items()
+                                   if k != "concurrency_repeats"}}
+        assert windows(shipped) == windows(once) * 3
