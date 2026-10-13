@@ -225,10 +225,14 @@ an ops number means, as distinct from `SCHEMA_VERSION`, which describes only the
 record's shape; records carrying no version at all were measured under version 1.
 **Version 2 measures exactly what version 1 measured** — it is simply the first
 value the scheme writes down, so a version 1 number and a version 2 number are
-directly comparable and nothing needs re-measuring to get one. That pair is
-listed in `OPS_MEASUREMENT_EQUIVALENT_VERSIONS` (`harness/metrics/records.py`),
-which is what the refusal below reads so that it never tells an operator to
-re-measure numbers this page calls comparable.
+directly comparable and nothing needs re-measuring to get one. That pair is what
+`OPS_MEASUREMENT_EQUIVALENT_VERSIONS` (`harness/metrics/records.py`) holds — not
+as a literal set but *derived* from the two constants that name the versions,
+`IMPLICIT_OPS_MEASUREMENT_VERSION` and `FIRST_RECORDED_OPS_MEASUREMENT_VERSION`,
+so a third member cannot be added without first naming a third concept and
+saying why that version changed nothing measured. That set is what the refusal
+below reads, so that it never tells an operator to re-measure numbers this page
+calls comparable.
 
 **Version 3 is not comparable with either**, and is deliberately absent from that
 set. It separated the concurrency query pool from `ops.max_queries` (§2.3), so a

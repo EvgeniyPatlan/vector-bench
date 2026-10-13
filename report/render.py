@@ -84,6 +84,20 @@ def _environment_rows(manifest: Dict[str, Any]) -> List[List[str]]:
         ["Docker", host.get("docker_version", "?") or "?"],
         ["cgroup", host.get("cgroup_version", "?")],
         ["Resource pass", str(config.get("resource_pass", "?"))],
+        # Which version of the ops measurement path produced these numbers.
+        # The reason `OPS_MEASUREMENT_VERSION` exists at all is that a change
+        # to `harness/` can alter what an ops number means without altering
+        # the record's shape -- version 3 moved the concurrency query pool off
+        # `ops.max_queries`, so a version 2 throughput and a version 3
+        # throughput are the same column measured over different fractions of
+        # the corpus. The report already refuses to put two versions on one
+        # chart; until now it printed neither of them above the numbers, so a
+        # reader of a PUBLISHED report could not tell which single version it
+        # was. "not recorded" rather than "?" or 1, because an absent manifest
+        # key means a run predating the field and the records themselves are
+        # what say version 1 -- see `ops_measurement_version`.
+        ["Ops measurement version",
+         str(config.get("ops_measurement_version", "not recorded"))],
         ["Server cpuset", str(resolved.get("server_cpuset", "?"))],
         ["Server memory limit", _fmt_bytes(resolved.get("server_memory_bytes"))],
         ["Buffer pool / shared_buffers", _fmt_bytes(resolved.get("buffer_bytes"))],
@@ -708,6 +722,286 @@ def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
 #: short result set.
 CLIENT_BOUND_MARK = "○"
 
+#: Footnote marks for the two statuses the ef sweep can end on without having
+#: put an engine at the target recall. `report/charts.py` imports these rather
+#: than spelling the glyphs again: the chart's dagger and the table's dagger
+#: have to be the same character or the footnote under one explains a mark the
+#: reader saw on the other. `CLIENT_BOUND_MARK` above is duplicated as a
+#: literal in the concurrency chart's suptitle, which is the drift this avoids.
+#:
+#: Two DIFFERENT marks, because PR 2 §2.3.3 asks for the distinction and the
+#: two conditions are opposites: a dagger means the engine is above the target
+#: and could not be slowed to it, so its throughput is understated relative to
+#: the rest; a double dagger means it never got there, so its throughput is
+#: overstated. One mark for both would present those as the same caveat.
+FLOOR_MARK = "†"
+UNREACHED_MARK = "‡"
+
+#: A third condition, and the one that is not a sweep outcome at all: this
+#: engine was never calibrated, so it was not held to the target the chart
+#: title names. Runs are checkpointed per (pass, engine, dataset, phase), so an
+#: operator who flips `ops.ef_mode` to `calibrated` and resumes keeps the
+#: fixed-ef records of every engine already measured -- and nothing refuses
+#: that, because the measurement version did not change. Without a mark those
+#: engines sit on a panel titled with a recall floor they never met, under a
+#: table whose own introduction says to read the Status column first, while
+#: having no row in it to read.
+#:
+#: `*` is the conventional first footnote mark and survives this file's two
+#: output paths: `_inline_md` converts only `` ` `` and `**`, so a lone
+#: asterisk reaches the HTML unchanged (measured), and in the Markdown it is
+#: always written mid-sentence with spaces either side -- never at the start
+#: of a line, which is the position where it would become a bullet, and never
+#: paired, which is what a renderer would read as emphasis.
+UNCALIBRATED_MARK = "*"
+
+
+def _fmt_target(target: float) -> str:
+    """A recall TARGET as the report should spell it, in the table and the chart.
+
+    `%g`, not `_fmt`'s fixed decimals, and this is not a style preference.
+    Measured on this interpreter: `_fmt(0.999, 2)` is `1.00`, so a
+    `--target-recall 0.999` run would have its Target column read as a demand
+    for PERFECT recall; and `_fmt(0.995, 2)` is `0.99`, because 0.995 is
+    slightly below 0.995 in binary, so the column would understate the floor
+    the engines were held to. `%g` prints 0.95, 0.9, 0.98, 0.995 and 0.999
+    exactly.
+
+    A target is a declared threshold, not a measurement: rounding it is
+    rewriting the run's configuration, which is why it does not share the
+    four-decimal convention the Recall@k columns use for measured values.
+    `report/charts.py` imports this so the chart title and this column cannot
+    print one target two ways.
+    """
+    return f"{target:g}"
+
+
+# ---------------------------------------------------------------------------
+# Operating point (PR 2 §2.3.2)
+# ---------------------------------------------------------------------------
+
+def _operating_point_table(summary: Dict[str, Any]) -> str:
+    """Which ef_search each engine was measured at, and what it bought.
+
+    This table is the premise of the three sections after it. Concurrency,
+    filtered search and churn are all measured at one ef_search per engine,
+    and once that ef is chosen per engine rather than declared in the profile,
+    a reader cannot check that the comparison was fair without seeing the
+    choice. The column that makes it checkable is **Status**: `ok` means the
+    engine was put at the target, and the other two values mean it was not --
+    in opposite directions.
+
+    Deliberately wider than §2.3.2's "engine · chosen ef · recall · status".
+    The remaining columns are what make a row identify one measurement: a
+    profile sweeping M calibrates once per M, so Dataset / Pass / M / Build
+    are the difference between four rows and one row printed four times. The
+    Grid column is there because a sweep can stop early, and "chose ef 640 out
+    of a grid whose largest point is 640" is a different fact from "chose 640
+    out of 1000".
+    """
+    rows = []
+    for point in summary.get("operating_points", []) or []:
+        status = point.get("status")
+        marked = {"floor_above_target": f"floor_above_target {FLOOR_MARK}",
+                  "target_unreached": f"target_unreached {UNREACHED_MARK}"}
+        if point.get("status_conflict"):
+            shown = ("conflict: "
+                     + ", ".join(str(s) for s in point["status_conflict"]))
+        else:
+            shown = marked.get(status, status or "not recorded")
+        if point.get("ef_conflict"):
+            ef_cell = ("conflict: "
+                       + ", ".join(str(e) for e in point["ef_conflict"]))
+        else:
+            ef_cell = (str(point["ef_search"])
+                       if point.get("ef_search") is not None else "—")
+        measured = point.get("points_measured")
+        size = point.get("grid_size")
+        grid = (f"{measured} of {size}" if measured and size
+                else (str(measured) if measured else "—"))
+        rows.append([
+            _label(point.get("engine", "?")), point.get("dataset", "?"),
+            point.get("resource_pass") or "—",
+            str(point.get("m") or "—"), point.get("build_mode") or "—",
+            ef_cell,
+            # Requested vs searched: MongoDB cannot search fewer candidates
+            # than k, so its "ef 10" at k=100 is a search of 100, and two
+            # engines compared at one chosen ef are not comparable without
+            # this. Printed only where it differs, so the column is silent on
+            # the engines that honour the request.
+            (str(point["effective_ef"])
+             if point.get("effective_ef") is not None
+             and point.get("effective_ef") != point.get("ef_search")
+             else "—"),
+            # Four decimals for the measured recall, matching the concurrency
+            # table's convention so the two can be read side by side; `%g` for
+            # the declared target, because rounding a threshold rewrites the
+            # run's configuration. See `_fmt_target`.
+            _fmt(point.get("recall_at_k"), 4),
+            (_fmt_target(point["target_recall"])
+             if point.get("target_recall") is not None else "—"),
+            shown,
+            grid,
+        ])
+    if not rows:
+        # Explicit, not an empty table. §2.3's whole point is that a reader
+        # can see which ef each engine was measured at; a blank table here
+        # would read as "the sweep ran and chose nothing", when the honest
+        # statement is that no sweep ran at all and the ef_search below came
+        # straight out of the profile.
+        return (
+            "_No ef_search calibration in this run._ Every number in the "
+            "sections below was measured at the `ef_search` the profile "
+            "declares (`ef_mode: fixed`), so the engines are compared at "
+            "equal *search effort* rather than at equal *answer quality* — "
+            "and on these implementations one `ef_search` can buy recalls "
+            "0.18 apart. Re-run with `ef_mode: calibrated` to populate this "
+            "section.\n")
+    return _md_table(
+        ["Engine", "Dataset", "Pass", "M", "Build", "Chosen ef_search",
+         "Effective ef", "Recall@k", "Target", "Status", "Grid points"],
+        rows,
+    ) + _operating_point_notes(summary)
+
+
+def _operating_point_notes(summary: Dict[str, Any]) -> str:
+    """The footnotes, each printed only when this run earned it."""
+    points = summary.get("operating_points", []) or []
+    floors = [p for p in points if p.get("status") == "floor_above_target"]
+    unreached = [p for p in points if p.get("status") == "target_unreached"]
+    parts = [
+        # `**bold**`, not `*italic*`, on the two direction words below and on
+        # "large" in the appendix. `_inline_md` converts backticks and `**`
+        # and has no italic rule at all -- its own comment says "bold before
+        # italic" over code that does not do italic -- so `*higher*` reached
+        # the HTML page as literal asterisks around the one token a misreading
+        # inverts. Asterisk-italics are used elsewhere in this file
+        # (`*first*` in `_validity_section`, `*intention*` in
+        # `_CONCURRENCY_NOTES`) and have the same defect there; following the
+        # convention on a word this load-bearing was the wrong trade, and
+        # fixing those two is someone else's diff.
+        "\n**Recall@k here is the calibration sweep's**, measured at the "
+        "chosen `ef_search` over `ops.max_queries` single-client queries "
+        "against warm caches — the measurement the choice was made on. The "
+        "Recall@k in the concurrency table below is a different number: the "
+        "median window's, over the shared query pool, with every other client "
+        "contending. They are not expected to be equal and neither is a check "
+        "on the other.\n",
+    ]
+    if floors:
+        where = ", ".join(sorted(
+            f"{_label(p.get('engine', '?'))} at M={p.get('m', '?')}"
+            f" ({p.get('resource_pass') or 'unknown pass'}),"
+            f" recall {_fmt(p.get('recall_at_k'), 4)} at ef_search"
+            f" {p.get('ef_search')}" for p in floors))
+        parts.append(
+            f"\n{FLOOR_MARK} **These engines cannot be slowed down to the "
+            f"target.** {where}. The smallest `ef_search` in the grid already "
+            f"exceeds the target recall by more than 0.02, so no grid point "
+            f"brings them down to it and every number below is measured at a "
+            f"**higher** recall than the engines marked `ok` — which understates "
+            f"their throughput relative to the others rather than flattering "
+            f"it. The comparison below is not like-for-like on recall for "
+            f"these rows.\n\nMHNSW and VIDX are both expected to land here at "
+            f"M=16 — 0.94–0.98 at minimum effort, per the tuned-profile notes "
+            f"— and for them it is a property of the implementation rather "
+            f"than a fault of the run. For any other engine, check that "
+            f"`ops.ef_grid` starts low enough to reach the target from "
+            f"below.\n")
+    if unreached:
+        where = ", ".join(sorted(
+            f"{_label(p.get('engine', '?'))} at M={p.get('m', '?')}"
+            f" ({p.get('resource_pass') or 'unknown pass'}) reached "
+            f"{_fmt(p.get('recall_at_k'), 4)} at ef_search "
+            f"{p.get('ef_search')}" for p in unreached))
+        parts.append(
+            f"\n{UNREACHED_MARK} **These engines reached the target at no grid "
+            f"point** and are reported at the best recall they achieved: "
+            f"{where}. Their throughput below is bought at a **lower** recall "
+            f"than the engines marked `ok`, so it is not comparable with "
+            f"theirs and will tend to look better than it is. Extend "
+            f"`ops.ef_grid` upwards and re-run if the target matters more than "
+            f"the run time.\n")
+    conflicts = [p for p in points
+                 if p.get("ef_conflict") or p.get("status_conflict")]
+    if conflicts:
+        parts.append(
+            f"\n**{len(conflicts)} row(s) show a conflict rather than a "
+            f"value.** Two different chosen `ef_search` values, or two "
+            f"different statuses, were found among the records of one "
+            f"measurement unit — which means this report is reading more than "
+            f"one measurement of that unit as though it were one. A run "
+            f"directory cannot produce this (one JSONL file per unit, emptied "
+            f"per attempt), so the records came from a merged file via "
+            f"`--from-records`. Split them and report each measurement "
+            f"separately; nothing in those rows is safe to read.\n")
+    missing = [p for p in points if p.get("status") is None
+               and not p.get("status_conflict")]
+    if missing:
+        parts.append(
+            f"\n**{len(missing)} row(s) have no status.** The sweep's records "
+            f"are present but no concurrency, filtered or churn record carries "
+            f"`extra.calibration_status`, so the ef was chosen and then "
+            f"nothing was measured at it — a unit whose downstream workloads "
+            f"did not run. The sweep's cost was paid and produced no "
+            f"comparison.\n")
+    # The mirror case: a unit whose sweep records are missing but whose
+    # downstream half is present. It renders an em dash in Recall@k, Effective
+    # ef and Grid points, and the `missing` branch above cannot see it because
+    # that keys on an absent STATUS and this row has one.
+    no_curve = [p for p in points if p.get("points_measured") is None]
+    if no_curve:
+        parts.append(
+            f"\n**{len(no_curve)} row(s) show an ef and a status but no "
+            f"curve.** The workloads recorded which ef they were given, but "
+            f"the `ef_calibration` records that ef was chosen from are not in "
+            f"this report — narrowed away by `--datasets`, or a records file "
+            f"assembled by hand. The ef and the status are trustworthy; the "
+            f"empty Recall@k means the evidence for the choice is absent, not "
+            f"that the recall was zero.\n")
+    missing_points = _engines_without_an_operating_point(summary)
+    if missing_points and points:
+        where = ", ".join(f"{_label(e)} on {d}" for e, d in missing_points)
+        parts.append(
+            f"\n**{len(missing_points)} engine(s) were measured but never "
+            f"calibrated: {where}.** They have throughput in the sections "
+            f"below and no row here, so the Status column cannot be read for "
+            f"them and the recall floor the concurrency chart's title names "
+            f"does not apply to their curves — which carry the "
+            f"{UNCALIBRATED_MARK} mark there. This is what a run that was "
+            f"resumed after `ops.ef_mode` changed looks like: checkpoints are "
+            f"per (pass, engine, dataset, phase), so engines already measured "
+            f"keep their fixed-ef records and nothing refuses the mixture, "
+            f"because the measurement version did not change. Re-measure "
+            f"those engines, or compare them only with each other.\n")
+    return "".join(parts)
+
+
+def _engines_without_an_operating_point(summary: Dict[str, Any]
+                                        ) -> List[Any]:
+    """(engine, dataset) pairs with measurements in a calibrated workload and
+    no operating point.
+
+    Only the three workloads the sweep exists to choose an ef for -- an engine
+    with an `ingest` or `index_build` record and nothing else was never going
+    to have an operating point, and saying so would fire on every profile that
+    builds an index without querying it.
+
+    The caller prints this only when at least one operating point exists. On
+    `ef_mode: fixed` every engine is in this list, the table has already said
+    the run was not calibrated, and repeating it per engine would turn the one
+    true sentence into six.
+    """
+    calibrated = {(p.get("engine"), p.get("dataset"))
+                  for p in summary.get("operating_points", []) or []}
+    seen = set()
+    for key in ("concurrency", "filtered", "churn"):
+        for r in summary.get(key, []) or []:
+            pair = (r.get("engine"), r.get("dataset"))
+            if all(pair) and pair not in calibrated:
+                seen.add(pair)
+    return sorted(seen)
+
 
 # The tuned pass measures MariaDB on both InnoDB and MyISAM, so an engine name
 # alone does not identify a row. Without this column the two appeared as
@@ -1060,7 +1354,48 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
-        "\n---\n\n## 6. Concurrency scaling\n\n",
+        # Before the concurrency section and not after it, per PR 2 §2.3.2,
+        # because it is the premise of the three sections that follow rather
+        # than a note about them: concurrency, filtered search and churn are
+        # all measured at the one ef_search this table reports, and a reader
+        # who meets those numbers first has already read them as
+        # equal-effort comparisons by the time the caveat arrives.
+        "\n---\n\n## 6. Operating point\n\n",
+        "Which `ef_search` each engine was measured at in the three sections "
+        "below, and what recall that bought. A fixed `ef_search` is not one "
+        "quantity across these engines — it is `mhnsw_ef_search`, VIDX's "
+        "equivalent, `hnsw.ef_search`, MongoDB's `numCandidates` and Valkey's "
+        "`EF_RUNTIME` — so a shared literal buys different amounts of search "
+        "effort and recalls up to 0.18 apart. The sweep chooses the smallest "
+        "grid `ef_search` that reaches the target recall and — where the grid "
+        "has a next point — is confirmed by it; a target first met at the "
+        "largest `ef_search` in the grid is used unconfirmed, because the "
+        "grid ran out rather than because the check failed. That makes the "
+        "sections below comparisons at equal answer quality instead of at "
+        "equal knob setting. **Read the Status column before the "
+        "throughput:** it names the engines for which that did not work, and "
+        "in which direction.\n\n",
+        _operating_point_table(summary),
+    ]
+    # The curve the choice was made from is in Appendix A, not here: §2.3.4
+    # places it in an appendix, and the reason that is right is that this
+    # section answers "is the comparison below fair" in one table, while the
+    # curve answers "was the ef chosen well" — a different question, asked by a
+    # smaller audience, and up to twelve points per engine wide.
+    #
+    # Conditional on the appendix actually being there. A cross-reference to a
+    # section the report does not contain is the one kind of wrong this page can
+    # be while every number on it is right, and it is reached by an ordinary
+    # route: matplotlib is absent from the host this report may be generated
+    # on, so the chart is skipped and every other section still renders.
+    calibration = sorted(stem for stem in chart_paths
+                         if stem.startswith("calibration-"))
+    if calibration:
+        parts.append(
+            "\nThe curves these efs were chosen from are in **Appendix A**.\n")
+
+    parts += [
+        "\n---\n\n## 7. Concurrency scaling\n\n",
         "Where a database should differ from an ANN library. MariaDB caches the "
         "MHNSW graph per `TABLE_SHARE`; AliSQL keeps a shared cache plus a "
         "per-transaction cache; pgvector serves graph pages from `shared_buffers`. "
@@ -1075,7 +1410,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
-        "\n---\n\n## 7. Filtered (hybrid) search\n\n",
+        "\n---\n\n## 8. Filtered (hybrid) search\n\n",
         "Vector search with a scalar predicate, scored against ground truth "
         "recomputed exactly over the qualifying rows. **Short results** counts "
         "queries that returned fewer than k rows — a real consequence of "
@@ -1089,7 +1424,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
-        "\n---\n\n## 8. Churn\n\n",
+        "\n---\n\n## 9. Churn\n\n",
         "Recall and throughput after deleting and re-inserting a fraction of rows. "
         "HNSW graphs degrade under deletion; how much differs by implementation.\n\n",
         (_churn_table(summary) if summary.get("churn")
@@ -1100,7 +1435,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
-        "\n---\n\n## 9. Reproducing this run\n\n",
+        "\n---\n\n## 10. Reproducing this run\n\n",
         "```bash\n"
         f"./run-benchmark.sh build --march {(config.get('resolved_resources') or {}).get('march', 'x86-64-v3')}\n"
         f"./run-benchmark.sh fetch --datasets {','.join(summary.get('datasets', []) or ['glove-100-angular'])}\n"
@@ -1114,6 +1449,35 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "`docs/03-running-manually.md` to reproduce any single measurement by hand "
         "without the framework.\n",
     ]
+
+    # PR 2 §2.3.4's appendix. Emitted only when the sweep ran: an appendix
+    # heading over a "not measured" paragraph is the empty-chart problem with
+    # extra steps, and `ef_mode: fixed` already says so in §6. `calibration` is
+    # the same list the §6 cross-reference above is conditioned on, so the
+    # pointer and its target cannot disagree.
+    if calibration:
+        parts.append(
+            "\n---\n\n## Appendix A. Calibration curves\n\n"
+            "Recall against requested `ef_search` from the sweep in §6, one "
+            "line per engine, with the chosen point ringed. A choice sitting "
+            "on a plateau is robust; one on a steep slope means a small change "
+            "in the error model moves the ef, and the engines whose curves "
+            "cross in this region are the ones whose ranking in §7 depends on "
+            "the target.\n\n"
+            "**Use it as a cross-check against §4.** Carry an engine's recall "
+            "at some `ef_search` off this chart and find the same engine at the "
+            "same `ef_search` on the recall/throughput frontier. The two are "
+            "measured by different code in different containers over different "
+            "query counts — ann-benchmarks computes its own recall, this sweep "
+            "computes ours — so they are not plotted together and are not "
+            "expected to match to the fourth decimal. A **large** disagreement "
+            "is the finding: it means one of the two measurement paths is "
+            "wrong about that engine, and nothing else in this report would "
+            "show it.\n")
+        for stem in calibration:
+            paths = chart_paths[stem]
+            parts.append(
+                f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
     return "".join(parts)
 
 
@@ -1331,8 +1695,9 @@ def _inline_md(text: str) -> str:
 def _pass_note(summary: Dict[str, Any]) -> str:
     """Explain an absent normalized-vs-tuned comparison.
 
-    The chart hangs off section 8, so when it is skipped the section simply
-    loses a figure with nothing said about it.
+    The chart hangs off section 9 — section 8 until "Operating point" was
+    inserted ahead of it — so when it is skipped that section simply loses a
+    figure with nothing said about it.
     """
     passes = sorted({p for p in summary.get("passes", []) if p})
     if len(passes) >= 2:
@@ -1400,29 +1765,56 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
          figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")),
         ("5. Index build cost",
          _md_tables_to_html(_build_table(summary)), figures("build-") + figures("storage-")),
+        # Before concurrency, and carrying no figure: the calibration chart is
+        # Appendix A below. Numbered and worded to match the markdown, for the
+        # reason the comment under this list gives -- this page is the one a
+        # reader actually opens, and a section that exists in one renderer and
+        # not the other is how the HTML came to say "No data." for workloads
+        # the markdown already explained.
+        ("6. Operating point",
+         _md_tables_to_html(_operating_point_table(summary)), ""),
         # These three must use the same not-measured wording as the markdown.
         # The HTML is built from its own section list, so fixing only the
         # markdown left the page a reader actually opens still saying
         # "No data." for a workload the profile never ran.
-        ("6. Concurrency scaling",
+        ("7. Concurrency scaling",
          _md_tables_to_html(_concurrency_table(summary) if summary.get("concurrency")
                             else _not_measured("concurrency", profile)),
          figures("concurrency-")),
-        ("7. Filtered (hybrid) search",
+        ("8. Filtered (hybrid) search",
          _md_tables_to_html(_filtered_table(summary) if summary.get("filtered")
                             else _not_measured("filtered", profile)),
          figures("filtered-")),
-        ("8. Churn",
+        ("9. Churn",
          _md_tables_to_html(_churn_table(summary) if summary.get("churn")
                             else _not_measured("churn", profile))
          + _pass_note(summary),
          figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
     ]
-
     body = "".join(
         f"<h2>{_html.escape(name)}</h2>{content}{figs}"
         for name, content, figs in sections
     )
+
+    # Last on the page, after "Reproducing this run", which is where the
+    # markdown puts it too. Emitted only when the sweep ran: an appendix
+    # heading over nothing is the empty-chart problem with extra steps, and
+    # §6 already says what a fixed-ef run means.
+    calibration_figures = figures("calibration-")
+    appendix = ""
+    if calibration_figures:
+        appendix = (
+            "<h2>Appendix A. Calibration curves</h2>"
+            "<p class=\"note\">Recall against requested <code>ef_search</code> "
+            "from the sweep in §6, one line per engine, with the chosen point "
+            "ringed. Cross-check it against §4: the same engine at the same "
+            "<code>ef_search</code> should sit at a similar recall there. The "
+            "two are measured by different code in different containers over "
+            "different query counts, so they are not plotted together and are "
+            "not expected to agree to the fourth decimal — a large "
+            "disagreement means one of the two measurement paths is wrong "
+            "about that engine, and nothing else in this report would show "
+            "it.</p>" + calibration_figures)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -1440,7 +1832,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
 <div class="meta">{cards_html}</div>
 {warn_html}
 {body}
-<h2>9. Reproducing this run</h2>
+<h2>10. Reproducing this run</h2>
 <pre><code>./run-benchmark.sh build
 ./run-benchmark.sh fetch --datasets {_html.escape(','.join(summary.get('datasets', []) or ['glove-100-angular']))}
 ./run-benchmark.sh run --profile {_html.escape(str(profile.get('name', 'quick')))} --resource-pass {_html.escape(str(config.get('resource_pass', 'normalized')))}</code></pre>
@@ -1448,6 +1840,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
 is in <code>run-manifest.json</code>. See <code>docs/05-methodology.md</code> for
 what is measured, and <code>docs/03-running-manually.md</code> to reproduce any
 single measurement by hand without this framework.</p>
+{appendix}
 </div>
 </body>
 </html>
