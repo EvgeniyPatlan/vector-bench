@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy
+
+from ..datasets import FILTER_COLUMNS, FILTER_CTAG, FILTER_TAG
 
 TABLE = "t1"
 DATABASE = "ann"
@@ -60,6 +62,172 @@ class LoadResult:
     @property
     def rows_per_second(self) -> float:
         return self.rows / self.wall_seconds if self.wall_seconds > 0 else 0.0
+
+
+@dataclass
+class RowAttrs:
+    """The scalar columns a row carries, as one object.
+
+    Filtered search is measured twice over the same index: once on `tag`,
+    whose values are independent of the vector space, and once on `ctag`,
+    whose values are nearest-pivot cluster ids and therefore follow it
+    (`harness/datasets.py`). Loading both columns in one build is PR 3's
+    option A. Option B -- one column whose values are chosen per run -- needs
+    no driver change at all, and was rejected because it needs a full reload
+    per filter mode: MHNSW and VIDX maintain their graph on every INSERT at
+    ~150 and ~55 rows/s, so a second mode at 1M rows is ~1.9 h and ~5 h of
+    ingest per engine, per M value.
+
+    Both columns travel in one object rather than as two parameters because
+    `load` (the bulk ingest) and `insert_rows` (churn's re-insert) have to
+    agree about how many columns an INSERT names, and they are in different
+    files. Two parameters is two places to forget one, and forgetting is not
+    equally loud everywhere: an INSERT whose column list and value tuple
+    disagree in length fails outright on the SQL engines, while a Valkey HSET
+    that omits a field writes a hash successfully -- the write returns OK --
+    and whether the module then counts that as an indexing failure or simply
+    indexes a document no `@ctag:[-inf (t]` can match, the first thing anyone
+    sees is a filtered recall of zero.
+
+    Not frozen, unlike `_Rows` in `tests/fake_driver.py` but like
+    `ConnectionSpec`, `IndexSpec` and `LoadResult` above it: this is a
+    parameter object handed straight to a cursor, not shared mutable state
+    that several threads read.
+    """
+
+    tag: numpy.ndarray
+    ctag: numpy.ndarray
+
+    def __post_init__(self) -> None:
+        """Both columns, one value per row, or nothing.
+
+        The invariant the whole structure exists for. Every write path below
+        reads the two arrays at the same index -- `row(i)`, `fields(i)` -- so
+        a pair of different lengths does not fail where it was built, it fails
+        at whichever row runs out first, or does not fail at all and pairs one
+        row's vector with another row's cluster id. Churn slices this, and
+        Valkey slices those slices again, so there are three chances to get a
+        bound wrong before anything is written.
+        """
+        if len(self.tag) != len(self.ctag):
+            raise ValueError(
+                f"a RowAttrs holds one value per column per row; got "
+                f"{len(self.tag)} {FILTER_TAG} and {len(self.ctag)} "
+                f"{FILTER_CTAG} values")
+
+    @classmethod
+    def coerce(cls, attrs: Union["RowAttrs", Sequence[int], numpy.ndarray]
+               ) -> "RowAttrs":
+        """A `RowAttrs` from either a `RowAttrs` or a bare array of tag values.
+
+        The bare-array form is not deprecation politeness. Counted by AST,
+        there are **13 such call sites across 6 files**, and the ones that
+        decide the question are the ones PR 3 may not edit:
+        `tests/test_workloads.py:1060` and `tests/test_calibrate.py:668` call
+        `load()` with one array, and `tests/test_config.py` drives
+        `ValkeyDriver.insert_rows` with a plain list of ints at six sites to
+        exercise the write-batch ladder. All three files are off limits to
+        this task, so a required `RowAttrs` is not a migration, it is a
+        broken suite. The rest -- `scripts/probe-valkey-filter.py:151`,
+        `scripts/verify-valkey-churn.py:197` and `:245`, and the helpers at
+        the bottom of `tests/fake_driver.py` -- are diagnostics with no cache
+        directory to compute a cluster assignment from, which is the reason
+        they have no `ctag` to give rather than merely no habit of giving one.
+
+        `ctag` is a `copy()` of the array, not the same object. Nothing today
+        writes through either column, so sharing one buffer was harmless and
+        measurably free -- and it put two names on one array in a repo whose
+        stated default is immutability, which is a trap set for whoever adds
+        the first in-place write. The copy costs one pass over an int64 array
+        per call, against a load that is doing one INSERT per row.
+
+        A bare array becomes `ctag = tag`. That is a named conversion rather
+        than a default argument precisely so the compromise is visible at the
+        call site. Zeros were the alternative and are worse: `ctag INT NOT
+        NULL` is satisfied either way, but a column of zeros makes `ctag < t`
+        true for every row at any t > 0, so a filtered measurement over it
+        would deliver the whole corpus while the record said 1%. Mirroring
+        keeps the delivered share exactly what the threshold asks for, so the
+        only thing wrong is the correlation -- and a run where `ctag` and
+        `tag` agree shows up as the two filter modes producing the same
+        numbers, which is the one result PR 3 exists to show they do not.
+        """
+        if isinstance(attrs, cls):
+            return attrs
+        values = numpy.asarray(attrs)
+        return cls(tag=values, ctag=values.copy())
+
+    def __len__(self) -> int:
+        return int(len(self.tag))
+
+    def __getitem__(self, index) -> "RowAttrs":
+        """Slice both columns together, so a sliced row keeps its own values.
+
+        Churn re-inserts in slices and Valkey re-inserts in slices of those,
+        and slicing the columns independently is how a row ends up with
+        another row's cluster id.
+        """
+        return RowAttrs(tag=self.tag[index], ctag=self.ctag[index])
+
+    def column(self, name: str) -> numpy.ndarray:
+        """One column's values, by whitelisted name.
+
+        The field names here are `FILTER_COLUMNS`' own strings, which is what
+        lets this be a lookup rather than a branch -- and is the coupling to
+        know about if a third filter column is ever added: it needs a field on
+        this dataclass spelled exactly as the dataset module spells it, and
+        `checked_filter_column` would otherwise accept a name that
+        `getattr` cannot find.
+        """
+        return getattr(self, checked_filter_column(name))
+
+    def row(self, i: int) -> Tuple[int, ...]:
+        """Row `i`'s scalar values, in `FILTER_COLUMNS` order.
+
+        For the engines whose INSERT or COPY takes a positional tuple. The
+        order is the dataset module's, which is also the order the column
+        lists in those statements are written in; `tests/test_t3b_drivers.py`
+        pins the two against each other rather than trusting the eye.
+        """
+        return tuple(int(self.column(name)[i]) for name in FILTER_COLUMNS)
+
+    def fields(self, i: int) -> Dict[str, int]:
+        """Row `i`'s scalar values keyed by column name.
+
+        For the two document/hash engines, where the field names are part of
+        the write. Valkey writes the same mapping from three separate places
+        (bulk load, churn re-insert, and the stall probe); building it here
+        means a column cannot be present in one of the three and missing from
+        another, which is the shape of the bug the three sites invite.
+        """
+        return {name: int(self.column(name)[i]) for name in FILTER_COLUMNS}
+
+
+def checked_filter_column(column: Any) -> str:
+    """The filter column's own name, or `ValueError`. Never interpolation.
+
+    Every predicate in every driver is built by formatting a column name into
+    a query string -- `WHERE {column} < %s`, `@{column}:[-inf (t]`, a BSON
+    key. A column name that reached one of those from outside would be
+    injection in four dialects at once, so the name is matched against
+    `datasets.FILTER_COLUMNS` and what is returned is **the matching element
+    of that tuple**, not the caller's string. The predicate is therefore
+    always built from a module constant, even if the caller handed in a `str`
+    subclass whose `__eq__` lies or whose `__str__` differs from its value.
+
+    Deriving the whitelist from `datasets.FILTER_COLUMNS` rather than keeping
+    a tuple here is the point: a second literal list of legal columns is a
+    second thing to update, and the failure when the two disagree is a column
+    the dataset module will happily compute ground truth for and the driver
+    refuses to query -- or worse, the reverse.
+    """
+    for allowed in FILTER_COLUMNS:
+        if column == allowed:
+            return allowed
+    raise ValueError(
+        f"{column!r} is not a filter column; "
+        f"expected one of {list(FILTER_COLUMNS)}"
+    )
 
 
 class EngineDriver(abc.ABC):
@@ -110,15 +278,24 @@ class EngineDriver(abc.ABC):
     # -- data -----------------------------------------------------------
 
     @abc.abstractmethod
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
-             threads: int = 1, start_id: int = 0) -> LoadResult: ...
+    def load(self, vectors: numpy.ndarray,
+             attrs: Union[RowAttrs, Sequence[int], numpy.ndarray],
+             threads: int = 1, start_id: int = 0) -> LoadResult:
+        """Ingest `vectors` with their scalar columns.
+
+        `attrs` is a `RowAttrs`; a bare array of tag values is accepted and
+        mirrored into `ctag` (see `RowAttrs.coerce`). Every implementation
+        coerces on entry rather than branching afterwards, so the write path
+        below the coercion only ever sees both columns.
+        """
 
     @abc.abstractmethod
     def delete_ids(self, ids: Sequence[int]) -> None: ...
 
     @abc.abstractmethod
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None: ...
+                    attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
+                    ) -> None: ...
 
     @abc.abstractmethod
     def count_rows(self) -> int: ...
@@ -154,16 +331,45 @@ class EngineDriver(abc.ABC):
     def query(self, vector, k: int) -> List[int]: ...
 
     @abc.abstractmethod
-    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]: ...
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
+        """Top-k among the rows satisfying `column < threshold`.
+
+        `column` is one of `datasets.FILTER_COLUMNS` and is put through
+        `checked_filter_column` before it reaches any query string. It
+        defaults to `tag`, which is what every caller measured before `ctag`
+        existed, so an existing three-argument call keeps measuring exactly
+        what it measured.
+
+        The third parameter is `threshold` rather than the `tag_threshold` it
+        was: it is no longer a threshold on `tag` specifically. Every caller
+        passes it positionally -- `harness/workloads/filtered.py` at 110 and
+        125, and `tests/test_fake_driver.py` at 291, 300, 304, 310, 317 and
+        319, eight sites counted by AST rather than by eye -- so the rename
+        reaches nobody. That is also why `explain_uses_vector_index` below
+        could NOT be renamed with it: its third argument is passed by
+        KEYWORD, at `filtered.py:104` and `test_fake_driver.py:65`.
+        """
 
     @abc.abstractmethod
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
         """Whether the planner actually chose the vector index.
 
         Not a nicety. Every one of these engines can fall back to a full scan,
         which returns exact results slowly — indistinguishable in the output
         from "high recall, low QPS" unless it is checked explicitly.
+
+        `tag_threshold` keeps its name here while `query_filtered`'s became
+        `threshold`, and the asymmetry is deliberate rather than an oversight:
+        this one is passed by keyword by two callers that may not be edited
+        from this task -- `harness/workloads/filtered.py:104` and
+        `tests/test_fake_driver.py:65` -- so renaming it is a TypeError in
+        both. `column` is appended instead, which is what the spec asks for
+        and all it asks for: it writes this signature as
+        `explain_uses_vector_index(..., column="tag")`, eliding the existing
+        parameters rather than restating them.
         """
 
     # -- sizing / metadata ----------------------------------------------

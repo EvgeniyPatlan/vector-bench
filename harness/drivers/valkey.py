@@ -35,11 +35,13 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy
 
-from .base import DATABASE, TABLE, ConnectionSpec, EngineDriver, IndexSpec, LoadResult
+from .base import (DATABASE, FILTER_COLUMNS, FILTER_TAG, TABLE,
+                   ConnectionSpec, EngineDriver, IndexSpec, LoadResult,
+                   RowAttrs, checked_filter_column)
 
 try:
     import valkey as valkey_client
@@ -54,7 +56,17 @@ PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
 INDEX = "idx"
 PREFIX = "v:"
 VECTOR_FIELD = "embedding"
-TAG_FIELD = "tag"
+# Kept, and now redundant inside this file: the FT.CREATE schema and the
+# filter expression both derive their field names from
+# `datasets.FILTER_COLUMNS` (via base.py), and the HSET mappings come from
+# `RowAttrs.fields()`, so nothing here spells a column name any more. The name
+# survives because `scripts/probe-valkey-filter.py` and
+# `scripts/verify-valkey-churn.py` import it, and those are lab tools outside
+# this task's ownership. Bound to FILTER_TAG rather than to the literal "tag"
+# so it cannot become the one place that disagrees with the dataset module.
+# There is deliberately no CTAG_FIELD: a second unused alias is a second name
+# for a reader to wonder which of the two the code actually uses.
+TAG_FIELD = FILTER_TAG
 DIALECT = 2
 
 BACKFILL_POLL_S = float(os.environ.get("VB_VALKEY_POLL_INTERVAL", "2"))
@@ -217,10 +229,20 @@ class ValkeyDriver(EngineDriver):
         if self._index_exists():
             return
         self._bytes_before_index = self._used_memory()
+        # Both scalar columns are declared NUMERIC, which is this engine's
+        # whole index on them -- there is no separate B-tree to create, so
+        # "the same kind of index on both" is satisfied by the two lines
+        # being the same line. Derived from FILTER_COLUMNS for that reason:
+        # a column missing from the schema is not an error at FT.CREATE
+        # time, it is an `@ctag:[-inf (t]` that matches nothing, which reads
+        # as a filtered recall of zero rather than as a missing field.
+        schema: List[str] = []
+        for column in FILTER_COLUMNS:
+            schema += [column, "NUMERIC"]
         args = [
             "FT.CREATE", INDEX, "ON", "HASH", "PREFIX", "1", PREFIX,
             "SCHEMA",
-            TAG_FIELD, "NUMERIC",
+            *schema,
             VECTOR_FIELD, "VECTOR", "HNSW", "8",
             "TYPE", "FLOAT32",
             "DIM", str(index.dim),
@@ -323,17 +345,19 @@ class ValkeyDriver(EngineDriver):
 
     # -- data -----------------------------------------------------------
 
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
+    def load(self, vectors: numpy.ndarray,
+             attrs: Union[RowAttrs, Sequence[int], numpy.ndarray],
              threads: int = 1, start_id: int = 0) -> LoadResult:
         rows = len(vectors)
+        attrs = RowAttrs.coerce(attrs)
         started = time.time()
         if threads <= 1:
-            self._write_range(vectors, tags, start_id, 0, rows)
+            self._write_range(vectors, attrs, start_id, 0, rows)
         else:
             chunk = (rows + threads - 1) // threads
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures = [
-                    pool.submit(self._write_range, vectors, tags, start_id,
+                    pool.submit(self._write_range, vectors, attrs, start_id,
                                 begin, min(begin + chunk, rows))
                     for begin in range(0, rows, chunk)
                 ]
@@ -343,7 +367,7 @@ class ValkeyDriver(EngineDriver):
         self._assert_nothing_evicted()
         return LoadResult(rows=rows, wall_seconds=elapsed, threads=threads)
 
-    def _write_range(self, vectors, tags, start_id: int,
+    def _write_range(self, vectors, attrs: RowAttrs, start_id: int,
                      begin: int, end: int, batch: int = 1000) -> None:
         # One connection per worker: a shared client would make the thread
         # count a property of the connection pool rather than a measure of
@@ -352,8 +376,30 @@ class ValkeyDriver(EngineDriver):
         try:
             pipe = conn.pipeline(transaction=False)
             for i in range(begin, end):
+                # One of THREE places in this file that writes this
+                # mapping -- the bulk load, churn's re-insert
+                # (`_write_batch_once`) and the stall probe (`_probe_write`).
+                # The scalar fields come from `attrs.fields()` at all three
+                # rather than being listed here, because PR 3 adds a field to
+                # each and the field that gets missed is the one in the path
+                # nobody runs on purpose.
+                #
+                # Three IN THIS FILE, and the count is worth stating exactly
+                # because there is a FOURTH outside it:
+                # `scripts/verify-valkey-churn.py:92-95` builds this mapping
+                # by hand with TAG_FIELD and VECTOR_FIELD only. That script
+                # calls `driver.create_index()` at :202, so the index it
+                # queries does declare `ctag NUMERIC`, and then it writes
+                # ctag-less hashes into the same `v:` keyspace at :92 while
+                # ALSO writing ctag-carrying ones through `driver.insert_rows`
+                # at :245. No published number moves -- it issues no filtered
+                # search anywhere, and `lab` tools diagnose rather than
+                # measure -- and `scripts/` is not PR 3's to change, so the
+                # boundary is recorded here instead of silently assumed.
+                # `scripts/probe-valkey-filter.py` needs nothing: it writes
+                # through `driver.load`, so its hashes carry both fields.
                 pipe.hset(f"{PREFIX}{start_id + i}", mapping={
-                    TAG_FIELD: int(tags[i]),
+                    **attrs.fields(i),
                     VECTOR_FIELD: encode_vector(vectors[i]),
                 })
                 if (i - begin + 1) % batch == 0:
@@ -484,7 +530,8 @@ class ValkeyDriver(EngineDriver):
         return waited
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None:
+                    attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
+                    ) -> None:
         """Write back in batches, shrinking the batch if one does not return.
 
         Two facts fix the shape of this. A pipeline of a thousand HSETs is what
@@ -502,13 +549,14 @@ class ValkeyDriver(EngineDriver):
         live HNSW graph is slower than writing into a hash table -- but it is a
         measurement, where a timeout is not.
         """
+        attrs = RowAttrs.coerce(attrs)
         cursor = 0
         while cursor < len(ids):
             size = min(self._write_batch, len(ids) - cursor)
             stop = cursor + size
             try:
                 self._write_batch_once(ids[cursor:stop], vectors[cursor:stop],
-                                       tags[cursor:stop])
+                                       attrs[cursor:stop])
             except _WriteStalled:
                 self._drop_write_connection()
                 if self._probed:
@@ -532,7 +580,7 @@ class ValkeyDriver(EngineDriver):
                 self._probed = True
                 print(self._diagnose_stalled_write(
                     ids[cursor:stop], vectors[cursor:stop],
-                    tags[cursor:stop]), flush=True)
+                    attrs[cursor:stop]), flush=True)
                 if not self._largest_working:
                     raise RuntimeError(
                         "no write returned at any size, down to a single row. "
@@ -544,7 +592,7 @@ class ValkeyDriver(EngineDriver):
                 continue
             cursor = stop
 
-    def _write_batch_once(self, ids, vectors, tags) -> None:
+    def _write_batch_once(self, ids, vectors, attrs) -> None:
         """One pipeline, one connection, a timeout a healthy write cannot hit.
 
         Fresh each time: redis-py disconnects a connection whose read timed
@@ -552,11 +600,12 @@ class ValkeyDriver(EngineDriver):
         socket with a wedged server -- which is the distinction this whole path
         exists to make.
         """
+        attrs = RowAttrs.coerce(attrs)
         conn = self._churn_connection()
         pipe = conn.pipeline(transaction=False)
         for i, key_id in enumerate(ids):
             pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
-                TAG_FIELD: int(tags[i]),
+                **attrs.fields(i),
                 VECTOR_FIELD: encode_vector(vectors[i]),
             })
         try:
@@ -671,12 +720,13 @@ class ValkeyDriver(EngineDriver):
         """
         return self._write_batch
 
-    def _diagnose_stalled_write(self, ids, vectors, tags) -> str:
+    def _diagnose_stalled_write(self, ids, vectors, attrs) -> str:
         """What the server was doing when a write did not come back.
 
         Deliberately best-effort throughout: this runs while something is
         already wrong, and a diagnosis that raises tells nobody anything.
         """
+        attrs = RowAttrs.coerce(attrs)
         lines = ["[valkey] the write did not return. Server state at that moment:"]
 
         info = self._ft_info()
@@ -715,15 +765,22 @@ class ValkeyDriver(EngineDriver):
         for size in _PROBE_SIZES:
             if size > len(ids):
                 break
-            outcome = self._probe_write(ids[:size], vectors[:size], tags[:size])
+            outcome = self._probe_write(ids[:size], vectors[:size],
+                                        attrs[:size])
             if outcome.startswith("OK"):
                 self._largest_working = size
             lines.append(f"    write of {size:>5} row(s) on a fresh "
                          f"connection: {outcome}")
         return "\n".join(lines)
 
-    def _probe_write(self, ids, vectors, tags) -> str:
-        """Try one sized write and describe what happened, without raising."""
+    def _probe_write(self, ids, vectors, attrs) -> str:
+        """Try one sized write and describe what happened, without raising.
+
+        Coerces like its two siblings: `tests/test_config.py` calls this and
+        `_diagnose_stalled_write` directly with a plain list of tag values,
+        and the diagnosis must not be the thing that raises.
+        """
+        attrs = RowAttrs.coerce(attrs)
         try:
             probe = self._write_connection(timeout_s=CANARY_TIMEOUT_S)
         except Exception as exc:
@@ -733,7 +790,7 @@ class ValkeyDriver(EngineDriver):
             pipe = probe.pipeline(transaction=False)
             for i, key_id in enumerate(ids):
                 pipe.hset(f"{PREFIX}{int(key_id)}", mapping={
-                    TAG_FIELD: int(tags[i]),
+                    **attrs.fields(i),
                     VECTOR_FIELD: encode_vector(vectors[i]),
                 })
             pipe.execute()
@@ -778,27 +835,62 @@ class ValkeyDriver(EngineDriver):
                 ids.append(int(key[len(PREFIX):]))
         return ids
 
+    def _filter_expr(self, column: str, threshold: int) -> str:
+        """`@column:[-inf (threshold]` -- the one place a predicate is built.
+
+        Exclusive upper bound, matching `WHERE tag < threshold` in the SQL
+        engines and `{"tag": {"$lt": ...}}` in Percona Search. The `(` before
+        the upper bound is what makes it exclusive; without it this engine
+        would be answering a different question from the other five at every
+        selectivity, and by exactly one bucket or one cluster.
+
+        The column goes through the whitelist here, which is the only place it
+        can: `query_filtered` and `explain_uses_vector_index` both built this
+        string themselves before, so a check added to one of them would have
+        left the other interpolating whatever it was handed into a query
+        string.
+        """
+        return f"@{checked_filter_column(column)}:[-inf ({int(threshold)}]"
+
     def query(self, vector, k: int) -> List[int]:
         return self._search(vector, k)
 
-    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]:
-        # Exclusive upper bound, matching `WHERE tag < threshold` in the SQL
-        # engines and `{"tag": {"$lt": ...}}` in Percona Search.
-        return self._search(vector, k, f"@{TAG_FIELD}:[-inf ({int(tag_threshold)}]")
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
+        return self._search(vector, k, self._filter_expr(column, threshold))
 
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
         """There is no plan to inspect and no scan to fall back to.
 
         FT.SEARCH is only answerable through the index; without one the command
         errors. What this distinguishes is an erroring configuration from a
         genuinely slow one, so the two are not both recorded as low throughput.
+
+        It does NOT reliably catch the new failure this column introduces,
+        and that is worth saying rather than assuming: an index created
+        without the `ctag` field would answer `@ctag:[-inf (t]` with either
+        an error or an empty result set, and only the error reaches here.
+        That is exactly why the FT.CREATE schema and `_filter_expr` are both
+        derived from `FILTER_COLUMNS` instead of relying on this check -- the
+        empty-result case is indistinguishable from a selective predicate.
         """
+        # Checked here, above the try, and the placement is the point. The
+        # body below swallows every exception on purpose -- a plan check that
+        # fails must not end a run -- so a column rejected inside the try
+        # would come back as a plain False, which every caller reads as a
+        # statement about the engine. It would be a statement about the
+        # caller. The measurement that followed would then fail anyway, one
+        # step later in `query_filtered`, with this check already recorded in
+        # the report's Validity section as an index that was not used.
+        column = checked_filter_column(column)
         try:
             if tag_threshold is None:
                 self._search(vector, k)
             else:
-                self._search(vector, k, f"@{TAG_FIELD}:[-inf ({int(tag_threshold)}]")
+                self._search(vector, k,
+                             self._filter_expr(column, tag_threshold))
             return True
         except Exception:
             return False

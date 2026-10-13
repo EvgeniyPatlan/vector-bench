@@ -15,11 +15,13 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy
 
-from .base import DATABASE, TABLE, ConnectionSpec, EngineDriver, IndexSpec, LoadResult
+from .base import (DATABASE, FILTER_COLUMNS, FILTER_CTAG, FILTER_TAG, TABLE,
+                   ConnectionSpec, EngineDriver, IndexSpec, LoadResult,
+                   RowAttrs, checked_filter_column)
 
 try:
     import psycopg
@@ -32,6 +34,19 @@ PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
 INDEX = f"{TABLE}_embedding_idx"
 OPCLASS = {"angular": "vector_cosine_ops", "euclidean": "vector_l2_ops"}
 OPERATOR = {"angular": "<=>", "euclidean": "<->"}
+
+#: B-tree index name per filter column, derived so the two columns cannot end
+#: up with one index between them. `create_schema` creates every entry.
+SCALAR_INDEXES = {column: f"{TABLE}_{column}_idx" for column in FILTER_COLUMNS}
+
+#: One COPY statement for the bulk load and for churn's re-insert. They each
+#: had their own copy of this string; PR 3 adds a column to both, and a COPY
+#: whose column list and `write_row` tuple disagree in width raises inside the
+#: copy block, which on the bulk path happens after an unknown number of rows
+#: have already been streamed.
+COPY_SQL = (
+    f"COPY {TABLE} (id, {FILTER_TAG}, {FILTER_CTAG}, embedding) FROM STDIN"
+)
 
 
 class PostgresDriver(EngineDriver):
@@ -88,14 +103,24 @@ class PostgresDriver(EngineDriver):
         self._index = index
         self._cur.execute(
             f"CREATE TABLE {TABLE} (id int PRIMARY KEY, tag int NOT NULL, "
-            f"embedding vector({index.dim}))"
+            f"ctag int NOT NULL, embedding vector({index.dim}))"
         )
         # Keep vectors inline. TOASTed vectors would add a detoast to every
         # distance comparison, which pgvector's own documentation warns against.
         self._cur.execute(
             f"ALTER TABLE {TABLE} ALTER COLUMN embedding SET STORAGE PLAIN"
         )
-        self._cur.execute(f"CREATE INDEX {TABLE}_tag_idx ON {TABLE} (tag)")
+        # Looped over SCALAR_INDEXES rather than written out twice: both
+        # columns get the same kind of index, which is what makes the
+        # planner's choice between them comparable. A second hand-written
+        # CREATE INDEX line is where one column quietly ends up unindexed, and
+        # pgvector is the engine where that matters most -- without a B-tree
+        # the predicate is evaluated as a filter above the index scan, which
+        # changes how many candidates `hnsw.iterative_scan` has to walk.
+        for column in FILTER_COLUMNS:
+            self._cur.execute(
+                f"CREATE INDEX {SCALAR_INDEXES[column]} ON {TABLE} ({column})"
+            )
         if index.build_mode == "incremental":
             self.create_index(index)
 
@@ -114,19 +139,21 @@ class PostgresDriver(EngineDriver):
     # Data
     # ------------------------------------------------------------------
 
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
+    def load(self, vectors: numpy.ndarray,
+             attrs: Union[RowAttrs, Sequence[int], numpy.ndarray],
              threads: int = 1, start_id: int = 0) -> LoadResult:
         total = len(vectors)
         threads = max(1, threads)
+        attrs = RowAttrs.coerce(attrs)
         start = time.perf_counter()
 
         def copy_range(lo: int, hi: int, cur, report: bool = False) -> None:
             span = hi - lo
             began = time.perf_counter()
             next_report = began + PROGRESS_INTERVAL_S
-            with cur.copy(f"COPY {TABLE} (id, tag, embedding) FROM STDIN") as copy:
+            with cur.copy(COPY_SQL) as copy:
                 for i in range(lo, hi):
-                    copy.write_row((start_id + i, int(tags[i]), vectors[i]))
+                    copy.write_row((start_id + i, *attrs.row(i), vectors[i]))
                     if report and (i - lo) % 5000 == 0:
                         now = time.perf_counter()
                         if now >= next_report:
@@ -166,10 +193,12 @@ class PostgresDriver(EngineDriver):
         )
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None:
-        with self._cur.copy(f"COPY {TABLE} (id, tag, embedding) FROM STDIN") as copy:
-            for i, v, t in zip(ids, vectors, tags):
-                copy.write_row((int(i), int(t), v))
+                    attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
+                    ) -> None:
+        attrs = RowAttrs.coerce(attrs)
+        with self._cur.copy(COPY_SQL) as copy:
+            for i, row_id in enumerate(ids):
+                copy.write_row((int(row_id), *attrs.row(i), vectors[i]))
 
     def count_rows(self) -> int:
         self._cur.execute(f"SELECT count(*) FROM {TABLE}")
@@ -186,18 +215,97 @@ class PostgresDriver(EngineDriver):
         assert self._index is not None, "create_schema must run before querying"
         return OPERATOR[self._index.metric]
 
+    def _select(self, filtered: bool = False, *,
+                column: str = FILTER_TAG) -> str:
+        """The one SELECT both the query path and the EXPLAIN path run.
+
+        Before PR 3 the filtered string was written out twice -- once in
+        `query_filtered`, once in `explain_uses_vector_index` -- and adding a
+        whitelisted column name to a predicate that exists in two places means
+        two checks, of which the second is the one nobody notices has been
+        bypassed. One builder makes "the column is checked before it reaches
+        SQL" a property of the file rather than a claim about two call sites.
+
+        **`filtered` is an explicit flag and not an `Optional[str]` sentinel,
+        and that is a bug fix rather than a style preference.** This read
+        `if column else ""` for one review cycle, which is truthiness: `""`,
+        `None` and `0` all skipped the predicate *and the whitelist with it*,
+        so `_select("")` returned an UNFILTERED select while the other four
+        drivers raised ValueError on the same input. `query_filtered` would
+        then have sent three parameters against two placeholders -- loud, but
+        loud about placeholder counts rather than about a column name, and
+        `explain_uses_vector_index` swallows exceptions, so the plan check
+        would have come back False for a query nobody asked for. A `None`
+        sentinel fixes the falsy-string half and leaves `None` itself a legal
+        argument to a function whose whole job is to refuse illegal ones; a
+        boolean cannot be mistaken for a column at all.
+
+        So the column is whitelisted unconditionally, on both branches, which
+        is also what `mysql_family._select` does and argues for -- the two
+        drivers now have the same shape rather than nearly the same shape.
+
+        **`column` is keyword-only**, and the `*` above is not decoration:
+        without it `_select(True, "ctag")` and `_select(True, "tag")` are two
+        positional booleans-then-string calls that read alike, and the
+        argument that decides which column a measurement names would be
+        identified by position. Named at every call site, it cannot be
+        confused with the flag. Deleting the `*` is a silent regression, which
+        is why the runtime guard below exists as well as the marker.
+
+        Parameter order follows the string: threshold, vector, k when
+        filtered; vector, k when not.
+        """
+        # `filtered` really is a flag, and this says so at runtime because
+        # the keyword-only marker above does not. Measured: with `column`
+        # keyword-only and `filtered` still positional, `_select("ctag")`
+        # returns `WHERE tag < %s` -- a well-formed filtered query on the
+        # WRONG column, silently, because a non-empty string is truthy. The
+        # marker stops a column reaching here in `column`'s position; only
+        # this stops one reaching here in the FLAG's position, which is the
+        # shape a caller who forgets the flag actually writes. Two lines for
+        # the one remaining way this file can measure `tag` while a record
+        # says `ctag`, and it survives someone deleting the `*`.
+        if not isinstance(filtered, bool):
+            raise TypeError(
+                f"_select's filtered argument is a flag, not a column; got "
+                f"{filtered!r}. Did you mean column={filtered!r}?")
+        checked = checked_filter_column(column)
+        where = f"WHERE {checked} < %s " if filtered else ""
+        return (
+            f"SELECT id FROM {TABLE} {where}"
+            f"ORDER BY embedding {self._op()} %s LIMIT %s"
+        )
+
     def query(self, vector, k: int) -> List[int]:
         self._cur.execute(
-            f"SELECT id FROM {TABLE} ORDER BY embedding {self._op()} %s LIMIT %s",
-            (vector, k), binary=True, prepare=True,
+            self._select(False), (vector, k), binary=True, prepare=True,
         )
         return [row[0] for row in self._cur.fetchall()]
 
-    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]:
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
+        # `prepare=True` is kept per column, which is safe for the reason the
+        # spec asks about: the two columns produce two different statement
+        # texts, so no cache keyed on anything derived from the statement can
+        # serve one column's plan to the other. psycopg3 keys its prepared
+        # statements on the query and its parameter types, but the property
+        # relied on here is the weaker one and holds whatever the key is --
+        # two statements that differ in their WHERE clause are two statements.
+        # The arrangement that would collide is one statement text with the
+        # column bound as a parameter, and PostgreSQL does not accept a
+        # parameter where an identifier belongs, so that shape is unreachable
+        # rather than merely avoided.
+        #
+        # Kept rather than dropped because dropping it would change the
+        # measurement: these queries are timed one at a time in a loop, so
+        # whether each one is re-planned is part of the per-query cost the
+        # filtered workload reports. Whatever that costs, it has to be the
+        # same for `tag` and for `ctag`, and it has to be the same as it was
+        # before this column existed.
         self._cur.execute(
-            f"SELECT id FROM {TABLE} WHERE tag < %s "
-            f"ORDER BY embedding {self._op()} %s LIMIT %s",
-            (int(tag_threshold), vector, k), binary=True, prepare=True,
+            self._select(True, column=column),
+            (int(threshold), vector, k),
+            binary=True, prepare=True,
         )
         return [row[0] for row in self._cur.fetchall()]
 
@@ -212,25 +320,39 @@ class PostgresDriver(EngineDriver):
         self._cur.execute(f"SET hnsw.iterative_scan = {mode}")
 
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
+        # Checked here, above the try, and the placement is the point. The
+        # body below swallows every exception on purpose -- a plan check that
+        # fails must not end a run -- so a column rejected inside the try
+        # would come back as a plain False, which every caller reads as a
+        # statement about the engine. It would be a statement about the
+        # caller. The measurement that followed would then fail anyway, one
+        # step later in `query_filtered`, with this check already recorded in
+        # the report's Validity section as an index that was not used.
+        column = checked_filter_column(column)
         try:
             if tag_threshold is None:
-                sql = f"SELECT id FROM {TABLE} ORDER BY embedding {self._op()} %s LIMIT %s"
+                sql = self._select(False, column=column)
                 params: Tuple[Any, ...] = (vector, k)
             else:
-                sql = (f"SELECT id FROM {TABLE} WHERE tag < %s "
-                       f"ORDER BY embedding {self._op()} %s LIMIT %s")
+                sql = self._select(True, column=column)
                 params = (int(tag_threshold), vector, k)
             self._cur.execute("EXPLAIN (FORMAT TEXT) " + sql, params)
             plan = " ".join(str(r[0]) for r in self._cur.fetchall())
         except Exception as exc:
             print(f"[pgvector] EXPLAIN failed: {exc}")
             return False
+        # Substring, and `INDEX` is `t1_embedding_idx` while the scalar
+        # indexes are `t1_tag_idx` and `t1_ctag_idx`: neither of those
+        # contains the other, so a plan that used only the B-tree does not
+        # read as having used the HNSW index.
         used = INDEX in plan
         if not used:
             print(
                 f"[pgvector] WARNING: HNSW index NOT used "
-                f"(k={k}, filtered={tag_threshold is not None}). Plan: {plan}"
+                f"(k={k}, filtered={tag_threshold is not None}, "
+                f"column={column!r}). Plan: {plan}"
             )
         return used
 

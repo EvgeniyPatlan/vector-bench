@@ -27,11 +27,13 @@ import os
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy
 
-from .base import DATABASE, TABLE, ConnectionSpec, EngineDriver, IndexSpec, LoadResult
+from .base import (DATABASE, FILTER_COLUMNS, FILTER_TAG, TABLE, ConnectionSpec,
+                   EngineDriver, IndexSpec, LoadResult, RowAttrs,
+                   checked_filter_column)
 
 try:
     import pymongo
@@ -150,7 +152,20 @@ class MongoDriver(EngineDriver):
             fields[0]["quantization"] = index.quantization
         # Declared even when unused: a field can only be filtered on if it was
         # indexed as one, and adding it later would rebuild the index.
-        fields.append({"type": "filter", "path": "tag"})
+        #
+        # That sentence is also the reason PR 3 loads both filter columns in
+        # one build rather than choosing one column's values per run. For this
+        # engine "choose per run" is not a reload of the table, it is a rebuild
+        # of the Lucene index by another process, waited out through
+        # `_wait_until_ready` -- so the cheaper-looking option B is the more
+        # expensive one here, and declaring both paths now costs one filter
+        # field in the definition. Both are declared from FILTER_COLUMNS, the
+        # same tuple `checked_filter_column` matches a query's path against,
+        # so the set of paths this index carries and the set of paths a query
+        # may ask for cannot drift apart -- and a drift here is only
+        # discoverable after the build, which is the expensive moment.
+        fields.extend({"type": "filter", "path": column}
+                      for column in FILTER_COLUMNS)
 
         self._coll.create_search_index({
             "name": INDEX_NAME,
@@ -191,17 +206,19 @@ class MongoDriver(EngineDriver):
 
     # -- data -----------------------------------------------------------
 
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
+    def load(self, vectors: numpy.ndarray,
+             attrs: Union[RowAttrs, Sequence[int], numpy.ndarray],
              threads: int = 1, start_id: int = 0) -> LoadResult:
         rows = len(vectors)
+        attrs = RowAttrs.coerce(attrs)
         started = time.time()
         if threads <= 1:
-            self._insert_range(vectors, tags, start_id, 0, rows)
+            self._insert_range(vectors, attrs, start_id, 0, rows)
         else:
             chunk = (rows + threads - 1) // threads
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures = [
-                    pool.submit(self._insert_range, vectors, tags, start_id,
+                    pool.submit(self._insert_range, vectors, attrs, start_id,
                                 begin, min(begin + chunk, rows))
                     for begin in range(0, rows, chunk)
                 ]
@@ -210,7 +227,7 @@ class MongoDriver(EngineDriver):
         return LoadResult(rows=rows, wall_seconds=time.time() - started,
                           threads=threads)
 
-    def _insert_range(self, vectors, tags, start_id: int,
+    def _insert_range(self, vectors, attrs: RowAttrs, start_id: int,
                       begin: int, end: int, batch: int = 1000) -> None:
         # Each worker opens its own client: MongoClient is thread safe but
         # shares one connection pool, and sharing it would make the thread count
@@ -222,7 +239,7 @@ class MongoDriver(EngineDriver):
                 chunk_end = min(chunk_start + batch, end)
                 coll.insert_many([
                     {"_id": start_id + i,
-                     "tag": int(tags[i]),
+                     **attrs.fields(i),
                      "embedding": encode_vector(vectors[i])}
                     for i in range(chunk_start, chunk_end)
                 ], ordered=False)
@@ -233,9 +250,11 @@ class MongoDriver(EngineDriver):
         self._coll.delete_many({"_id": {"$in": list(ids)}})
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None:
+                    attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
+                    ) -> None:
+        attrs = RowAttrs.coerce(attrs)
         self._coll.insert_many([
-            {"_id": int(ids[i]), "tag": int(tags[i]),
+            {"_id": int(ids[i]), **attrs.fields(i),
              "embedding": encode_vector(vectors[i])}
             for i in range(len(ids))
         ], ordered=False)
@@ -274,7 +293,13 @@ class MongoDriver(EngineDriver):
         return max(int(ef), int(k))
 
     def _pipeline(self, vector, k: int,
-                  tag_threshold: Optional[int] = None) -> List[Dict[str, Any]]:
+                  tag_threshold: Optional[int] = None,
+                  column: str = FILTER_TAG) -> List[Dict[str, Any]]:
+        """The one aggregation both the query path and EXPLAIN build.
+
+        `tag_threshold` keeps its name because `tests/test_config.py:1988`
+        passes it by keyword and that file is not this task's to edit.
+        """
         stage: Dict[str, Any] = {
             "index": INDEX_NAME,
             "path": "embedding",
@@ -285,19 +310,31 @@ class MongoDriver(EngineDriver):
             "limit": k,
         }
         if tag_threshold is not None:
-            stage["filter"] = {"tag": {"$lt": int(tag_threshold)}}
+            # The path is whitelisted even though a BSON key cannot be
+            # injected the way a SQL identifier can: what it protects against
+            # here is not injection but silence. `$vectorSearch.filter` on a
+            # path the index has no filter field for is rejected by mongot,
+            # but a path that is merely *misspelled* and happens to be
+            # declared is not -- and the whitelist and the index definition
+            # above are now built from the same tuple, so they cannot differ.
+            stage["filter"] = {
+                checked_filter_column(column): {"$lt": int(tag_threshold)}
+            }
         return [{"$vectorSearch": stage}, {"$project": {"_id": 1}}]
 
     def query(self, vector, k: int) -> List[int]:
         return [d["_id"] for d in
                 self._coll.aggregate(self._pipeline(vector, k))]
 
-    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]:
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
         return [d["_id"] for d in
-                self._coll.aggregate(self._pipeline(vector, k, tag_threshold))]
+                self._coll.aggregate(
+                    self._pipeline(vector, k, threshold, column))]
 
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
         """Whether the query ran as a vector search rather than a collection scan.
 
         $vectorSearch has no planner fallback the way a SQL optimiser does: if
@@ -305,11 +342,21 @@ class MongoDriver(EngineDriver):
         The check is kept anyway, because an error here and a slow exact scan
         are worth telling apart in the record.
         """
+        # Checked here, above the try, and the placement is the point. The
+        # body below swallows every exception on purpose -- a plan check that
+        # fails must not end a run -- so a column rejected inside the try
+        # would come back as a plain False, which every caller reads as a
+        # statement about the engine. It would be a statement about the
+        # caller. The measurement that followed would then fail anyway, one
+        # step later in `query_filtered`, with this check already recorded in
+        # the report's Validity section as an index that was not used.
+        column = checked_filter_column(column)
         try:
             plan = self._db.command({
                 "explain": {
                     "aggregate": TABLE,
-                    "pipeline": self._pipeline(vector, k, tag_threshold),
+                    "pipeline": self._pipeline(vector, k, tag_threshold,
+                                               column),
                     "cursor": {},
                 },
                 "verbosity": "queryPlanner",

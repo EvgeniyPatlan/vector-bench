@@ -22,8 +22,8 @@ from typing import Optional
 
 import numpy
 
-from ..datasets import Dataset, assign_tags
-from ..drivers.base import EngineDriver, IndexSpec
+from ..datasets import FILTER_CTAG, FILTER_TAG, Dataset, filter_values
+from ..drivers.base import EngineDriver, IndexSpec, RowAttrs
 from ..metrics.latency import Timer
 from ..metrics.records import PHASE_BUILD, PHASE_INGEST, Record, Recorder
 from ..progress import Heartbeat
@@ -37,7 +37,52 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     vectors = dataset.train
     if subset_rows is not None and subset_rows < len(vectors):
         vectors = vectors[:subset_rows]
-    tags = assign_tags(len(vectors))
+
+    # Both filter columns, loaded in the one build -- PR 3's option A, argued
+    # in `drivers/base.py:RowAttrs` and `datasets.py:FILTER_COLUMNS`. Three
+    # things about these two lines are load-bearing.
+    #
+    # `filter_values` for BOTH columns, including `tag`, whose values it just
+    # computes with `assign_tags`. The filtered workload asks the same
+    # function for the values it builds exact ground truth over, keyed on the
+    # same (dataset, rows) pair, so the column in the engine and the column
+    # the yardstick was computed from cannot be two different arrays. Calling
+    # `assign_tags` here and `filter_values` there would be two paths that
+    # agree today.
+    #
+    # `len(vectors)`, not `subset_rows`: the pivots are drawn from the rows
+    # given, so clustering 2,000 rows and clustering the first 500 of them
+    # produce different labels for those 500 -- measured, 497 of 500 differ.
+    # `main.py` takes `indexed_rows` from `driver.count_rows()` after this,
+    # which is this number and not the profile's request.
+    #
+    # Before `drop_schema` and before either timer below, so the cluster
+    # assignment is charged to neither ingest nor build. It is cached and
+    # measured at 0.5-3.2 s for 1M rows against a ~1.9 h MHNSW ingest, but
+    # "small" is not "outside the measurement".
+    #
+    # It is also a new SIDE EFFECT in a phase that previously had none:
+    # `cached_ctags` does `makedirs(cache_dir, exist_ok=True)` and saves an
+    # .npy, so a build-only profile -- `config/profiles/mariadb-blog-repro.yml`
+    # declares `workloads: [build]` -- now writes a cache entry for labels
+    # that run will never query. ~0.6 s and a few megabytes for glove, and
+    # the alternative is a flag threading "will anything filter later?" from
+    # the profile down to here, which is more coupling than the cost buys.
+    #
+    # One new failure mode, worth knowing before it costs someone an hour:
+    # `assign_ctags` refuses a corpus smaller than its cluster count (100 by
+    # default), so `build.run` now needs at least that many rows where it
+    # previously took any. Clamping the count to the row count is the obvious
+    # alternative and the dangerous one -- the count is part of the ctag cache
+    # key, so a build that clamped and a ground truth that did not would score
+    # the engine against a different clustering, which is the one failure the
+    # shared `filter_values` call above exists to prevent.
+    attrs = RowAttrs(
+        tag=filter_values(ctx.cache_dir, dataset, FILTER_TAG,
+                          indexed_rows=len(vectors)),
+        ctag=filter_values(ctx.cache_dir, dataset, FILTER_CTAG,
+                           indexed_rows=len(vectors)),
+    )
 
     driver.drop_schema()
 
@@ -54,7 +99,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         f"with {load_threads} thread(s); "
         f"{'graph maintained during load' if incremental else 'bulk build after load'}"
     )
-    load = driver.load(vectors, tags, threads=load_threads)
+    load = driver.load(vectors, attrs, threads=load_threads)
     print(
         f"[{driver.name}] load: {load.wall_seconds:.1f}s "
         f"({load.rows_per_second:,.0f} rows/s)"

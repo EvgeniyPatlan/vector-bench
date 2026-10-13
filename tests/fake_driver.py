@@ -8,8 +8,9 @@ anything in this repo, and why the bugs it shipped were the quiet kind — a
 record written under the wrong phase, a recall number scored against the wrong
 ground truth — rather than crashes.
 
-`FakeDriver` is an `EngineDriver` whose storage is three NumPy arrays and whose
-ANN behaviour is a deliberately crude model with the knobs turned outward. It is
+`FakeDriver` is an `EngineDriver` whose storage is a handful of NumPy arrays --
+vectors, ids, one per filter column, and a tombstone flag -- and whose ANN
+behaviour is a deliberately crude model with the knobs turned outward. It is
 not a simulator of any real engine and must never be used to produce a number
 that appears in a report. Its only job is to let a test assert *the harness's*
 behaviour in milliseconds:
@@ -44,9 +45,10 @@ import numpy
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness import datasets as ds  # noqa: E402
-from harness.datasets import ANGULAR, EUCLIDEAN, Dataset  # noqa: E402
+from harness.datasets import (ANGULAR, EUCLIDEAN, FILTER_COLUMNS,  # noqa: E402
+                              FILTER_CTAG, FILTER_TAG, Dataset)
 from harness.drivers.base import (ConnectionSpec, EngineDriver,  # noqa: E402
-                                  IndexSpec, LoadResult)
+                                  IndexSpec, LoadResult, RowAttrs)
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,13 @@ class _Rows:
 
     vectors: numpy.ndarray      # (n, dim) float32
     ids: numpy.ndarray          # (n,) int64 — row ids as the engine knows them
-    tags: numpy.ndarray         # (n,) int64 — the scalar attribute filters use
+    # One array per filter column, held separately rather than as a dict keyed
+    # by column name. The real engines store two columns and a test that wants
+    # to show a predicate reading the wrong one needs them to be able to hold
+    # different values; a single array shared under two names could not fail
+    # that way, so the test would pass whichever column the code read.
+    tags: numpy.ndarray         # (n,) int64 — `tag`, uncorrelated with vectors
+    ctags: numpy.ndarray        # (n,) int64 — `ctag`, a cluster id
     tombstoned: numpy.ndarray   # (n,) bool  — deleted but not yet reclaimed
 
 
@@ -86,6 +94,7 @@ def _empty_rows(dim: int) -> _Rows:
         vectors=numpy.empty((0, max(int(dim), 0)), dtype=numpy.float32),
         ids=numpy.empty(0, dtype=numpy.int64),
         tags=numpy.empty(0, dtype=numpy.int64),
+        ctags=numpy.empty(0, dtype=numpy.int64),
         tombstoned=numpy.empty(0, dtype=bool),
     )
 
@@ -104,7 +113,7 @@ class FakeDriver(EngineDriver):
                  uses_vector_index: bool = True,
                  capabilities: Optional[Dict[str, Any]] = None,
                  version: str = "fake-engine 0.1",
-                 tag_columns: Sequence[str] = ("tag",),
+                 tag_columns: Sequence[str] = FILTER_COLUMNS,
                  seed: int = 20261012,
                  _store: Optional[_Store] = None):
         super().__init__(spec or ConnectionSpec(host="fake", port=0))
@@ -195,7 +204,7 @@ class FakeDriver(EngineDriver):
 
     # -- data -----------------------------------------------------------
 
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
+    def load(self, vectors: numpy.ndarray, attrs,
              threads: int = 1, start_id: int = 0) -> LoadResult:
         """Ingest rows, reporting how long it took.
 
@@ -209,7 +218,7 @@ class FakeDriver(EngineDriver):
         """
         started = time.perf_counter()
         ids = numpy.arange(start_id, start_id + len(vectors), dtype=numpy.int64)
-        self._append(ids, vectors, tags)
+        self._append(ids, vectors, attrs)
         if self.load_latency_s > 0.0:
             time.sleep(self.load_latency_s)
         return LoadResult(rows=len(vectors),
@@ -217,9 +226,9 @@ class FakeDriver(EngineDriver):
                           threads=max(1, int(threads)))
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None:
+                    attrs) -> None:
         self._append(numpy.asarray([int(i) for i in ids], dtype=numpy.int64),
-                     vectors, tags)
+                     vectors, attrs)
 
     def delete_ids(self, ids: Sequence[int]) -> None:
         """Mark rows deleted without reclaiming them.
@@ -254,7 +263,8 @@ class FakeDriver(EngineDriver):
             keep = ~rows.tombstoned
             self._store.rows = _Rows(
                 vectors=rows.vectors[keep], ids=rows.ids[keep],
-                tags=rows.tags[keep], tombstoned=rows.tombstoned[keep],
+                tags=rows.tags[keep], ctags=rows.ctags[keep],
+                tombstoned=rows.tombstoned[keep],
             )
             return purged
 
@@ -263,9 +273,21 @@ class FakeDriver(EngineDriver):
         rows = self._store.rows
         return int((~rows.tombstoned).sum())
 
-    def _append(self, ids: numpy.ndarray, vectors, tags) -> None:
+    def _append(self, ids: numpy.ndarray, vectors, attrs) -> None:
+        """Append rows, taking a `RowAttrs` or a bare array of tag values.
+
+        Coerced through `RowAttrs.coerce`, exactly as the four real drivers
+        do, so this fake keeps the interface they implement rather than a
+        laxer one. The bare-array form mirrors `tag` into `ctag`, which is
+        what the helpers at the bottom of this file and most existing tests
+        get; a test that needs the two columns to differ passes a `RowAttrs`
+        and this is the only place that matters.
+        """
+        attrs = RowAttrs.coerce(attrs)
         new_vectors = numpy.asarray(vectors, dtype=numpy.float32)
-        new_tags = numpy.asarray([int(t) for t in tags], dtype=numpy.int64)
+        new_tags = numpy.asarray([int(t) for t in attrs.tag], dtype=numpy.int64)
+        new_ctags = numpy.asarray([int(t) for t in attrs.ctag],
+                                  dtype=numpy.int64)
         with self._store.lock:
             rows = self._store.rows
             if len(rows.ids) == 0:
@@ -279,6 +301,7 @@ class FakeDriver(EngineDriver):
                 vectors=stacked,
                 ids=numpy.concatenate([rows.ids, ids]),
                 tags=numpy.concatenate([rows.tags, new_tags]),
+                ctags=numpy.concatenate([rows.ctags, new_ctags]),
                 tombstoned=numpy.concatenate(
                     [rows.tombstoned, numpy.zeros(len(ids), dtype=bool)]),
             )
@@ -333,30 +356,59 @@ class FakeDriver(EngineDriver):
         rows = self._store.rows
         return [int(i) for i in rows.ids[self._candidates(rows, vector, k)]]
 
-    def query_filtered(self, vector, k: int, tag_threshold: int,
-                       column: str = "tag") -> List[int]:
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
         """Post-filter the ANN candidate list — the top `ef` only.
 
         Post-filtering rather than pre-filtering is what makes this fake useful
         for the filtered workload: with a selective predicate the top-`ef`
         candidates rarely contain `k` qualifying rows, so short result sets and
         the correlated-filter collapse appear on their own instead of being
-        staged test by test. `column` names which scalar column the predicate
-        reads; every configured column carries the same tag values here, so it
-        exists to be plumbed and validated, not to hold different data.
+        staged test by test.
+
+        `column` names which scalar column the predicate reads, and it reads
+        that column's own values: `_Rows` holds `tag` and `ctag` separately,
+        so a driver or workload that asked for one and got the other produces
+        a different result set here rather than the same one. It used to be
+        one array under two names, which made "the right column was read"
+        untestable -- every answer was the same answer.
+
+        The whitelist is `tag_columns`, which defaults to the dataset
+        module's `FILTER_COLUMNS` rather than to a literal of its own, so a
+        column this fake accepts is a column the real drivers accept.
         """
         self._require_connection()
-        if column not in self._tag_columns:
-            raise ValueError(
-                f"no such column: {column!r} (have {list(self._tag_columns)})")
+        values = self._column_values(column)
         self._sleep()
         rows = self._store.rows
         candidates = self._candidates(rows, vector, self._ef_search)
-        qualifying = candidates[rows.tags[candidates] < int(tag_threshold)]
+        qualifying = candidates[values[candidates] < int(threshold)]
         return [int(i) for i in rows.ids[qualifying[:k]]]
 
+    def _column_values(self, column: str) -> numpy.ndarray:
+        """One filter column's values, or `ValueError` for anything else.
+
+        Raises before `_sleep()` and before any candidate is computed, so a
+        rejected column costs nothing and cannot half-run a query.
+        """
+        if column not in self._tag_columns:
+            raise ValueError(
+                f"no such column: {column!r} (have {list(self._tag_columns)})")
+        rows = self._store.rows
+        return rows.ctags if column == FILTER_CTAG else rows.tags
+
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
+        """The configured flag, but only for a column that exists.
+
+        The flag is what tests set; the column check is here because this is
+        the plan check every workload runs before it measures, and a workload
+        that asked about a column the engine has no index on must not be told
+        the index is fine. `tag_threshold` keeps its name: `test_fake_driver`
+        passes it by keyword.
+        """
+        self._column_values(column)
         return self.uses_vector_index
 
     # -- the error model ------------------------------------------------
@@ -548,12 +600,21 @@ def index_spec(dataset: Dataset, m: int = 16,
                      build_mode=build_mode)
 
 
-def loaded_driver(dataset: Dataset, **kwargs) -> FakeDriver:
-    """A connected FakeDriver holding the whole tiny corpus."""
+def loaded_driver(dataset: Dataset, attrs=None, **kwargs) -> FakeDriver:
+    """A connected FakeDriver holding the whole tiny corpus.
+
+    `attrs` defaults to `assign_tags(N_ROWS)`, a bare array, which
+    `RowAttrs.coerce` mirrors into `ctag`. Mirrored is the right default for
+    the tests that only care about `tag`, and it is the wrong thing to build a
+    `ctag` test on -- a predicate reading either column would then give the
+    same answer, which is the vacuity this parameter exists to let a caller
+    avoid. Pass a `RowAttrs` whose two columns differ.
+    """
     driver = FakeDriver(dim=dataset.dim, metric=dataset.metric, **kwargs)
     driver.connect()
     driver.create_schema(index_spec(dataset))
-    driver.load(dataset.train, ds.assign_tags(N_ROWS))
+    driver.load(dataset.train,
+                ds.assign_tags(N_ROWS) if attrs is None else attrs)
     return driver
 
 
