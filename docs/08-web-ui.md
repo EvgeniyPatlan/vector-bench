@@ -472,7 +472,7 @@ develop against.
 - **Add a new database architecture.** The Engines tab adds a *variant* of a
   family the harness already drives — another MySQL fork, another Postgres
   build — because that is genuinely just `config/engines/<name>.yml`: a source
-  tag, an image name, server flags and a SQL dialect. Something none of the
+  tag, an image name, server flags and a `runtime:` block. Something none of the
   existing drivers speak needs a driver in `harness/drivers/`, an
   ann-benchmarks module and a Dockerfile, and the form refuses a config that
   names a driver which does not exist rather than accepting one nothing can

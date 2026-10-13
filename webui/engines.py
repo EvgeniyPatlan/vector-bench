@@ -150,10 +150,21 @@ def validate(config_dir: str, name: str, text: str) -> Tuple[List[str], List[str
                     f"{others[ref]}; two engines sharing an image tag would "
                     f"overwrite each other at build time")
 
-    if not (parsed.get("sql") or parsed.get("runtime", {}).get("driver") in
-            ("MongoDriver", "ValkeyDriver")):
-        warnings.append("no sql block: SQL-family drivers read their dialect from it")
-
+    # Nothing is said here about a `sql:` block, and nothing should be. A
+    # warning used to fire when one was absent -- "no sql block: SQL-family
+    # drivers read their dialect from it" -- and no part of it was true. The
+    # bench container mounts harness/ alone and cannot read config/, so no
+    # driver has ever taken a statement, a dialect or a plan marker out of an
+    # engine config; the blocks that existed were read by exactly nothing, and
+    # the only check anywhere was this one testing whether the key was present.
+    # Unread, they drifted twice: past the `tag` column their own
+    # `query_filtered` filtered on, and then past `ctag` entirely. The message
+    # was asking an operator to write config that would never run and to keep
+    # it in step with a schema it did not describe.
+    #
+    # `warnings` stays in the return tuple though nothing fills it any more:
+    # the shape is shared with webui/profiles.validate, and control.py puts the
+    # key in the JSON that engines.js iterates unguarded.
     return errors, warnings, parsed
 
 
