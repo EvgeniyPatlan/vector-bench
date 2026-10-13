@@ -128,6 +128,28 @@ class EngineDriver(abc.ABC):
     @abc.abstractmethod
     def set_ef_search(self, ef_search: int) -> None: ...
 
+    def effective_ef(self, ef: int, k: int) -> int:
+        """How many candidates this engine will really search for `ef`.
+
+        For every engine here except one the answer is `ef`, which is why this
+        is a concrete method rather than another abstract one. MongoDB clamps:
+        `numCandidates` below `limit` cannot return `limit` rows, so it raises
+        the low end of the grid to k and the calibration records have to say so
+        -- a reader comparing two engines at "ef 10" needs to know that one of
+        them looked at 10 candidates and the other at k.
+
+        Takes `k` because the only clamp in this codebase is against k. The
+        spec names the shape `effective_ef(ef)`, and a one-argument version
+        would have to keep its own copy of k: k arrives per query
+        (`query(vector, k)`) and no driver stores it, so the value would be
+        stale exactly when a profile changed it.
+
+        Reports rather than enforces. The engine does the clamping; this says
+        what it did, and a driver that returned a value its queries do not use
+        would be worse than no method at all.
+        """
+        return int(ef)
+
     @abc.abstractmethod
     def query(self, vector, k: int) -> List[int]: ...
 

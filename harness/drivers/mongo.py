@@ -253,6 +253,26 @@ class MongoDriver(EngineDriver):
         """
         self._num_candidates = int(ef_search)
 
+    def effective_ef(self, ef: int, k: int) -> int:
+        """`numCandidates` is clamped to k, so "ef 4" here is a search of k.
+
+        The one driver in the set that overrides this. `_pipeline` sends
+        `max(self._num_candidates, k)` because numCandidates below limit cannot
+        return limit rows, and that clamp changes what a calibration point
+        means. At the default k=10 the shared grid's floor of 10 is untouched,
+        so nothing moves; at a k of 100 the six grid points below it -- 10, 16,
+        24, 32, 48 and 64 -- all collapse onto 100 and measure the same search
+        six times over. `tests/test_calibrate.py` counts those six against the
+        grid itself rather than leaving the number here to rot.
+
+        Written as the same expression `_pipeline` uses rather than as a
+        condition on it, because the promise this makes is about the query the
+        driver actually sends; `tests/test_calibrate.py` checks the two against
+        each other over a range of (ef, k) pairs instead of trusting that they
+        agree.
+        """
+        return max(int(ef), int(k))
+
     def _pipeline(self, vector, k: int,
                   tag_threshold: Optional[int] = None) -> List[Dict[str, Any]]:
         stage: Dict[str, Any] = {

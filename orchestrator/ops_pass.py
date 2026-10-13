@@ -422,6 +422,20 @@ def _quantization(profile: Dict[str, Any], resources: Dict[str, Any],
 DEFAULT_CONCURRENCY_QUERIES = 0
 
 
+#: The ef policy, as `harness/workloads/calibrate.py` defines it. Declared
+#: again here rather than imported, and that is deliberate: this module runs on
+#: the host, whose only Python dependency is pyyaml, and
+#: `harness.workloads.calibrate` reaches numpy through `harness.datasets`. The
+#: same reason `cli.py` imports `harness.datasets` inside a function body
+#: instead of at module scope. `tests/test_calibrate.py` pins the two
+#: declarations together, which is how `ops.selectivities` and
+#: `ops.churn_fractions` are already handled.
+DEFAULT_EF_MODE = "calibrated"
+DEFAULT_TARGET_RECALL = 0.95
+DEFAULT_EF_CALIBRATION = (10, 16, 24, 32, 48, 64, 100, 160, 256, 400, 640,
+                          1000)
+
+
 def _concurrency_queries(ops: Dict[str, Any]) -> int:
     """How many queries the concurrency clients may draw from.
 
@@ -450,6 +464,15 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--m", str(m),
         "--k", str(profile.get("k", 10)),
         "--ef-search", str(ops.get("ef_search", 100)),
+        # The ef policy. Emitted unconditionally, including the default, so the
+        # harness command line in a run's phase log says which policy produced
+        # the numbers rather than leaving a reader to infer it from the
+        # harness's own default at the time.
+        "--ef-mode", str(ops.get("ef_mode", DEFAULT_EF_MODE)),
+        "--target-recall", str(ops.get("target_recall", DEFAULT_TARGET_RECALL)),
+        "--ef-grid", ",".join(
+            str(int(ef)) for ef in
+            (ops.get("ef_calibration") or DEFAULT_EF_CALIBRATION)),
         "--storage-engine", storage_engine,
         "--build-mode", build_mode,
         "--churn-budget", str(ops.get("churn_budget_s", 1800)),

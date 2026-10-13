@@ -73,12 +73,45 @@ SCHEMA_VERSION = 1
 # introduced and then extended inside one change set, so there is no version 3
 # figure anywhere for a trimmed one to be incomparable with.
 #
+# VERSION 4 chose ef_search instead of declaring it. The ops pass now
+# calibrates: it sweeps a grid on the index it has just built, picks the
+# smallest ef_search reaching a target recall (0.95 by default), and runs
+# concurrency, filtered and churn at that value instead of at the profile's
+# `ops.ef_search`. A version 3 concurrency QPS is throughput at a declared ef
+# — 100 for every engine — and a version 4 one is throughput at whatever ef
+# puts THAT engine at the target. Two engines at ef_search 100 sit at recall
+# 0.98 and 0.80, which is the ordinary spread of these implementations, so the
+# version 3 figure and the version 4 figure are not two samples of one
+# quantity: one holds the knob fixed and lets quality vary, the other holds
+# quality fixed and lets the knob vary. That is the whole point of PR 2 and it
+# is exactly what this constant exists to keep off one series.
+#
+# WHY A BUMP AND NOT JUST extra.ef_mode, which the records also now carry and
+# which is the obvious reason to think one is unnecessary: this constant is
+# what makes the REPORT REFUSE TO MIX, not what lets a reader tell two numbers
+# apart by hand. Two concurrency records both stamped version 3, one `fixed` at
+# ef_search 100 and one `calibrated` at 98, load together with no refusal and
+# land on one chart — the comparison PR 2 exists to prevent. `extra.ef_mode`
+# is the right diagnostic for which policy produced a number; it is not a
+# guard, and `report/measurement_versions.py` reads this.
+#
+# It covers `--ef-mode fixed` too, which measures what version 3 measured. The
+# version names the harness that wrote a record, not the flags it was given:
+# per-run is the granularity the whole scheme is built on (see the per-phase
+# argument below), and a constant that varied with a flag would have to be
+# computed per record and could no longer be stamped from one place. A fixed
+# run under version 4 is therefore labelled conservatively — reported as a
+# different measurement from a version 3 run that it in fact matches. That is
+# the safe direction of the two: this set is about refusing to merge, and the
+# cost of an unnecessary refusal is one report per version, while the cost of a
+# missing one is a published chart that is wrong.
+#
 # The cost this scheme knowingly pays: the bump invalidates comparison across
 # every ops phase, including build cost and churn, which this change does not
 # touch. The version is per-run, not per-phase, because a record names the
 # harness that wrote it and splitting it per phase would mean four constants
 # and four ways to forget one.
-OPS_MEASUREMENT_VERSION = 3
+OPS_MEASUREMENT_VERSION = 4
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.
@@ -150,11 +183,25 @@ PHASE_BUILD = "index_build"       # index construction cost
 PHASE_CONCURRENCY = "concurrency"  # multi-client QPS / latency
 PHASE_FILTERED = "filtered"       # vector search with a scalar predicate
 PHASE_CHURN = "churn"             # recall after update/delete cycles
+# The ef_search calibration sweep: recall and QPS at each grid point, written
+# so the choice of ef is auditable. Its own phase and not PHASE_RECALL, because
+# these are not Pareto points: they are single-client probes against the index
+# the ops pass just built, and a chart that drew them as recall/QPS results
+# would put twelve points per engine on a curve measured with a different
+# method, a different container and a different query count.
+PHASE_CALIBRATION = "ef_calibration"
 
 ALL_PHASES = (
     PHASE_RECALL, PHASE_INGEST, PHASE_BUILD,
-    PHASE_CONCURRENCY, PHASE_FILTERED, PHASE_CHURN,
+    PHASE_CALIBRATION, PHASE_CONCURRENCY, PHASE_FILTERED, PHASE_CHURN,
 )
+
+#: Keys under `extra` that name the ef policy a record was measured under.
+#: Stamped by `Recorder`, not written by the workloads -- see
+#: `stamp_run_extra`.
+EF_MODE_KEY = "ef_mode"
+TARGET_RECALL_KEY = "target_recall"
+CALIBRATION_STATUS_KEY = "calibration_status"
 
 
 @dataclass
@@ -255,22 +302,72 @@ def stamp_measurement_version(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {**payload, "extra": extra}
 
 
+def stamp_run_extra(payload: Dict[str, Any],
+                    run_extra: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of a record dict carrying facts that are true of the whole run.
+
+    The second stamp applied in `Recorder.write`, and it exists for exactly the
+    reason `stamp_measurement_version` does: `RunContext.record_defaults` is
+    the obvious home for run-wide provenance and cannot carry an `extra` key,
+    because four workloads splat that dict into `Record(**common, ...,
+    extra={...})` and a duplicate keyword argument is a TypeError.
+
+    What travels this way is the ef policy -- `ef_mode`, `target_recall`,
+    `calibration_status`. A concurrency figure measured at a calibrated
+    ef_search and one measured at the profile's literal are not the same
+    quantity, and the record has to say which it is without the reader having
+    to find the calibration records that preceded it. Stamping here makes that
+    true for every workload, including the three this change does not touch.
+
+    Unconditional, like the version stamp and for the same reason: a record
+    reaching this Recorder was produced by this run, so this run's policy is
+    the honest answer. Keys whose value is None are left out rather than
+    written as nulls -- in `fixed` mode no target was pursued and no
+    calibration ran, and a record carrying `target_recall: null` beside an ef
+    nobody chose would be a claim about a calibration that never happened.
+    `ops.pgvector_iterative_scan` spent 69 records saying null; absence is the
+    honest encoding of "there was none".
+    """
+    if not run_extra:
+        return payload
+    extra = dict(payload.get("extra") or {})
+    extra.update({k: v for k, v in run_extra.items() if v is not None})
+    return {**payload, "extra": extra}
+
+
 class Recorder:
     """Append-only JSON-lines writer, safe for use from multiple threads."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, run_extra: Optional[Dict[str, Any]] = None):
         self.path = path
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._lock = threading.Lock()
         self._fh = open(path, "a", buffering=1, encoding="utf-8")
+        self._run_extra: Dict[str, Any] = dict(run_extra or {})
+
+    def declare_run_extra(self, **values: Any) -> None:
+        """Add facts every record written from now on should carry.
+
+        Deliberately not a constructor-only argument: `calibration_status` is
+        not known until the calibration sweep has finished, and the sweep's own
+        records are written before it exists. A per-point record therefore
+        carries no status, which is correct -- at the time it was written there
+        was not one.
+        """
+        with self._lock:
+            self._run_extra.update(values)
 
     def write(self, record: Record) -> None:
         if record.phase not in ALL_PHASES:
             raise ValueError(f"unknown phase: {record.phase}")
-        # After to_dict(), which drops an empty `extra`, so the stamp survives
+        # After to_dict(), which drops an empty `extra`, so the stamps survive
         # that filter instead of being removed by it.
-        line = json.dumps(stamp_measurement_version(record.to_dict()),
-                          sort_keys=True)
+        with self._lock:
+            run_extra = dict(self._run_extra)
+        line = json.dumps(
+            stamp_run_extra(stamp_measurement_version(record.to_dict()),
+                            run_extra),
+            sort_keys=True)
         with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()

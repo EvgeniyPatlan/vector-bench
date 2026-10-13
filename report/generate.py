@@ -84,6 +84,35 @@ def _parse_ts(value: Any) -> Optional[float]:
         return None
 
 
+#: Which phase lands in which `summary` bucket, as a named constant rather
+#: than a literal inside `summarize`, for two reasons.
+#:
+#: The first is that `ef_calibration` has to be ABSENT from it and absence is
+#: invisible in an inline tuple. A calibration point carries `clients=1` and a
+#: `qps`, so a sixth entry mapping it to "concurrency" would put up to twelve
+#: single-client probes per engine into `summary["concurrency"]` and from there
+#: into both the concurrency table and the concurrency chart, beside the
+#: numbers this report publishes as throughput. The two are not the same
+#: quantity: a calibration point is one client over `--max-queries` fresh
+#: queries, a concurrency point is N clients over the shared query pool, and
+#: `extra.query_pool` and `extra.query_reuse` are recorded precisely because
+#: throughput over a small hot set and throughput over the whole corpus are
+#: measurements of different things. The sweep's records reach the report
+#: through `operating_points` instead, which is a join over them rather than a
+#: phase bucket.
+#:
+#: The second is that the absence is then testable: a test can add that entry
+#: at run time and watch the published QPS move, which is the only way to show
+#: the exclusion is doing work rather than being a comment.
+_PHASE_GROUPS = (
+    ("index_build", "build"),
+    ("concurrency", "concurrency"),
+    ("filtered", "filtered"),
+    ("churn", "churn"),
+    ("ingest", "ingest"),
+)
+
+
 def summarize(records: List[Dict[str, Any]],
               manifest: Optional[Dict[str, Any]] = None,
               memory: Optional[Dict[str, List[Dict[str, Any]]]] = None
@@ -344,10 +373,17 @@ def summarize(records: List[Dict[str, Any]],
     summary["filter_strategies"].sort(key=lambda s: s["ratio"])
 
     # Build-cost and concurrency headlines.
-    for phase, key in (("index_build", "build"), ("concurrency", "concurrency"),
-                       ("filtered", "filtered"), ("churn", "churn"),
-                       ("ingest", "ingest")):
+    for phase, key in _PHASE_GROUPS:
         summary[key] = [r for r in records if r.get("phase") == phase]
+
+    # PR 2 §2.3.1: the ef each calibrated unit settled on, with the recall and
+    # the status that justify it. Built here rather than in `render.py` so the
+    # concurrency chart and the operating-point table are drawn from one
+    # derivation -- a chart marking an engine `floor_above_target` beside a
+    # table that does not is worse than neither.
+    from report.loaders import calibration_targets, operating_points
+    summary["operating_points"] = operating_points(records)
+    summary["calibration_targets"] = calibration_targets(records)
 
     # An engine whose ann phase ran and wrote nothing.
     #
@@ -582,6 +618,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             "filtered": "filtered",
             "churn": "churn",
             "churnimpact": "churn",
+            # PR 2 §2.3.4 calls the calibration chart optional. This is what
+            # makes it so, and through the existing mechanism rather than a
+            # second one: `ef_mode: fixed` runs no sweep and writes no
+            # `ef_calibration` records, so the chart is skipped.
+            #
+            # Two caveats on the shared skip line below, both of which are
+            # about this entry and not about the mechanism. It says "not in
+            # this profile's workloads", which is wrong for this one: the
+            # cause is `ops.ef_mode`, not `ops.workloads`. And it is §6 that
+            # explains the absence to a reader, not the appendix -- there IS
+            # no appendix on a fixed-ef run, which `render_markdown` enforces
+            # and `test_there_is_no_appendix_without_a_chart` pins. Fixing the
+            # console wording means giving this entry its own skip branch; it
+            # is a log line, the report itself is unambiguous, and that branch
+            # belongs with whatever next needs a second reason for a skip.
+            "calibration": "ef_calibration",
         }
 
         # The pass comparison exists to put normalized next to tuned. With one
@@ -608,6 +660,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("churn", charts.churn, (records, dataset)),
             ("churnimpact", charts.churn_impact, (records, dataset)),
             ("passcompare", charts.pass_comparison, (records, dataset)),
+            # The whole record list, not the calibration records alone: the
+            # chart rings the chosen point on each curve, and which point that
+            # is lives on the downstream records (see
+            # `loaders.operating_points`). Handed only the sweep's own records
+            # it would draw twelve points per engine and mark none of them.
+            ("calibration", charts.calibration_curves, (records, dataset)),
         ):
             if name == "passcompare" and len(passes_present) < 2:
                 print(f"[report] skipping passcompare: only the "
