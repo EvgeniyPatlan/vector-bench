@@ -22,9 +22,36 @@ FACET_FIELDS: Tuple[str, ...] = (
 )
 
 #: Numeric fields the UI can plot.
+#:
+#: Every entry must be a field something in this repo actually writes, because
+#: `available_measures` below is the ceiling the Explore tab's axis pickers are
+#: filtered against: a name here that no writer ever populates becomes a
+#: dropdown option that resolves to an empty chart, which reads as "this run
+#: measured nothing" rather than as "nothing measures this".
+#:
+#: `build_cpu_s` was exactly that and is why this note exists. It is declared
+#: on `Record` in `harness/metrics/records.py` and was listed here and offered
+#: by the Explore tab's index-build view, and nothing in `harness/`,
+#: `report/`, `orchestrator/` or `webui/` ever assigned it. Measured on the
+#: archive of completed runs kept beside this repo -- 239 `ops-*.jsonl` files
+#: plus 41 merged `report/records.jsonl`, and 484 index_build records between
+#: them, 239 raw and 245 merged -- it is on 0 of those 484, against 484 of 484
+#: for `build_wall_s` beside it.
+#:
+#: The schema column stays: a `Record` field nothing writes is a question about
+#: the schema, with an ops-measurement-version argument attached, and
+#: `docs/01-architecture.md` documents the row shape rather than this tuple.
+#: Removing it from this tuple is enough to take the dead axis away, and the
+#: day something measures build CPU time it goes back in the same change.
+#:
+#: Note that an entry here need not be written by the harness. `peak_rss_bytes`
+#: is merged in from the `mem-*.jsonl` timeseries by `report/generate.py`'s
+#: `attach_peak_rss`, so it is on none of the 239 raw index_build records and
+#: on 238 of the 245 merged ones -- a legitimately partial measure, which is a
+#: different thing from one nothing writes.
 MEASURE_FIELDS: Tuple[str, ...] = (
     "recall_at_k", "qps", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms",
-    "build_wall_s", "build_cpu_s", "peak_rss_bytes", "index_bytes",
+    "build_wall_s", "peak_rss_bytes", "index_bytes",
     "ingest_rows_per_s", "ingest_wall_s",
 )
 
