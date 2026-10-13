@@ -61,6 +61,25 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
 
     for selectivity in selectivities:
         threshold = selectivity_to_threshold(selectivity)
+        # WRONG, and the name hides it. This is the NOMINAL share, not the
+        # delivered one, and it is what reaches Record(selectivity=...) below.
+        # `threshold / 100.0` is exact only when the row count is a multiple
+        # of 100: glove's 1,183,514 training rows make a 1% request deliver
+        # 1.000073%. For the `ctag` column added in PR 3 it is not even the
+        # wrong row share — it is the fraction of *clusters*, and the row
+        # share it stands in for was measured at 1.00%-4.96% for a nominal 1%
+        # depending only on the seed.
+        #
+        # The replacement exists and is tested: datasets.filtered_truth_for()
+        # returns the truth array together with a ResolvedFilter carrying the
+        # counted share, so a caller cannot reconstruct it wrongly —
+        #     truth, filt = filtered_truth_for(ctx.cache_dir, dataset, ctx.k,
+        #                                      column, selectivity,
+        #                                      indexed_rows=indexed_rows)
+        #     ... selectivity=filt.actual_selectivity, extra={**filt.as_extra()}
+        # T3c owns this file and this change. Until then
+        # tests/test_datasets.py::TestTheRecordedSelectivityIsTheMeasuredOne
+        # is xfail and names this line; it XPASSes the moment this is fixed.
         actual_selectivity = threshold / 100.0
 
         print(
