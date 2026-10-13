@@ -6771,7 +6771,22 @@ class TestARefusalDescribesTheSetItIsAbout:
     def test_it_does_not_claim_every_record_is_one_version(self):
         message = self._message(self._three_way(), declared=2)
         assert "every ops record here was measured under version" not in message
-        assert "3 different measurement versions" in message
+        # TWO, not three. This assertion read "3" and so pinned a second
+        # falsehood in the same sentence: `_three_way` is v1 and v3 records
+        # under a manifest declaring v2, and the count was taken over every
+        # version involved INCLUDING the manifest's -- which has no records,
+        # as this refusal's own listing says four lines further down. An
+        # operator told to produce "one report per version" went looking for a
+        # third pile of records that does not exist. The count is now of the
+        # versions records were actually found at, and the number still
+        # confirms the mixed branch was the one taken.
+        #
+        # `from 2`, not `2`: a bare "2 different measurement versions" is a
+        # substring of "12 different measurement versions", so a mutant
+        # counting something else entirely satisfied this assertion while
+        # failing five in tests/test_t2b_report.py. The preceding word is what
+        # anchors it to the number the sentence is about.
+        assert "from 2 different measurement versions" in message
 
     def test_it_does_not_claim_the_records_agree(self):
         message = self._message(self._three_way(), declared=2)
