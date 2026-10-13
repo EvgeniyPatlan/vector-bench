@@ -35,8 +35,9 @@ fraction, which is exactly what they recorded before.
 
 from __future__ import annotations
 
+import sys
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy
 
@@ -46,6 +47,24 @@ from ..drivers.base import EngineDriver, IndexSpec, RowAttrs
 from ..metrics.latency import LatencyCollector, Timer
 from ..metrics.records import PHASE_CHURN, Record
 from ..progress import Heartbeat, Progress
+from .clients import DriverFactory, PoolError, PoolWindow
+# PR 4 §4.3's reader pool. Its own module because inlining it here breaches
+# the repo's stated 800-line maximum badly: the two files are 1,119 lines
+# today and splice back into ONE file of 1,055, which is 255 over. (An earlier
+# revision of this comment said 907 and 107 over -- that was the figure before
+# the module grew its own header, and it understated the case.
+# `tests/test_t4b_readers.py` now measures the splice so neither number can
+# drift again.) The block has one caller each and no state, so it moved rather
+# than being compressed into prose that no longer explains anything. The names
+# below are re-exported because `DEFAULT_CHURN_READERS` is read from
+# `harness/main.py` the way `DEFAULT_CHURN_BUDGET_S` is, and the two should be
+# reachable the same way.
+from .churn_readers import (DEFAULT_CHURN_READERS,  # noqa: F401
+                            OPS_UNIT_KEYS, READER_BASELINE_WINDOW_S,
+                            _during_writes_extra, _print_during_writes,
+                            _reader_count, _reader_pool, _reader_shape,
+                            _reader_window, _warn_reader_pool_failed,
+                            warn_empty_windows)
 from .context import RunContext
 
 # Wall clock allowed for one re-insertion. An engine that cannot write its rows
@@ -94,8 +113,23 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         fractions: Sequence[float] = DEFAULT_FRACTIONS,
         max_queries: int = 1_000, seed: int = 20260803,
         indexed_rows: Optional[int] = None,
-        budget_s: float = DEFAULT_CHURN_BUDGET_S) -> None:
-    """Measure recall/QPS before churn and after each churn step."""
+        budget_s: float = DEFAULT_CHURN_BUDGET_S,
+        driver_factory: Optional[DriverFactory] = None,
+        readers: int = DEFAULT_CHURN_READERS) -> None:
+    """Measure recall/QPS before churn and after each churn step.
+
+    `driver_factory` and `readers` are PR 4 §4.3: a pool of readers queries
+    the index while the writer re-inserts, so the record says what a mixed
+    workload costs instead of leaving a reader to assume the two compose.
+    `harness/main.py` already had a factory for the concurrency workload and
+    now passes the same one here; `readers=0` (`ops.churn_readers: 0`) turns
+    the pool off and restores the write-only re-insert rate exactly.
+
+    `driver_factory` defaults to None rather than being required, because
+    `tests/test_config.py` and `tests/test_t3b_drivers.py` call this with a
+    writer driver and nothing else, and a required argument would have made
+    this change edit files it does not own.
+    """
     queries = dataset.test[:max_queries]
     # Recomputed when only part of the training set was loaded; the shipped
     # neighbours would otherwise point at rows the engine never received.
@@ -123,6 +157,16 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     # plus one slice. `_reinsert` has always had that overrun and the
     # filtered loop has the same shape.
     effective_budget = budget_s if budget_s > 0 else float("inf")
+
+    # §4.3 item 2. Resolved once, before the baseline, so the operator learns
+    # that readers are off at the top of the workload rather than after the
+    # first delete has already happened.
+    reader_count = _reader_count(readers, queries, driver_factory, driver.name)
+    # The ops unit both halves of §4.3 item 5's ratio must share. Read off
+    # `common`, which is the one place this workload's provenance comes from,
+    # so an axis that `record_defaults` stops supplying becomes a None in the
+    # pool identity rather than a silently narrower guard.
+    unit = tuple(common.get(key) for key in OPS_UNIT_KEYS)
 
     # §4.2 item 1. Once, and before the baseline rather than before the first
     # delete: whatever this puts the engine into has to be in force for the
@@ -196,14 +240,74 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         print(f"[churn] {driver.name}: deleting and re-inserting {count:,} rows "
               f"(cumulative {fraction:.0%})")
 
+        # §4.3 item 5's denominator, and it is measured HERE -- before the
+        # deletes -- because that is what the specification asks for and
+        # because it is the only reading that makes the ratio about concurrent
+        # writes. Taken after the deletes it would also carry this step's
+        # tombstones; taken once at the top of the workload it would be
+        # compared against a corpus two churn steps older.
+        #
+        # `reader_baseline` is None when readers are off, which is the one
+        # state in which the whole during-writes record is absent.
+        reader_baseline: Optional[PoolWindow] = None
+        reader_failure: Optional[BaseException] = None
+        if reader_count:
+            try:
+                reader_baseline = _reader_window(
+                    driver_factory, queries, reader_count, ctx.k, ef_search,
+                    index, unit,
+                    f"{reader_count}-reader baseline before the "
+                    f"{fraction:.0%} deletes", driver.name,
+                    READER_BASELINE_WINDOW_S)
+            except PoolError as exc:
+                # Caught here for the same reason the during-writes pool's
+                # failure is caught below: this half of the ratio failing
+                # must not take the post-churn measurement with it, which is
+                # a finished and unaffected result. Without it, a reader
+                # whose connection dies in the baseline window kills the
+                # whole churn workload -- and on a real corpus that is a
+                # night of ingest thrown away to lose a diagnostic.
+                #
+                # Recorded, not announced here: the single announcement site
+                # is after the re-insert, so a baseline failure and a
+                # during-writes failure print once each rather than the
+                # baseline printing twice.
+                reader_failure = exc
+
         with Heartbeat(f"deleting {len(current_ids):,} rows", prefix=driver.name):
             with Timer() as delete_timer:
                 driver.delete_ids(current_ids)
 
         new_ids = list(range(next_id, next_id + len(original_ids)))
         next_id += len(original_ids)
-        inserted, insert_seconds = _reinsert(
-            driver, new_ids, vectors, attrs, effective_budget)
+
+        # §4.3 item 4: after the delete step, and stopped when `_reinsert`
+        # returns -- which covers "or its budget ends", because that is the
+        # other way `_reinsert` returns.
+        reader_pool = None
+        if reader_baseline is not None:
+            reader_pool = _reader_pool(driver_factory, queries, reader_count,
+                                       ctx.k, ef_search, index, unit)
+            reader_pool.start(
+                f"{reader_count}-reader warm-up before the {fraction:.0%} "
+                f"re-insert", prefix=driver.name)
+        reader_during: Optional[PoolWindow] = None
+        try:
+            inserted, insert_seconds = _reinsert(
+                driver, new_ids, vectors, attrs, effective_budget)
+        finally:
+            # In a `finally` because the readers are threads holding
+            # connections: a writer that raises must not leave them querying
+            # for the rest of the run. `stop()` is also where a reader
+            # exception surfaces, so it is caught rather than allowed to
+            # replace whatever the writer was already failing with.
+            if reader_pool is not None:
+                try:
+                    reader_during = reader_pool.stop()
+                except PoolError as exc:
+                    reader_failure = exc
+        if reader_failure is not None:
+            _warn_reader_pool_failed(driver.name, fraction, reader_failure)
 
         if inserted < len(new_ids):
             # Bounded rather than open-ended, because an engine can take the
@@ -241,6 +345,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                     # that states it, because it is the only one the budget
                     # changed.
                     "churn_budget_s": budget_s,
+                    **_reader_shape(driver_factory, readers, reader_count),
                     "repair_path": driver.repair_path,
                     # No `index_sync_s`, and the absence is the honest answer
                     # rather than an oversight: the corpus is missing rows, so
@@ -257,6 +362,63 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             # meaningful left to measure.
             break
 
+        # §4.3 item 5's record, written here: after the re-insert is known to
+        # have completed and before `wait_index_synced`, because the readers
+        # ran against the index as the writer left it and not against one that
+        # has since caught up.
+        #
+        # NOT written on the incomplete branch above, for the reason that
+        # branch omits recall and throughput: `writer_rows_per_s_with_readers`
+        # would describe a write that never finished, and §4.3 item 7's whole
+        # point is that the re-insert rate is now a rate measured with
+        # concurrent reads. That branch stamps `readers` instead, so the
+        # JSONL still says what the stalled write was contending with.
+        if reader_baseline is not None and reader_during is not None:
+            # `_during_writes_extra` divides the two windows, and
+            # `clients.window_ratio` RAISES rather than returning a number if
+            # their pool identities disagree. That refusal has to fail this
+            # record and not the workload, exactly as a reader exception
+            # does: the post-churn measurement below is a finished result
+            # that the reader pool is no part of.
+            #
+            # `warn_empty_windows` first: a window that counted no query
+            # makes every figure derived from it absent rather than zero, and
+            # the operator should learn that while the run is happening
+            # rather than from a blank cell a day later.
+            warn_empty_windows(driver.name, fraction, reader_baseline,
+                               reader_during)
+            try:
+                during_extra = _during_writes_extra(
+                    reader_baseline, reader_during,
+                    len(new_ids) / insert_seconds if insert_seconds else None,
+                    len(new_ids))
+            except PoolError as exc:
+                reader_failure = exc
+                _warn_reader_pool_failed(driver.name, fraction, exc)
+                during_extra = None
+        else:
+            during_extra = None
+        if during_extra is not None:
+            _print_during_writes(driver.name, fraction, during_extra)
+            ctx.recorder.write(Record(
+                **common, phase=PHASE_CHURN, ef_search=ef_search,
+                # The READER count, which is what this record's throughput and
+                # percentiles are over. The single-client post-churn record
+                # below keeps `clients=1`.
+                clients=reader_count,
+                churn_fraction=fraction, rows=driver.count_rows(),
+                index_bytes=driver.index_bytes(),
+                qps=round(reader_during.qps, 2),
+                # `recall_at_k` is deliberately absent, not 0.0: §4.3 item 6.
+                # The corpus is mid-change, so no ground truth describes it,
+                # and a zero would read as a recall collapse. T3c made a null
+                # recall legitimate for a filtered point and the report
+                # renders it; this is the same null for the same reason.
+                **reader_during.merged,
+                notes="reader pool measured during the re-insert",
+                extra=during_extra,
+            ))
+
         for original, new in zip(original_ids, new_ids):
             id_map[original] = new
         churned_so_far = fraction
@@ -272,13 +434,25 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             "delete_seconds": round(delete_timer.elapsed, 3),
             "insert_seconds": round(insert_seconds, 3),
             "reinsert_completed": True,
+            # §4.3 item 7: this is the re-insert rate measured WITH
+            # `extra.readers` concurrent readers, which is not the quantity it
+            # was before PR 4 unless that number is 0. The reader count
+            # travels beside it for exactly that reason -- a rate whose read
+            # load is not stated is two different measurements under one key.
             "reinsert_rows_per_s": round(
                 len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
+            **_reader_shape(driver_factory, readers, reader_count),
             "index_sync_s": round(synced_s, 3),
             "repair_path": driver.repair_path,
             **_write_shape(driver),
             **_sync_shape(driver),
         }
+        if reader_failure is not None:
+            # The readers died partway through the write, so the rate above
+            # was measured against an unknown amount of read load. Said in
+            # the record rather than only on stderr, because the stderr of a
+            # run is not what anyone reads a month later.
+            step_extra["readers_failed"] = str(reader_failure)
 
         after = _measure(driver, queries, ctx.k, id_map, truth)
         drop = baseline["recall_at_k"] - after["recall_at_k"]
@@ -314,7 +488,6 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                             maintain_timer.elapsed, step_extra)
 
 
-
 def _record_maintenance(ctx: RunContext, driver: EngineDriver,
                         common: Dict[str, object], queries: numpy.ndarray,
                         truth: numpy.ndarray, ef_search: int,
@@ -342,13 +515,15 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     raw JSONL answers "what did the repair buy?" by subtracting one record
     from the other.
 
-    **The report cannot yet tell the pair apart, and that is published-wrong
-    rather than merely incomplete.** `maintenance`, `maintenance_state`,
-    `repair_path` and `index_sync` have **zero** occurrences anywhere in
-    `report/`, so nothing there names the state, and all three churn artifacts
-    consume both records as peers. Each figure below says what it reproduces
-    over, because two of these quantities are deterministic and one is a ratio
-    of wall clocks; the structural claims held in 9 of 9 runs of the identical
+    **The report could not tell the pair apart until T4b, and that was
+    published-wrong rather than merely incomplete.** When this record was
+    first written, `maintenance`, `maintenance_state`, `repair_path` and
+    `index_sync` had **zero** occurrences anywhere in `report/`, so nothing
+    there named the state and all three churn artifacts consumed both records
+    as peers. What that produced is recorded below, because the fix has to
+    keep being recognisable as a fix: each figure says what it reproduces
+    over, two of these quantities being deterministic and one a ratio of wall
+    clocks, and the structural claims held in 9 of 9 runs of the identical
     configuration on `tests/fake_driver.py`, two fractions:
 
       * `render._churn_table` emits two rows per fraction whose four identity
@@ -393,14 +568,38 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     baseline is plausible and **unmeasured** -- no live engine has been run
     for PR 4 -- so it is not asserted here.
 
-    So this record is written for T4b, which owns `report/*`: the table needs
-    an identity column for `maintenance_state`, and the two charts need the
-    pair split into separate series (or the `"after"` records excluded from
-    the retention ratio). Everything needed is in the record --
-    `maintenance_state`, `maintenance`, `maintenance_s`, `repair_path` -- and
-    none of it is read yet. `docs/05-methodology.md` is accurate as written
-    because it tells a reader to read the `"before"` RECORDS, which is true of
-    the JSONL and not of the rendered report.
+    **T4b reads three of the four keys**, and the three artifacts above are
+    fixed in three different ways because they are three different claims:
+    `render._churn_table` gained a `Repair` identity column naming what ran;
+    `charts.churn` groups by `series_key(r) + (maintenance_state,)` so each
+    state is its own curve; and `charts.churn_retention` EXCLUDES the repaired
+    measurement rather than splitting it, because its denominator is the
+    pre-churn baseline -- a state before any maintenance -- and because
+    `tests/test_config.py:1705` looks its result up by
+    `series_key(r) + (resource_pass, build_mode)`, a key shape T4b does not
+    own. `report/churn_state.py` holds the two accessors
+    (`maintenance_state`, `churn_measurements`) so a fourth churn artifact
+    cannot be added without them. `docs/05-methodology.md` now describes the
+    rendered report as well as the JSONL.
+
+    **`repair_path` and `index_sync_s` are still read nowhere**, and that is
+    stated rather than left to be discovered. Counted across `report/`: at the
+    base all four keys had 0 occurrences; they are now `maintenance` 20,
+    `maintenance_state` 13, `repair_path` 1 -- and that one is inside a
+    docstring, not a read -- and `index_sync` 0.
+    `tests/test_t4b_readers.py` asserts those four counts, so this paragraph
+    cannot drift from the directory it describes.
+
+    Neither gap is an oversight. `repair_path` names the MECHANISM an engine
+    has ("vacuum_analyze", "none") where the `Repair` column already names
+    what actually ran on that row, so a column for it would repeat the row
+    beside it for five of six engines and disagree with it for none;
+    `index_sync_s` is 0.0 for the four engines that maintain their index on
+    the write path, and PR 4 §4.1's own acceptance for it is "non-zero or a
+    reason documented" -- which `extra.index_sync_note` carries and which no
+    shipped profile has yet produced a non-zero reading for. Both are
+    candidates for the validity section rather than for a churn column, and
+    neither is T4b's to place.
     """
     if not isinstance(what, str) or not what:
         return

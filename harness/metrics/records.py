@@ -203,6 +203,61 @@ SCHEMA_VERSION = 1
 # T3b inside this same change set, so nothing has ever been MEASURED at a
 # version 5 that lacked these, and the cross-version guard already refuses to
 # chart a version 1 record beside a version 5 one.
+#
+# VERSION 5 ALSO COVERS PR 4, and this paragraph exists because PR 4 is the
+# first change here whose effect is a NEW KIND OF RECORD rather than a new
+# key, so the enumerations above do not describe it.
+#
+# §4.1 and §4.2 (T4a) added three driver hooks and a second record per churn
+# fraction stamped `extra.maintenance_state`. Every field of that is an
+# `extra` key, and the hooks' no-op defaults mean MariaDB, AliSQL and Valkey
+# record exactly what they recorded before.
+#
+# §4.3 (T4b) is the one worth writing down, and it moves a recorded quantity:
+#
+#   * A THIRD KIND of churn record, carrying `extra.during_writes = true`. It
+#     is aggregate reader throughput and percentiles measured by
+#     `ops.churn_readers` clients while the writer re-inserts, and it uses no
+#     new COLUMN -- checked field by field against the `Record` dataclass
+#     below: `clients`, `qps`, the four latency fields and
+#     `queries_executed` are the columns it fills, and everything else about
+#     it is an `extra` key. `recall_at_k` is deliberately NULL on it, not
+#     0.0: the corpus is mid-change while the readers run, so no ground truth
+#     describes it. T3c made a null recall legitimate for a filtered point
+#     that managed no queries and the report renders it; this is the same
+#     null for a different reason.
+#   * `extra.reinsert_rows_per_s` CHANGES WHAT IT MEASURES, and this is the
+#     part a reader has to be told. The re-insert now runs against four
+#     concurrent readers by default, so the rate on a churn step record is no
+#     longer a write-only rate. That is the same class of move as version 3's
+#     query pool -- the same workload against a different amount of load, not
+#     two samples of one quantity.
+#
+# WHY THAT DOES NOT EARN A SIXTH VERSION, by version 3's own precedent: "no
+# run has ever been measured at version 3 -- the value was introduced and
+# then extended inside one change set, so there is no version 3 figure
+# anywhere for a trimmed one to be incomparable with." The same is true of 5,
+# and it is measured rather than assumed. The archived corpus the test suite
+# reads (`SMOKE_RESULTS/`, the tree `tests/test_config.py:1499` points at)
+# holds 239 ops record files and 2,134 ops records, and
+# `extra.ops_measurement_version` is ABSENT from every one of them -- so all
+# 2,134 are implicit version 1 and not one record anywhere carries a 5. There
+# is no version 5 `reinsert_rows_per_s` for a readers-contended one to be
+# incomparable with.
+#
+# WHAT DOES KEEP THE TWO RATES APART, since the version cannot once a version
+# 5 run exists: `extra.readers`, which every churn step record from a caller
+# with a driver factory now carries, INCLUDING the value 0. §4.3 item 7 keeps
+# `ops.churn_readers: 0` available precisely so the write-only rate stays
+# measurable, and `config/profiles/dev.yml` runs it, so the distinction is a
+# number in the record rather than a setting nobody uses. Note the limit of
+# that: `extra.readers` is a diagnostic, not a guard. Two
+# `reinsert_rows_per_s` figures both stamped version 5, one at 4 readers and
+# one at 0, load together with no refusal -- exactly the gap the version-4
+# block argues `extra.ef_mode` leaves. If a profile ever sweeps
+# `ops.churn_readers` within one run, that gap becomes a real chart and the
+# fix is a key the report groups on, not a bump that would invalidate every
+# recall curve beside it.
 OPS_MEASUREMENT_VERSION = 5
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.

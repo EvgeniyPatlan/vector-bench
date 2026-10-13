@@ -1125,8 +1125,10 @@ _CONCURRENCY_NOTES = (
         "throughput comparable with another's.\n",
         "\n**QPS counts only the queries that both began and ended inside the "
         "window.** `extra.inflight_discarded` records how many were dropped "
-        "at the close — at most one per client, the query each was holding "
-        "when the clock stopped. Their share of the uncorrected figure is "
+        "at the close — at most one per client on any real driver, the query "
+        "each was holding when the clock stopped, though a query cheaper than "
+        "the gap between the stop instant and the stop flag can be discarded "
+        "several times over. Their share of the uncorrected figure is "
         "about per-query latency ÷ window length, so the correction is a few "
         "per cent for a slow engine over a short window and 0.005% for a "
         "1.4 ms query over thirty seconds.\n",
@@ -1376,26 +1378,221 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
 
 
 def _churn_table(summary: Dict[str, Any]) -> str:
+    """One row per churn measurement, with the state that tells two apart.
+
+    **The `Repair` column is a fix, not an addition.** PR 4 §4.2 writes a
+    `"before"` and an `"after"` record per churn fraction -- the index as the
+    churn left it, and the index after the engine's repair path ran -- and
+    until this column existed nothing in `report/` read
+    `extra.maintenance_state`. Two rows per fraction were emitted whose
+    engine, dataset, storage and churn columns were byte-identical, carrying
+    recalls 0.8960 and 0.9980 and index sizes 275.0 KiB and 250.0 KiB. Both
+    pairs reproduced exactly in 9 of 9 runs of one configuration on the
+    synthetic driver. A reader had two readings available -- "a noisy
+    measurement" and "a duplicate row" -- and both were false.
+
+    The dash is for a record that names no state: the pre-churn baseline, and
+    every churn record written before §4.2. Those measure one state and do not
+    say which, so claiming either would be this column inventing the thing it
+    exists to report.
+
+    `churn_measurements`, not `summary["churn"]`: the reader-pool records §4.3
+    writes are the same phase with a `churn_fraction` and a multi-client QPS,
+    and they belong in their own table below rather than in a column of
+    single-client ones.
+    """
+    from report.churn_state import churn_measurements, maintenance_state
+
     rows = []
-    for r in sorted(summary.get("churn", []),
+    for r in sorted(churn_measurements(summary.get("churn", [])),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
                                    r.get("storage_engine") or "",
-                                   r.get("churn_fraction") or 0)):
+                                   r.get("churn_fraction") or 0,
+                                   # Ranked, not sorted as strings: "after"
+                                   # sorts BEFORE "before" alphabetically,
+                                   # which put the repaired row above the
+                                   # degraded one and reversed the order the
+                                   # two were measured in.
+                                   _CHURN_STATE_ORDER.get(
+                                       maintenance_state(r), 99))):
         extra = r.get("extra") or {}
+        state = maintenance_state(r)
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
             _storage(r),
             f"{(r.get('churn_fraction') or 0):.0%}",
+            _churn_state_cell(state, extra),
             _fmt(r.get("recall_at_k"), 4),
             _fmt(extra.get("recall_drop_vs_baseline"), 4),
             _fmt(r.get("qps"), 0),
             _fmt_bytes(r.get("index_bytes")),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Churn", "Recall@k",
+        ["Engine", "Dataset", "Storage", "Churn", "Repair", "Recall@k",
          "Recall drop vs baseline", "QPS", "Index size"],
         rows,
-    ) + _churn_notes(summary)
+    ) + _churn_notes(summary) + _churn_during_writes_table(summary)
+
+
+#: The order the churn states are measured in, which is the order they are
+#: rendered in. A plain string sort puts "after" first.
+_CHURN_STATE_ORDER = {None: 0, "before": 1, "after": 2}
+
+
+def _empty_or(value: Any, is_empty: Optional[bool], places: int) -> str:
+    """A figure, or an em dash where the window that produced it was empty.
+
+    Separate from `_fmt` because the two absences mean different things:
+    `_fmt(None)` is "nobody measured this", and this is "the window was open
+    for less than one query, so the 0.0 in the record is arithmetic rather
+    than a measurement".
+    """
+    if is_empty:
+        return "—"
+    return _fmt(value, places)
+
+
+def _churn_state_cell(state: Optional[str], extra: Dict[str, Any]) -> str:
+    """The `Repair` cell: which side of the repair path this row measured.
+
+    Named with what actually ran where the driver said -- `extra.maintenance`
+    is `maintain()`'s own description, "VACUUM (ANALYZE)" for pgvector -- so
+    the column reports the mechanism rather than only the word "after". The
+    engines with no repair path write one record per fraction carrying
+    `repair_path = "none"`, which is what they wrote before PR 4, and they get
+    the `before` cell and no second row.
+    """
+    if state is None:
+        return "—"
+    if state != "after":
+        return state
+    what = extra.get("maintenance")
+    seconds = extra.get("maintenance_s")
+    cell = f"after {what}" if what else "after"
+    return cell + (f" ({seconds:,.1f} s)" if isinstance(seconds, (int, float))
+                   else "")
+
+
+def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
+    """PR 4 §4.3: what a read costs while the engine is taking writes.
+
+    The headline figure is the p99 ratio, and the table shows both percentiles
+    beside it so a reader can do the division. That is not a courtesy: it is
+    the only way a reader can check that the two numbers being divided
+    describe the same thing, and this repository has published two ratios that
+    did not. The filter-strategy ratio divided a narrow point from one ops
+    unit by a wide point from another; `charts.churn_retention` pairs records
+    from two different maintenance states. Both read as findings.
+
+    One row per (engine, dataset, fraction, ops unit), never one per engine,
+    for the same reason the filter-strategy table carries Pass, M, Build mode
+    and Storage: pgvector's `post` and `incremental` builds are different
+    indexes and the two resource passes give the engine different memory and
+    cpusets, so pooling them divides two latencies that never ran together.
+
+    **A ratio here is not a figure to quote to two decimals.** It is a ratio
+    of two wall-clock percentiles. On the synthetic driver the same churn
+    configuration's QPS ranged from 6,028 to 16,811 over nine runs -- a factor
+    of 2.79 -- while its seeded recall did not move in the last digit. What
+    the measurement supports is the direction and the rough magnitude of the
+    cost, and the reader count beside it.
+    """
+    rows_in = summary.get("churn_during_writes") or []
+    if not rows_in:
+        return ""
+    parts = [
+        "\n**Reads while the engine is taking writes.** Every number in this "
+        "table comes from one pool of readers measured twice: for 30 s before "
+        "the step's deletes, and again throughout the re-insert. Both windows "
+        "share the client count, the query pool, k, the ef_search and the ops "
+        "unit — the harness refuses to divide them otherwise — so the ratio "
+        "is a property of the write load and not of two configurations. "
+        "Readers compute no recall here: the corpus is mid-change, so no "
+        "ground truth describes it.\n\n"
+        "The ratio is a ratio of two wall-clock percentiles and should be "
+        "read as a direction and a magnitude rather than to two decimals. "
+        "The writer rate beside it is the re-insert rate measured *with* "
+        "those readers running, which is not the same quantity as the "
+        "write-only rate; `ops.churn_readers: 0` measures that one.\n",
+    ]
+    table_rows = []
+    for s in rows_in:
+        ratio = s.get("p99_ratio")
+        ratio_cell = f"{ratio:,.2f}x" if ratio is not None else "—"
+        if s.get("ratio_disagrees"):
+            # Loud in the cell, because a reader scanning the column is the
+            # person who needs to know the record's two halves disagree.
+            ratio_cell += " ⚠"
+        if s.get("client_bound"):
+            # The same hollow-point convention the concurrency chart uses: the
+            # readers may have been part of the ceiling, so the figure is not
+            # evidence about the engine.
+            ratio_cell += " ○"
+        # A window that counted no query has no throughput and no
+        # percentile, and the cell says so rather than printing the 0.0 the
+        # record carries. `clients.client_cpu` makes the argument for the
+        # client-CPU figure and it is the same argument here: zero is the
+        # claim "the readers did nothing", which is the one thing that cannot
+        # be true of a window that executed queries. Found on a synthetic
+        # driver whose re-insert returns in ~1 ms, where the row read
+        # `Reader QPS: 186 → 0` with nothing to say the window never opened.
+        baseline_empty = s.get("baseline_empty")
+        under_empty = s.get("under_writes_empty")
+        table_rows.append([
+            _label(s.get("engine") or "?"), s.get("dataset") or "?",
+            s.get("resource_pass") or "—",
+            _fmt(s.get("m"), 0),
+            s.get("build_mode") or "—",
+            s.get("storage_engine") or "—",
+            f"{(s.get('churn_fraction') or 0):.0%}",
+            _fmt(s.get("readers"), 0),
+            f"{_empty_or(s.get('baseline_p99_ms'), baseline_empty, 3)} → "
+            f"{_empty_or(s.get('under_writes_p99_ms'), under_empty, 3)} ms",
+            ratio_cell,
+            f"{_empty_or(s.get('baseline_qps'), baseline_empty, 0)} → "
+            f"{_empty_or(s.get('under_writes_qps'), under_empty, 0)}",
+            _fmt(s.get("writer_rows_per_s"), 1, " rows/s"),
+        ])
+    parts.append(_md_table(
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
+         "Readers", "Reader p99", "p99 under writes", "Reader QPS",
+         "Writer rate"],
+        table_rows))
+    if any(s.get("ratio_disagrees") for s in rows_in):
+        parts.append(
+            "\n⚠ The ratio this report computed from the record's own two "
+            "percentiles differs from the one the harness stamped into the "
+            "same record by more than 1%. The two halves of that record do "
+            "not describe each other, so neither number is reportable: read "
+            "the raw `extra.reader_baseline_p99_ms` and "
+            "`extra.reader_under_writes_p99_ms` before quoting anything from "
+            "that row.\n")
+    empty = [s for s in rows_in
+             if s.get("baseline_empty") or s.get("under_writes_empty")]
+    if empty:
+        windows = ", ".join(
+            f"{(s.get('churn_fraction') or 0):.0%} "
+            f"({(s.get('under_writes_window_s') or 0) * 1000:.0f} ms)"
+            for s in empty)
+        parts.append(
+            f"\n**A blank reader cell means the window closed before a single "
+            f"reader query finished**, not that the engine answered none. A "
+            f"during-writes window is exactly as long as the re-insert takes, "
+            f"so this happens when the write path returns faster than one "
+            f"read: {windows}. The record keeps the evidence — "
+            f"`extra.reader_under_writes_queries_executed` is 0 and "
+            f"`extra.reader_under_writes_window_s` is the length it managed. "
+            f"A zero printed here would read as a throughput collapse, which "
+            f"is the one thing it is not.\n")
+    if any(s.get("client_bound") for s in rows_in):
+        parts.append(
+            "\n○ The readers used more than 80% of their container's CPUs, so "
+            "the reader figures at that point are bounded by the readers as "
+            "well as by the engine. Note the limit is sufficient and not "
+            "necessary — an unmarked point is not a guarantee that the "
+            "readers were not part of the ceiling, because a CPU threshold "
+            "cannot see an interpreter-lock ceiling.\n")
+    return "".join(parts)
 
 
 def _churn_notes(summary: Dict[str, Any]) -> str:

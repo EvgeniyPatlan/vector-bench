@@ -471,6 +471,28 @@ DEFAULT_CHURN_BUDGET_S = 1800
 #: against it by the same test.
 DEFAULT_FILTER_COLUMNS = ("tag", "ctag")
 
+#: Readers querying the index while the churn writer re-inserts, per PR 4
+#: §4.3 item 2. Matches `harness.workloads.churn_readers`'
+#: `DEFAULT_CHURN_READERS`, which is not importable here -- the orchestrator
+#: runs on the host and the harness runs in a container -- and is pinned
+#: against it by `tests/test_t4b_readers.py`, the way `tests/test_calibrate.py`
+#: already pins the ef policy and `tests/test_t3c_filtered.py` the filtered
+#: budget.
+#:
+#: Emitted unconditionally, including the default, for the reason `--ef-mode`
+#: and `--filtered-budget` are: the harness command line in a run's phase log
+#: should say what read load the churn write rate was measured against rather
+#: than leaving a reader to infer it from whatever the workload's default was
+#: at the time. `ops.churn_readers: 0` is the write-only rate and is a real
+#: choice, not an absence.
+#:
+#: NOT run through `_budget_arg`. That function turns a `null` into "0", which
+#: is right for a budget -- null and 0 both mean "no cap" -- and wrong here: a
+#: reader count of 0 means "no readers", so `null` would silently become
+#: "turn the pool off" rather than "use the default". A profile that wants no
+#: readers writes 0.
+DEFAULT_CHURN_READERS = 4
+
 
 def _budget_arg(ops: Dict[str, Any], key: str, default: Any) -> str:
     """A budget key as a command-line value, with YAML `null` meaning no cap.
@@ -505,6 +527,22 @@ def _budget_arg(ops: Dict[str, Any], key: str, default: Any) -> str:
     """
     value = ops.get(key, default)
     return "0" if value is None else str(value)
+
+
+def _churn_readers(ops: Dict[str, Any]) -> int:
+    """How many readers run while the churn writer re-inserts.
+
+    Its own function rather than an inline `.get` for the same reason
+    `_concurrency_queries` is one: a `null` here must not mean what a `null`
+    in a budget key means. `ops.churn_budget_s: null` means "no cap" and
+    `_budget_arg` turns it into "0"; `ops.churn_readers: null` is a profile
+    that cleared the key and wants whatever the default is, and emitting "0"
+    for it would quietly turn the reader pool off -- which changes what
+    `extra.reinsert_rows_per_s` measures while the record still looks the
+    same. A profile that wants the write-only rate writes 0 explicitly.
+    """
+    value = ops.get("churn_readers", DEFAULT_CHURN_READERS)
+    return int(DEFAULT_CHURN_READERS if value is None else value)
 
 
 def _filter_columns(ops: Dict[str, Any]) -> List[str]:
@@ -597,6 +635,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--filtered-budget", _budget_arg(ops, "filtered_budget_s",
                                          DEFAULT_FILTERED_BUDGET_S),
         "--churn-fractions", ",".join(str(c) for c in ops.get("churn_fractions", [0.1])),
+        "--churn-readers", str(_churn_readers(ops)),
     ]
     if ops.get("subset_rows"):
         args += ["--subset-rows", str(ops["subset_rows"])]

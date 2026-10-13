@@ -46,32 +46,61 @@ made the chart above misleading until they were added:
    container's own cgroup CPU over the window, as `extra.client_cpu_seconds`,
    `extra.client_cpus`, `extra.client_cpu_util` and the derived
    `extra.client_bound`. The report draws a bound point hollow and the run
-   says so on stderr while it happens. See `CLIENT_BOUND_UTIL` for what that
-   flag can and cannot see -- it catches a saturated cpuset and not a
-   saturated interpreter lock, and the difference has been measured.
+   says so on stderr while it happens. See `clients.CLIENT_BOUND_UTIL` for
+   what that flag can and cannot see -- it catches a saturated cpuset and not
+   a saturated interpreter lock, and the difference has been measured.
+
+PR 4 §4.3 item 3 moved the client, the barrier, the window trimming and the CPU
+accounting into `clients.py`, because churn's readers need all four and a
+second implementation of them would start out agreeing and then drift. Nothing
+about what this workload measures changed, and the existing concurrency suite
+passing untouched is what says so.
 """
 
 from __future__ import annotations
 
 import sys
-import threading
+import threading  # noqa: F401 - an injected instrument; see `_instruments`
 import time
-from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
-                    Tuple)
+from typing import Dict, NamedTuple, Optional, Sequence, Tuple
 
 import numpy
 
 from ..datasets import Dataset, cached_ground_truth, recall_at_k
-from ..drivers.base import EngineDriver, IndexSpec
-from ..metrics.latency import (INFLIGHT_DISCARDED, PREWINDOW_DISCARDED,
-                               LatencyCollector, merge_collectors,
-                               span_disposition)
+from ..drivers.base import IndexSpec
+from ..metrics.latency import (INFLIGHT_DISCARDED,  # noqa: F401 - instrument
+                               PREWINDOW_DISCARDED, merge_collectors)
 from ..metrics.records import PHASE_CONCURRENCY, Record
-from ..metrics.resources import own_cpu_count, read_own_cpu_usec
-from ..progress import Heartbeat
+from ..metrics.resources import own_cpu_count, read_own_cpu_usec  # noqa: F401
+# PR 4 §4.3 item 3 moved the client, the barrier, the window trimming and the
+# CPU accounting into `clients.py` so churn's readers use the same code rather
+# than a second implementation that would start out agreeing and then drift.
+# Re-exported under the names they had here because that is how the existing
+# tests and `report/` reach them, and "concurrency tests unchanged" is the
+# only thing that proves the lift changed nothing.
+from .clients import (CLIENT_BOUND_UTIL, Answer,  # noqa: F401
+                      ClientPool, DriverFactory, Instruments, client_cpu,
+                      shard_queries)
 from .context import RunContext
 
-DriverFactory = Callable[[], EngineDriver]
+_client_cpu = client_cpu
+_shard_queries = shard_queries
+
+
+def _instruments() -> Instruments:
+    """This module's own clocks and counters, bundled for the pool.
+
+    Built on every call rather than once at import, and that is the whole
+    point: five concurrency tests replace `threading`, `merge_collectors` or
+    `read_own_cpu_usec` ON THIS MODULE to calibrate a window against a known
+    quantity, and a bundle built at import time would hold the originals.
+    Looking the four names up here means a `monkeypatch.setattr` on this
+    module still reaches the pool -- which is what keeps "concurrency tests
+    unchanged" a real statement about the lift rather than one the lift
+    quietly invalidated.
+    """
+    return Instruments(threading=threading, merge=merge_collectors,
+                       cpu_usec=read_own_cpu_usec, cpu_count=own_cpu_count)
 
 #: `max_queries` sentinel meaning "every query the dataset ships". The pool is
 #: a property of the dataset, not of the cap the filtered and churn workloads
@@ -85,58 +114,6 @@ WHOLE_TEST_SET = 0
 #: offsets-to-truth mapping is wrong or the index moved underneath the
 #: measurement. Either way the QPS beside it is not what it claims to be.
 RECALL_SPREAD_LIMIT = 0.005
-
-#: Share of the client container's CPUs above which the point is reported as
-#: client-bound. Not a measured constant and not claimed to be one: it is the
-#: level at which this harness stops being able to say whose ceiling the curve
-#: shows. Python threads serializing vectors do not scale smoothly to the last
-#: percent of a cpuset, so a point at 0.8 is already one where the client may
-#: be contributing to the flattening, and the honest report is "this number is
-#: not evidence about the engine" rather than a correction factor nobody can
-#: justify.
-#:
-#: SUFFICIENT, NOT NECESSARY, and the gap is structural rather than a question
-#: of where the limit was set. **A CPU-utilisation threshold cannot see a GIL
-#: ceiling, because the GIL prevents the CPU consumption the threshold looks
-#: for.** A thread waiting its turn to hold the lock is not running, so it
-#: costs nothing this counter can measure: the harness stops scaling while its
-#: utilisation stays flat, and no ratio of CPU-seconds to CPUs can distinguish
-#: that from an engine that stopped scaling. Raising or lowering 0.80 does not
-#: help, because the quantity itself is blind to the case.
-#:
-#: The signature is throughput falling with more clients while the utilisation
-#: does not move, and it is measured rather than supposed. Run against
-#: `tests/fake_driver.py` on a twenty-CPU box, this workload's own CPU flattens
-#: at 2.06 cores from four clients upwards -- 0.51 of a four-CPU client
-#: container at 4, 8, 16 and 32 clients alike -- while aggregate throughput
-#: peaks at two clients (16,614 q/s) and falls to 8,127 by thirty-two. That is
-#: the exact shape a reader would call an engine ceiling, and this flag would
-#: not have fired on any of those points.
-#:
-#: So a marked point is evidence that the harness was part of the limit, and an
-#: unmarked one is not evidence that the engine was. The fake's queries are
-#: numpy-bound in-process, whereas a real driver spends most of a query blocked
-#: on a socket with the lock released, so the figure above overstates a real
-#: client's cost and the synthetic shape may not reproduce -- which is why the
-#: decision to run the clients as processes waits on a real dev or smoke run
-#: rather than on this measurement.
-CLIENT_BOUND_UTIL = 0.80
-
-
-class _Answer(NamedTuple):
-    """One query's returned ids, with the span that produced them.
-
-    The ids and the span travel together because the window is trimmed to the
-    queries that finished inside it and recall must be scored over exactly the
-    queries that were counted. Keeping the span beside the ids means the same
-    `span_disposition` call decides both, rather than the latency being
-    trimmed by one rule and the result set by another.
-    """
-
-    ids: List[int]
-    started: float
-    finished: float
-
 
 class _Window(NamedTuple):
     """One measured window's results.
@@ -165,107 +142,6 @@ class _Window(NamedTuple):
     client_cpu_seconds: Optional[float]
     client_cpus: int
     client_cpu_util: Optional[float]
-
-
-class _Client(threading.Thread):
-    """One benchmark client: own connection, own query slice, own latencies."""
-
-    def __init__(self, driver_factory: DriverFactory, queries: numpy.ndarray,
-                 query_offsets: numpy.ndarray,
-                 k: int, ef_search: int, index: IndexSpec, warmup: int,
-                 ready: threading.Barrier, stop: threading.Event):
-        super().__init__(daemon=True)
-        self._factory = driver_factory
-        self._queries = queries
-        # Where this client's queries sit in the full query array. Needed
-        # because recall scores a result against the ground truth of the query
-        # that produced it, and a shard is a strided view: `shards[1]` under
-        # four clients is queries 1, 5, 9, ... and its results belong against
-        # those rows of the truth, not against rows 0, 1, 2, ...
-        self._offsets = query_offsets
-        self._k = k
-        self._ef_search = ef_search
-        self._index = index
-        self._warmup = warmup
-        self._ready = ready
-        self._stop_event = stop
-        self.collector = LatencyCollector(warmup=0)
-        #: Query position -> that query's answer and span, first pass only.
-        self.results: Dict[int, _Answer] = {}
-        self.error: Optional[BaseException] = None
-
-    def run(self) -> None:
-        driver = None
-        try:
-            driver = self._factory()
-            driver.connect()
-            # The driver needs the metric to build its SELECT; supplying the
-            # spec directly avoids a catalog round-trip per client.
-            driver._index = self._index
-            driver.set_ef_search(self._ef_search)
-
-            # Warm up before the barrier: cold-cache cost belongs to neither the
-            # measured window nor to one unlucky client, and every client must
-            # enter the measured window equally warm.
-            for i in range(min(self._warmup, len(self._queries))):
-                driver.query(self._queries[i], self._k)
-        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
-            self.error = exc
-        finally:
-            # Always release the barrier, or a failing client deadlocks the run.
-            try:
-                self._ready.wait(timeout=120)
-            except threading.BrokenBarrierError:
-                pass
-
-        if self.error is not None or driver is None:
-            return
-
-        try:
-            self.collector.start()
-            i = 0
-            n = len(self._queries)
-            while not self._stop_event.is_set():
-                q = self._queries[i % n]
-                started = time.perf_counter()
-                ids = driver.query(q, self._k)
-                # Both instants, not the duration: whether this query counts
-                # depends on when it ran. The window ends by setting a flag,
-                # and this client is holding a query when that happens -- a
-                # query that finishes after the wall clock in the denominator
-                # stopped. `merge_collectors` drops it on the strength of
-                # `finished`, so the instant has to survive to the merge.
-                finished = time.perf_counter()
-                self.collector.add_span(started, finished)
-                # Only the first pass over the shard. The window is a fixed
-                # duration, so a fast engine makes thousands of passes and
-                # keeping every result would grow without bound and charge the
-                # measurement for the allocation; every pass answers the same
-                # query, so later ones add no recall information. This bounds
-                # the memory to one result list per query however long the
-                # window runs.
-                #
-                # After `collector.add_span`, deliberately: the timer brackets
-                # the query alone, so recording the result cannot be charged
-                # to the latency the record reports.
-                #
-                # The span is stored with the ids, not just in the collector.
-                # Whether this query's latency counts is decided after the
-                # window closes, and its result has to be decided the same way
-                # -- recall over a query whose timing was discarded would
-                # describe a different set of queries from the QPS beside it.
-                if i < n:
-                    self.results[int(self._offsets[i])] = _Answer(
-                        ids, started, finished)
-                i += 1
-            self.collector.stop()
-        except BaseException as exc:  # noqa: BLE001
-            self.error = exc
-        finally:
-            try:
-                driver.close()
-            except Exception:
-                pass
 
 
 def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
@@ -414,9 +290,13 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 "query_reuse": round(reuse, 2) if reuse is not None else None,
                 # Queries the window cut off, and the evidence that both ends
                 # of the window are honest. `inflight_discarded` is at most
-                # one per client -- the one each was holding when the clock
-                # stopped -- and those are the queries the QPS above no longer
-                # counts. Their share of it is
+                # one per client on any real driver -- the one each was
+                # holding when the clock stopped -- and those are the queries
+                # the QPS above no longer counts. Not a hard bound: the stop
+                # instant is read before the flag is set, so a query cheaper
+                # than that gap can be discarded several times over. Measured
+                # against a zero-latency synthetic driver at 3 clients, 6
+                # discarded against 2,097-2,950 executed (0.20-0.29%). Their share of it is
                 # `inflight_discarded / queries_executed`, about
                 # `latency / window` and independent of the client count: a
                 # few per cent for a slow engine over a short window, 0.005%
@@ -474,31 +354,7 @@ def _query_pool(test: numpy.ndarray, max_queries: int) -> numpy.ndarray:
     return test[:max_queries]
 
 
-def _shard_queries(queries: numpy.ndarray,
-                   clients: int) -> List[Tuple[numpy.ndarray, numpy.ndarray]]:
-    """Each client's query slice, paired with those queries' positions.
-
-    The slice and the offsets are built in one place and returned together
-    because they are two spellings of one fact: `queries[c::clients]` is a
-    strided view and `arange(c, n, clients)` is where its elements came from.
-    Let them drift apart and recall is scored against the wrong rows of the
-    ground truth — client 1 of 4 answering queries 1, 5, 9, ... while its
-    results are compared against the neighbours of queries 0, 1, 2, ... That
-    produces a plausible-looking low recall rather than an error, which is the
-    exact failure mode this repository opens by warning about, and it would be
-    read as the engine's ANN quality.
-
-    Strided rather than contiguous blocks, which is the older decision this
-    preserves: two clients handed adjacent slices of a sorted query set warm
-    each other's caches, and part of what the window measured would be that
-    rather than the engine.
-    """
-    n = len(queries)
-    return [(queries[c::clients], numpy.arange(c, n, clients))
-            for c in range(clients)]
-
-
-def _window_recall(results: Dict[int, _Answer], truth: numpy.ndarray,
+def _window_recall(results: Dict[int, Answer], truth: numpy.ndarray,
                    k: int) -> Tuple[Optional[float], int]:
     """Recall over the queries this window actually executed, and how many.
 
@@ -538,36 +394,6 @@ def _warn_nothing_finished(clients: int, duration_s: float,
         f"latency — a window shorter than a single query cannot measure "
         f"throughput.",
         file=sys.stderr, flush=True)
-
-
-def _client_cpu(cpu_start: Optional[int], cpu_end: Optional[int],
-                wall_s: float,
-                cpus: int) -> Tuple[Optional[float], Optional[float]]:
-    """The clients' own CPU over the window, in seconds and as a utilisation.
-
-    Both numbers from one place because the second is the first divided by
-    `wall_s * cpus`, and a record that carried only the ratio would leave a
-    reader unable to tell a busy window from a short one or from a narrow
-    cpuset. Each of those three inputs can be wrong in a way that still
-    produces a number between 0 and 1: the counter in the wrong unit (cgroup
-    v1 publishes nanoseconds), the wall taken around the wrong interval, or
-    the CPU count taken from the host rather than from the cpuset. So all
-    three are recorded and the arithmetic is one expression in one function
-    that a test can calibrate against a known number of saturated cores.
-
-    `(None, None)`, never `(0.0, 0.0)`, when the counter is unavailable or the
-    window is degenerate. Zero is the claim "the clients did nothing", which
-    is the one thing that cannot be true of a window that executed queries,
-    and it would make the client-bound flag read false on a run where nothing
-    was ever measured.
-    """
-    if cpu_start is None or cpu_end is None or wall_s <= 0 or cpus <= 0:
-        return None, None
-    # Clamped at zero: the counter is monotonic, so a negative delta means the
-    # two readings did not come from the same cgroup and the magnitude is
-    # meaningless either way.
-    seconds = max(0.0, (cpu_end - cpu_start) / 1e6)
-    return seconds, seconds / (wall_s * cpus)
 
 
 def _warn_client_bound(clients: int, util: float, cpus: int,
@@ -675,123 +501,35 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
     throughput and in recall. See `merge_collectors` for what counting the
     query each client was still holding did to the QPS.
     """
-    shards = _shard_queries(queries, clients)
-
-    # The instant the window opens, read by the barrier itself.
-    #
-    # NOT `perf_counter()` after `ready.wait()` returns in this thread, which
-    # is the obvious place and is wrong. A barrier releases every party at
-    # once, so a client can issue its first query before this thread is next
-    # scheduled to read the clock — with eight clients on one GIL, six of them
-    # did. Those queries then look as though they began before the window, and
-    # dropping them takes the first query of each client out of the window's
-    # recall coverage: `extra.recall_queries` came in at 198 of a 200-query
-    # pool however long the window ran, because no duration can change what
-    # happened at its start.
-    #
-    # `Barrier(action=...)` runs in the last party to arrive, after all of them
-    # are waiting and before any is released, so this reading precedes every
-    # measured query by construction. It is also the honest start: from the
-    # release onwards the clients are querying, so the time this thread spends
-    # getting back to `time.sleep` is time the window contains and its queries
-    # are counted in.
-    # The CPU counter is read in the same barrier action, immediately before
-    # the wall instant, so the two readings bracket one interval instead of
-    # two. Reading it in this thread after `ready.wait()` returns would put
-    # the clients' first queries' CPU outside a window whose denominator
-    # covers them -- the same gap that took the first query of each client out
-    # of the recall coverage, in the other direction. Reading it before the
-    # barrier would include every client's warm-up, which is hundreds of
-    # queries of CPU charged to a window that did not run them.
-    #
-    # CPU first, then the wall: the file read costs microseconds, and spending
-    # them before the wall starts means the window contains no CPU that its
-    # start reading has already counted.
-    opened: List[Tuple[Optional[int], float]] = []
-
-    def _open_window() -> None:
-        opened.append((read_own_cpu_usec(), time.perf_counter()))
-
-    ready = threading.Barrier(clients + 1, action=_open_window)
-    stop = threading.Event()
-
-    workers = [
-        _Client(driver_factory, shard, offsets, k, ef_search, index,
-                warmup, ready, stop)
-        for shard, offsets in shards
-    ]
-    for w in workers:
-        w.start()
-
-    # Warm-up is unbounded from the operator's point of view: every client
-    # runs `warmup` queries before the barrier releases, and on a slow
-    # configuration that is minutes of silence before the measured window
-    # even starts.
-    try:
-        with Heartbeat(f"{clients}-client warm-up", prefix="concurrency"):
-            ready.wait(timeout=300)
-    except threading.BrokenBarrierError:
-        ready.abort()
-        raise RuntimeError("a client failed during warm-up")
-
-    cpu_start, wall_start = opened[0]
+    # Everything from the barrier to the trimmed result set now lives in
+    # `clients.ClientPool`, because churn's readers need the same machinery and
+    # §4.3 item 3 asks for one implementation of it. What stays here is what is
+    # concurrency's alone: the fixed duration, the recall scoring and the
+    # repeats.
+    pool = ClientPool(driver_factory, queries, clients, k, ef_search, index,
+                      warmup, instruments=_instruments())
+    pool.start(f"{clients}-client warm-up", prefix="concurrency")
+    # The window is exactly this sleep: the pool's start instant was read in
+    # the barrier action, before any client was released, and its stop instant
+    # is read before the flag is set. See `clients.ClientPool`.
     time.sleep(duration_s)
-    # The stop instant, read BEFORE the flag is set and used as both the
-    # denominator's end and the numerator's cutoff. Those were different
-    # instants until this was recorded: the wall ended here, while every
-    # client went on to finish the query it was holding and record it, so QPS
-    # counted up to one query per client that its own wall did not cover.
-    stop_at = time.perf_counter()
-    # And the CPU counter immediately after, for the same reason in the same
-    # direction: read after `stop.set()`, it would include whatever the
-    # clients burned finishing the query each was holding -- work the wall
-    # above deliberately excludes.
-    cpu_end = read_own_cpu_usec()
-    stop.set()
-    wall = stop_at - wall_start
-    client_cpus = own_cpu_count()
-    cpu_seconds, cpu_util = _client_cpu(cpu_start, cpu_end, wall, client_cpus)
+    window = pool.stop()
 
-    for w in workers:
-        w.join(timeout=120)
-
-    failures = [w.error for w in workers if w.error is not None]
-    if failures:
-        raise RuntimeError(
-            f"{len(failures)} of {clients} clients failed; "
-            f"first error: {failures[0]}")
-
-    merged = merge_collectors([w.collector for w in workers], wall,
-                              cutoff=stop_at, window_start=wall_start)
+    merged = window.merged
     if not merged["queries_executed"]:
-        _warn_nothing_finished(clients, duration_s, merged[INFLIGHT_DISCARDED])
+        _warn_nothing_finished(clients, duration_s, window.inflight_discarded)
 
-    # One dict across every client. The shards are disjoint and the offsets
-    # are absolute positions, so no two clients can write the same key and the
-    # merge cannot lose a result.
-    #
-    # Trimmed by the same predicate and the same window as the latencies, so
-    # the recall reported beside this window's QPS is over the queries that
-    # QPS counted. Letting the two diverge puts `queries_executed` below
-    # `extra.recall_queries` for any window inside its first pass, and
-    # `extra.query_reuse` -- executed over distinct -- below 1.0 for a window
-    # in which nothing was repeated.
-    results: Dict[int, _Answer] = {}
-    for w in workers:
-        for offset, answer in w.results.items():
-            if span_disposition(answer.started, answer.finished,
-                                wall_start, stop_at) is None:
-                results[offset] = answer
+    results = window.results
     recall, recall_queries = _window_recall(results, truth, k)
 
     return _Window(
-        qps=merged.pop("qps"),
-        inflight_discarded=merged.pop(INFLIGHT_DISCARDED),
-        prewindow_discarded=merged.pop(PREWINDOW_DISCARDED),
+        qps=window.qps,
+        inflight_discarded=window.inflight_discarded,
+        prewindow_discarded=window.prewindow_discarded,
         merged=merged,
         recall=recall,
         recall_queries=recall_queries,
-        client_cpu_seconds=cpu_seconds,
-        client_cpus=client_cpus,
-        client_cpu_util=cpu_util,
+        client_cpu_seconds=window.client_cpu_seconds,
+        client_cpus=window.client_cpus,
+        client_cpu_util=window.client_cpu_util,
     )

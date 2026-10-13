@@ -163,6 +163,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # An engine that stalls re-inserting must release the machine and record
     # what it managed, rather than holding the run until someone notices.
     p.add_argument("--churn-budget", type=float, default=1800.0)
+    # PR 4 §4.3 item 2. A churn number measured with nothing else touching the
+    # index describes a maintenance window, not a database under load, and the
+    # two can differ by more than the engines differ from each other. 0 turns
+    # the pool off, which is what `ops.churn_readers: 0` is for: the
+    # write-only re-insert rate the report showed before this existed is still
+    # a quantity someone may want, and it is not the same quantity as a rate
+    # measured against four concurrent readers.
+    p.add_argument("--churn-readers", type=int,
+                   default=churn_workload.DEFAULT_CHURN_READERS,
+                   help="readers querying the index while the churn writer "
+                        "re-inserts; 0 disables the pool and restores the "
+                        "write-only re-insert rate")
     # Comma-separated, and the workload loops whatever it is given: PR 3 §3.4
     # item 4 measures the filtered grid once per declared mode, against ONE
     # loaded index. Looping in the orchestrator instead would re-run build,
@@ -352,6 +364,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_queries=args.max_queries,
                 indexed_rows=indexed_rows,
                 budget_s=args.churn_budget,
+                # PR 4 §4.3 item 1. The same factory the concurrency workload
+                # already gets: readers need their own connections, and the
+                # writer above keeps `driver`. Churn deliberately runs last
+                # and mutates the table, so nothing after it inherits what the
+                # readers saw.
+                driver_factory=driver_factory,
+                readers=args.churn_readers,
             )
 
     except Exception:

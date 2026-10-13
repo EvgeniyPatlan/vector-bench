@@ -98,11 +98,11 @@ engines:
 | Profile | Passes | Ingest | Query, typical | Query, worst case | Run, worst case |
 | --- | --- | ---: | ---: | ---: | ---: |
 | `dev` | 1 | ~0.0 h | ~0.0 h | ~0.2 h | **~0.2 h** |
-| `smoke` | 1 | ~0.3 h | ~0.0 h | ~2.7 h | **~3.0 h** |
-| `quick` | 1 | ~36.2 h | ~1.8 h | ~12.2 h | **~48.4 h** |
-| `main` | 1 | ~51.1 h | ~4.4 h | ~13.2 h | **~64.3 h** |
-| `full` | 2 | ~532.0 h | ~47.0 h | ~158.4 h | **~690.4 h** |
-| `mariadb-blog` | 1 | ~21.3 h | ~1.2 h | ~2.8 h | **~24.1 h** |
+| `smoke` | 1 | ~0.3 h | ~0.1 h | ~2.7 h | **~3.0 h** |
+| `quick` | 1 | ~36.2 h | ~1.95 h | ~12.3 h | **~48.5 h** |
+| `main` | 1 | ~51.1 h | ~4.5 h | ~13.3 h | **~64.4 h** |
+| `full` | 2 | ~532.0 h | ~48.5 h | ~160.0 h | **~692.0 h** |
+| `mariadb-blog` | 1 | ~21.3 h | ~1.25 h | ~2.8 h | **~24.2 h** |
 
 The ingest column differs from the table above it because that one was computed
 by hand from §1's three headline rates, while the estimator uses the measured
@@ -147,15 +147,17 @@ estimated ingest time (loading only, before any queries):
     ann.m_values or the dataset list to cut it roughly proportionally.
 
 estimated query time (the parts the profile puts a clock on):
-  concurrency windows  ~1.2 h
-                         6 client count(s) x 30s x 3 repeat(s) per ops unit, fixed by the profile not by the engine
-  filtered search      ~0.0 h typical, ~4.0 h worst case
-                         2 filter column(s) x 3 selectivities x 500 queries = 3,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured; 300s cap/point bounds it
-  churn re-insert      ~3.2 h typical, ~8.0 h worst case
-                         e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
-  subtotal ~4.4 h typical, ~13.2 h worst case
+  concurrency windows    ~1.2 h
+                           6 client count(s) x 30s x 3 repeat(s) per ops unit, fixed by the profile not by the engine
+  filtered search        ~0.0 h typical, ~4.0 h worst case
+                           2 filter column(s) x 3 selectivities x 500 queries = 3,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured; 300s cap/point bounds it
+  churn re-insert        ~3.2 h typical, ~8.0 h worst case
+                           e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
+  churn reader baseline  ~0.1 h
+                           2 churn fraction(s) x 30s of 4 reader(s) before each step's deletes, fixed by the profile not by the engine
+  subtotal ~4.5 h typical, ~13.3 h worst case
 
-estimated run time ~55.5 h typical, ~64.3 h worst case
+estimated run time ~55.6 h typical, ~64.4 h worst case
   Plan against the worst case: a run materially longer than it is a bug.
   Each budgeted term tests its deadline before starting work, so it can overrun
     by the one query or slice already running when the budget expires.
@@ -164,6 +166,7 @@ estimated run time ~55.5 h typical, ~64.3 h worst case
       recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set
       churn re-measurement: ops.max_queries before churn and again after each churn fraction
       churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
+      churn repair path: on an engine with one (pgvector of the six), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
       concurrency warm-up: 50 queries per client before each measured window
       filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
 ```
