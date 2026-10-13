@@ -27,3 +27,7 @@ venv/
 # Local overrides
 config/local.yml
 .env
+
+# Agent worktrees. Not source; an outer clone cannot resolve them, and a
+# `git add -A` here commits them as gitlinks.
+.claude/
