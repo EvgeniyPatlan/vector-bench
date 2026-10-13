@@ -16,11 +16,13 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy
 
-from .base import DATABASE, TABLE, ConnectionSpec, EngineDriver, IndexSpec, LoadResult
+from .base import (DATABASE, FILTER_CTAG, FILTER_TAG, TABLE, ConnectionSpec,
+                   EngineDriver, IndexSpec, LoadResult, RowAttrs,
+                   checked_filter_column)
 
 PROGRESS_INTERVAL_S = float(os.environ.get("VB_PROGRESS_INTERVAL", "20"))
 
@@ -28,6 +30,17 @@ try:
     import mariadb as _connector
 except ImportError:  # pragma: no cover - only the bench image has it
     _connector = None
+
+# One INSERT for both write paths. The bulk load and churn's re-insert each
+# held their own copy of this string, naming the same columns by coincidence
+# rather than by construction; PR 3 adds a column to both, which is exactly
+# the edit where one copy gets missed. The column names come from
+# `datasets.FILTER_COLUMNS` via base.py rather than being spelled here, so the
+# statement cannot name a column the dataset module does not compute.
+INSERT_SQL = (
+    f"INSERT INTO {TABLE} (id, {FILTER_TAG}, {FILTER_CTAG}, v) "
+    f"VALUES (%s, %s, %s, %s)"
+)
 
 
 def to_binary_f32(vector) -> bytes:
@@ -120,12 +133,21 @@ class MySQLFamilyDriver(EngineDriver):
     def create_schema(self, index: IndexSpec) -> None:
         self._index = index
         metric = self.dialect.metric_names[index.metric]
+        # `ctag` carries a plain KEY exactly as `tag` does, and that parity is
+        # the measurement rather than tidiness: the two columns exist to be
+        # compared, and an optimiser offered an index on one and not the other
+        # is choosing between different plans, not between different filter
+        # correlations. `tests/test_t3b_drivers.py` pins the index kinds on
+        # the two columns as equal sets rather than checking that a `ctag`
+        # index exists somewhere in the DDL.
         ddl = (
             f"CREATE TABLE {TABLE} (\n"
             f"  id INT PRIMARY KEY,\n"
             f"  tag INT NOT NULL,\n"
+            f"  ctag INT NOT NULL,\n"
             f"  v VECTOR({index.dim}) NOT NULL,\n"
             f"  KEY tag_idx (tag),\n"
+            f"  KEY ctag_idx (ctag),\n"
             f"  VECTOR INDEX {self.dialect.index_name} (v) "
             f"M={index.m} DISTANCE={metric}\n"
             f") ENGINE={index.storage_engine}"
@@ -144,14 +166,19 @@ class MySQLFamilyDriver(EngineDriver):
     # Data
     # ------------------------------------------------------------------
 
-    def load(self, vectors: numpy.ndarray, tags: numpy.ndarray,
+    def load(self, vectors: numpy.ndarray,
+             attrs: Union[RowAttrs, Sequence[int], numpy.ndarray],
              threads: int = 1, start_id: int = 0) -> LoadResult:
         total = len(vectors)
         threads = max(1, threads)
+        # Coerced once, here, rather than inside `_load_range`: the worker
+        # threads below each get a slice of the same object, and a per-worker
+        # coercion would be per-worker mirroring of a bare array.
+        attrs = RowAttrs.coerce(attrs)
         start = time.perf_counter()
 
         if threads == 1:
-            self._load_range(self._cur, vectors, tags, start_id, 0, total,
+            self._load_range(self._cur, vectors, attrs, start_id, 0, total,
                              report=True)
         else:
             bounds = [(total * i // threads, total * (i + 1) // threads)
@@ -170,7 +197,7 @@ class MySQLFamilyDriver(EngineDriver):
                     for stmt in self.dialect.session_setup:
                         cur.execute(stmt)
                     # Only the first shard reports, or the threads interleave.
-                    self._load_range(cur, vectors, tags, start_id, lo, hi,
+                    self._load_range(cur, vectors, attrs, start_id, lo, hi,
                                      report=(lo == 0))
                     cur.close()
                 finally:
@@ -182,7 +209,8 @@ class MySQLFamilyDriver(EngineDriver):
         elapsed = time.perf_counter() - start
         return LoadResult(rows=total, wall_seconds=elapsed, threads=threads)
 
-    def _load_range(self, cur, vectors, tags, start_id: int, lo: int, hi: int,
+    def _load_range(self, cur, vectors, attrs: RowAttrs, start_id: int,
+                    lo: int, hi: int,
                     batch: int = 500, report: bool = False) -> None:
         """Load a contiguous range in batches.
 
@@ -192,16 +220,15 @@ class MySQLFamilyDriver(EngineDriver):
         output there is no way to tell a working load from a hung one, and no
         way to answer "how long will this take" except by waiting.
         """
-        sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
-        rows: List[Tuple[int, int, bytes]] = []
+        rows: List[Tuple[Any, ...]] = []
         total = hi - lo
         started = time.perf_counter()
         next_report = started + PROGRESS_INTERVAL_S
 
         for i in range(lo, hi):
-            rows.append((start_id + i, int(tags[i]), to_binary_f32(vectors[i])))
+            rows.append((start_id + i, *attrs.row(i), to_binary_f32(vectors[i])))
             if len(rows) >= batch:
-                cur.executemany(sql, rows)
+                cur.executemany(INSERT_SQL, rows)
                 # Rebind rather than clear(): the connector receives the list
                 # itself, and mutating the object it was handed is a needless
                 # bet on executemany() having fully consumed it.
@@ -215,7 +242,7 @@ class MySQLFamilyDriver(EngineDriver):
                           f"{rate:,.0f} rows/s, ETA {eta / 60:.1f} min", flush=True)
                     next_report = now + PROGRESS_INTERVAL_S
         if rows:
-            cur.executemany(sql, rows)
+            cur.executemany(INSERT_SQL, rows)
         cur.execute("COMMIT")
 
     def delete_ids(self, ids: Sequence[int]) -> None:
@@ -231,14 +258,15 @@ class MySQLFamilyDriver(EngineDriver):
         self._cur.execute("COMMIT")
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
-                    tags: Sequence[int]) -> None:
-        sql = f"INSERT INTO {TABLE} (id, tag, v) VALUES (%s, %s, %s)"
+                    attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
+                    ) -> None:
+        attrs = RowAttrs.coerce(attrs)
         rows = [
-            (int(i), int(t), to_binary_f32(v))
-            for i, v, t in zip(ids, vectors, tags)
+            (int(row_id), *attrs.row(i), to_binary_f32(vectors[i]))
+            for i, row_id in enumerate(ids)
         ]
         for chunk_start in range(0, len(rows), 500):
-            self._cur.executemany(sql, rows[chunk_start:chunk_start + 500])
+            self._cur.executemany(INSERT_SQL, rows[chunk_start:chunk_start + 500])
         self._cur.execute("COMMIT")
 
     def count_rows(self) -> int:
@@ -256,8 +284,39 @@ class MySQLFamilyDriver(EngineDriver):
         assert self._index is not None, "create_schema must run before querying"
         return self.dialect.metric_names[self._index.metric].lower()
 
-    def _select(self, k: int, filtered: bool) -> str:
-        where = "WHERE tag < %s " if filtered else ""
+    def _select(self, k: int, filtered: bool, *,
+                column: str = FILTER_TAG) -> str:
+        """The one SELECT every query path in this driver runs.
+
+        `query`, `query_filtered` and `explain_uses_vector_index` all come
+        through here, so there is exactly one place a predicate is built and
+        exactly one place the column name is checked. Two sites checking the
+        same thing is the arrangement where one of them is later edited and
+        the other is not.
+
+        The column is whitelisted unconditionally, not only on the filtered
+        branch: a `column` that cannot be queried is a caller's mistake
+        whether or not this particular call puts it in the WHERE clause, and
+        reporting it on the first call rather than the first *filtered* call
+        is the difference between a clear error and a plan check that passed
+        before a measurement that could not.
+
+        `column` is keyword-only for the reason `postgres._select` gives at
+        length: it is the argument that decides which column a measurement
+        names, and it must not be identified by position. Same marker, same
+        guard, same shape -- the two drivers differ only in the `k` they
+        interpolate into LIMIT.
+        """
+        # The flag guard, argued in full beside `postgres._select`'s copy:
+        # the `*` above stops a column arriving in `column`'s position, and
+        # only this stops one arriving in the FLAG's -- `_select(k, "ctag")`
+        # is truthy and silently builds `WHERE tag < %s`. It also survives
+        # someone deleting the marker.
+        if not isinstance(filtered, bool):
+            raise TypeError(
+                f"_select's filtered argument is a flag, not a column; got "
+                f"{filtered!r}. Did you mean column={filtered!r}?")
+        where = f"WHERE {checked_filter_column(column)} < %s " if filtered else ""
         return (
             f"SELECT id FROM {TABLE} {where}"
             f"ORDER BY vec_distance_{self._metric_fn()}(v, %s) LIMIT {int(k)}"
@@ -267,30 +326,49 @@ class MySQLFamilyDriver(EngineDriver):
         self._cur.execute(self._select(k, False), (to_binary_f32(vector),))
         return [row[0] for row in self._cur.fetchall()]
 
-    def query_filtered(self, vector, k: int, tag_threshold: int) -> List[int]:
+    def query_filtered(self, vector, k: int, threshold: int,
+                       column: str = FILTER_TAG) -> List[int]:
         self._cur.execute(
-            self._select(k, True), (int(tag_threshold), to_binary_f32(vector))
+            self._select(k, True, column=column),
+            (int(threshold), to_binary_f32(vector)),
         )
         return [row[0] for row in self._cur.fetchall()]
 
     def explain_uses_vector_index(self, vector, k: int,
-                                  tag_threshold: Optional[int] = None) -> bool:
+                                  tag_threshold: Optional[int] = None,
+                                  column: str = FILTER_TAG) -> bool:
+        # Checked here, above the try, and the placement is the point. The
+        # body below swallows every exception on purpose -- a plan check that
+        # fails must not end a run -- so a column rejected inside the try
+        # would come back as a plain False, which every caller reads as a
+        # statement about the engine. It would be a statement about the
+        # caller. The measurement that followed would then fail anyway, one
+        # step later in `query_filtered`, with this check already recorded in
+        # the report's Validity section as an index that was not used.
+        column = checked_filter_column(column)
         filtered = tag_threshold is not None
         params: Tuple[Any, ...] = (
             (int(tag_threshold), to_binary_f32(vector)) if filtered
             else (to_binary_f32(vector),)
         )
         try:
-            self._cur.execute("EXPLAIN " + self._select(k, filtered), params)
+            self._cur.execute(
+                "EXPLAIN " + self._select(k, filtered, column=column),
+                params)
             plan = " | ".join(str(c) for row in self._cur.fetchall() for c in row)
         except Exception as exc:
             print(f"[{self.name}] EXPLAIN failed: {exc}")
             return False
         used = self.dialect.index_name in plan
         if not used:
+            # The column is named, not just `filtered=True`: `tag` and `ctag`
+            # carry the same kind of index and different value distributions,
+            # and an optimiser that takes the vector index for one and a range
+            # scan for the other is the single most likely way this check
+            # fires in PR 3. "filtered" alone would not say which.
             print(
                 f"[{self.name}] WARNING: vector index NOT used "
-                f"(k={k}, filtered={filtered}). Plan: {plan}"
+                f"(k={k}, filtered={filtered}, column={column!r}). Plan: {plan}"
             )
         return used
 

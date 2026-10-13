@@ -111,7 +111,64 @@ SCHEMA_VERSION = 1
 # touch. The version is per-run, not per-phase, because a record names the
 # harness that wrote it and splitting it per phase would mean four constants
 # and four ways to forget one.
-OPS_MEASUREMENT_VERSION = 4
+#
+# VERSION 5 added a second filter column to the table. Every row now carries
+# `ctag` -- a nearest-pivot cluster id -- beside `tag`, so that filtered
+# search can be measured on a predicate that follows the vector space and on
+# one that does not, both against the same graph. Three recorded quantities
+# move, and none of them is the one the change is for:
+#
+#   * Ingest. Every engine writes one more scalar per row: an INT column in
+#     the MySQL family, an int4 in PostgreSQL, a BSON field in Percona Search,
+#     a hash field in Valkey. A version 4 `ingest_rows_per_s` and a version 5
+#     one are throughput over rows of two different widths.
+#   * `table_bytes`, and by more than the column. Wider rows first, and not
+#     reliably four bytes per row at that: every engine here rounds a record
+#     up to an alignment boundary, so four more bytes of payload can cost
+#     nothing or cost eight. But for MariaDB and AliSQL `table_bytes` is
+#     measured from a `t1.ibd` glob, and in InnoDB file-per-table the .ibd
+#     holds the table's SECONDARY INDEXES too -- so for those two it now
+#     absorbs an entire new B-tree on `ctag` as well, which at scale is of
+#     the order of fifteen bytes per row rather than four. The direction is
+#     the same and the magnitude is not, which is the whole reason this is a
+#     version bump and not a correction a reader could apply by hand.
+#   * `index_bytes`, but only where the scalar column lives inside the thing
+#     being sized -- Valkey, where it is a resident-memory delta across
+#     FT.CREATE and the index now carries a second NUMERIC attribute, and
+#     Percona Search, where it is the size of mongot's Lucene directory and
+#     the index now carries a second filter field. The MySQL family and
+#     pgvector size only the vector structure (MariaDB's `t1#i#*` glob,
+#     AliSQL's `vidx_*.ibd` glob, `pg_relation_size` of pgvector's HNSW
+#     index), which this change does not touch, so their `index_bytes` is
+#     unmoved -- and still not comparable across the bump, because the
+#     version is per-run, as argued above.
+#
+# One thing that moved and is recorded NOWHERE, worth writing down in the
+# block that enumerates what moved: pgvector's new `t1_ctag_idx` is counted
+# by neither figure. `index_bytes` is `pg_relation_size('t1_embedding_idx')`,
+# the HNSW index alone, and `table_bytes` is `pg_table_size('t1')`, which
+# excludes indexes. So the same new structure lands inside `table_bytes` for
+# MariaDB and AliSQL and in no number at all for pgvector. Pre-existing --
+# `t1_tag_idx` was already invisible the same way -- and therefore not a
+# regression this change introduced; it is an asymmetry in what the two
+# sizing methods count, and it is larger now that there are two such indexes
+# rather than one.
+#
+# The filtered numbers move too, and for a reason easy to miss when reading
+# the diff: a version 5 run measured at `column="tag"` is not a re-run of a
+# version 4 filtered measurement. The predicate is the same and the
+# qualifying rows are the same, but the table is wider, pgvector carries a
+# second B-tree and mongot's index carries a second filter path, so the
+# per-query cost is being paid on a different object.
+#
+# WHY A BUMP AND NOT just `extra.filter_column`, which the records will also
+# carry once PR 3's filtered workload lands: the same argument as for
+# `extra.ef_mode` above. A diagnostic lets a reader tell two numbers apart by
+# hand; this constant is what makes the report refuse to put them on one
+# series. Two ingest figures both stamped version 4 -- one from a three-column
+# table and one from a four-column table -- load together with no refusal and
+# land on the same bar chart of rows per second.
+OPS_MEASUREMENT_VERSION = 5
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.

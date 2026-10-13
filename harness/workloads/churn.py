@@ -22,7 +22,7 @@ import numpy
 
 from ..datasets import (Dataset, assign_tags, cached_ground_truth,
                         recall_at_k)
-from ..drivers.base import EngineDriver, IndexSpec
+from ..drivers.base import EngineDriver, IndexSpec, RowAttrs
 from ..metrics.latency import LatencyCollector, Timer
 from ..metrics.records import PHASE_CHURN, Record
 from ..progress import Heartbeat, Progress
@@ -245,8 +245,25 @@ def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, tags,
                 break
             end = min(begin + chunk, total)
             try:
+                # `RowAttrs.coerce` rather than a real pair of columns, and
+                # the limitation is deliberate rather than overlooked. The
+                # mirror means a re-inserted row carries `ctag = tag`, not the
+                # cluster id its vector belongs to, so a `ctag`-filtered
+                # measurement taken AFTER a churn would score the engine
+                # against a ground truth computed from the real clustering.
+                # No run does that today -- `main.py` runs filtered before
+                # churn, deliberately, so that nothing measures a degraded
+                # index -- which is why this is a bounded compromise and not a
+                # live wrong number. The fix needs the real `ctag` values for
+                # `original_ids`, which means a `cached_ctags` call where
+                # `tags` is computed above; T4a and T4b own this file.
+                #
+                # Coercing here rather than relying on the driver to do it
+                # keeps the mirror visible at the call site: every driver
+                # accepts a bare array and would mirror it silently, and a
+                # silent mirror is how this stops being noticed.
                 driver.insert_rows(ids[begin:end], vectors[begin:end],
-                                   tags[begin:end])
+                                   RowAttrs.coerce(tags[begin:end]))
             except Exception as exc:
                 # A write that times out or a connection that dies ends the
                 # re-insertion; it does not end the run. What was written is
