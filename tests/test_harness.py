@@ -174,6 +174,267 @@ class TestLatency:
 
 
 # ---------------------------------------------------------------------------
+# Trimming a measured window to the queries that finished inside it
+# ---------------------------------------------------------------------------
+
+class TestWindowTrimming:
+    """QPS is counted queries over wall time, and the two used to disagree
+    about where the window ended.
+
+    Every client finishes the query it holds when `stop` is set and records
+    it, but the wall clock stops at `stop`. So the numerator included one query
+    per client that the denominator did not cover, and the overstatement is
+    that query over the ones the client did finish:
+    `1 / queries-completed-per-client`, about `latency / window`. The client
+    count cancels, so it is 2.5% over a two-second window of 50 ms queries at
+    any client count from 1 to 32 -- what makes it bite is a slow engine over
+    a short window, not a wide client sweep.
+
+    These tests use synthetic spans with exact instants, so every number below
+    is arithmetic rather than a measurement. The window is [0, 1] throughout.
+    """
+
+    #: A span wholly inside the window, 100 ms long.
+    INSIDE = (0.10, 0.20)
+    #: A span that began inside the window and finished after the cutoff:
+    #: the in-flight query §1.3 is about. Deliberately a full second long, so
+    #: a merge that keeps it cannot help but move the percentiles too.
+    OVERRUNS = (0.90, 1.90)
+    #: A span that began before the window opened, which is what a client that
+    #: passed the barrier late leaves behind.
+    STARTED_EARLY = (-0.30, 0.40)
+
+    def _collector(self, *spans) -> latency.LatencyCollector:
+        collector = latency.LatencyCollector()
+        collector.start()
+        for started, finished in spans:
+            collector.add_span(started, finished)
+        collector.stop()
+        return collector
+
+    def test_the_record_keys_are_the_names_the_report_will_read(self):
+        # Pinned as literals because they are a published part of the record,
+        # not an internal name: a rename here silently renames a field in
+        # every concurrency record. The workload and this test both spell the
+        # key through the constant, so only this assertion notices.
+        assert latency.INFLIGHT_DISCARDED == "inflight_discarded"
+        assert latency.PREWINDOW_DISCARDED == "prewindow_discarded"
+
+    def test_a_query_finishing_after_the_cutoff_is_not_counted(self):
+        collector = self._collector(self.INSIDE, (0.3, 0.4), self.OVERRUNS)
+        merged = latency.merge_collectors(
+            [collector], wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        assert merged["queries_executed"] == 2
+        assert merged["qps"] == pytest.approx(2.0)
+        assert merged[latency.INFLIGHT_DISCARDED] == 1
+        assert merged[latency.PREWINDOW_DISCARDED] == 0
+
+    def test_a_query_finishing_exactly_at_the_cutoff_is_counted(self):
+        # The boundary belongs to the window: `finished > cutoff` drops, not
+        # `>=`. A query that completed at the instant the clock stopped was
+        # paid for inside the window the denominator measures.
+        merged = latency.merge_collectors(
+            [self._collector((0.5, 1.0))],
+            wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        assert merged["queries_executed"] == 1
+        assert merged[latency.INFLIGHT_DISCARDED] == 0
+
+    def test_the_discarded_query_is_gone_from_the_percentiles_too(self):
+        # Not only from the count. The in-flight query is the one that ran
+        # longest -- it is still running -- so leaving its latency in while
+        # dropping it from the count would move p99 by more than the count
+        # error it was fixing.
+        collector = self._collector(self.INSIDE, (0.3, 0.4), self.OVERRUNS)
+        merged = latency.merge_collectors(
+            [collector], wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        # Both kept spans are exactly 100 ms, so every percentile is 100.0 and
+        # the 1,000 ms overrun cannot hide inside a tolerance.
+        assert merged["latency_p99_ms"] == pytest.approx(100.0)
+        assert merged["latency_mean_ms"] == pytest.approx(100.0)
+
+    def test_a_query_that_began_before_the_window_is_not_counted(self):
+        # Should never happen: every client waits on the barrier and the
+        # window opens after it releases. Recording it is what turns "should
+        # never happen" into something the record can be checked against.
+        collector = self._collector(self.STARTED_EARLY, self.INSIDE)
+        merged = latency.merge_collectors(
+            [collector], wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        assert merged["queries_executed"] == 1
+        assert merged[latency.PREWINDOW_DISCARDED] == 1
+        assert merged[latency.INFLIGHT_DISCARDED] == 0
+        # 700 ms long against the survivor's 100 ms, so a merge that counted
+        # it would be visible here even if the count above were right.
+        assert merged["latency_mean_ms"] == pytest.approx(100.0)
+
+    def test_every_span_lands_in_exactly_one_of_the_three_buckets(self):
+        # Kept + discarded == recorded, so neither counter can double-count a
+        # span that both started early and overran, and no span can vanish
+        # without being accounted for in one of the two fields the record
+        # publishes.
+        spans = (self.INSIDE, self.OVERRUNS, self.STARTED_EARLY,
+                 (-0.5, 1.5), (0.0, 1.0))
+        merged = latency.merge_collectors(
+            [self._collector(*spans)],
+            wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        accounted = (merged["queries_executed"]
+                     + merged[latency.INFLIGHT_DISCARDED]
+                     + merged[latency.PREWINDOW_DISCARDED])
+        assert accounted == len(spans)
+        # And the two kept are the two that fit: [0.1, 0.2] and [0.0, 1.0].
+        assert merged["queries_executed"] == 2
+
+        # WHICH bucket, not just how many buckets. The accounting assertion
+        # above is satisfied by either ordering of the two tests inside
+        # `span_disposition`, and `(-0.5, 1.5)` offends at both ends: it
+        # started before the window opened AND outlived the cutoff. The
+        # cutoff is tested first, so it counts as in-flight — 2 in-flight
+        # here, not 1.
+        #
+        # This is diagnostic rather than numeric: the kept set, the QPS and
+        # the percentiles are identical either way. What changes is the one
+        # field whose entire value is being zero. `prewindow_discarded` is
+        # documented to mean "the window's two ends disagree about when it
+        # began", and under the other ordering an ordinary in-flight query
+        # that merely happened to start early raises that alarm. Swapping the
+        # two tests passed every other test in this repository.
+        assert merged[latency.INFLIGHT_DISCARDED] == 2
+        assert merged[latency.PREWINDOW_DISCARDED] == 1
+
+    def test_without_a_cutoff_nothing_is_trimmed(self):
+        # The way back, and what the other three workloads get: they measure
+        # to completion rather than to a deadline, so there is no cutoff to
+        # pass and no span of theirs may be dropped.
+        collector = self._collector(self.INSIDE, self.OVERRUNS,
+                                    self.STARTED_EARLY)
+        merged = latency.merge_collectors([collector], wall_seconds=1.0)
+        assert merged["queries_executed"] == 3
+        assert merged[latency.INFLIGHT_DISCARDED] == 0
+        assert merged[latency.PREWINDOW_DISCARDED] == 0
+
+    def test_a_window_with_nothing_to_trim_is_untouched(self):
+        # The trimmed and untrimmed merges of spans that all fit must agree
+        # exactly, or the cutoff is doing something besides trimming.
+        spans = ((0.0, 0.1), (0.2, 0.35), (0.4, 0.9))
+        trimmed = latency.merge_collectors(
+            [self._collector(*spans)],
+            wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        untrimmed = latency.merge_collectors(
+            [self._collector(*spans)], wall_seconds=1.0)
+        for key in ("queries_executed", "qps", "latency_mean_ms",
+                    "latency_p50_ms", "latency_p95_ms", "latency_p99_ms"):
+            assert trimmed[key] == pytest.approx(untrimmed[key]), key
+
+    def test_durations_recorded_without_a_span_survive_a_cutoff(self):
+        """`add(seconds)` is what the filtered and churn workloads call.
+
+        A duration carries no instants, so there is nothing to compare
+        against a cutoff and the only honest thing to do is keep it. If a
+        cutoff silently dropped spanless samples, passing one would empty
+        those workloads' percentiles rather than trim them.
+        """
+        collector = latency.LatencyCollector()
+        collector.start()
+        for _ in range(4):
+            collector.add(0.25)
+        collector.stop()
+        merged = latency.merge_collectors(
+            [collector], wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        assert merged["queries_executed"] == 4
+        assert merged["latency_mean_ms"] == pytest.approx(250.0)
+        assert merged[latency.INFLIGHT_DISCARDED] == 0
+
+    def test_add_span_and_add_agree_about_the_duration(self):
+        # One quantity, two spellings. `add_span` must not be an independent
+        # path to a different latency.
+        spanned = self._collector((10.5, 10.75))
+        duration = latency.LatencyCollector()
+        duration.start()
+        duration.add(0.25)
+        duration.stop()
+        assert (spanned.stats().mean_ms
+                == pytest.approx(duration.stats().mean_ms))
+        assert spanned.measured_seconds == pytest.approx(0.25)
+
+    def test_warmup_still_counts_spans(self):
+        # The prefix discard is about which queries are measured, not about
+        # how they were recorded, so `add_span` has to honour it exactly as
+        # `add` does -- the concurrency workload passes warmup=0 today, and a
+        # span path that ignored it would make that silently load-bearing.
+        collector = latency.LatencyCollector(warmup=2)
+        collector.start()
+        for started in (0.0, 0.1, 0.2, 0.3):
+            collector.add_span(started, started + 0.05)
+        collector.stop()
+        assert collector.stats().count == 2
+
+    def test_a_window_that_kept_nothing_reports_no_latency_at_all(self):
+        """NaN is not JSON, and this is the path that reaches it.
+
+        `summarize([])` returns NaN for every percentile and `json.dumps`
+        writes that as the bare literal `NaN`: Python's `json.loads` takes it
+        as an extension, the browser's `JSON.parse` throws. Before the window
+        was trimmed the sample set was never empty, because every client
+        completed at least one query; a configuration whose queries outlast
+        the window now keeps nothing.
+        """
+        collector = self._collector((0.5, 1.5), (1.5, 2.5))
+        merged = latency.merge_collectors(
+            [collector], wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        assert merged["queries_executed"] == 0
+        assert merged[latency.INFLIGHT_DISCARDED] == 2
+        for field in ("latency_mean_ms", "latency_p50_ms", "latency_p95_ms",
+                      "latency_p99_ms"):
+            assert merged[field] is None, (field, merged[field])
+        # Zero completions over the window is what was observed, and it both
+        # serialises and plots.
+        assert merged["qps"] == 0.0
+
+    def test_the_null_is_scoped_to_the_merged_window(self):
+        """`summarize` itself is deliberately untouched.
+
+        It predates this window and the build, filtered and churn workloads
+        all reach their percentiles through it. Those loops run to completion,
+        so an empty sample set there means nothing was asked of the engine at
+        all — a different fact from "nothing finished in time", and not one
+        this change has any business relabelling. Pinned because the obvious
+        tidy-up is to move the null down into `summarize` and make all four
+        workloads share it.
+        """
+        assert numpy.isnan(latency.summarize([]).p99_ms)
+        empty = latency.LatencyCollector()
+        empty.start()
+        empty.stop()
+        assert numpy.isnan(empty.stats().p99_ms)
+        assert numpy.isnan(empty.stats().mean_ms)
+
+    def test_trimming_cannot_let_more_work_through_than_the_clients_could_do(
+            self):
+        """Little's law, which is the invariant §1.3 restores.
+
+        Mean latency x QPS is the average number of queries in flight, and a
+        client runs one query at a time, so it cannot exceed the client count.
+        Counting a query that outlived the window breaks that: here two
+        clients each hold a 0.6 s query across the cutoff of a 1 s window, so
+        untrimmed the four queries average 0.55 s at 4 q/s = 2.2 queries in
+        flight across two clients, which no two clients can have done.
+
+        This is the property the workload test pins, where the spans are real
+        and no absolute rate can be asserted. Stated here on exact numbers so
+        that what it means is not left to a measurement.
+        """
+        clients = [self._collector((0.1, 0.6), (0.6, 1.2)),
+                   self._collector((0.2, 0.7), (0.7, 1.3))]
+        trimmed = latency.merge_collectors(
+            clients, wall_seconds=1.0, window_start=0.0, cutoff=1.0)
+        untrimmed = latency.merge_collectors(clients, wall_seconds=1.0)
+        in_flight = trimmed["qps"] * trimmed["latency_mean_ms"] / 1000.0
+        assert in_flight <= len(clients)
+        assert in_flight == pytest.approx(1.0)
+        over = untrimmed["qps"] * untrimmed["latency_mean_ms"] / 1000.0
+        assert over > len(clients), over
+
+
+# ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
 

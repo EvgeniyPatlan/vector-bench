@@ -19,10 +19,13 @@ anything — is calibrated in tests/test_fake_driver.py.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
+import threading
 import time
+import types
 
 import numpy
 import pytest
@@ -31,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness import datasets as ds  # noqa: E402
 from harness.datasets import Dataset  # noqa: E402
-from harness.metrics import records  # noqa: E402
+from harness.metrics import latency, records  # noqa: E402
 from harness.workloads import build as build_workload  # noqa: E402
 from harness.workloads import churn as churn_workload  # noqa: E402
 from harness.workloads import concurrency as concurrency_workload  # noqa: E402
@@ -310,6 +313,367 @@ class TestConcurrencyWorkload:
         assert [r["clients"] for r in written(ctx)] == [1]
 
 
+#: Per-query cost for the window-trimming tests, and the whole reason they can
+#: say anything. The effect being measured is one in-flight query per client,
+#: so it has to be a visible fraction of the window: at the fake's native
+#: ~0.09 ms a two-second window holds twenty thousand queries per client and
+#: one of them is 0.005% -- below every rounding in the record. At 50 ms it is
+#: one in forty.
+TRIM_LATENCY_S = 0.05
+
+#: The spec's configuration for §1.3: eight clients, 50 ms queries, a
+#: two-second window. Kept because that is the configuration the change was
+#: specified against; what is asserted over it is not.
+TRIM_CLIENTS = 8
+TRIM_WINDOW_S = 2.0
+
+#: A query slower than the whole window, which is the only way to reach a
+#: window in which nothing finished. Six times `EMPTY_WINDOW_S` so the outcome
+#: is a property of the arithmetic rather than of how loaded the host is: the
+#: one query a client issues cannot complete before the cutoff however the
+#: scheduler behaves, because `time.sleep` is a floor.
+EMPTY_WINDOW_LATENCY_S = 0.3
+EMPTY_WINDOW_S = 0.05
+
+
+def strict_json_lines(path: str) -> int:
+    """Parse every record in `path` the way a strict JSON parser would.
+
+    `json.dumps` writes a NaN as the bare literal `NaN`, which is not JSON.
+    Python's own `json.loads` accepts it as a documented extension, so a
+    records file full of NaNs reads back perfectly here and in
+    `report/loaders.py` while `JSON.parse` in the browser throws — one
+    consumer silently fine and another broken, which is this repository's
+    signature failure mode. `parse_constant` is the hook CPython calls for
+    exactly the three non-standard literals, so this is the browser's verdict
+    rather than an imitation of it.
+
+    Returns the number of records parsed, so a caller cannot be reassured by
+    an empty file.
+    """
+    def reject(literal: str):
+        raise AssertionError(
+            f"records file contains the non-standard JSON literal "
+            f"{literal!r}, which JSON.parse rejects")
+
+    seen = 0
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                json.loads(line, parse_constant=reject)
+                seen += 1
+    return seen
+
+
+class TestConcurrencyCountsOnlyTheWindow:
+    """After `stop` is set every client finishes the query it is holding and
+    records it, but the wall clock stopped at `stop`.
+
+    So QPS counted one query per client that its own denominator did not
+    cover. The overstatement is that query over the ones the client did
+    finish: `1 / queries-completed-per-client`, which is
+    `inflight_discarded / queries_executed` in the record and about
+    `latency / window`. THE CLIENT COUNT CANCELS -- each client contributes one
+    spurious query and roughly `window / latency` real ones -- so it is the
+    same at 1 client as at 32, measured flat at 2.564% across all six counts
+    of a full sweep. What makes it bite is a slow engine over a short window:
+    0.005% for a 1.4 ms query in a 30-second window, 2.5% for a 50 ms query in
+    two seconds, whatever the concurrency.
+
+    WHAT IS NOT ASSERTED HERE, and why. The specification for this change
+    proposed "QPS within +/-1% of 8 / 0.05 = 160". That assertion is worse
+    than flaky: it passes the bug and fails the fix. 160 q/s assumes a query
+    costs exactly `latency_s`, but `time.sleep` only guarantees a floor, and on
+    this machine a query costs 50.40 ms. Thirty-nine of them fit in two
+    seconds, not forty, so the honest trimmed figure is ~156 q/s -- 2.5% below
+    160 and outside the tolerance. The untrimmed code reports 159.98, because
+    the fortieth query it wrongly counts is precisely what closes the gap.
+    Measured here: trimmed, 155.94-155.98 q/s over nine idle runs and
+    151.86-155.86 over nine at 3x oversubscription; untrimmed, 159.98-159.99
+    over six idle runs. Every trimmed run is outside +/-1% and every untrimmed
+    one is inside it. See
+    `test_queries_in_flight_cannot_exceed_the_client_count` for what is
+    pinned instead.
+    """
+
+    def _run(self, ctx, dataset, driver, clients, duration_s, **kw):
+        concurrency_workload.run(
+            ctx, driver.clone, dataset, index_spec(dataset), ef_search=32,
+            client_counts=(clients,), duration_s=duration_s, warmup=2,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=N_ROWS, **kw)
+        return written(ctx)[-1]
+
+    def _driver(self, dataset):
+        return loaded_driver(dataset, ef_half=64.0, ef_search=32,
+                             latency_s=TRIM_LATENCY_S)
+
+    def test_queries_in_flight_cannot_exceed_the_client_count(self, ctx,
+                                                              dataset):
+        """Little's law, which is the invariant the overstatement broke.
+
+        Mean latency x QPS is the average number of queries in flight over the
+        window, and a client issues one query at a time and waits for it, so
+        that average cannot exceed the client count.
+
+        It is an ALGEBRAIC IDENTITY on trimmed data, not a tendency of this
+        machine: every counted span lies inside the window, and one client's
+        spans cannot overlap because it waits for each query, so each client
+        contributes at most `wall` seconds of query time to a window `wall`
+        seconds long. No absolute rate appears in it and nothing in it assumes
+        the machine finished a particular amount of work, which is why it can
+        be asserted where a QPS figure cannot.
+
+        What load does is narrow the observed margin, not create a failure:
+        the largest value seen was 7.888 of 8 idle and 7.954 of 8 under
+        oversubscription, because a slower query raises the mean faster than it
+        lowers the count. The identity is what makes that safe -- the honest
+        value approaches the bound and provably cannot cross it. An earlier
+        version of this docstring claimed load pushes the value further inside
+        the bound; it does the opposite, and the identity rather than that
+        claim is the reason this assertion cannot flake.
+
+        Counting the in-flight query breaks the identity from the other side:
+        that query is the longest one in the sample (it has not finished yet),
+        and it charges the window with time the window did not contain.
+        Untrimmed this reads 8.072-8.085 queries in flight across eight
+        clients, which eight clients cannot have had.
+
+        The 0.1% slack is for the record's own rounding -- `qps` to two
+        decimals and `latency_mean_ms` to four, 6e-5 relative at these
+        magnitudes -- and never for the measurement, which cannot reach the
+        bound. The untrimmed violation is about 1%, an order of magnitude
+        clear of it.
+        """
+        row = self._run(ctx, dataset, self._driver(dataset),
+                        TRIM_CLIENTS, TRIM_WINDOW_S)
+        # The latency floor really was in force, so "one query per client" is
+        # a visible share of this window rather than a rounding.
+        assert row["latency_p50_ms"] >= TRIM_LATENCY_S * 1000.0
+        assert row["queries_executed"] > 0
+        in_flight = row["qps"] * row["latency_mean_ms"] / 1000.0
+        assert in_flight <= TRIM_CLIENTS * 1.001, (
+            f"{in_flight:.4f} queries in flight across {TRIM_CLIENTS} "
+            f"clients: the window is being credited with work that finished "
+            f"outside it")
+        # And the bound is live rather than vacuously satisfied: eight busy
+        # clients really were nearly always inside a query, so a merge that
+        # dropped far too much would fail here instead.
+        assert in_flight > TRIM_CLIENTS * 0.8, in_flight
+
+    def test_the_record_says_how_many_queries_the_window_cut_off(self, ctx,
+                                                                 dataset):
+        """`extra.inflight_discarded` is exactly one per client, which is a
+        property of the client loop rather than a measurement.
+
+        At most one: a client runs its queries one after another, so only the
+        last one it started can still be running when the window ends. At
+        least one: for a client to contribute none, it would have to complete
+        a query before the cutoff and then read the flag after `set()` landed
+        — a window of a microsecond or two inside a 50.4 ms cycle, and all
+        eight clients would have to manage it at once.
+
+        Asserted as an EQUALITY, not as `1 <= n <= clients`. The range form is
+        satisfied by a merge that trims only the first client's in-flight
+        query, which is a plausible off-by-one over the collector loop and
+        exactly the kind of mutant a range hides. Measured `== clients` in
+        every run of six different client counts, idle and under
+        oversubscription; Little's law and the scored-versus-counted test both
+        kill that mutant too, so this is defence in depth rather than the only
+        line.
+
+        `prewindow_discarded` is the other end of the same window and is zero
+        by construction, because the window opens at the barrier release and no
+        measured query can precede it. It is recorded so that "a client began
+        before the window" stops being an assumption; the unit tests in
+        test_harness.py drive the non-zero case, which no real window produces.
+        """
+        row = self._run(ctx, dataset, self._driver(dataset),
+                        TRIM_CLIENTS, TRIM_WINDOW_S)
+        extra = row["extra"]
+        assert extra["inflight_discarded"] == TRIM_CLIENTS, extra
+        assert extra["prewindow_discarded"] == 0, extra
+
+    def test_trimming_removed_queries_the_untrimmed_merge_counted(
+            self, ctx, dataset, monkeypatch):
+        """The same spans, merged both ways, which is the only form of this
+        claim that does not depend on how fast the machine is.
+
+        An absolute rate cannot be asserted here (see the class docstring) and
+        a before/after comparison across two runs would compare two different
+        windows. Merging one window's real spans with and without the cutoff
+        holds everything else fixed, so the difference is the change and
+        nothing else.
+
+        A short window on purpose: one unfinished query out of three is a
+        third of the count, where over two seconds it is 2.5%. The exact
+        relation below holds at any length; this one just costs 0.3 s.
+        """
+        real_merge = concurrency_workload.merge_collectors
+        both = []
+
+        def merge_twice(collectors, wall_seconds, **kw):
+            trimmed = real_merge(collectors, wall_seconds, **kw)
+            # No cutoff: what the code did before §1.3, over the very same
+            # collectors. `merge_collectors` only reads them.
+            untrimmed = real_merge(collectors, wall_seconds)
+            # A copy, because the workload pops keys out of what it is handed.
+            both.append((dict(trimmed), untrimmed))
+            return trimmed
+
+        monkeypatch.setattr(concurrency_workload, "merge_collectors",
+                            merge_twice)
+        clients = 4
+        row = self._run(ctx, dataset, self._driver(dataset), clients, 0.3)
+        assert len(both) == 1, "one window, one merge"
+        trimmed, untrimmed = both[0]
+
+        dropped = (trimmed[latency.INFLIGHT_DISCARDED]
+                   + trimmed[latency.PREWINDOW_DISCARDED])
+        assert dropped >= 1
+        # Exact, not approximate: the two merges differ by the spans one of
+        # them dropped and by nothing else.
+        assert (untrimmed["queries_executed"] - trimmed["queries_executed"]
+                == dropped)
+        # The overstatement was real and is gone. Strict inequality: the
+        # untrimmed merge divides a larger count by the same wall.
+        assert untrimmed["qps"] > trimmed["qps"]
+        # And it is the record that carries the trimmed figure, not the
+        # discarded one -- the whole point is which number reaches the chart.
+        assert row["qps"] == pytest.approx(trimmed["qps"], rel=1e-3)
+        assert row["queries_executed"] == trimmed["queries_executed"]
+
+    def test_a_window_that_finished_nothing_records_nulls_not_nan(
+            self, ctx, dataset, capsys):
+        """The path this change newly created, and why it is not cosmetic.
+
+        Before the window was trimmed, every client completed at least one
+        query, so the sample set was never empty. Trim it and a configuration
+        whose queries outlast the window keeps nothing — and `summarize([])`
+        returns NaN for every percentile, which `json.dumps` writes as the
+        bare literal `NaN`. That is not JSON: Python's `json.loads` accepts it
+        as an extension and the browser's `JSON.parse` does not, so the report
+        would read the run happily while the web UI threw on it.
+
+        None, not NaN. It serialises as a value every parser accepts, and
+        `report/render.py::_fmt` already renders a missing figure as an
+        em-dash — the convention T1b used for `recall_spread` at one window.
+        Note which shape it takes in the record: `Record.to_dict` drops its
+        own None columns, as `test_none_fields_are_omitted` pins, so an
+        unmeasured percentile is an absent key rather than a null one. Both
+        parse; the assertion below says which it is so the schema is not left
+        to inference.
+
+        And loud as well as empty: a window too short for one query is a
+        profile fault that should not be discovered later from a chart with a
+        gap in it.
+        """
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32,
+                               latency_s=EMPTY_WINDOW_LATENCY_S)
+        # warmup=0 deliberately: at 0.3 s a query, warming up would cost more
+        # than the rest of this file's concurrency tests put together.
+        concurrency_workload.run(
+            ctx, driver.clone, dataset, index_spec(dataset), ef_search=32,
+            client_counts=(1,), duration_s=EMPTY_WINDOW_S, warmup=0,
+            max_queries=concurrency_workload.WHOLE_TEST_SET,
+            indexed_rows=N_ROWS)
+        row = written(ctx)[-1]
+
+        # The window really did finish nothing, and for the stated reason.
+        assert row["queries_executed"] == 0
+        assert row["extra"]["inflight_discarded"] == 1, row["extra"]
+        assert row["extra"]["recall_queries"] == 0
+
+        for field in ("latency_mean_ms", "latency_p50_ms", "latency_p95_ms",
+                      "latency_p99_ms"):
+            assert row.get(field) is None, (field, row.get(field))
+            assert field not in row, (
+                f"{field} was written as a value; an unmeasured column is "
+                f"omitted, like every other None column in a Record")
+
+        # The file a strict parser has to read, over every record in it.
+        assert strict_json_lines(ctx.recorder.path) == 1
+
+        # Zero completions per second is the honest throughput for a window
+        # that completed nothing, and unlike NaN it serialises and plots.
+        assert row["qps"] == 0.0
+
+        err = capsys.readouterr().err
+        assert "NOTHING FINISHED" in err, err
+        # Naming the window length, because the remedy is to raise it.
+        assert str(EMPTY_WINDOW_S) in err, err
+
+    def test_the_window_closes_before_the_stop_flag_is_set(self, ctx, dataset,
+                                                           monkeypatch):
+        """The cutoff is read BEFORE `stop.set()`, not after.
+
+        Unamplified this is unguardable and should not be guarded: setting an
+        `Event` nobody is waiting on costs well under a microsecond against a
+        2-60 second window, and any tolerance able to see that would be
+        asserting on the implementation. Saying "no test can distinguish it"
+        was the wrong conclusion, though — the ORDERING is observable once the
+        cost of setting the flag is made large, and then the evidence is in the
+        record rather than in the source.
+
+        So the stop flag is given a `set()` that takes `SLOW_STOP_S`. During
+        that time the clients are still looping, because none of them has seen
+        the flag yet. Read before `set()`, the cutoff excludes everything they
+        do in that interval and the window stays `duration_s` long. Read after,
+        the window silently absorbs `SLOW_STOP_S` of extra querying — which is
+        §1.3's fault in macroscopic form, a denominator that ends later than
+        the numerator believes.
+
+        Note `inflight_discarded` here is far more than one per client, and
+        that is the amplifier rather than a counter-example: the clients get a
+        whole `SLOW_STOP_S` of querying past the cutoff instead of the
+        microsecond a real `Event` gives them. `test_the_record_says_how_many_
+        queries_the_window_cut_off` pins the real case.
+
+        The shim is scoped to this module's `threading` attribute on purpose.
+        Patching `threading.Event` globally would also slow the `Heartbeat`
+        around the barrier — whose `__exit__` now runs inside the measured
+        window — and inflate the very figure under test.
+        """
+        slow_stop_s = 0.2
+        clients = 4
+        window_s = 0.2
+
+        class _SlowStop(threading.Event):
+            """A stop flag that takes a visible amount of time to set."""
+
+            def set(self) -> None:
+                time.sleep(slow_stop_s)
+                super().set()
+
+        monkeypatch.setattr(
+            concurrency_workload, "threading",
+            types.SimpleNamespace(
+                Event=_SlowStop, Barrier=threading.Barrier,
+                BrokenBarrierError=threading.BrokenBarrierError))
+
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32,
+                               latency_s=0.02)
+        row = self._run(ctx, dataset, driver, clients, window_s)
+
+        # The window the record implies. `queries_executed / qps` is the wall
+        # handed to the merge, because both come out of it. The tolerance is
+        # half the injected delay: 140x the honest excess (the barrier-to-
+        # sleep gap, well under a millisecond) and half the thing being
+        # detected.
+        implied_window = row["queries_executed"] / row["qps"]
+        assert implied_window < window_s + slow_stop_s / 2, (
+            f"the measured window is {implied_window:.4f}s against a "
+            f"requested {window_s}s: it has absorbed the {slow_stop_s}s the "
+            f"stop flag took to set, so its end is being read after the flag "
+            f"rather than before it")
+
+        # And the amplifier worked, so the assertion above was not vacuous:
+        # the clients really did keep querying past the cutoff while the flag
+        # was being set. One query per client would mean the flag went up
+        # instantly and there was no ordering to observe.
+        assert row["extra"]["inflight_discarded"] > clients, row["extra"]
+
+
 #: p(ef) = 98 / (98 + 2) = 0.98 exactly, so the recall these tests compare is
 #: a real measurement of a real error model rather than the 1.0 a perfect fake
 #: returns. An assertion that two 1.0s agree is satisfied by a hardcoded 1.0;
@@ -527,6 +891,46 @@ class TestConcurrencyRecordsRecall:
         assert rows[0]["extra"]["query_reuse"] == 1.0, (
             rows[0]["extra"]["query_reuse"], covered)
         assert rows[0]["queries_executed"] == covered
+
+    def test_the_scored_queries_are_the_counted_queries(self, ctx, wide):
+        """Recall and QPS must be about the same set of queries.
+
+        The window is trimmed to the queries that finished inside it, and the
+        ids a query returned are kept in the same breath as its latency. Trim
+        one without the other and the record reports recall over queries whose
+        timing it refused to count: `queries_executed` comes in BELOW
+        `recall_queries`, and `query_reuse` -- executed over distinct -- drops
+        under 1.0, which reads as a pool reused less than once.
+
+        Four clients inside one incomplete pass, which is the only regime
+        where it is visible: every client is still on its first pass when the
+        window ends, so every client's unfinished query is one whose result
+        was recorded. One client would make the discrepancy a single query;
+        four make it four, and a real sweep reaches thirty-two.
+
+        The sibling test above pins the same equality at one client. This one
+        is here because the per-client factor is what a reader would notice,
+        and because `SHORT_WINDOW_LATENCY_S` is what makes an incomplete pass
+        a property of the code rather than of this machine's speed.
+        """
+        driver = loaded_driver(wide, ef_half=EF_HALF_98,
+                              ef_search=EF_SEARCH_98,
+                              latency_s=SHORT_WINDOW_LATENCY_S)
+        rows = self._run(ctx, wide, driver, (4,), duration_s=0.05)
+        row = rows[0]
+        covered = row["extra"]["recall_queries"]
+        # Inside one pass: nothing was repeated, so "covered" and "executed"
+        # are two counts of the same queries and must agree exactly.
+        assert 0 < covered < N_WIDE_QUERIES, covered
+        assert row["queries_executed"] == covered, (
+            f"{row['queries_executed']} counted against {covered} scored: "
+            f"recall and QPS are describing different query sets")
+        assert row["extra"]["query_reuse"] == 1.0
+        # The queries that were cut off are the reason this could go wrong,
+        # so the record has to show there were some.
+        assert row["extra"]["inflight_discarded"] >= 1, row["extra"]
+        # Recall over the part that ran is still the engine's recall.
+        assert row["recall_at_k"] > 0.9, row["recall_at_k"]
 
     def test_a_recall_that_moves_between_windows_is_reported_as_a_bug(
             self, ctx, wide, capsys):

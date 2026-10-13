@@ -73,6 +73,34 @@ differently under concurrency and that difference is the point.
 
 Reported as: absolute QPS curve, and **scaling efficiency** = `QPS(n) / (n × QPS(1))`.
 
+**Only the queries that finished inside the window are counted.** The window is
+a closed interval: it opens at the instant the clients' barrier releases and
+closes at the instant recorded immediately *before* the stop flag is set — not
+when a client later notices the flag, which is the whole point. QPS is the
+queries completing inside that interval divided by its length. Every client
+finishes the query it is holding when the window closes, so counting those put
+one query per client in the numerator that the denominator never covered.
+
+The relative error is that one query over the ones a client did finish:
+`1 ÷ queries-completed-per-client`, which in record fields is
+`extra.inflight_discarded ÷ queries_executed` and is about **per-query latency ÷
+window length**. The client count cancels — each client contributes one spurious
+query and roughly `window ÷ latency` real ones — so it is the same at 1 client as
+at 32, measured flat at 2.564% across 1, 2, 4, 8, 16 and 32 clients over a
+two-second window of 50 ms queries. What it depends on is a **slow engine over a
+short window**: 0.005% for a 1.4 ms query in a 30-second window, 2.5% for a
+50 ms query in two seconds, whatever the concurrency. The uncorrected figure also
+reported more queries in flight on average than there were clients to hold them,
+which no client count can do. `extra.inflight_discarded` counts the queries
+dropped at the close; `extra.prewindow_discarded` counts those dropped at the
+open, and is zero by construction because the window opens at the barrier release
+and no measured query can precede it, so **a non-zero value there means the
+window's two ends disagree about when it began**. Recall is scored over the same
+trimmed set, so `extra.recall_queries` and `queries_executed` always describe the
+same queries. A window in which nothing finished at all — a configuration whose
+queries outlast `ops.concurrency_duration_s` — records a QPS of 0, no latency
+figures, and says so on stderr while it runs.
+
 **Recall is recorded beside the throughput**, as `recall_at_k` on every
 concurrency record. The sentence above — "a fixed `ef_search` chosen to put all
 engines at comparable recall" — is an intention, and until the ids were kept
@@ -211,7 +239,18 @@ different amounts of the corpus, not two measurements of one quantity, and the
 engines whose caches differ most are exactly the ones the difference moves.
 Concurrency recall also arrives in version 3, but a field that was absent
 becoming populated is new information rather than a changed number and would not
-on its own have earned a bump. The bump invalidates comparison across the other
+on its own have earned a bump. Version 3 also counts only the queries that
+finish inside each concurrency window (§2.3), and that correction is part of what
+version 3 means rather than a fourth version — no run has ever been measured at
+version 3, because the value was introduced and then extended inside the same
+change set, so there is no version 3 figure anywhere for a trimmed one to be
+incomparable with. The magnitude says the same thing from the other side: the
+correction moves a figure by roughly `per-query latency ÷ window length`, which
+at `main`'s 30-second windows and the p50s these engines actually record is
+about 0.005% — well inside the window-to-window spread
+`ops.concurrency_repeats` exists to expose.
+
+The bump invalidates comparison across the other
 ops phases too — build cost, filtered, churn — none of which version 3 changes;
 the version names the harness that wrote the record rather than the phase, which
 is the cost of having one constant instead of four that can each be forgotten.

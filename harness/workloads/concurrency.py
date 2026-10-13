@@ -41,13 +41,16 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence,
+                    Tuple)
 
 import numpy
 
 from ..datasets import Dataset, cached_ground_truth, recall_at_k
 from ..drivers.base import EngineDriver, IndexSpec
-from ..metrics.latency import LatencyCollector, merge_collectors
+from ..metrics.latency import (INFLIGHT_DISCARDED, PREWINDOW_DISCARDED,
+                               LatencyCollector, merge_collectors,
+                               span_disposition)
 from ..metrics.records import PHASE_CONCURRENCY, Record
 from ..progress import Heartbeat
 from .context import RunContext
@@ -66,6 +69,41 @@ WHOLE_TEST_SET = 0
 #: offsets-to-truth mapping is wrong or the index moved underneath the
 #: measurement. Either way the QPS beside it is not what it claims to be.
 RECALL_SPREAD_LIMIT = 0.005
+
+
+class _Answer(NamedTuple):
+    """One query's returned ids, with the span that produced them.
+
+    The ids and the span travel together because the window is trimmed to the
+    queries that finished inside it and recall must be scored over exactly the
+    queries that were counted. Keeping the span beside the ids means the same
+    `span_disposition` call decides both, rather than the latency being
+    trimmed by one rule and the result set by another.
+    """
+
+    ids: List[int]
+    started: float
+    finished: float
+
+
+class _Window(NamedTuple):
+    """One measured window's results.
+
+    A named tuple rather than a bare tuple because `run()` sorts these by
+    throughput, takes the median and then reads four other fields off it: with
+    positional access that is `s[0]` in the sort, `s[2]` in the spread check
+    and a five-way unpack in between, and adding a field means finding all
+    three. `merged` deliberately holds nothing but `Record` columns, so
+    `Record(**merged)` stays valid -- the discard counts belong in `extra` and
+    are therefore carried here instead.
+    """
+
+    qps: float
+    merged: Dict[str, float]
+    recall: Optional[float]
+    recall_queries: int
+    inflight_discarded: int
+    prewindow_discarded: int
 
 
 class _Client(threading.Thread):
@@ -91,8 +129,8 @@ class _Client(threading.Thread):
         self._ready = ready
         self._stop_event = stop
         self.collector = LatencyCollector(warmup=0)
-        #: Query position -> the ids that query returned, first pass only.
-        self.results: Dict[int, List[int]] = {}
+        #: Query position -> that query's answer and span, first pass only.
+        self.results: Dict[int, _Answer] = {}
         self.error: Optional[BaseException] = None
 
     def run(self) -> None:
@@ -130,7 +168,14 @@ class _Client(threading.Thread):
                 q = self._queries[i % n]
                 started = time.perf_counter()
                 ids = driver.query(q, self._k)
-                self.collector.add(time.perf_counter() - started)
+                # Both instants, not the duration: whether this query counts
+                # depends on when it ran. The window ends by setting a flag,
+                # and this client is holding a query when that happens -- a
+                # query that finishes after the wall clock in the denominator
+                # stopped. `merge_collectors` drops it on the strength of
+                # `finished`, so the instant has to survive to the merge.
+                finished = time.perf_counter()
+                self.collector.add_span(started, finished)
                 # Only the first pass over the shard. The window is a fixed
                 # duration, so a fast engine makes thousands of passes and
                 # keeping every result would grow without bound and charge the
@@ -139,11 +184,18 @@ class _Client(threading.Thread):
                 # the memory to one result list per query however long the
                 # window runs.
                 #
-                # After `collector.add`, deliberately: the timer brackets the
-                # query alone, so recording the result cannot be charged to
-                # the latency the record reports.
+                # After `collector.add_span`, deliberately: the timer brackets
+                # the query alone, so recording the result cannot be charged
+                # to the latency the record reports.
+                #
+                # The span is stored with the ids, not just in the collector.
+                # Whether this query's latency counts is decided after the
+                # window closes, and its result has to be decided the same way
+                # -- recall over a query whose timing was discarded would
+                # describe a different set of queries from the QPS beside it.
                 if i < n:
-                    self.results[int(self._offsets[i])] = ids
+                    self.results[int(self._offsets[i])] = _Answer(
+                        ids, started, finished)
                 i += 1
             self.collector.stop()
         except BaseException as exc:  # noqa: BLE001
@@ -233,9 +285,12 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         # tuple rather than being selected by a second indexing expression, so
         # "the recall of the median window" is true by construction and cannot
         # drift into being some other window's recall.
-        samples.sort(key=lambda s: s[0])
-        qps, merged, recall, recall_queries = samples[len(samples) // 2]
-        spread = ((samples[-1][0] - samples[0][0]) / qps * 100.0) if qps else 0.0
+        samples.sort(key=lambda s: s.qps)
+        window = samples[len(samples) // 2]
+        qps, merged, recall = window.qps, window.merged, window.recall
+        recall_queries = window.recall_queries
+        spread = (((samples[-1].qps - samples[0].qps) / qps * 100.0)
+                  if qps else 0.0)
 
         recall_spread = _check_recall_spread(samples, clients)
 
@@ -272,7 +327,7 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 "repeats": len(samples),
                 # Every sample, so a reader can see the spread rather than
                 # trust a summary of it.
-                "qps_samples": [round(q, 1) for q, *_ in samples],
+                "qps_samples": [round(s.qps, 1) for s in samples],
                 "qps_spread_pct": round(spread, 1),
                 # How many distinct queries the recall above covers. A window
                 # too short for one pass over a shard leaves part of the pool
@@ -285,6 +340,22 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 # so a reader can see what the engines' caches were shown.
                 "query_pool": len(queries),
                 "query_reuse": round(reuse, 2) if reuse is not None else None,
+                # Queries the window cut off, and the evidence that both ends
+                # of the window are honest. `inflight_discarded` is at most
+                # one per client -- the one each was holding when the clock
+                # stopped -- and those are the queries the QPS above no longer
+                # counts. Their share of it is
+                # `inflight_discarded / queries_executed`, about
+                # `latency / window` and independent of the client count: a
+                # few per cent for a slow engine over a short window, 0.005%
+                # for a 1.4 ms query over thirty seconds.
+                # `prewindow_discarded` is zero by
+                # construction, because the window opens at the barrier
+                # release and no measured query can precede that, so a number
+                # here means the window's two ends disagree about when it
+                # began.
+                INFLIGHT_DISCARDED: window.inflight_discarded,
+                PREWINDOW_DISCARDED: window.prewindow_discarded,
             },
         ))
 
@@ -340,7 +411,7 @@ def _shard_queries(queries: numpy.ndarray,
             for c in range(clients)]
 
 
-def _window_recall(results: Dict[int, List[int]], truth: numpy.ndarray,
+def _window_recall(results: Dict[int, _Answer], truth: numpy.ndarray,
                    k: int) -> Tuple[Optional[float], int]:
     """Recall over the queries this window actually executed, and how many.
 
@@ -348,13 +419,47 @@ def _window_recall(results: Dict[int, List[int]], truth: numpy.ndarray,
     one pass over a shard leaves the rest of the pool unexecuted, and padding
     those with empty result sets would report a recall collapse that is the
     window's length rather than the engine's quality.
+
+    The caller has already dropped the answers whose queries fell outside the
+    measured window, so this counts the same queries the QPS beside it counts.
     """
     offsets = sorted(results)
     if not offsets:
         return None, 0
-    returned = [results[offset] for offset in offsets]
+    returned = [results[offset].ids for offset in offsets]
     want = truth[numpy.array(offsets, dtype=numpy.int64)]
     return recall_at_k(returned, want, k), len(offsets)
+
+
+def _warn_nothing_finished(clients: int, duration_s: float,
+                           inflight: int) -> None:
+    """Say so when a window completed no query at all.
+
+    Reachable only for a configuration whose queries outlast the window, which
+    no shipped profile sets up — but the record it writes has no latency
+    figures and a QPS of zero, and a gap in a chart discovered a day later is
+    the expensive way to learn that `ops.concurrency_duration_s` was shorter
+    than one query. Loud, and on stderr, like the recall-spread check: this one
+    is a profile fault rather than a framework bug, so it says what to change.
+    """
+    print(
+        f"[concurrency] NOTHING FINISHED: no query completed inside the "
+        f"{duration_s}s window at {clients} client(s); {inflight} were still "
+        f"running when it closed. The record carries a QPS of 0 and no "
+        f"latency figures, because there is nothing to report one over. "
+        f"Raise ops.concurrency_duration_s above this configuration's query "
+        f"latency — a window shorter than a single query cannot measure "
+        f"throughput.",
+        file=sys.stderr, flush=True)
+
+
+def _ms(value: Optional[float]) -> str:
+    """A latency for the operator's line, or `n/a` where there is none.
+
+    None arrives from a window that completed no query, which is the one case
+    with no percentiles to print; formatting it with `:7.3f` raises.
+    """
+    return f"{value:7.3f}ms" if value is not None else f"{'n/a':>7}  "
 
 
 def _print_point(engine: str, clients: int, k: int, qps: float,
@@ -377,14 +482,14 @@ def _print_point(engine: str, clients: int, k: int, qps: float,
         f"[concurrency] {engine:>8} clients={clients:>3} "
         f"qps={qps:11,.1f} "
         f"recall@{k}={recall_text} "
-        f"p50={merged['latency_p50_ms']:7.3f}ms "
-        f"p95={merged['latency_p95_ms']:7.3f}ms "
-        f"p99={merged['latency_p99_ms']:7.3f}ms "
+        f"p50={_ms(merged['latency_p50_ms'])} "
+        f"p95={_ms(merged['latency_p95_ms'])} "
+        f"p99={_ms(merged['latency_p99_ms'])} "
         f"efficiency={eff_text}{spread_text}"
     )
 
 
-def _check_recall_spread(samples: Sequence[Tuple],
+def _check_recall_spread(samples: Sequence[_Window],
                          clients: int) -> Optional[float]:
     """How far the windows' recall figures spread, complaining if too far.
 
@@ -395,7 +500,7 @@ def _check_recall_spread(samples: Sequence[Tuple],
     already draws that distinction for `qps_spread_pct` by consulting
     `repeats`; this keeps the recall field honest without a reader having to.
     """
-    recalls = [s[2] for s in samples if s[2] is not None]
+    recalls = [s.recall for s in samples if s.recall is not None]
     if len(recalls) < 2:
         return None
     spread = max(recalls) - min(recalls)
@@ -419,16 +524,41 @@ def _check_recall_spread(samples: Sequence[Tuple],
 
 def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
                 ef_search: int, index: IndexSpec, warmup: int,
-                duration_s: float, truth: numpy.ndarray):
+                duration_s: float, truth: numpy.ndarray) -> _Window:
     """One warm-up and one measured window.
 
-    Returns `(qps, latency stats, recall, queries recall covers)`. Recall is
-    computed here, inside the window that produced the results, so the median
-    window's throughput and the recall reported beside it are the same
-    window's numbers rather than two independently chosen ones.
+    Recall is computed here, inside the window that produced the results, so
+    the median window's throughput and the recall reported beside it are the
+    same window's numbers rather than two independently chosen ones.
+
+    The window is a closed interval `[wall_start, stop_at]` and only the
+    queries that both began and ended inside it are counted -- in latency, in
+    throughput and in recall. See `merge_collectors` for what counting the
+    query each client was still holding did to the QPS.
     """
     shards = _shard_queries(queries, clients)
-    ready = threading.Barrier(clients + 1)
+
+    # The instant the window opens, read by the barrier itself.
+    #
+    # NOT `perf_counter()` after `ready.wait()` returns in this thread, which
+    # is the obvious place and is wrong. A barrier releases every party at
+    # once, so a client can issue its first query before this thread is next
+    # scheduled to read the clock — with eight clients on one GIL, six of them
+    # did. Those queries then look as though they began before the window, and
+    # dropping them takes the first query of each client out of the window's
+    # recall coverage: `extra.recall_queries` came in at 198 of a 200-query
+    # pool however long the window ran, because no duration can change what
+    # happened at its start.
+    #
+    # `Barrier(action=...)` runs in the last party to arrive, after all of them
+    # are waiting and before any is released, so this reading precedes every
+    # measured query by construction. It is also the honest start: from the
+    # release onwards the clients are querying, so the time this thread spends
+    # getting back to `time.sleep` is time the window contains and its queries
+    # are counted in.
+    opened: List[float] = []
+    ready = threading.Barrier(
+        clients + 1, action=lambda: opened.append(time.perf_counter()))
     stop = threading.Event()
 
     workers = [
@@ -450,10 +580,16 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
         ready.abort()
         raise RuntimeError("a client failed during warm-up")
 
-    wall_start = time.perf_counter()
+    wall_start = opened[0]
     time.sleep(duration_s)
+    # The stop instant, read BEFORE the flag is set and used as both the
+    # denominator's end and the numerator's cutoff. Those were different
+    # instants until this was recorded: the wall ended here, while every
+    # client went on to finish the query it was holding and record it, so QPS
+    # counted up to one query per client that its own wall did not cover.
+    stop_at = time.perf_counter()
     stop.set()
-    wall = time.perf_counter() - wall_start
+    wall = stop_at - wall_start
 
     for w in workers:
         w.join(timeout=120)
@@ -464,14 +600,34 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
             f"{len(failures)} of {clients} clients failed; "
             f"first error: {failures[0]}")
 
-    merged = merge_collectors([w.collector for w in workers], wall)
+    merged = merge_collectors([w.collector for w in workers], wall,
+                              cutoff=stop_at, window_start=wall_start)
+    if not merged["queries_executed"]:
+        _warn_nothing_finished(clients, duration_s, merged[INFLIGHT_DISCARDED])
 
     # One dict across every client. The shards are disjoint and the offsets
     # are absolute positions, so no two clients can write the same key and the
     # merge cannot lose a result.
-    results: Dict[int, List[int]] = {}
+    #
+    # Trimmed by the same predicate and the same window as the latencies, so
+    # the recall reported beside this window's QPS is over the queries that
+    # QPS counted. Letting the two diverge puts `queries_executed` below
+    # `extra.recall_queries` for any window inside its first pass, and
+    # `extra.query_reuse` -- executed over distinct -- below 1.0 for a window
+    # in which nothing was repeated.
+    results: Dict[int, _Answer] = {}
     for w in workers:
-        results.update(w.results)
+        for offset, answer in w.results.items():
+            if span_disposition(answer.started, answer.finished,
+                                wall_start, stop_at) is None:
+                results[offset] = answer
     recall, recall_queries = _window_recall(results, truth, k)
 
-    return merged.pop("qps"), merged, recall, recall_queries
+    return _Window(
+        qps=merged.pop("qps"),
+        inflight_discarded=merged.pop(INFLIGHT_DISCARDED),
+        prewindow_discarded=merged.pop(PREWINDOW_DISCARDED),
+        merged=merged,
+        recall=recall,
+        recall_queries=recall_queries,
+    )

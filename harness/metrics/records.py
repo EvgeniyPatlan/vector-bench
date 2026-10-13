@@ -67,6 +67,12 @@ SCHEMA_VERSION = 1
 # earned a bump — a field that was None is now populated, and nothing a
 # version 2 reader already trusted moves. The pool is what earned it.
 #
+# Version 3 ALSO counts only the queries that finish inside each concurrency
+# window, which sits inside this version rather than earning a fourth one
+# because no run has ever been measured at version 3 — the value was
+# introduced and then extended inside one change set, so there is no version 3
+# figure anywhere for a trimmed one to be incomparable with.
+#
 # The cost this scheme knowingly pays: the bump invalidates comparison across
 # every ops phase, including build cost and churn, which this change does not
 # touch. The version is per-run, not per-phase, because a record names the
