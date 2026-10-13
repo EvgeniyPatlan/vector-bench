@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 # Allow running as `python3 /opt/vb-harness/main.py` as well as `-m harness.main`.
 if __package__ in (None, ""):  # pragma: no cover
@@ -28,12 +28,34 @@ from .drivers.base import ConnectionSpec, IndexSpec  # noqa: E402
 from .drivers.postgres import get_driver  # noqa: E402
 from .metrics.records import Recorder  # noqa: E402
 from .workloads import build as build_workload  # noqa: E402
+from .workloads import calibrate as calibrate_workload  # noqa: E402
 from .workloads import churn as churn_workload  # noqa: E402
 from .workloads import concurrency as concurrency_workload  # noqa: E402
 from .workloads import filtered as filtered_workload  # noqa: E402
 from .workloads.context import RunContext  # noqa: E402
 
 ALL_WORKLOADS = ("build", "concurrency", "filtered", "churn")
+
+
+def _should_calibrate(ef_mode: str, workloads: Sequence[str]) -> bool:
+    """Whether to sweep for an ef_search before measuring.
+
+    Two conditions, and the second is the one worth stating: the sweep exists
+    to choose the ef that concurrency, filtered and churn are measured at, so a
+    run that measures none of them would pay up to twelve grid points of
+    queries and then discard the answer. `--workloads build` is a real
+    invocation: this parser accepts any subset of ALL_WORKLOADS, and a run that
+    only wants ingest and index-build cost asks for exactly that one.
+
+    A narrowing of PR 2 §2.2.2, which says to calibrate whenever the mode is
+    calibrated. No profile in the repo selects a build-only ops phase today, so
+    nothing changes for any configured run; what it buys is that the cheapest
+    possible ops invocation does not silently acquire the most expensive new
+    cost in this change.
+    """
+    return (ef_mode == calibrate_workload.EF_MODE_CALIBRATED
+            and any(w in workloads
+                    for w in calibrate_workload.CALIBRATED_WORKLOADS))
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -68,6 +90,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--m", type=int, required=True)
     p.add_argument("--ef-construction", type=int, default=None)
     p.add_argument("--ef-search", type=int, default=100)
+    # The ef policy. `calibrated` is the default because a shared literal
+    # ef_search is not a shared amount of work: the knob is mhnsw_ef_search,
+    # VIDX's equivalent, hnsw.ef_search, numCandidates and EF_RUNTIME, and two
+    # of these engines sit at recall 0.98 and 0.80 at 100. `fixed` keeps
+    # --ef-search verbatim, which is what every run before this did.
+    p.add_argument("--ef-mode", default=calibrate_workload.EF_MODE_CALIBRATED,
+                   choices=calibrate_workload.EF_MODES,
+                   help="calibrated (default): sweep --ef-grid and measure at "
+                        "the smallest ef reaching --target-recall; fixed: "
+                        "measure at --ef-search")
+    p.add_argument("--target-recall", type=float,
+                   default=calibrate_workload.DEFAULT_TARGET_RECALL,
+                   help="recall@k the calibration sweep aims for")
+    p.add_argument("--ef-grid",
+                   default=",".join(str(ef) for ef in
+                                    calibrate_workload.DEFAULT_EF_GRID),
+                   help="comma-separated ef_search values the calibration "
+                        "sweep measures, in any order")
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--storage-engine", default="InnoDB")
     p.add_argument("--build-mode", default="post", choices=("post", "incremental"))
@@ -170,7 +210,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     def driver_factory():
         return get_driver(args.engine, spec, args.driver)
 
-    recorder = Recorder(args.output)
+    # The mode is known now and is true of every record this run writes; the
+    # target and the status are not known until the sweep has run, and are
+    # declared afterwards. See `Recorder.declare_run_extra`.
+    recorder = Recorder(args.output, run_extra={"ef_mode": args.ef_mode})
     ctx = RunContext(
         run_id=args.run_id,
         resource_pass=args.resource_pass,
@@ -221,10 +264,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 file=sys.stderr,
             )
 
+        # Which ef_search everything below is measured at. In fixed mode it is
+        # the profile's literal, exactly as before this existed; in calibrated
+        # mode the sweep replaces it with the smallest ef reaching the target,
+        # so the engines downstream are compared at equal answer quality
+        # instead of at equal knob setting.
+        ef_search = args.ef_search
+        if _should_calibrate(args.ef_mode, workloads):
+            calibration = calibrate_workload.run(
+                ctx, driver, dataset, index,
+                ef_grid=_ints(args.ef_grid),
+                target_recall=args.target_recall,
+                max_queries=args.max_queries,
+                indexed_rows=indexed_rows,
+            )
+            ef_search = calibration.ef_search
+            # Stamped onto every record written from here on, including the
+            # three workloads' own. A concurrency figure at a calibrated ef and
+            # one at a literal are different quantities and the record has to
+            # say which it is.
+            recorder.declare_run_extra(
+                **calibrate_workload.status_extra(args.ef_mode, calibration))
+
         if "concurrency" in workloads:
             concurrency_workload.run(
                 ctx, driver_factory, dataset, index,
-                ef_search=args.ef_search,
+                ef_search=ef_search,
                 client_counts=_ints(args.client_counts),
                 duration_s=args.concurrency_duration,
                 max_queries=args.concurrency_queries,
@@ -232,10 +297,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 indexed_rows=indexed_rows,
             )
 
+        # The calibrated *unfiltered* ef, not one calibrated per selectivity.
+        # Re-calibrating here would hide exactly what this workload exists to
+        # show: that a scalar predicate costs recall or speed, which it cannot
+        # do if the ef is raised until it does not. See docs/05-methodology.md.
         if "filtered" in workloads:
             filtered_workload.run(
                 ctx, driver, dataset, index,
-                ef_search=args.ef_search,
+                ef_search=ef_search,
                 selectivities=_floats(args.selectivities),
                 max_queries=args.max_queries,
                 iterative_scan=args.iterative_scan,
@@ -247,7 +316,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if "churn" in workloads:
             churn_workload.run(
                 ctx, driver, dataset, index,
-                ef_search=args.ef_search,
+                ef_search=ef_search,
                 fractions=_floats(args.churn_fractions),
                 max_queries=args.max_queries,
                 indexed_rows=indexed_rows,
