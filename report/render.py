@@ -386,13 +386,45 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         # Build mode and pass are what tell these apart. pgvector is measured
         # in two build modes across two passes, so four real measurements
         # rendered as the same row four times and read as a rendering fault.
+        # The column joined them in PR 3 for the same reason: `tag` at 10% and
+        # `ctag` at 10.85% otherwise differ only by a selectivity a reader
+        # cannot attribute to a predicate.
         rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
                  c.get("resource_pass") or "—", c.get("build_mode") or "—",
-                 f"{(c.get('selectivity') or 0):.0%}", str(c.get("queries", "—"))]
+                 c.get("filter_column") or "tag",
+                 f"{(c.get('selectivity') or 0):.2%}",
+                 str(c.get("queries", "—"))]
                 for c in summary["short_result_cases"][:30]]
         parts.append(_md_table(
-            ["Engine", "Dataset", "Pass", "Build mode", "Selectivity",
-             "Queries short of k"], rows))
+            ["Engine", "Dataset", "Pass", "Build mode", "Column",
+             "Selectivity", "Queries short of k"], rows))
+
+    if summary.get("time_bounded_points"):
+        parts.append(
+            "\n### Filtered points the time budget stopped\n\n"
+            "`ops.filtered_budget_s` caps each (column, selectivity, "
+            "iterative-scan mode) point. These points spent it before "
+            "answering every planned query, so their recall and latency are "
+            "computed over the queries that finished and carry that sample's "
+            "variance rather than the full query set's. **This is a finding "
+            "about the configuration, not a harness fault** — a point that "
+            "cannot finish 500 queries in five minutes is running below 1.7 "
+            "QPS, which is itself the measurement. Points marked ✕ completed "
+            "fewer than 50 queries and are drawn greyed with a cross on the "
+            "filtered chart; □ points completed at least 50.\n"
+        )
+        rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+                 c.get("resource_pass") or "—", c.get("build_mode") or "—",
+                 c.get("filter_column") or "tag",
+                 f"{(c.get('selectivity') or 0):.2%}",
+                 f"{c.get('queries_executed', '—')}/"
+                 f"{c.get('queries_planned', '—')}",
+                 f"{c.get('budget_s', '—')}",
+                 "✕ under 50" if c.get("insufficient_sample") else "□"]
+                for c in summary["time_bounded_points"][:30]]
+        parts.append(_md_table(
+            ["Engine", "Dataset", "Pass", "Build mode", "Column",
+             "Selectivity", "Queries done", "Budget (s)", "Sample"], rows))
 
     if warnings:
         parts.append("\n### Environment warnings\n\n")
@@ -1184,28 +1216,100 @@ def _concurrency_notes(summary: Dict[str, Any]) -> str:
 
 
 def _filtered_table(summary: Dict[str, Any]) -> str:
+    """One row per (engine, dataset, ops unit, column, selectivity, mode).
+
+    **Pass, M and build mode are columns because the ops phase loops them.**
+    `_run_unit` iterates `m_values x build_modes x storage_engines` inside each
+    resource pass, and every pass through it reloads the corpus, rebuilds the
+    index and writes its own full column x selectivity grid. Without those
+    columns `full` gives mariadb three indistinguishable rows per (column,
+    selectivity) and pgvector six -- verbatim the "four real measurements
+    rendered as the same row four times and read as a rendering fault" that
+    the short-results block in Validity cites as its own reason for carrying
+    them. They are rendered unconditionally rather than only when they vary,
+    which is what that block does: a column that appears and disappears is a
+    second thing for a reader to notice.
+
+    Selectivity is printed to two decimal places, not zero. `tag` at a nominal
+    1% delivers 1.00% and `ctag` delivers 1.90% on the 2,000-row fixture --
+    and up to 4.96% on a 100,000-row one depending only on the clustering seed
+    -- so `{:.0%}` renders both as "2%" or both as "1%" and erases the
+    difference the second column exists to show. The share here is counted,
+    not requested: `nominal` is beside it so a reader can see both.
+
+    The near_pass / near_fail columns are the heart of PR 3 §3.3 item 3. A
+    query whose true unfiltered nearest neighbour passes the filter has its
+    answer inside the candidate list the engine was going to walk anyway; one
+    whose nearest neighbour fails has to keep looking. For `tag` the two
+    groups track the selectivity and the recalls are close; for `ctag` the
+    near_fail group is where post-filtering collapses. A dash means the group
+    was empty, which is a real state and not a missing measurement -- `tag` at
+    1% put zero of fifty queries in near_pass, measured, because a uniform 1%
+    of rows contains a query's nearest neighbour about 1% of the time.
+    """
     rows = []
     for r in sorted(summary.get("filtered", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("resource_pass") or "",
+                                   # `or 0`, not `str()`: as text, M 8/16/32
+                                   # sorts 16, 32, 8. `full` sweeps exactly
+                                   # that grid, and `_build_table` in this
+                                   # same file already does it this way.
+                                   r.get("m") or 0,
+                                   r.get("build_mode") or "",
                                    r.get("storage_engine") or "",
+                                   _filter_column(r),
                                    r.get("selectivity") or 0)):
         extra = r.get("extra") or {}
+        nominal = extra.get("nominal_selectivity")
+        executed, planned = r.get("queries_executed"), extra.get("queries_planned")
+        queries = _fmt(executed, 0) if executed is not None else "—"
+        if planned and executed is not None and executed < planned:
+            queries = f"{executed:,}/{planned:,}"
+            if extra.get("insufficient_sample"):
+                queries += " ✕"
+            elif extra.get("time_bounded"):
+                queries += " □"
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            r.get("resource_pass") or "—",
+            _fmt(r.get("m"), 0),
+            r.get("build_mode") or "—",
             _storage(r),
-            f"{(r.get('selectivity') or 0):.0%}",
+            _filter_column(r),
+            f"{(r.get('selectivity') or 0):.2%}",
+            "—" if nominal is None else f"{nominal:.0%}",
             _fmt(r.get("recall_at_k"), 4),
+            _fmt(extra.get("recall_near_pass"), 4),
+            _fmt(extra.get("recall_near_fail"), 4),
+            f"{extra.get('near_pass_queries', '—')}/"
+            f"{extra.get('near_fail_queries', '—')}",
             _fmt(r.get("qps"), 0),
             _fmt(r.get("latency_p99_ms"), 3),
             "yes" if r.get("vector_index_used") else "no",
             str(extra.get("short_result_queries", 0)),
+            queries,
             extra.get("iterative_scan") or "—",
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Selectivity", "Recall@k", "QPS",
-         "p99 (ms)", "Index used", "Short results", "Iterative scan"],
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Column",
+         "Selectivity", "Nominal", "Recall@k", "Recall near_pass",
+         "Recall near_fail", "pass/fail n", "QPS", "p99 (ms)", "Index used",
+         "Short results", "Queries", "Iterative scan"],
         rows,
     )
+
+
+def _filter_column(record: Dict[str, Any]) -> str:
+    """The filter column a filtered record measured.
+
+    Absence means `tag`: every filtered record written before PR 3 had one
+    column and it was `tag`. Imported from `report.generate` rather than
+    re-spelled, so the renderer and the summariser cannot disagree about what
+    an archived record measured.
+    """
+    from report.generate import filter_column
+    return filter_column(record)
 
 
 def _filter_strategy_table(summary: Dict[str, Any]) -> str:
@@ -1222,24 +1326,52 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
     strategies = summary.get("filter_strategies") or []
     if not strategies:
         return ""
+    # The column is part of the key, so it has to be part of the row: the
+    # ratio is derived from the narrowest and widest point of ONE column's
+    # curve, and two rows for one engine are two predicates rather than a
+    # repeated measurement.
     parts = [
         "\n#### What each engine actually did\n\n",
         "Derived from how median latency moves as the predicate narrows, not "
         "from what the engine documents. **A pre-filter gets faster** — fewer "
         "qualifying vectors is less work. Anything that applies the predicate "
         "during or after the graph walk gets slower, because it has to travel "
-        "further to find k survivors.\n",
+        "further to find k survivors.\n\n"
+        "**One row per filter column per ops unit, and they can disagree.** "
+        "The ratio is taken across the two ends of ONE curve — one column, "
+        "one iterative-scan mode, one resource pass, and one (M, build mode, "
+        "storage engine) unit. Every one of those changes the answer, and the "
+        "ops phase loops the last three: pgvector's `post` and `incremental` "
+        "builds are different indexes, MariaDB's InnoDB and MyISAM are "
+        "different storage, and the two resource passes give the engine "
+        "different memory and cpusets. Pooling any of them divides two "
+        "latencies that never ran together and publishes the result as a "
+        "verdict about an engine — measured on one engine and one column over "
+        "two build modes, 0.20x `pre-filter` and 1.00x `post-filter, abandons "
+        "the query` separately, against a pooled 50.0x `post-filter, "
+        "exhaustive` that neither build mode produced. An engine that "
+        "pre-filters on an indexed `tag` predicate and walks the graph for a "
+        "`ctag` one is a real and interesting outcome, which a single row "
+        "could not express.\n",
     ]
     rows = [[_label(s["engine"]),
-             f"{s['wide']:.0%} → {s['narrow']:.0%}",
+             s.get("resource_pass") or "—",
+             _fmt(s.get("m"), 0),
+             s.get("build_mode") or "—",
+             s.get("storage_engine") or "—",
+             s.get("filter_column") or "tag",
+             f"{s['wide']:.2%} → {s['narrow']:.2%}",
              f"{s['wide_p50']:,.1f} → {s['narrow_p50']:,.1f} ms",
              f"{s['ratio']}x",
              _fmt(s.get("narrow_recall"), 4),
+             s.get("iterative_scan") or "—",
              s["observed"]]
             for s in strategies]
     parts.append(_md_table(
-        ["Engine", "Selectivity", "Median latency", "Change",
-         "Recall at the narrow end", "Observed strategy"], rows))
+        ["Engine", "Pass", "M", "Build mode", "Storage", "Column",
+         "Selectivity", "Median latency", "Change",
+         "Recall at the narrow end", "Iterative scan", "Observed strategy"],
+        rows))
     return "".join(parts)
 
 

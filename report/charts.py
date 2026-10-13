@@ -823,11 +823,48 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 # Filtered search
 # ---------------------------------------------------------------------------
 
+#: Grey, not an engine colour: a truncated point is a property of the
+#: harness's budget rather than of the engine, and colouring it with the
+#: engine's own palette entry would read as another measurement of it.
+TIME_BOUNDED_GREY = "#8a8a8a"
+
+#: What each filter column is, for the chart title. A reader who sees two
+#: filtered charts needs to know why in the title and not in §2.4.
+_COLUMN_BLURB = {
+    "tag": "row_id % 100, independent of the vector space",
+    "ctag": "cluster id, correlated with the vector space",
+}
+
+
 def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
-             stem: str) -> Optional[Dict[str, str]]:
-    """Filtered recall and QPS against selectivity."""
+             stem: str, column: Optional[str] = None
+             ) -> Optional[Dict[str, str]]:
+    """Filtered recall and QPS against selectivity, for one filter column.
+
+    `column` is PR 3's "a column selector (or two charts)" done as two charts,
+    which is the option that needs no JavaScript in a report that is also
+    rendered to Markdown. `generate.py` calls this once per column present and
+    names the files `filtered-tag-<dataset>` and `filtered-ctag-<dataset>`,
+    both of which `render.py` picks up through its existing
+    `figures("filtered-")` prefix.
+
+    Drawing both columns on one pair of axes is what the previous version did
+    by omission, and it is worse than it sounds: the x axis is the fraction of
+    rows passing the filter, so a `tag` point at 0.0100 and a `ctag` point at
+    0.0190 -- the share a nominal 1% actually delivers -- land at different x
+    for the same request, and one line through both reads as an engine whose
+    recall moved between two selectivities when it is two predicates.
+
+    `column=None` plots every filtered record regardless, which is what an
+    archived run needs: nothing written before PR 3 carries
+    `extra.filter_column` at all.
+    """
     plotted_records = [r for r in records if r.get("dataset") == dataset
                        and r.get("selectivity") is not None]
+    if column is not None:
+        from .generate import filter_column
+        plotted_records = [r for r in plotted_records
+                           if filter_column(r) == column]
     if not plotted_records:
         return None
     by_series, labels, storages, degrees = _grouped(plotted_records)
@@ -859,22 +896,60 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
 
-        # An engine returning fewer than k rows is a real behaviour, not noise —
-        # mark it so a high-looking recall is not read as unqualified success.
+        # The near_pass / near_fail split, on the recall panel only. A query
+        # whose true unfiltered nearest neighbour passes the filter has its
+        # best answer inside the candidate list the engine was going to walk
+        # anyway; one whose nearest neighbour fails has to keep looking, and
+        # that is where post-filtering gives up. Drawn as a thin band between
+        # the two rather than two more lines: the headline is still the
+        # overall recall, and the gap is the finding.
+        if any((r.get("extra") or {}).get("recall_near_fail") is not None
+               for r in rows):
+            band_sel, lo, hi = [], [], []
+            for r in rows:
+                extra = r.get("extra") or {}
+                a, b = extra.get("recall_near_fail"), extra.get("recall_near_pass")
+                if a is None or b is None:
+                    continue
+                band_sel.append(r["selectivity"])
+                lo.append(min(a, b))
+                hi.append(max(a, b))
+            if band_sel:
+                axes[0].fill_between(band_sel, lo, hi, color=style["color"],
+                                     alpha=0.13, linewidth=0, zorder=1)
+
         for r in rows:
-            if (r.get("extra") or {}).get("returned_fewer_than_k"):
+            extra = r.get("extra") or {}
+            # An engine returning fewer than k rows is a real behaviour, not
+            # noise — mark it so a high-looking recall is not read as
+            # unqualified success.
+            if extra.get("returned_fewer_than_k"):
                 axes[0].scatter([r["selectivity"]], [r.get("recall_at_k")],
                                 s=140, facecolors="none",
                                 edgecolors=style["color"], linewidths=1.6, zorder=5)
+            # A point the budget stopped early, greyed as PR 3 asks. Its
+            # recall is a mean over however many queries finished, so it
+            # carries variance the other points do not; `insufficient_sample`
+            # (under 50 queries) gets the heavier mark of the two.
+            if extra.get("time_bounded"):
+                heavy = bool(extra.get("insufficient_sample"))
+                axes[0].scatter([r["selectivity"]], [r.get("recall_at_k")],
+                                s=190 if heavy else 150, marker="X" if heavy else "s",
+                                facecolors="none", edgecolors=TIME_BOUNDED_GREY,
+                                linewidths=2.0 if heavy else 1.3, zorder=6)
 
     axes[0].set_ylim(-0.02, 1.02)
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=10,
                    loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    titled = f"Filtered (hybrid) search — {dataset}"
+    if column is not None:
+        titled += f" — {column} ({_COLUMN_BLURB.get(column, column)})"
     fig.suptitle(
-        f"Filtered (hybrid) search — {dataset}   "
-        f"○ = returned fewer than k results", fontsize=12, y=1.14
+        f"{titled}\n○ = returned fewer than k results   "
+        f"□ = stopped by the time budget   ✕ = under 50 queries   "
+        f"band = near_pass vs near_fail recall", fontsize=11, y=1.18
     )
     fig.tight_layout()
     return _save(fig, out_dir, stem)

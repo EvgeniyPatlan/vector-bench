@@ -215,11 +215,15 @@ class TestTotalHoursStillMeansIngest:
     def test_long_run_is_still_the_ingest_warning(self):
         """The warning text is about M values reloading the corpus, so the flag
         that triggers it stays keyed on ingest. pgvector alone is 0.68 h of
-        loading and 4.88 h of worst-case run time, and the M-reload warning
-        would be the wrong thing to print about it."""
+        loading and 7.28 h of worst-case run time, and the M-reload warning
+        would be the wrong thing to print about it.
+
+        The worst case grew in T3c -- the filtered budget turned a term with
+        no ceiling into one with a real one -- and `long_run` did not move,
+        which is the property being pinned."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.68
-        assert e["worst_case_total_hours"] == 5.28
+        assert e["worst_case_total_hours"] == 7.28
         assert e["long_run"] is False
 
 
@@ -358,14 +362,25 @@ class TestTheChurnFractionsAreCumulative:
 
 
 class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
-    """Filtered search runs `selectivities x max_queries` queries per ops unit,
-    over the one iterative-scan mode the run pins. The shape is exact; the
-    duration is not, because no QPS has been measured and nothing caps the
-    loop. Both facts are carried by the term so the output does not charge for
-    the cost and disclaim it at the same time.
+    """Filtered search runs `columns x selectivities x max_queries` queries per
+    ops unit, over the one iterative-scan mode the run pins. The shape is
+    exact and so, since T3c, is the ceiling: `ops.filtered_budget_s` caps
+    every point and the workload stops when it is spent. The *typical*
+    duration is still unknown, because no QPS has been measured, and the term
+    carries both facts so the output does not charge for the cost and disclaim
+    it at the same time.
 
-    `main`: 2 selectivities x 500 queries = 1,000 queries per ops unit, over
-    the one iterative-scan mode the run pins.
+    Two columns, not one: `harness/workloads/filtered.py` measures `tag` and
+    `ctag` by default because `build` loads both, so the point count doubled
+    in T3c and this term has to double with it.
+
+    One mode: `cli.py:_ops_iterative_scan` pins the first declared
+    `ops.pgvector_iterative_scan` value, so a `* modes` factor could only ever
+    be `* 1` and is deliberately absent from the arithmetic. See
+    `_filtered_search`.
+
+    `main`: 2 columns x 3 selectivities x 500 queries = 3,000 queries per ops
+    unit, capped at 300 s a point.
     """
 
     PROFILE = {"name": "t", "ops": {"enabled": True, "workloads": ["filtered"],
@@ -379,36 +394,76 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
 
     def test_the_shape_is_stated_even_though_the_duration_is_not(self):
         t = self._term()
-        assert "2 selectivities x 500 queries = 1,000 queries" in t["basis"]
+        assert ("2 filter column(s) x 2 selectivities x 500 queries "
+                "= 2,000 queries") in t["basis"]
         assert "one iterative-scan mode" in t["basis"]
-        assert "1,000 queries per ops unit" in t["basis"]
+        # Anchored: "2,000 queries per ops unit" is a substring of
+        # "12,000 queries per ops unit".
+        assert "= 2,000 queries per ops unit" in t["basis"]
+        # The typical figure is still the thing no cap can supply.
+        assert "at a rate nothing here has measured" in t["basis"]
 
-    def test_an_unmeasurable_cost_is_flagged_not_scored_zero(self):
+    def test_an_unmeasurable_typical_is_flagged_not_scored_zero(self):
+        """The typical figure, which a cap cannot supply.
+
+        `bounded` is True and `typical_hours` is 0.0 at once, and that pair is
+        the honest state rather than a contradiction: the budget says what the
+        work cannot exceed, and nothing here says what it will actually take.
+        The same split `_churn_reinsert` keeps, for the same reason --
+        collapsing them there would have hidden two lost runs.
+        """
         t = self._term()
-        assert t["quantified"] is False
-        assert t["bounded"] is False
-        assert (t["typical_hours"], t["worst_hours"]) == (0.0, 0.0)
+        assert t["typical_hours"] == 0.0
+        # 4 points x 300 s = 1,200 s = 0.33 h, which the budget guarantees.
+        assert t["worst_hours"] == 0.33
+        assert t["bounded"] is True
+        # `quantified` reads off the worst case, so a real ceiling makes it
+        # True even while the typical figure is unknown.
+        assert t["quantified"] is True
 
-    def test_it_makes_the_run_worst_case_stop_claiming_to_be_a_ceiling(self):
+    def test_it_no_longer_stops_the_run_worst_case_being_a_ceiling(self):
+        """The inverse of what this asserted before T3c, and the reason the
+        budget was worth building.
+
+        `query_worst_case_is_a_ceiling` is an `all()` over the terms, and
+        filtered search was the single term holding it open: every configured
+        profile printed "not yet a ceiling" about the one number the "a run
+        longer than its printed estimate is a bug" convention refers to. The
+        budget closes it.
+        """
         e = estimate_load_hours(self.PROFILE, ["mariadb"],
                                 ["glove-100-angular"], ["normalized"], ["ops"])
-        assert e["query_worst_case_is_a_ceiling"] is False
+        assert e["query_worst_case_is_a_ceiling"] is True
 
-    def test_a_budget_key_alone_buys_no_ceiling(self):
-        """`ops.filtered_budget_s` exists nowhere but in a profile a reader
-        might write: not in ops_pass.harness_args, not in harness/main.py, not
-        in filtered.py. Honouring it here would print a concrete ceiling, flip
-        query_worst_case_is_a_ceiling and drop the caveat while nothing capped
-        anything — a false ceiling, which is the one thing the estimate must
-        never produce. The cross-check below is what tells T3c to turn this on
-        once the run enforces it."""
+    def test_the_budget_key_now_buys_a_real_ceiling(self):
+        """`ops.filtered_budget_s` now exists in all three places the
+        cross-check below names: `ops_pass.harness_args` emits it,
+        `harness/main.py` parses it and hands it on, and `filtered.py` stops
+        the query loop on it. So honouring it here prints a ceiling something
+        enforces, which is the state this test used to say T3c had to reach.
+
+        Lowering it lowers the ceiling proportionally, which is what proves the
+        figure is read from the key rather than from the default; and turning
+        it off restores the unbounded term, so the branch that refuses to
+        invent a ceiling is still reachable.
+        """
         profile = {"name": "t", "ops": {**self.PROFILE["ops"],
                                         "filtered_budget_s": 300}}
         t = self._term(profile)
-        assert (t["typical_hours"], t["worst_hours"]) == (0.0, 0.0)
-        assert t["bounded"] is False
-        assert t["quantified"] is False
-        assert "300" not in t["basis"]
+        assert (t["typical_hours"], t["worst_hours"]) == (0.0, 0.33)
+        assert t["bounded"] is True
+        assert "300s cap/point" in t["basis"]
+
+        # Half the budget, half the ceiling: 4 points x 150 s = 600 s = 0.17 h.
+        halved = {"name": "t", "ops": {**self.PROFILE["ops"],
+                                       "filtered_budget_s": 150}}
+        assert self._term(halved)["worst_hours"] == 0.17
+        assert "150s cap/point" in self._term(halved)["basis"]
+
+        off = {"name": "t", "ops": {**self.PROFILE["ops"],
+                                    "filtered_budget_s": 0}}
+        assert self._term(off)["bounded"] is False
+        assert self._term(off)["worst_hours"] == 0.0
 
     def test_the_estimate_and_the_runner_honour_the_budget_together(self):
         """Whichever part of T3c lands first, this fails until the rest does.
@@ -429,7 +484,9 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
         has to care about the layer that stops rather than the layers that
         carry.
 
-        Today none of the three exists, which is consistent, so this passes."""
+        Since T3c all three exist, which is consistent, so this passes. It
+        passed before T3c too, when none of them did; the states it rejects
+        are the partial ones in between."""
         from orchestrator import ops_pass
         from orchestrator.config import load_resources
         profile = {"name": "t", "k": 10,
@@ -449,27 +506,35 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
             "nothing enforces, nor ignore one that is enforced")
 
     def test_a_measured_rate_turns_it_into_a_duration(self, monkeypatch):
-        """The other half: 1,000 queries at 0.9 QPS = 1,111.1 s = 0.31 h — the
-        measured MariaDB filtered rate, which docs/07 records as 37 minutes for
-        2,000 queries at 1% selectivity."""
+        """The other half: 2,000 queries at 0.9 QPS = 2,222.2 s, capped at
+        4 points x 300 s = 1,200 s = 0.33 h. The measured MariaDB filtered
+        rate -- which docs/07 records as 37 minutes for 2,000 queries at 1%
+        selectivity -- is slow enough that the budget binds, which is the
+        budget doing its job: the modelled cost exceeds the cap, so the cap is
+        what the run will spend."""
         monkeypatch.setitem(est_mod._MEASURED_QUERY_QPS,
                             ("mariadb", "glove-100-angular"), 0.9)
         t = self._term()
-        assert t["typical_hours"] == 0.31
+        assert t["typical_hours"] == 0.33
         assert t["quantified"] is True
-        assert t["bounded"] is False      # a rate is not a cap
+        # Bounded by the cap, not by the rate: a rate is still not a cap, and
+        # here the two meet only because the modelled cost is the larger.
+        assert t["bounded"] is True
+        assert t["worst_hours"] == 0.33
 
     def test_more_selectivities_cost_proportionally(self, monkeypatch):
-        """3 x 500 = 1,500 queries at 0.9 QPS = 1,666.7 s = 0.46 h."""
+        """2 columns x 3 selectivities x 500 = 3,000 queries at 0.9 QPS =
+        3,333.3 s, capped at 6 points x 300 s = 1,800 s = 0.50 h."""
         monkeypatch.setitem(est_mod._MEASURED_QUERY_QPS,
                             ("mariadb", "glove-100-angular"), 0.9)
         profile = {"name": "t", "ops": {**self.PROFILE["ops"],
                                         "selectivities": [0.01, 0.10, 0.50]}}
-        assert self._term(profile)["typical_hours"] == 0.46
+        assert self._term(profile)["typical_hours"] == 0.50
 
     def test_it_scales_with_ops_units_like_everything_else(self, monkeypatch):
-        """pgvector runs both build modes: 2 units x 1,000 queries at 2 QPS =
-        1,000 s = 0.28 h."""
+        """pgvector runs both build modes: 2 units x 2,000 queries at 2 QPS =
+        2,000 s = 0.56 h, under a 4 x 300 = 1,200 s per-unit cap that the
+        1,000 s a unit costs does not reach."""
         monkeypatch.setitem(est_mod._MEASURED_QUERY_QPS,
                             ("pgvector", "glove-100-angular"), 2.0)
         two = {"name": "t",
@@ -477,8 +542,8 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
                "ops": self.PROFILE["ops"]}
         one = {"name": "t", "ann": {"pgvector_build_modes": ["post"]},
                "ops": self.PROFILE["ops"]}
-        assert self._term(two, engine="pgvector")["typical_hours"] == 0.28
-        assert self._term(one, engine="pgvector")["typical_hours"] == 0.14
+        assert self._term(two, engine="pgvector")["typical_hours"] == 0.56
+        assert self._term(one, engine="pgvector")["typical_hours"] == 0.28
 
     def test_a_profile_without_the_workload_pays_nothing(self):
         profile = {"name": "t", "ops": {**self.PROFILE["ops"],
@@ -497,9 +562,11 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
         ops = {k: v for k, v in self.PROFILE["ops"].items()
                if k != "selectivities"}
         t = self._term({"name": "t", "ops": ops})
-        # 1 x 500 queries at 0.9 QPS = 555.6 s = 0.15 h
-        assert t["typical_hours"] == 0.15
-        assert "1 selectivity x 500 queries = 500 queries" in t["basis"]
+        # 2 columns x 1 selectivity x 500 = 1,000 queries at 0.9 QPS =
+        # 1,111.1 s, capped at 2 points x 300 s = 600 s = 0.17 h.
+        assert t["typical_hours"] == 0.17
+        assert ("2 filter column(s) x 1 selectivity x 500 queries "
+                "= 1,000 queries") in t["basis"]
 
     def test_the_default_matches_the_one_the_runner_uses(self):
         """Pinned against ops_pass rather than restated, because the defect was
@@ -696,6 +763,7 @@ class TestTheIterativeScanModeNowReachesTheRun:
         from harness.metrics import records
         from harness.workloads import filtered as filtered_workload
         from harness.workloads.context import RunContext
+        from harness.datasets import FILTER_TAG
         from tests.fake_driver import index_spec, loaded_driver, tiny_dataset
 
         dataset = tiny_dataset()
@@ -718,6 +786,9 @@ class TestTheIterativeScanModeNowReachesTheRun:
                 ctx, driver, dataset, index_spec(dataset), ef_search=64,
                 selectivities=(0.50,), max_queries=8, warmup=1,
                 indexed_rows=len(dataset.train),
+                # T3c: one column, so this stays a test about the MODE
+                # reaching the record rather than about the column loop.
+                columns=(FILTER_TAG,),
                 iterative_scan=cli_mod._ops_iterative_scan(
                     "pgvector", load_profile("main"), {}, "normalized"),
             )
@@ -770,7 +841,14 @@ class TestACapIsPrintedAsACapNotADuration:
 class TestTheWholeQueryEstimateForMain:
     """The aggregate, so a reader can see the number the convention now refers
     to and check it against the parts: 2.10 h of concurrency windows and 4.77 h
-    of modelled churn re-insert, against a 14.00 h churn ceiling."""
+    of modelled churn re-insert, against a 14.00 h churn ceiling and a 7.00 h
+    filtered one.
+
+    T3c moved the worst case and left the typical figure alone, which is what
+    a budget does: 6 filtered points per ops unit x 300 s is a ceiling nothing
+    had before, and no rate exists to turn any of it into a duration. So
+    `query_hours` is unchanged at 6.87 and `query_hours_worst` went 16.10 ->
+    23.10."""
 
     def test_the_parts_and_the_totals(self):
         e = est("main")
@@ -778,10 +856,12 @@ class TestTheWholeQueryEstimateForMain:
             "concurrency windows", "filtered search", "churn re-insert"]
         assert term(e, "churn re-insert")["typical_hours"] == 4.77
         assert term(e, "churn re-insert")["worst_hours"] == 14.00
+        assert term(e, "filtered search")["typical_hours"] == 0.0
+        assert term(e, "filtered search")["worst_hours"] == 7.00
         assert e["query_hours"] == 6.87
-        assert e["query_hours_worst"] == 16.10
+        assert e["query_hours_worst"] == 23.10
         assert e["typical_total_hours"] == 76.64
-        assert e["worst_case_total_hours"] == 85.87
+        assert e["worst_case_total_hours"] == 92.87
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -832,13 +912,35 @@ class TestAMissingQueryRateIsReportedNotInvented:
         assert any("churn" in n for n in names)
         assert any("warm-up" in n for n in names)
 
-    def test_filtered_is_charged_as_a_term_and_so_is_not_also_disclaimed(self):
-        """It may appear in one list or the other, never both: output that
-        charges for a cost and calls it unmodelled in the same breath tells a
-        reader nothing."""
+    def test_the_filtered_query_loop_is_charged_and_not_also_disclaimed(self):
+        """The query loop may appear in one list or the other, never both:
+        output that charges for a cost and calls it unmodelled in the same
+        breath tells a reader nothing.
+
+        Its GROUND TRUTH is a different cost in neither figure -- harness CPU,
+        over the whole test set rather than `ops.max_queries`, and outside the
+        budget -- so it is disclosed. This pins exactly which filtered-related
+        disclosures exist rather than asserting none do, which is stricter
+        than the bare substring check it replaces: a second disclosure, or one
+        about the query loop, fails here instead of passing.
+        """
         e = est("main")
         assert "filtered search" in [t["name"] for t in e["query_terms"]]
-        assert not any("filtered" in n for n in e["query_costs_not_modelled"])
+        mentions = [n for n in e["query_costs_not_modelled"] if "filtered" in n]
+        assert len(mentions) == 1, mentions
+        assert mentions[0].startswith("filtered ground truth:")
+        # The thing the term already charges for must not be in here.
+        assert "ops.max_queries queries per point" not in mentions[0]
+        assert "~150 s per million qualifying rows" in mentions[0]
+        # M-2: the figure has to range over the PROFILE, not over one of its
+        # two datasets. Pairing a per-dataset number with main's two-dataset
+        # ceiling understated this by nearly half, and the same class of error
+        # (a per-unit number against a per-profile denominator) has cost this
+        # repo a 46-vs-51.1 h docs drift and a 270 h one in CLAUDE.md.
+        assert "main's two datasets" in mentions[0]
+        assert "glove" not in mentions[0], (
+            "a per-dataset figure cannot be quoted against a per-profile "
+            "ceiling")
 
     def test_an_ann_only_run_still_declares_its_query_cost(self):
         e = est("m-sweep")
@@ -986,37 +1088,65 @@ class TestThePrintedOutput:
         assert "~4.8 h typical" in out
         assert "~14.0 h worst case" in out
 
-    def test_an_unquantified_term_says_so_instead_of_printing_zero(self):
-        """`~0.0 h` for filtered search would read as free rather than as
-        unmeasured, which is the opposite of what is known about it."""
+    def test_a_term_with_a_ceiling_but_no_duration_prints_both(self):
+        """Filtered search used to print "cost not quantified", because it had
+        neither a rate nor a cap. T3c gave it a cap, so it now prints a
+        typical figure of ~0.0 h beside a real worst case -- and the pair is
+        the honest reading: nothing has measured the rate, and the budget says
+        what it cannot exceed regardless.
+
+        `~0.0 h typical` alone would read as free. It is only not misleading
+        because the worst case sits on the same line."""
         out = printed("main")
-        assert "filtered search      cost not quantified" in out
-        assert "1,000 queries per ops unit" in out
+        assert "filtered search      ~0.0 h typical, ~7.0 h worst case" in out
+        # Anchored on the `=`, because "3,000 queries per ops unit" is a
+        # substring of "13,000 queries per ops unit" -- the shape that has
+        # cost this series four tests.
+        assert "= 3,000 queries per ops unit" in out
+        assert "at a rate nothing here has measured" in out
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~85.9 h worst case" in out
+        assert "~92.9 h worst case" in out
         assert "~76.6 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
-        cannot exceed and then that a run can exceed it. The caveat now comes
-        first and the claim is conditional on it."""
-        out = printed("main")
-        run_line = out.index("estimated run time")
-        caveat = out.index("Not yet a ceiling")
-        assert caveat > run_line
-        assert "nothing caps filtered search" in out
-        assert "a run longer than it is a bug" not in out
-        assert "largest figure this configuration justifies" in out
+        cannot exceed and then that a run can exceed it. The caveat comes
+        first and the claim is conditional on it.
 
-        # With only bounded terms the claim is made, and the caveat is not.
+        Since T3c every configured profile makes the claim, because filtered
+        search was the only unbounded term and the budget closed it. So the
+        case worth pinning flipped: the claim is asserted on the real profile
+        and the caveat is reached by injecting an unbounded term, which is the
+        direction that cannot pass vacuously -- an `all()` over an empty or
+        all-bounded list is True, and the caveat branch would otherwise never
+        be executed by any test again."""
+        out = printed("main")
+        assert "a run materially longer than it is a bug" in out
+        assert "Not yet a ceiling" not in out
+        # The qualifier that makes "materially" mean something, and it has to
+        # cover churn as well as filtered search: both print a ceiling and
+        # both overrun by one unit of work from the same `>` comparison.
+        assert "can overrun" in out
+        assert "the one query or slice already running" in out
+
+        # Inject one unbounded term and the caveat comes back, after the run
+        # line and naming the term responsible.
+        def unbounded(plan):
+            return est_mod._QueryTerm(
+                name="unbounded probe", typical_s=60.0, worst_s=60.0,
+                basis="no cap exists", bounded=False, scope="pass")
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
-                            (est_mod._concurrency_windows,
-                             est_mod._churn_reinsert))
-        bounded_out = printed("main")
-        assert "a run longer than it is a bug" in bounded_out
-        assert "Not yet a ceiling" not in bounded_out
+                            tuple(est_mod._QUERY_TERMS) + (unbounded,))
+        loose = printed("main")
+        run_line = loose.index("estimated run time")
+        caveat = loose.index("Not yet a ceiling")
+        assert caveat > run_line
+        assert "nothing caps unbounded probe" in loose
+        assert "a run materially longer than it is a bug" not in loose
+        assert "can overrun" not in loose
+        assert "largest figure this configuration justifies" in loose
 
     def test_the_printed_total_is_the_dict_total(self):
         """The two cannot drift: the printed figure is the dict's own."""
@@ -1037,7 +1167,18 @@ class TestThePrintedOutput:
 
     def test_a_trivial_run_still_prints_nothing(self):
         """`dev` is a one-minute framework exercise; an estimate for it is
-        noise. The gate is the worst-case total, not ingest alone."""
+        noise. The gate is the worst-case total, not ingest alone.
+
+        This is what `dev.yml`'s own `filtered_budget_s: 60` is for. Four
+        filtered points at the 300 s default would be a 2.0 h worst case for
+        a run of about six minutes across six engines -- 20x -- which clears
+        the 1 h threshold this function gates on and makes the shortest
+        profile in the repo print an estimate at all.
+
+        Not to be confused with `long_run`, which is keyed on ingest above
+        12 h and is False for `dev` under either budget: that flag decides
+        whether the block carries the M-reload caveat, not whether the block
+        appears."""
         assert printed("dev") == ""
 
     def test_a_profile_whose_cost_is_query_time_is_no_longer_silent(self):
@@ -1046,7 +1187,7 @@ class TestThePrintedOutput:
         out = printed("smoke")
         assert "estimated ingest time" in out
         assert "churn re-insert" in out
-        assert "~4.0 h worst case" in out
+        assert "~5.2 h worst case" in out
 
 
 # ---------------------------------------------------------------------------

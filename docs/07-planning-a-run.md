@@ -97,12 +97,12 @@ engines:
 
 | Profile | Passes | Ingest | Query, typical | Query, worst case | Run, worst case |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `dev` | 1 | ~0.0 h | ~0.0 h | ~0.0 h | **~0.0 h** |
-| `smoke` | 1 | ~0.3 h | ~0.0 h | ~2.0 h | **~2.3 h** |
-| `quick` | 1 | ~36.2 h | ~1.8 h | ~8.2 h | **~44.4 h** |
-| `main` | 1 | ~51.1 h | ~4.4 h | ~9.2 h | **~60.3 h** |
-| `full` | 2 | ~532.0 h | ~47.0 h | ~110.4 h | **~642.4 h** |
-| `mariadb-blog` | 1 | ~21.3 h | ~1.2 h | ~1.8 h | **~23.1 h** |
+| `dev` | 1 | ~0.0 h | ~0.0 h | ~0.2 h | **~0.2 h** |
+| `smoke` | 1 | ~0.3 h | ~0.0 h | ~2.7 h | **~3.0 h** |
+| `quick` | 1 | ~36.2 h | ~1.8 h | ~12.2 h | **~48.4 h** |
+| `main` | 1 | ~51.1 h | ~4.4 h | ~13.2 h | **~64.3 h** |
+| `full` | 2 | ~532.0 h | ~47.0 h | ~158.4 h | **~690.4 h** |
+| `mariadb-blog` | 1 | ~21.3 h | ~1.2 h | ~2.8 h | **~24.1 h** |
 
 The ingest column differs from the table above it because that one was computed
 by hand from §1's three headline rates, while the estimator uses the measured
@@ -121,12 +121,20 @@ it is:
   differ. The typical figure is what the configuration should cost; the worst
   case is what it cannot be made to exceed by an engine behaving badly.
 * It is honest about its holes, and prints them. Filtered search runs a fixed
-  number of queries at a rate nothing here has measured, with nothing capping
-  the loop, so it is listed with its shape and no duration — and the run figure
-  says, in as many words, that it is not yet a ceiling. The recall sweep, the
-  churn re-measurements and the concurrency warm-ups are named under the total
-  for the same reason. A dataset with no measured ingest rate has always been
-  reported this way; this is the same treatment for query time.
+  number of queries at a rate nothing here has measured, so it is listed with
+  a ceiling and **no typical duration** — `~0.0 h typical, ~7.0 h worst case`
+  rather than one confident figure. The ceiling is real:
+  `ops.filtered_budget_s` caps every (column, selectivity, iterative-scan
+  mode) point at five minutes, the workload stops the query loop when it is
+  spent, and the record says so. Until that budget existed this was the one
+  term with no bound at all, and the run figure had to say in as many words
+  that it was not yet a ceiling — so the "a run longer than its printed
+  estimate is a bug" convention was false for every profile that measured
+  filtered search, which is all of them but `m-sweep`. The recall sweep, the
+  churn re-measurements and the concurrency warm-ups are still named under
+  the total, because those are counted in queries and no rate exists to price
+  them. A dataset with no measured ingest rate has always been reported this
+  way; this is the same treatment for query time.
 
 A run prints all of it before starting:
 
@@ -141,21 +149,23 @@ estimated ingest time (loading only, before any queries):
 estimated query time (the parts the profile puts a clock on):
   concurrency windows  ~1.2 h
                          6 client count(s) x 30s x 3 repeat(s) per ops unit, fixed by the profile not by the engine
-  filtered search      cost not quantified
-                         2 selectivities x 500 queries = 1,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured and with no budget anywhere in the run to cap it
+  filtered search      ~0.0 h typical, ~4.0 h worst case
+                         2 filter column(s) x 3 selectivities x 500 queries = 3,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured; 300s cap/point bounds it
   churn re-insert      ~3.2 h typical, ~8.0 h worst case
                          e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
-  subtotal ~4.4 h typical, ~9.2 h worst case
+  subtotal ~4.4 h typical, ~13.2 h worst case
 
-estimated run time ~55.5 h typical, ~60.3 h worst case
-  ! Not yet a ceiling: nothing caps filtered search, so a run can exceed the worst case until that is fixed.
-  Plan against it all the same: it is the largest figure this configuration justifies.
+estimated run time ~55.5 h typical, ~64.3 h worst case
+  Plan against the worst case: a run materially longer than it is a bug.
+  Each budgeted term tests its deadline before starting work, so it can overrun
+    by the one query or slice already running when the budget expires.
   ! Neither figure includes the costs below. They are a number of queries, and
     there is no measured query rate for mariadb, alisql, pgvector to multiply them by:
       recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set
       churn re-measurement: ops.max_queries before churn and again after each churn fraction
       churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
       concurrency warm-up: 50 queries per client before each measured window
+      filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
 ```
 
 Read it. It is the cheapest part of the whole exercise.

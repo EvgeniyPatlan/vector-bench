@@ -27,7 +27,7 @@ in step with it. `orchestrator/engines.py` is the registry everything derives fr
 ## Commands
 
 ```bash
-python3 -m pytest tests/ -q                 # ~777 tests, ~30 s. The fast inner loop.
+python3 -m pytest tests/ -q                 # ~1,700 tests, ~70 s. The fast inner loop.
 ./tests/make-tiny-dataset.sh                # synthetic corpus, no download
 ./run-benchmark.sh run --profile dev        # ~1 min/engine end-to-end cycle
 ./run-benchmark.sh run --profile smoke      # ~45 min/pass gate before any long run
@@ -182,7 +182,7 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~726 h of ingest before a single query runs, and ~920 h of run time
+--resource-pass both` is ~726 h of ingest before a single query runs, and ~1,004 h of run time
 in the worst case once querying is counted — all six engines, which is what that command
 measures when `--engines` is omitted. Before proposing a run,
 check `docs/07-planning-a-run.md` and the estimate the run prints. Prefer `dev` → `smoke` when

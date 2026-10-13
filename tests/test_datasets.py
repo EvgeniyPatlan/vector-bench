@@ -1294,23 +1294,6 @@ class TestTheRecordedSelectivityIsTheMeasuredOne:
     careless call site fail a test.
     """
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "KNOWN DEFECT, owned by T3c. harness/workloads/filtered.py "
-            "computes `actual_selectivity = threshold / 100.0` (at :83, "
-            "annotated there) and passes it to Record(selectivity=...) at "
-            ":150; the failure message prints the live line. "
-            "That is the nominal share "
-            "under a measured-sounding name: wrong for `tag` on any row count "
-            "that is not a multiple of 100 (glove's 1,183,514 rows give "
-            "1.000073%, not 1%) and wrong by up to 4.96x for `ctag`, where "
-            "the value is a fraction of clusters rather than of rows. T3a "
-            "landed the mechanism (filtered_truth_for returns the measured "
-            "share with the array it belongs to); T3c has to use it. When "
-            "this XPASSes, the defect is fixed — delete this marker."
-        ),
-    )
     def test_the_workloads_write_a_measured_share_or_none_at_all(self):
         sources = _record_selectivity_sources()
         assert sources, (

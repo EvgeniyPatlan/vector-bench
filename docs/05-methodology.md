@@ -139,13 +139,143 @@ together cover the pool exactly.
 
 ### 2.4 Filtered / hybrid search (ops harness)
 
-Vector search with a scalar `WHERE` predicate, at three selectivities: ~1%, ~10%,
-~50% of rows passing.
+Vector search with a scalar `WHERE` predicate, at three selectivities (~1%, ~10%,
+~50% of rows passing) on **two different predicates**. Six points per engine,
+dataset and index configuration.
+
+#### The two filter modes
+
+The two columns exist because one predicate measures half the problem. Both are
+loaded in the same build, so both are measured against the same graph.
+
+| Column | Definition | Relationship to the vector space |
+| --- | --- | --- |
+| `tag` | `row_id % 100` | **Independent.** The qualifying rows are a uniform sample, so a query's true neighbours pass the filter about as often as anything else does. |
+| `ctag` | nearest-pivot cluster id (100 pivots, fixed seed) | **Correlated.** `ctag < t` selects `t` whole clusters, so for most queries the real nearest neighbours sit in a cluster that fails. |
+
+`tag` is the control case and `ctag` is the treatment. An engine that
+pre-filters sees little difference between them: it compares only the
+qualifying vectors either way. An engine that post-filters — walk the graph,
+then discard what fails — sees a large one, because under `ctag` the
+candidates it walks are exactly the rows the predicate rejects. This is the
+case a single uncorrelated column cannot distinguish, and it is the realistic
+one: a filter in production usually correlates with the embedding (a category,
+a tenant, a language), it rarely correlates with a row id.
+
+**The selectivity recorded is the one that was delivered, not the one that was
+asked for.** Cluster sizes are unequal, so a nominal 1% on `ctag` is never 1%:
+measured, it delivers 1.90% on the 2,000-row test fixture and between 1.00%
+and 4.96% on a 100,000-row corpus depending only on the clustering seed. The
+`selectivity` field is a counted share of rows and `extra.nominal_selectivity`
+is the request beside it. Comparing the two columns means comparing them at
+their measured shares; comparing at the nominal share compares two different
+predicates and calls the difference an engine property.
+
+#### The near_pass / near_fail split
+
+Within one column and one selectivity, queries divide into two groups by
+whether **the query's true unfiltered nearest neighbour passes the filter**:
+
+* `near_pass` — it passes. The best answer is inside the candidate list the
+  engine was going to walk anyway, so the filter costs little.
+* `near_fail` — it fails. The engine has to keep looking, and this is where
+  post-filtering collapses: it exhausts `ef_search` candidates without finding
+  `k` that qualify, and returns a short result set or a poor one.
+
+Recall is reported for each group (`extra.recall_near_pass`,
+`extra.recall_near_fail`) with the query counts beside them. For `tag` the two
+groups track the selectivity and their recalls stay close. For `ctag` they
+separate: on a clustered 2,000-row corpus at a 10% predicate the two groups
+measured 0.983 and 0.241 recall for `ctag`, against 0.625 and 0.641 for `tag`
+— the same split applied to both columns, separating them by a factor of four
+on one and not at all on the other.
+
+A dash in the report means the group was empty, which is a real state rather
+than a missing measurement: `tag` at 1% puts zero of fifty queries in
+`near_pass`, because a uniform 1% of rows contains a given query's nearest
+neighbour about 1% of the time. The group's recall is recorded as absent, not
+as zero.
+
+#### Short and truncated results
+
+The distribution of returned result counts is recorded in
+`extra.returned_count_hist`, not only a count of the short ones: an engine
+returning three rows for most queries and an engine returning nine are both
+"short" and are not the same behaviour.
+
+**Six buckets, and every query lands in exactly one at every `k`:**
+
+| Bucket | Meaning |
+| --- | --- |
+| `0` | nothing qualified in the candidate list at all |
+| `1-4` | a token result |
+| `5-9` | most of the way |
+| `short_other` | 10 to `k-1`. Only reachable for `k > 10` |
+| `k` | the complete answer |
+| `over_k` | more than `k` rows, which no correct driver returns |
+
+The last three are why there are six rather than the four an earlier draft of
+this section listed. `k` is tested **before** the ranges, so at `k = 5` a
+complete answer of five rows is reported as complete rather than filed under
+`5-9`. `short_other` exists because at `k = 20` a result of twelve rows
+belongs to no other bucket — measured on the test fixture at `k = 20`,
+`ef_search = 32` and a 50% predicate, 43 of 50 queries returned between ten
+and nineteen rows, and the four-bucket reading would have dropped all 43 and
+left a histogram summing to 7 of 50. `over_k` is counted precisely because it
+should always be zero: every driver slices its result to `k`, so a non-empty
+`over_k` means one stopped and the recall denominator is no longer what the
+report says it is.
+
+All six keys are always present, including the zeros. An absent key cannot be
+told from a zero by a reader or a chart.
+
+Each point is also **time-bounded**: `ops.filtered_budget_s` caps it (300 s in
+`main`), and the query loop stops when the budget is spent. Recall and latency
+are then computed over the queries that finished, and the record says so —
+`extra.time_bounded`, `queries_executed` against `extra.queries_planned`, and
+`extra.insufficient_sample` when fewer than 50 queries completed. The report
+greys those points out. The budget exists because this dimension is the one
+whose cost cannot be predicted: MariaDB measured 0.9 QPS at 1% selectivity
+against 326 unfiltered, a 360x spread, which made 2,000 queries at one point
+cost 37 minutes. A truncated point is a measurement of a slow configuration,
+not a harness fault, so it is recorded and flagged rather than dropped.
+
+#### Ground truth
 
 Recall here is computed against ground truth **recomputed for the filtered
 subset** — filtering changes the correct answer set, so reusing the unfiltered
-ground truth would be wrong. The harness computes filtered ground truth by brute
-force over the qualifying rows.
+ground truth would be wrong. The harness computes filtered ground truth by
+brute force over the qualifying rows and caches it on nine components —
+dataset, metric, `k`, column, threshold, row count, `tag_buckets`,
+`ctag_clusters` and `ctag_seed`. Every one of them changes the correct answer
+set: `tag` and `ctag` at the same threshold have entirely different qualifying
+sets, so a key missing the column would score one filter against the other's
+answers, and the last three are present for either column though each applies
+to one, because a key that varies with something irrelevant only wastes work
+while one that misses something relevant publishes a wrong number.
+
+That brute force is **not** inside `ops.filtered_budget_s`, and it runs over
+the whole test set rather than `ops.max_queries`: it is harness CPU spent on
+the yardstick, and charging the engine's budget for it would make a cold cache
+look like a slow engine.
+
+Measured at **~150 s per million qualifying rows** over 10,000 test queries,
+with a 5–8% spread within a run and ~10% drift between sessions on a shared
+box. The figure is close to **dimension-independent** at these widths, which
+is worth stating because it looks like it should not be: the dominant
+`queries @ subset.T` term is linear in the vector width, so 128 dimensions
+against 100 would be 1.28× and 960 would be 9.6× if the dot products ruled.
+The measured medians are 158.7 s/M at 100 dimensions, 155.0 at 128 (0.98×,
+marginally *faster*, inside the spread), 164.7 at 256 and 240.2 at 960 — so
+what dominates is the dimension-independent work instead: materialising the
+`n_test × n_qualifying` score matrix and partially sorting it. One rate
+therefore covers both of `main`'s datasets.
+
+For `main` that is ~3.6 minutes for glove's two-column grid and ~3.1 for
+sift's — **~6.7 minutes for the profile**, against the 4.0 h filtered ceiling
+it prints, so ~2.8%. Paid once per (dataset, metric, k, column, threshold,
+rows) and then shared across every engine, ops unit and resource pass. The run
+estimate names it under the costs neither of its figures includes.
 
 Ground truth is also recomputed whenever a profile loads only **part** of the
 training set (the smoke profile loads 20,000 of fashion-MNIST's 60,000 rows).
@@ -158,7 +288,17 @@ the ground-truth cache key so a subset run cannot poison a full run's cache.
 This is where integrated vector search is supposed to beat standalone vector
 stores, and where the engines' query planners diverge most: the SQL engines
 post-filter, Percona Search pre-filters, pgvector can iterate its index scan,
-and Valkey's planner chooses per query.
+and Valkey's planner chooses per query. The report does not take any of those
+descriptions on trust — §5's strategy table derives what each engine did from
+how its own median latency moves as the predicate narrows, per column, because
+the report once asserted for weeks that Valkey chose its strategy per query on
+the strength of its documentation while its own numbers said otherwise.
+
+pgvector's `hnsw.iterative_scan` is set explicitly rather than left at its
+default and is recorded on every filtered record. The workload can measure the
+grid once per declared mode against one loaded index; `ops.pgvector_iterative_scan`
+declares the modes and the orchestrator currently pins the first of them, so a
+run measures one mode and the record names which.
 
 ### 2.5 Churn (ops harness)
 

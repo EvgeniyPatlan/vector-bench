@@ -38,6 +38,7 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
 # already imports orchestrator.cli for KNOWN_ENGINES, so ann_pass and
 # docker_ctl are on that path either way.
 from . import ann_pass
+from .ops_pass import DEFAULT_FILTERED_BUDGET_S, _filter_columns
 
 # Measured ingest rates, rows/s, on a Xeon Gold 6230.
 #
@@ -176,10 +177,18 @@ _MEASURED_QUERY_QPS: Dict[Tuple[str, str], float] = {}
 # What costs a number of queries rather than a span of time, keyed by the ops
 # workload that pays it. Each is named in the output while no rate exists.
 #
-# Filtered search is deliberately NOT here: it has a term of its own, which
-# carries both the shape of the cost and the fact that nothing has measured it.
-# Naming it in both places would have the printed output charge for it and
-# disclaim it in the same breath.
+# The filtered QUERY LOOP is deliberately not here: it has a term of its own,
+# which carries both the shape of the cost and the fact that nothing has
+# measured it. Naming it in both places would have the printed output charge
+# for it and disclaim it in the same breath.
+#
+# Its GROUND TRUTH is a different cost and is here, because neither figure
+# includes it. It is harness CPU rather than engine time, it runs over the
+# whole test set rather than `ops.max_queries`, and it sits outside
+# `ops.filtered_budget_s` on purpose -- charging the engine's budget for the
+# yardstick would make a cold cache look like a slow engine.
+# `tests/test_estimate.py` pins which filtered-related disclosures exist, so
+# a second one cannot be added without that being a decision.
 _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
     "churn": (
         "churn re-measurement: ops.max_queries before churn and again after "
@@ -195,6 +204,40 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
     "concurrency": (
         "concurrency warm-up: 50 queries per client before each measured "
         "window",
+    ),
+    "filtered": (
+        # Measured rather than modelled, and the figure ranges over the
+        # WHOLE PROFILE rather than one dataset -- `main` has two.
+        #
+        # Rate: 2,000 test queries scaled to the 10,000 both datasets ship,
+        # against 40,000 qualifying rows, five interleaved repeats per
+        # dimensionality. Medians 158.7 s/M at 100 dims, 155.0 at 128, 164.7
+        # at 256, 240.2 at 960, with a 5-8% spread within each and ~10% drift
+        # between sessions on a shared box. So ~150 s/M is the working figure
+        # and its uncertainty is the box, not the dimensionality: 128 dims
+        # came out 0.98x of 100 dims -- marginally FASTER, inside the spread.
+        #
+        # That is a structural fact rather than luck. The dominant term
+        # `batch @ subset.T` is linear in dim, so 128/100 would be 1.28x and
+        # 960/100 would be 9.6x if the dot products ruled; the measured 0.98x
+        # and 1.51x say the dim-INDEPENDENT work dominates instead -- the
+        # n_test_batch x n_qualify score matrix and the argpartition over it.
+        # Hence one rate for both of main's datasets, flat to a few hundred
+        # dims and rising sub-linearly beyond.
+        #
+        # Total: glove is 11,835 + 118,351 + 591,757 = 721,943 qualifying
+        # rows per column and sift 610,000, so both columns of both datasets
+        # are ~217 + ~183 = ~400 s (6.7 min) against main's printed 4.0 h
+        # filtered ceiling -- 2.8%. Small, cached and shared, and in neither
+        # printed figure, which is the only reason it is named at all.
+        "filtered ground truth: exact top-k recomputed by brute force over "
+        "the qualifying rows of every (column, selectivity), over the whole "
+        "test set rather than ops.max_queries and outside "
+        "ops.filtered_budget_s; cached per (dataset, metric, k, column, "
+        "threshold, rows) and shared across engines, ops units and passes, "
+        "so paid once each -- measured at ~150 s per million qualifying rows "
+        "(5-8% spread, near dimension-independent below ~256), which is "
+        "~6.7 min for main's two datasets x two columns",
     ),
 }
 _ANN_QUERY_COST = ("recall/QPS sweep: every ann.ef_search point, `runs` times, "
@@ -364,56 +407,106 @@ def _concurrency_windows(plan: _QueryPlan) -> Optional[_QueryTerm]:
 
 
 def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
-    """Filtered search: a fixed number of queries per selectivity, uncapped.
+    """Filtered search: a fixed number of queries per point, capped per point.
 
-    The shape is exact and the duration is unknown, and both facts are printed.
-    What runs is `len(ops.selectivities)` points x one iterative-scan mode x
-    `ops.max_queries` queries per ops unit. What it costs depends on a rate
-    nothing here has measured, and no budget caps it, so this term reports
-    `bounded=False` and the run total says it is not yet a ceiling. That is the
-    honest state: on MariaDB at 1% selectivity the measured rate was 0.9 QPS
-    against 326 unfiltered, so 2,000 queries cost 37 minutes for one point --
-    a 360x spread that no default could stand in for.
+    What runs is `len(ops.filter_columns)` columns x `len(ops.selectivities)`
+    selectivities x one iterative-scan mode x `ops.max_queries` queries per
+    ops unit. What a query costs depends on a rate nothing here has measured
+    -- on MariaDB at 1% selectivity the measured rate was 0.9 QPS against 326
+    unfiltered, a 360x spread that no default could stand in for -- so the
+    typical figure stays unquantified while a rate is missing.
 
-    It is a term rather than a line in `_PER_QUERY_OPS_COSTS` because it is
-    where the two things that would quantify it must land. A figure in
-    `_MEASURED_QUERY_QPS` turns `typical_s` into a duration, below, and needs
-    nothing else: a rate is an input to the estimate, not a behaviour of the
-    run.
+    **What changed in T3c is the worst case.** `ops.filtered_budget_s` caps
+    every point, `harness/workloads/filtered.py` stops the loop when it is
+    spent, and the record says so (`extra.time_bounded`), so this term can
+    report a real ceiling for the first time: points x budget. That matters
+    beyond this term, because `query_worst_case_is_a_ceiling` is an `all()`
+    over the terms -- filtered search was the one term holding the whole run
+    figure open, and the printed block had to say "not yet a ceiling" about
+    the number the "a run longer than its estimate is a bug" convention
+    refers to.
 
-    A ceiling is different, and this function deliberately does **not** read an
-    `ops.filtered_budget_s`. Such a key exists nowhere else -- not in a profile,
-    not in `ops_pass.harness_args`, not in `harness/main.py`, not in
-    `filtered.py` -- so honouring it here would report `bounded=True`, print a
-    concrete ceiling and drop the "not yet a ceiling" caveat while nothing
-    capped anything. Contrast `ops.churn_budget_s`, which `_churn_reinsert` is
-    right to trust: `ops_pass.py` passes it and `churn.py` enforces it. T3c
-    adds the flag, the plumbing and the enforcement, and then adds the branch
-    here; `tests/test_estimate.py` cross-checks the two halves against each
-    other so whichever moves first is told about the other.
+    A profile that turns the cap off still gets no ceiling. The flag has a
+    default in the workload and in `ops_pass`, so in practice every configured
+    run is bounded; the unbounded branch is for `filtered_budget_s: 0` or
+    `null`, both of which mean "no cap" the whole way down -- `ops_pass`
+    emits `0` for either spelling and `filtered.run` converts a non-positive
+    budget into an infinite deadline. An estimate that printed a ceiling for
+    those would be inventing one.
 
-    One iterative-scan mode is counted, and it is not a factor in the
-    arithmetic: `cli.py` pins the first declared
-    `ops.pgvector_iterative_scan` value and the workload runs that one mode, so
-    a `* modes` here could only ever be `* 1`. It was written that way and no
-    fixture could set it to anything else, which made the promise it carried
-    untestable. When T3c loops the modes inside
-    `harness/workloads/filtered.py`, multiply `points` below by the mode count
-    and name it in `shape`; the factor arrives with the test that can move it.
+    Both spellings used to be traps rather than options, and the docstring
+    that invited them is what found it: `0` emitted `--filtered-budget 0`,
+    whose first elapsed-time check fired immediately, so every point recorded
+    ZERO queries; `null` emitted the string `'None'`, which argparse rejected
+    with `SystemExit(2)` and took concurrency and churn down with the unit,
+    because `harness/main.py` wraps all three in one `except`.
+
+    The ceiling this reports is `points x budget`, and the real bound is one
+    query per point above it: a deadline tested before each query cannot
+    abandon the query already running.
+
+    **Both figures below are per ops unit, matched to a per-unit
+    denominator.** `main` runs SIX filtered points per ops unit -- two columns
+    x three selectivities -- and 8 ops units with three engines (mariadb 1 +
+    alisql 1 + pgvector 2 build modes, over 2 datasets), so 48 points per
+    profile. Pairing the per-unit overrun against the per-profile ceiling is
+    the error that has cost this repo the most: docs once said 46 h where the
+    code said 51.1, and CLAUDE.md was out by 270 h.
+
+    At the 1.1 s a query measured for `tag` at 1%, the overrun is 6 x 1.1 =
+    **6.6 s against the 0.50 h a unit's six points can spend** -- 0.37%. The
+    same ratio per profile is 48 x 1.1 = 52.8 s against the printed 4.0 h.
+    Either pairing is honest; mixing them understates it eightfold.
+
+    **One iterative-scan mode is counted, and the factor is deliberately not
+    in the arithmetic.** `cli.py:_ops_iterative_scan` resolves the FIRST
+    declared `ops.pgvector_iterative_scan` value and pins it, so the grid runs
+    once per ops unit whatever the profile declares. T3c put the loop inside
+    the workload and the comma-joined carriage inside `ops_pass.harness_args`,
+    so the harness and the command line both handle N modes -- but the one
+    call site that chooses them still chooses one, and a `* modes` here would
+    charge for runs nobody can currently start. When that call site is changed
+    to pass the whole list, multiply `points` by `len(modes)` and name it in
+    `shape`. `ops_pass._iterative_scan_modes` is the function that would
+    produce the count; it is deliberately NOT imported until it is used,
+    because an import whose only reader is a docstring is the shape of the
+    defect this whole dimension is an example of.
     """
     if "filtered" not in plan.workloads:
         return None
-    # Defaulted exactly as ops_pass.harness_args defaults it. A profile that
-    # omits the key still runs one selectivity, so charging nothing here would
+    # Defaulted exactly as ops_pass.harness_args defaults them. A profile that
+    # omits either key still runs the workload, so charging nothing here would
     # drop a real cost out of the terms list *and* out of the disclosure list.
     selectivities = list(plan.ops.get("selectivities") or [0.1])
+    columns = _filter_columns(plan.ops)
     max_queries = int(plan.ops.get("max_queries", 1000))
-    points = len(selectivities)
+    budget = float(plan.ops.get("filtered_budget_s",
+                                DEFAULT_FILTERED_BUDGET_S) or 0.0)
+    points = len(columns) * len(selectivities)
     queries = points * max_queries
-    shape = (f"{points} "
-             f"{'selectivity' if points == 1 else 'selectivities'}"
+    shape = (f"{len(columns)} filter column(s) x {len(selectivities)} "
+             f"{'selectivity' if len(selectivities) == 1 else 'selectivities'}"
              f" x {max_queries:,} queries = {queries:,} queries per ops unit, "
              f"one iterative-scan mode")
+
+    # The cap, when there is one. `typical` still needs a rate: a budget says
+    # what the work cannot exceed, not what it will take, and collapsing the
+    # two is what made the churn estimate wrong by the whole budget before
+    # `_churn_reinsert` separated them.
+    if budget > 0:
+        worst = points * budget
+        if plan.query_qps:
+            typical = min(queries / plan.query_qps, worst)
+            return _QueryTerm(
+                name="filtered search", typical_s=typical, worst_s=worst,
+                basis=(f"{shape} at a measured {plan.query_qps:,.1f} QPS, "
+                       f"{budget:.0f}s cap/point"),
+                bounded=True)
+        return _QueryTerm(
+            name="filtered search", typical_s=0.0, worst_s=worst,
+            basis=(f"{shape}, at a rate nothing here has measured; "
+                   f"{budget:.0f}s cap/point bounds it"),
+            bounded=True)
 
     if plan.query_qps:
         seconds = queries / plan.query_qps
@@ -447,11 +540,40 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
     The re-insert only. `churn_budget_s` bounds `_reinsert` and nothing else,
     so the delete that precedes each step is open-ended and is disclosed in
     `_PER_QUERY_OPS_COSTS` rather than counted here.
+
+    **`churn_budget_s: null` and `: 0` are handled the way
+    `_filtered_search` handles them, and both used to be defects here.**
+    Found by T4a, which could not fix them because `orchestrator/` is not in
+    its ownership:
+
+    * `null` raised `TypeError: float() argument must be a string or a real
+      number, not 'NoneType'` -- on the HOST, before any container starts, so
+      a profile with that one key printed a traceback instead of an estimate.
+      `or 0.0` is what `_filtered_search` already had, and the defect turned
+      out to have three sites rather than two: the emission in `ops_pass`, the
+      enforcement in `churn.run`, and this.
+    * `0`, meaning "no cap", made `worst` stay 0 and the `worst <= 0` guard
+      drop the term entirely -- so the estimate stopped disclosing a cost it
+      could not bound, where the same input makes `_filtered_search` report
+      one unbounded. Dropping a term is the one thing worse than printing it
+      without a ceiling: a reader sees no churn cost at all.
+
+    The guard is now on `rows`, which is what "this profile does not churn"
+    actually means -- every fraction zero, or duplicated so that no step adds
+    anything.
+
+    No configured profile is affected: only `tuned-complete.yml` sets
+    `churn_budget_s` and it sets 7200. Verified across all nine profiles at
+    three engines and six, one pass and two -- every published figure and
+    every `query_worst_case_is_a_ceiling` is unchanged.
     """
     if "churn" not in plan.workloads or plan.rows <= 0:
         return None
     fractions = [float(f) for f in plan.ops.get("churn_fractions", [0.1])]
-    budget = float(plan.ops.get("churn_budget_s", 1800))
+    # `or 0.0` so a key present with value null means "no cap" rather than a
+    # TypeError, matching `_filtered_search` and `ops_pass`'s `_budget_arg`.
+    budget = float(plan.ops.get("churn_budget_s", 1800) or 0.0)
+    uncapped = budget <= 0
     rate = plan.write_rows_per_s
     typical = 0.0
     worst = 0.0
@@ -466,10 +588,26 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
             continue
         churned_so_far = fraction
         rows += count
-        typical += min(count / rate, budget) if rate > 0 else budget
-        worst += budget
-    if worst <= 0:
+        if uncapped:
+            # No ceiling to collapse onto, so the modelled duration is all
+            # there is -- and it is a figure, not a bound.
+            typical += count / rate if rate > 0 else 0.0
+        else:
+            typical += min(count / rate, budget) if rate > 0 else budget
+            worst += budget
+    if rows <= 0:
         return None
+    if uncapped:
+        return _QueryTerm(
+            name="churn re-insert",
+            typical_s=typical,
+            worst_s=typical,
+            basis=(f"{rows:,} rows written back at ~{rate:,.0f} rows/s (the "
+                   f"load rate; re-insert can be far slower); "
+                   f"ops.churn_budget_s turns the cap off, so this is a "
+                   f"figure and not a ceiling"),
+            bounded=False,
+        )
     return _QueryTerm(
         name="churn re-insert",
         typical_s=typical,
@@ -488,9 +626,10 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
 #
 #   T1d  concurrency repeats  -- already multiplied inside _concurrency_windows
 #   T2a  ef-calibration sweep -- gate on plan.phases/plan.ann, scope "unit"
-#   T3c  filtered budget      -- no new term needed; _filtered_search's own
-#                                docstring has the instruction, and is the
-#                                only place that carries it
+#   T3c  filtered budget      -- DONE, inside _filtered_search: the budget
+#                                became a real ceiling and the column loop
+#                                doubled the points. The mode factor is still
+#                                outstanding and the docstring says why
 #   T4a  churn maintenance    -- gate on "churn" in plan.workloads
 #
 # Ordered as the profiles order `ops.workloads`, so the printed block reads in
@@ -754,7 +893,20 @@ def _print_query_estimate(estimate: Dict[str, Any]) -> None:
         print("  Plan against it all the same: it is the largest figure this "
               "configuration justifies.")
     else:
-        print("  Plan against the worst case: a run longer than it is a bug.")
+        # "Materially", and the clause after it, because the claim was
+        # absolute and is false by a small structural amount. Every budgeted
+        # term -- filtered search per point, churn re-insert per step --
+        # tests its deadline BEFORE starting work and cannot abandon the
+        # query or slice already running, so each can overrun by one of
+        # those. Measured at 0.37% of the filtered ceiling at 1.1 s a query;
+        # churn carries the identical overshoot from the same `>` comparison
+        # in `churn.py`. One clause rather than an entry per term in the
+        # disclosure list below, which is for costs measured in whole hours.
+        print("  Plan against the worst case: a run materially longer than "
+              "it is a bug.")
+        print("  Each budgeted term tests its deadline before starting work, "
+              "so it can overrun\n    by the one query or slice already "
+              "running when the budget expires.")
 
     gaps = estimate["query_costs_not_modelled"]
     if gaps:
