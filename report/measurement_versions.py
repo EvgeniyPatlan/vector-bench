@@ -260,7 +260,8 @@ def _mismatch_text(source: str, measured: Any, declared: Any,
 
 
 def _mixed_records_text(source: str, versions: List[Any],
-                        declared: Optional[Any] = None) -> Any:
+                        declared: Optional[Any] = None,
+                        measured_versions: Optional[List[Any]] = None) -> Any:
     """Head and tail for a directory whose records disagree among themselves.
 
     `declared` is the manifest's version when no record carries it. The records
@@ -274,7 +275,20 @@ def _mixed_records_text(source: str, versions: List[Any],
     versions evaluated {1, 2, 3} as {1, 2} and came back "equivalent", which
     asserted comparability across a real bump -- the one thing this wording
     must never claim by accident.
+
+    `measured_versions` is the subset that records were actually found at, and
+    it is what the COUNT in the first sentence is taken from. The two differ by
+    exactly the unmatched manifest version, and counting `versions` there said
+    "ops records from 3 different measurement versions" over records from two
+    -- directly contradicted four lines below by this refusal's own listing,
+    which prints "version 2: declared by the run manifest, no records measured
+    under it". An operator told to produce "one report per version" would then
+    go looking for a third pile of records that does not exist. Defaults to
+    `versions` so the pure-mixed call, where every version listed does have
+    records, needs no second argument.
     """
+    if measured_versions is None:
+        measured_versions = versions
     if _equivalent(versions):
         why = _SAME_MEASUREMENT_MIXED
     else:
@@ -285,8 +299,8 @@ def _mixed_records_text(source: str, versions: List[Any],
                "counterpart of ann_fingerprint keeping a 16 GB recall curve "
                "out of a 64 GB report.")
     head = [
-        f"{source}: ops records from {len(versions)} different measurement "
-        f"versions cannot go on one chart.",
+        f"{source}: ops records from {len(measured_versions)} different "
+        f"measurement versions cannot go on one chart.",
         "",
         why,
     ]
@@ -342,7 +356,14 @@ def _refusal_message(source: str, sides: List[Any],
     head, tail = (
         _mismatch_text(source, measured[0][0], declared, all_versions)
         if declared is not None and len(measured) == 1
-        else _mixed_records_text(source, all_versions, declared))
+        # Both lists, and they are not interchangeable: the equivalence claim
+        # is made over every version involved (the manifest's included, or
+        # {1, 2, 3} evaluates as {1, 2} and comes back "comparable"), while the
+        # count in the first sentence is of the versions records were found
+        # at. Passing one list for both jobs is what made the headline
+        # contradict the listing underneath it.
+        else _mixed_records_text(source, all_versions, declared,
+                                 measured_versions=[v for v, _r in measured]))
 
     lines = head + [""]
     for version, found in sides:

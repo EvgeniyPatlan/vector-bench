@@ -456,6 +456,265 @@ def _is_concurrency_point(record: Dict[str, Any], dataset: str) -> bool:
             and record.get("clients") and record.get("qps"))
 
 
+#: The two statuses' footnote marks, imported from the renderer rather than
+#: declared here so the mark in this chart's legend and the mark in the
+#: operating-point table's footnote cannot drift apart -- a dagger on the
+#: chart explained by a footnote under a different glyph in the table is worse
+#: than no mark at all. `render.py` imports no chart code, so this is the
+#: direction with no cycle; it is also where `CLIENT_BOUND_MARK` already
+#: lives, and that one IS spelled twice (as a literal in the suptitle below),
+#: which is exactly the drift this import avoids.
+#: Imported, not re-spelled, for the same reason the marks are: the chart
+#: title and the operating-point table's Target column name the same number
+#: and must name it the same way. `_fmt_target` is `%g` rather than fixed
+#: decimals, and its docstring has the measured reason. PR 2 §2.3.3 writes the
+#: title with a literal `0.95`, and `{0.95:g}` is exactly `0.95`, so the
+#: default target renders the spec's own string.
+from .render import (FLOOR_MARK, UNCALIBRATED_MARK,  # noqa: E402
+                     UNREACHED_MARK, _fmt_target)
+
+
+def _uncalibrated_engines(records: List[Dict[str, Any]], dataset: str
+                          ) -> List[str]:
+    """Engines plotted on this dataset's concurrency chart with no status.
+
+    An engine qualifies when ANY of its plotted points lacks
+    `extra.calibration_status`, not only when all of them do. One engine can
+    be half-calibrated: the checkpoint grain is (pass, engine, dataset, phase)
+    and within an ops phase (M, build_mode), so a resume after flipping
+    `ops.ef_mode` can leave one M of an engine measured at the profile's
+    literal ef and the next calibrated. The line drawn through both is then
+    partly held to the target and partly not, and the honest treatment of a
+    line like that is the same as of one held to it nowhere.
+    """
+    plotted = [r for r in records if _is_concurrency_point(r, dataset)]
+    unheld = {r.get("engine") for r in plotted
+              if not (r.get("extra") or {}).get("calibration_status")}
+    return sorted(e for e in unheld if e is not None)
+
+
+def _qps_panel_title(records: List[Dict[str, Any]], dataset: str) -> str:
+    """What the concurrency chart's QPS panel is actually showing.
+
+    PR 2 §2.3.3 specifies the title "QPS at recall >= 0.95". The 0.95 in it is
+    `DEFAULT_TARGET_RECALL`, not a constant: `--target-recall` is a flag and
+    `extra.target_recall` is stamped on every record of a calibrated run, so
+    the title is built from the records being plotted and renders the spec's
+    literal string whenever the run used the default. Hard-coding 0.95 would
+    caption a `--target-recall 0.90` run with a floor none of its engines was
+    held to -- the precise failure this title exists to prevent, inverted, and
+    the reader has nothing else on the page to catch it with.
+
+    Three cases, because the honest caption differs in each:
+
+    * one target -- the spec's title, with that target's value.
+    * none -- `ef_mode: fixed`. No calibration ran, every engine sat at the
+      profile's literal ef_search, and what recall that bought differs per
+      engine by up to 0.18 on these implementations. Claiming a recall floor
+      here would be the chart asserting a comparison the run did not make, so
+      it says the opposite.
+    * more than one -- a `--from-records` rebuild over records merged from two
+      runs. Naming either target would be false about the other half of the
+      chart, so both are named and neither is presented as the floor.
+
+    Then qualified once more, because a single target is not the same claim as
+    a floor that held. An engine with no `calibration_status` was never put at
+    the target, and the first version of this function got that right at RUN
+    granularity -- no targets anywhere means no claim -- and wrong at ENGINE
+    granularity: one calibrated engine beside one resumed from a fixed-ef pass
+    titled the panel "QPS at recall >= 0.95" over a line that had never been
+    held to 0.95, with no mark on it and no row in the operating-point table.
+    See `_uncalibrated_engines` for how that state is reached without anyone
+    hand-editing a file.
+
+    `dataset` narrows the targets as well. `ops.target_recall` is one
+    profile-level value (`orchestrator/ops_pass.py` passes a single
+    `--target-recall`), so one run cannot vary it across datasets and this is
+    unreachable from a single run directory -- but a `--from-records` rebuild
+    over two merged runs can, and it put the sift run's target in the glove
+    chart's title: measured, two datasets at 0.80 and 0.95 produced "QPS at
+    mixed recall targets (0.8, 0.95)" on the glove panel, where every record
+    plotted had been held to 0.95.
+    """
+    from .loaders import calibration_targets
+
+    scoped = [r for r in records if r.get("dataset") == dataset]
+    targets = calibration_targets(scoped)
+    if not targets:
+        return "QPS at a fixed ef_search — recall differs per engine"
+    if len(targets) == 1:
+        title = f"QPS at recall ≥ {_fmt_target(targets[0])}"
+    else:
+        title = ("QPS at mixed recall targets ("
+                 + ", ".join(_fmt_target(t) for t in targets) + ")")
+    if _uncalibrated_engines(records, dataset):
+        title += f" — not for every engine ({UNCALIBRATED_MARK})"
+    return title
+
+
+def _calibration_marks(records: List[Dict[str, Any]], dataset: str
+                       ) -> Dict[str, Dict[str, Any]]:
+    """Per engine: which footnote marks it earned on this dataset, and why.
+
+    Keyed on the ENGINE and not on the plotted series key, because the mark is
+    a statement about the engine's floor and ceiling rather than about one
+    line. `series_key` is (engine, build_signature) and `build_signature`
+    omits `resource_pass`, so one engine measured in both passes is one series
+    here while `operating_points` keys the pass separately -- an engine whose
+    floor sits above the target in the tuned pass and not the normalized one
+    therefore earns the mark, and the footnote names both so the reader is not
+    left to guess which half it applies to.
+
+    `recalls` carries the recall actually achieved, which §2.3.3 requires
+    beside the `target_unreached` mark. It is the calibration sweep's recall at
+    the chosen ef -- the largest in the grid for that status, which is the
+    engine's best showing and what §2.1.6 says the engine is reported at. The
+    concurrency record's own `recall_at_k` is a different measurement and is
+    already its own column in the table.
+
+    The dataset filter is load-bearing and is not a tidiness measure. Measured
+    with it removed, over one engine daggered on glove and `ok` on sift: the
+    sift chart's legend suffix went from `''` to `' †'` and its footnote from
+    empty to an assertion that MariaDB cannot be slowed down to the target --
+    on a chart of a dataset where that was never measured.
+
+    `uncalibrated` is not a sweep outcome: the engine has plotted points with
+    no `calibration_status` at all. It is collected here rather than beside
+    the title so the legend, the footnote and the title all come from one
+    derivation -- see UNCALIBRATED_MARK for how a run reaches that state.
+    """
+    from .loaders import operating_points
+
+    marks: Dict[str, Dict[str, Any]] = {}
+
+    def entry_for(engine: str) -> Dict[str, Any]:
+        return marks.setdefault(engine, {"statuses": set(), "recalls": []})
+
+    for row in operating_points(records):
+        if row.get("dataset") != dataset:
+            continue
+        engine = row.get("engine")
+        status = row.get("status")
+        if engine is None or status not in ("floor_above_target",
+                                            "target_unreached"):
+            continue
+        entry = entry_for(engine)
+        entry["statuses"].add(status)
+        entry["recalls"].append((status, row.get("resource_pass"),
+                                 row.get("m"), row.get("recall_at_k")))
+
+    # Only where a target was pursued at all. On `ef_mode: fixed` every engine
+    # lacks a status, the title already says the chart is at a fixed ef, and
+    # marking all six as exceptions to a claim nobody made would be noise.
+    from .loaders import calibration_targets
+    if calibration_targets([r for r in records
+                            if r.get("dataset") == dataset]):
+        for engine in _uncalibrated_engines(records, dataset):
+            entry_for(engine)["statuses"].add("uncalibrated")
+    return marks
+
+
+def _mark_suffix(entry: Optional[Dict[str, Any]]) -> str:
+    """The marks one legend label should carry, in footnote order."""
+    if not entry:
+        return ""
+    # Known statuses only, by construction: `_calibration_marks` tests against
+    # the two literals and adds `uncalibrated` itself. An unrecognised
+    # `calibration_status` -- a future value, or a merged file from newer code
+    # -- therefore reaches the table as a raw cell with no mark here and no
+    # footnote, under a title that still claims the floor held. The status set
+    # is closed in `calibrate.py` (`ok`, `target_unreached`,
+    # `floor_above_target`) and the measurement version is what guards the
+    # merged-file case, so this is not reachable today; it is the thing to
+    # revisit if a fourth status is ever added.
+    statuses = entry["statuses"]
+    out = ""
+    if "uncalibrated" in statuses:
+        out += " " + UNCALIBRATED_MARK
+    if "floor_above_target" in statuses:
+        out += " " + FLOOR_MARK
+    if "target_unreached" in statuses:
+        out += " " + UNREACHED_MARK
+    return out
+
+
+def _agree(engines: Sequence[str]) -> Dict[str, str]:
+    """Verb and pronouns for a footnote written over a LIST of engines.
+
+    Chosen explicitly rather than written singular, because for two of the
+    three footnotes multi-engine is the normal case, not the edge: an operator
+    who flips `ops.ef_mode` mid-run has every engine already measured carrying
+    no status, and `target_unreached` lands on whole families at low M -- the
+    tuned-profile notes record all three MySQL-family engines between 0.736
+    and 0.818 at M=6, every one of them below a 0.95 target.
+
+    Written singular, the uncalibrated paragraph read, verbatim over two
+    engines: "AliSQL (VIDX), PostgreSQL (pgvector) WAS not calibrated: IT
+    carries no calibration_status, so IT was measured at ... does not apply to
+    IT. ITS throughput ...". An explicit choice is also how
+    `_refusal_message` already handles "1 record" against "2 records".
+    """
+    if len(engines) == 1:
+        return {"was": "was", "it": "it", "its": "its", "carries": "carries",
+                "is": "is"}
+    return {"was": "were", "it": "they", "its": "their", "carries": "carry",
+            "is": "are"}
+
+
+def _calibration_footnote(marks: Dict[str, Dict[str, Any]]) -> str:
+    """The footnotes §2.3.3 asks for, each printed only when it applies.
+
+    The `floor_above_target` sentence carries §2.1.6's requirement verbatim --
+    "cannot be slowed down to the target" -- because that is the one thing a
+    reader of this chart must not have to infer. An engine sitting above the
+    comparison recall is not being judged on the same terms as the rest, and a
+    dagger with no sentence behind it reads as a minor caveat.
+
+    A third paragraph for the engines that were never calibrated. It comes
+    first, because it is the only one of the three that says the title above
+    the panel does not describe that line at all.
+    """
+    floors = sorted(e for e, v in marks.items()
+                    if "floor_above_target" in v["statuses"])
+    unreached = sorted(e for e, v in marks.items()
+                       if "target_unreached" in v["statuses"])
+    uncalibrated = sorted(e for e, v in marks.items()
+                          if "uncalibrated" in v["statuses"])
+    parts: List[str] = []
+    if uncalibrated:
+        g = _agree(uncalibrated)
+        parts.append(
+            f"{UNCALIBRATED_MARK} "
+            f"{', '.join(style_for(e)['label'] for e in uncalibrated)}"
+            f" {g['was']} NOT calibrated: {g['carries']} no"
+            f" calibration_status, so the recall floor in the title above does"
+            f" not apply. Measured at the profile's literal ef_search,"
+            f" {g['its']} throughput is not comparable with the rest at any"
+            f" known recall")
+    if floors:
+        parts.append(
+            f"{FLOOR_MARK} {', '.join(style_for(e)['label'] for e in floors)}"
+            f" cannot be slowed down to the target: the smallest grid"
+            f" ef_search is already above it, so this QPS is measured at a"
+            f" HIGHER recall than the rest")
+    if unreached:
+        shown = []
+        for engine in unreached:
+            for status, _pass, _m, recall in marks[engine]["recalls"]:
+                if status != "target_unreached" or recall is None:
+                    continue
+                shown.append(f"{style_for(engine)['label']} {recall:.4f}")
+        detail = f" (best achieved: {', '.join(shown)})" if shown else ""
+        g = _agree(unreached)
+        parts.append(
+            f"{UNREACHED_MARK} "
+            f"{', '.join(style_for(e)['label'] for e in unreached)}"
+            f" reached the target at no grid point and {g['is']} shown at"
+            f" {g['its']} best achievable recall{detail} — a LOWER recall than"
+            f" the rest")
+    return "\n".join(parts)
+
+
 def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                 stem: str) -> Optional[Dict[str, str]]:
     """QPS, p99 latency and scaling efficiency against client count."""
@@ -479,6 +738,14 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_ylabel("p99 latency (ms)  (lower is better ↓)", fontsize=10)
     axes[2].set_ylabel("Scaling efficiency  (1.0 = linear)", fontsize=10)
 
+    # PR 2 §2.3.3. On the QPS panel and not as the figure's title, because it
+    # is true of that panel only: the latency and efficiency panels are not
+    # throughput at a recall. Built from `records` rather than
+    # `plotted_records` so a run whose concurrency workload was skipped for one
+    # engine still reports the target the others were held to.
+    axes[0].set_title(_qps_panel_title(records, dataset), fontsize=10)
+    marks = _calibration_marks(records, dataset)
+
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
         style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["clients"])
@@ -486,7 +753,8 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
         axes[0].plot(clients, [r["qps"] for r in rows], color=style["color"],
                      marker=style["marker"], linestyle=style["linestyle"],
-                     linewidth=1.8, markersize=6, label=labels[key])
+                     linewidth=1.8, markersize=6,
+                     label=labels[key] + _mark_suffix(marks.get(key[0])))
 
         p99 = [(c, r.get("latency_p99_ms")) for c, r in zip(clients, rows)
                if r.get("latency_p99_ms") is not None]
@@ -535,11 +803,19 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=10,
                    loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    # The calibration footnotes go below the axes, not into the suptitle that
+    # already carries the hollow-marker legend: they are two full sentences
+    # each and naming an engine's achieved recall there would push the title
+    # wider than the figure.
+    footnote = _calibration_footnote(marks)
     fig.suptitle(
         f"Concurrency scaling — {dataset}   "
         f"○ = client CPU-bound (>80% of the client container's CPUs)",
         fontsize=12, y=1.14)
     fig.tight_layout()
+    if footnote:
+        fig.text(0.01, -0.04, footnote, fontsize=9, color="#444444",
+                 ha="left", va="top")
     return _save(fig, out_dir, stem)
 
 
@@ -1076,4 +1352,97 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     ax.axhline(1.0, color="#888888", linewidth=1.0, linestyle=":")
     ax.text(0.0, 1.01, " no degradation", fontsize=8, color="#888888", va="bottom")
     ax.legend(frameon=False, fontsize=8)
+    return _save(fig, out_dir, stem)
+
+
+# ---------------------------------------------------------------------------
+# ef_search calibration (appendix)
+# ---------------------------------------------------------------------------
+
+def calibration_curves(records: List[Dict[str, Any]], dataset: str,
+                       out_dir: str, stem: str) -> Optional[Dict[str, str]]:
+    """PR 2 §2.3.4: recall against ef_search, one line per engine.
+
+    The audit trail for every other number in a calibrated report. The
+    operating-point table states the ef each engine was given; this is the
+    curve that choice was made from, so a reader can see whether the chosen
+    point sits on a plateau or on a slope — and a sweep that early-stopped
+    after three of twelve grid points is visibly three points long rather than
+    silently short.
+
+    It "doubles as a sanity check against the ann frontier" in the sense that a
+    reader can carry a recall off this chart to §4 and find the same engine at
+    the same ef_search there. The two are deliberately NOT drawn on one axis:
+    `PHASE_CALIBRATION`'s own docstring is explicit that these are not Pareto
+    points — they are single-client probes against the index the ops pass just
+    built, measured in a different container, over a different query count, by
+    a different code path's recall computation. Overlaid they would read as one
+    curve, and the first thing a reader would do with a disagreement is
+    average it. Kept apart, a disagreement between the two charts is what it
+    actually is: a signal that one of the two measurement paths is wrong about
+    this engine.
+
+    Returns None when no sweep ran, which `generate.py` also guards ahead of
+    the call: the chart is optional because the sweep is.
+    """
+    from .loaders import (calibration_records, operating_point_key,
+                          operating_points)
+
+    _require_matplotlib()
+    points = [r for r in calibration_records(records)
+              if r.get("dataset") == dataset
+              and r.get("ef_search") is not None
+              and r.get("recall_at_k") is not None]
+    if not points:
+        return None
+
+    targets = sorted({(r.get("extra") or {}).get("target_recall")
+                      for r in points
+                      if (r.get("extra") or {}).get("target_recall")
+                      is not None})
+
+    fig, ax = _new_axes(
+        f"ef_search calibration — {dataset}",
+        "ef_search (requested)", "Recall@k  (single-client sweep)",
+        figsize=(9, 5.5))
+    ax.set_xscale("log", base=2)
+
+    by_series, labels, storages, degrees = _grouped(points)
+    # Which (unit, ef) pairs the run actually settled on, so the ring marks the
+    # point the downstream workloads were measured at rather than this
+    # function's own guess at which point the rule should have picked. Matched
+    # through `operating_point_key`, via the key each row carries, so there is
+    # one definition of the unit: a ring on a point no workload ran at, or no
+    # ring where a sweep succeeded, is then a real disagreement between the
+    # sweep and what consumed it rather than two derivations drifting.
+    settled = {(row["key"], row["ef_search"])
+               for row in operating_points(records)
+               if row.get("dataset") == dataset
+               and row.get("ef_search") is not None}
+
+    for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
+        style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
+        rows = sorted(rows, key=lambda r: r["ef_search"])
+        ax.plot([r["ef_search"] for r in rows], [r["recall_at_k"] for r in rows],
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=1.8, markersize=5,
+                label=labels[key])
+        chosen = [r for r in rows
+                  if (operating_point_key(r), r["ef_search"]) in settled]
+        if chosen:
+            ax.scatter([r["ef_search"] for r in chosen],
+                       [r["recall_at_k"] for r in chosen], s=170,
+                       facecolors="none", edgecolors=style["color"],
+                       linewidths=1.8, zorder=5)
+
+    for target in targets:
+        ax.axhline(target, color="#888888", linewidth=1.0, linestyle="--")
+        ax.text(ax.get_xlim()[0], target + 0.002,
+                f" target {_fmt_target(target)}", fontsize=8,
+                color="#888888", va="bottom")
+    ax.legend(frameon=False, fontsize=8)
+    ax.text(0.0, -0.17,
+            "◯ = the ef_search the concurrency, filtered and churn workloads "
+            "were then measured at",
+            transform=ax.transAxes, fontsize=8, color="#444444")
     return _save(fig, out_dir, stem)

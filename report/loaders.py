@@ -498,3 +498,247 @@ def split_sessions(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         segments[-1].append(current)
     return segments
 
+
+# ---------------------------------------------------------------------------
+# ef_search calibration
+# ---------------------------------------------------------------------------
+
+def calibration_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The ef_search sweep's own records, selected by explicit phase equality.
+
+    A named selector rather than a comprehension at each call site, because
+    nothing in this package's aggregations picks a new phase up on its own.
+    Each one names the phase it wants: the concurrency chart's
+    `_is_concurrency_point`, `summarize`'s build / concurrency / filtered /
+    churn / ingest group-by, `attach_peak_rss`, `storage_breakdown` and
+    `churn_retention` all compare `phase` against a literal, so
+    `ef_calibration` records were read out of the JSONL by `load_ops_records`
+    and then dropped on the floor by every one of them, including code that
+    looks generic.
+
+    That default is right for all of those and must stay: a calibration point
+    carries `clients=1` and a `qps`, so admitting it to the concurrency
+    aggregation would add up to twelve single-client points per engine to a
+    sweep measured over a shared query pool and move the published QPS.
+
+    Three consumers SHOULD see these records, and all three already do -- by
+    being written as inequalities or as no test at all, which is what makes
+    "every consumer filters by equality" the wrong generalisation to reason
+    from:
+
+    * `summarize`'s plan-failure loop has no phase filter, so a calibration
+      probe that ran without the vector index in the plan is reported like any
+      other full scan. Correct: it is a full scan.
+    * `measurement_versions._is_ops_record` is `phase != PHASE_RECALL`, so
+      `_is_ops_record({"phase": "ef_calibration"})` is True (measured) and the
+      sweep's records are grouped and version-checked with the rest of the ops
+      path. Also correct -- they are ops records, written by the same harness
+      under the same `OPS_MEASUREMENT_VERSION`.
+    * `webui/records.py`'s `facets`, `filter_records` and `series` do not
+      mention `phase` at all (measured), so `ef_calibration` shows up as a
+      facet value in the Explore tab's Raw view. The web UI has no calibration
+      VIEW -- `webui/static/fields.js` declares one per *reportable workload*
+      rather than one per phase, five of them against seven entries in
+      `ALL_PHASES`, with `ingest` unviewed as well as `ef_calibration`
+      (measured) -- so the Explore tab is blind to the sweep rather than wrong
+      about it, and `explore.js`'s per-view `phaseFilter` is what keeps these
+      records out of its concurrency view. Left for a follow-up; `webui/` is
+      not this change's to edit.
+
+    This function's callers are the fourth consumer, and the only one that
+    needed writing.
+    """
+    from harness.metrics.records import PHASE_CALIBRATION
+
+    return [r for r in records if r.get("phase") == PHASE_CALIBRATION]
+
+
+def operating_point_key(record: Dict[str, Any]) -> Any:
+    """Which calibrated measurement unit a record belongs to.
+
+    PR 2 §2.3.1 asks for a summary "keyed by (engine, dataset, pass)". That
+    triple is not unique: `orchestrator/cli.py` invokes the harness once per
+    (M, build_mode, storage_engine) and each invocation runs its own sweep, so
+    `config/profiles/m-sweep.yml` -- `m_values: [6, 8, 16, 24, 32]` --
+    calibrates five times per engine, dataset and pass. A literal three-part
+    key would collapse five independent operating points into one row and
+    publish whichever the iteration order reached last.
+
+    The key is the resource pass plus `build_signature`, which is this repo's
+    existing definition of "everything about a measurement except the query
+    effort" -- and `ef_search` is exactly the query effort the sweep chooses,
+    so the signature is already the right grain. On a profile that measures one
+    configuration it reduces to the spec's triple.
+
+    `resource_pass` is added because `build_signature` omits it, and for the
+    MySQL-family engines nothing else in the signature separates the two
+    passes. `config/resources/tuned.yml` sweeps `pgvector_ef_construction`
+    and `valkey_ef_construction` over [64, 200, 400], which IS in the
+    signature, and pins `mariadb_storage_engines: [InnoDB]` -- so MariaDB's
+    normalized and tuned sweeps carry the same engine, dataset, M, build mode,
+    storage engine and (absent) ef_construction, and collide on a key without
+    the pass. Those are two separate sweeps on two different memory and CPU
+    budgets, and merging them would report one ef for both.
+    """
+    return (record.get("resource_pass"), build_signature(record))
+
+
+def _operating_point_sort_key(row: Dict[str, Any]) -> Any:
+    """Stable order for the table, None-safe on every axis a profile may skip.
+
+    `m` sorts NUMERICALLY. Stringifying it alongside the text axes ordered
+    `m-sweep`'s five values as 16, 24, 32, 6, 8 -- in the very profile
+    `operating_point_key` cites as the reason this key has the grain it does,
+    and in a column a reader scans for a trend. The text axes still sort as
+    text, and every axis keeps its None-last tiebreak because a profile may
+    leave `build_mode` or `storage_engine` unset.
+    """
+    def text(value: Any) -> Any:
+        return (value is None, str(value))
+
+    def number(value: Any) -> Any:
+        try:
+            return (value is None, float(value), "")
+        except (TypeError, ValueError):
+            # A hand-edited record can hold anything here; sort it after the
+            # real numbers rather than raising inside a sort.
+            return (value is None, float("inf"), str(value))
+
+    return (text(row.get("engine")), text(row.get("dataset")),
+            text(row.get("resource_pass")), number(row.get("m")),
+            text(row.get("build_mode")), text(row.get("storage_engine")))
+
+
+def operating_points(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The ef each calibrated unit settled on, at what recall, and why.
+
+    A join, not a filter, and the two sides carry different halves of the
+    answer:
+
+    * the *chosen* ef and the status come from the DOWNSTREAM records. The
+      sweep writes one record per grid point and marks none of them as the
+      choice -- `CalibrationResult` is returned to `harness/main.py`, which
+      substitutes `ef_search` and then calls `Recorder.declare_run_extra`, so
+      what the run actually measured at is the `ef_search` on the concurrency,
+      filtered and churn records and the status is their
+      `extra.calibration_status`. Reading the choice back off the measurement
+      that used it cannot disagree with it. Re-deriving it here by reapplying
+      `calibrate.select` to the curve could: it would be a second copy of the
+      selection rule, and the first symptom of the two drifting apart would be
+      a report whose "chosen ef" column names an ef no workload ran at.
+    * the *recall* comes from the CALIBRATION record at that ef. The sweep
+      measured it over `--max-queries` single-client queries against freshly
+      warmed caches, which is the measurement the choice was made on. The
+      concurrency records carry a `recall_at_k` too and it is NOT this number:
+      it is the median window's, over a shared query pool, under contention
+      from every other client. Using it here would put a figure in the
+      "Recall@k" column that the ef was not chosen by, which is how this table
+      would come to disagree with the sweep that produced it.
+
+    A unit with only one half is kept rather than dropped, with the missing
+    half as None. A sweep whose downstream workloads never ran cost minutes per
+    engine and produced no operating point; a report that simply omits it says
+    the sweep never happened.
+    """
+    from harness.metrics.records import (CALIBRATION_STATUS_KEY,
+                                         PHASE_CALIBRATION,
+                                         TARGET_RECALL_KEY)
+
+    curves: Dict[Any, List[Dict[str, Any]]] = {}
+    chosen: Dict[Any, List[Dict[str, Any]]] = {}
+    for record in records:
+        extra = record.get("extra") or {}
+        if record.get("phase") == PHASE_CALIBRATION:
+            curves.setdefault(operating_point_key(record), []).append(record)
+        elif extra.get(CALIBRATION_STATUS_KEY):
+            # Only records carrying a status, which is what makes this the
+            # downstream half of a CALIBRATED run rather than every ops record
+            # in the directory. `stamp_run_extra` drops a None, so in `fixed`
+            # mode no record has the key and no operating point is claimed --
+            # which is correct: nothing aimed at a recall.
+            chosen.setdefault(operating_point_key(record), []).append(record)
+
+    rows: List[Dict[str, Any]] = []
+    for key in set(curves) | set(chosen):
+        curve = sorted(curves.get(key, []),
+                       key=lambda r: (r.get("ef_search") is None,
+                                      r.get("ef_search")))
+        users = chosen.get(key, [])
+        sample = (users or curve)[0]
+
+        # The set, never the first element: two disagreeing efs under one key
+        # are two measurements presented as one, and printing either as "the"
+        # operating point is the failure this column exists to expose. A run
+        # directory cannot produce it -- one JSONL file per unit, truncated per
+        # attempt -- but `--from-records` over a hand-merged file can.
+        efs = sorted({r.get("ef_search") for r in users
+                      if r.get("ef_search") is not None})
+        statuses = sorted({(r.get("extra") or {}).get(CALIBRATION_STATUS_KEY)
+                           for r in users
+                           if (r.get("extra") or {}).get(
+                               CALIBRATION_STATUS_KEY)})
+        targets = sorted({(r.get("extra") or {}).get(TARGET_RECALL_KEY)
+                          for r in users
+                          if (r.get("extra") or {}).get(TARGET_RECALL_KEY)
+                          is not None})
+
+        ef = efs[0] if len(efs) == 1 else None
+        at_ef = next((r for r in curve if r.get("ef_search") == ef), None)
+        rows.append({
+            # The key itself, so a consumer that has to match a row back to the
+            # records it came from uses this function's definition of the unit
+            # rather than rebuilding it from the row's own columns. Rebuilding
+            # it does not work: `build_signature`'s column fallback includes
+            # `ef_construction` and `extra.quantization`, neither of which is
+            # a column of this row, so a reconstructed key silently fails to
+            # equal the one the records hash to -- and the symptom is a chart
+            # that marks no chosen point at all.
+            "key": key,
+            "engine": sample.get("engine"),
+            "dataset": sample.get("dataset"),
+            "resource_pass": sample.get("resource_pass"),
+            "m": sample.get("m"),
+            "build_mode": sample.get("build_mode"),
+            "storage_engine": sample.get("storage_engine"),
+            "ef_search": ef,
+            "ef_conflict": efs if len(efs) > 1 else None,
+            "effective_ef": ((at_ef.get("extra") or {}).get("effective_ef")
+                             if at_ef else None),
+            "recall_at_k": at_ef.get("recall_at_k") if at_ef else None,
+            "status": statuses[0] if len(statuses) == 1 else None,
+            "status_conflict": statuses if len(statuses) > 1 else None,
+            "target_recall": targets[0] if len(targets) == 1 else None,
+            # How much of the grid ran, straight from the sweep's own record: a
+            # sweep that early-stopped after three of twelve points says so
+            # here rather than only in the log, and a reader comparing two
+            # engines' chosen ef needs to know neither was capped by a grid
+            # that stopped short.
+            "grid_size": ((curve[0].get("extra") or {}).get("grid_size")
+                          if curve else None),
+            "points_measured": len(curve) or None,
+            "ef_grid": [r.get("ef_search") for r in curve] or None,
+        })
+    rows.sort(key=_operating_point_sort_key)
+    return rows
+
+
+def calibration_targets(records: List[Dict[str, Any]]) -> List[float]:
+    """Every distinct recall target the given records were measured against.
+
+    A list rather than one value because a report can honestly hold more than
+    one: `--target-recall` is a flag, and `--from-records` over records merged
+    from two runs can hand this package both. A caller naming the target in a
+    chart title or a footnote has to decide what to say for zero and for two,
+    and it cannot do that from a single float.
+
+    Read off the records rather than from `DEFAULT_TARGET_RECALL`, because the
+    default is what the flag falls back to and not what the run used. An empty
+    list means `ef_mode: fixed` -- no target was pursued, and `stamp_run_extra`
+    leaves the key out rather than writing the default as though one had been.
+    """
+    from harness.metrics.records import TARGET_RECALL_KEY
+
+    found = {(r.get("extra") or {}).get(TARGET_RECALL_KEY) for r in records}
+    return sorted(float(t) for t in found
+                  if isinstance(t, (int, float)) and not isinstance(t, bool))
+
