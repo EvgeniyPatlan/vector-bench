@@ -147,6 +147,14 @@ class FakeDriver(EngineDriver):
         self._index: Optional[IndexSpec] = None
         self._connected = False
         self._store = _store if _store is not None else _Store(dim)
+        # Every iterative-scan mode `set_iterative_scan` was asked for, in
+        # order. A list rather than a single value because the thing worth
+        # asserting is the SEQUENCE: PR 3 §3.4 item 4 has the filtered
+        # workload measure its grid once per declared mode, and "the last mode
+        # won" cannot tell a two-mode loop from a one-mode loop that set the
+        # mode twice.
+        self.iterative_scan_calls: List[str] = []
+        self.iterative_scan: Optional[str] = None
         # Call counters, so a test can prove which schema calls a workload made
         # rather than inferring it from a timing.
         self.create_schema_calls = 0
@@ -310,6 +318,34 @@ class FakeDriver(EngineDriver):
 
     def set_ef_search(self, ef_search: int) -> None:
         self._ef_search = int(ef_search)
+
+    def set_iterative_scan(self, mode: str) -> None:
+        """Record a pgvector iterative-scan mode; change no behaviour.
+
+        This exists because `harness/workloads/filtered.py` gates on
+        `hasattr(driver, "set_iterative_scan")` and this fake had no such
+        method, so the branch that applies the mode -- and the loop that now
+        measures the grid once per mode -- could not be reached in a test at
+        all. `ops.pgvector_iterative_scan` was declared in three config files
+        and executed in none of 69 archived records, and an untestable branch
+        is how that lasted the life of the project.
+
+        Deliberately NOT modelled. The real knob changes how far pgvector
+        walks its graph when a filter rejects candidates, which would change
+        recall; faking a recall effect here would invite a test to asserting
+        a number this fake invented, and the fake "must never be used to
+        produce a number that appears in a report". What a test may assert is
+        that the workload asked for the right modes in the right order, which
+        is what `iterative_scan_calls` is for.
+
+        The mode is not validated. `PostgresDriver.set_iterative_scan`
+        interpolates it into a `SET` and the whitelist that protects that
+        lives in the orchestrator (`cli.py:_ops_iterative_scan`, against the
+        engine config's own `iterative_scan_modes`), so a fake that refused an
+        unknown mode would be testing a guard the driver does not have.
+        """
+        self.iterative_scan = str(mode)
+        self.iterative_scan_calls.append(str(mode))
 
     def p_ef(self, ef: Optional[int] = None) -> float:
         """p(ef) = min(1, ef / (ef + ef_half)).

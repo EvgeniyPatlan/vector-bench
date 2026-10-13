@@ -113,6 +113,102 @@ _PHASE_GROUPS = (
 )
 
 
+#: What `extra.filter_column` means when it is absent, which it is on every
+#: filtered record written before PR 3: all 69 archived pgvector filtered
+#: records, every record `tests/synthetic.py` builds, and anything a
+#: pre-T3c harness produced. Those runs had one filter column and it was
+#: `tag`, so reading absence as `tag` is a statement of fact about them
+#: rather than a default -- and the alternative, bucketing them as "unknown",
+#: would split one engine's `tag` curve across two series on every chart that
+#: reads an archived run.
+FILTER_COLUMN_WHEN_ABSENT = "tag"
+
+
+def filter_column(record: Dict[str, Any]) -> str:
+    """The filter column a filtered record measured."""
+    return ((record.get("extra") or {}).get("filter_column")
+            or FILTER_COLUMN_WHEN_ABSENT)
+
+
+def filtered_chart_entries(records: List[Dict[str, Any]], dataset: str,
+                           draw=None) -> List[Any]:
+    """The `(name, fn, payload)` chart entries for the filtered section.
+
+    One per filter column present, or -- when there are no filtered records
+    at all -- the single `filtered` entry this always had, so that the `needs`
+    table still matches it and the shared "not in this profile's workloads"
+    skip line still prints. Without that fallback a profile running no
+    filtered workload would generate no chart and say nothing about why.
+
+    `functools.partial`, not a lambda. A lambda written
+    `lambda *a, **kw: charts.filtered(*a, column=column, **kw)` closes over
+    the NAME `column`, not its value, so every entry in the list would plot
+    whichever column the comprehension finished on: two filenames, one chart,
+    and the `tag` curve silently gone from a report that still looks
+    complete. `partial` binds the value at construction and the mistake
+    cannot be written. A module-level function rather than an expression
+    inside `main()` so the binding is testable without a run directory --
+    `draw` is the chart function, injectable for exactly that.
+    """
+    from functools import partial
+
+    from report import charts as charts_mod
+    draw = draw or charts_mod.filtered
+    columns = _filter_columns_present(records, dataset)
+    if not columns:
+        return [("filtered", draw, (records, dataset))]
+    return [(f"filtered-{column}", partial(draw, column=column),
+             (records, dataset))
+            for column in columns]
+
+
+#: The axes `cli.py:_run_unit` loops over. One ops unit is one
+#: (M, build_mode, storage_engine) combination inside one resource pass, and
+#: each unit reloads the corpus, rebuilds the index and writes its OWN full
+#: column x selectivity grid of filtered records. `main` gives pgvector two
+#: units per (pass, dataset); `full` gives mariadb three and pgvector six;
+#: `--resource-pass both` doubles all of them.
+OPS_UNIT_FIELDS = ("m", "build_mode", "storage_engine", "resource_pass")
+
+
+def ops_unit(record: Dict[str, Any]) -> tuple:
+    """Which ops unit a record was measured in.
+
+    Any derivation that compares two filtered points -- a latency ratio
+    across a selectivity curve, most of all -- has to hold these constant or
+    it is comparing two indexes built differently on two different machine
+    allocations. Measured on a two-build-mode fixture: `post` alone gives a
+    0.20x ratio and the verdict "pre-filter", `incremental` alone gives 1.00x
+    and "post-filter, abandons the query", and pooling them publishes ONE row
+    at 50.0x and "post-filter, exhaustive" -- a verdict neither unit
+    produced, obtained by dividing one unit's 1% latency by the other's 50%.
+    """
+    return tuple(record.get(field) for field in OPS_UNIT_FIELDS)
+
+
+def _filter_columns_present(records: List[Dict[str, Any]],
+                            dataset: str) -> List[str]:
+    """The filter columns this dataset has filtered records for, in order.
+
+    `FILTER_COLUMNS`' order rather than first-seen order, so the list does
+    not depend on whatever order the JSONL happens to be in -- which is what
+    makes the generated file set reproducible for a given run.
+
+    It does NOT decide the order they appear in the report: `render.figures()`
+    iterates `sorted(chart_paths.items())`, so `filtered-ctag-<dataset>`
+    renders before `filtered-tag-<dataset>` alphabetically. Changing that
+    means changing how every figure in every section is ordered, which is a
+    larger decision than this function should make; both charts carry the
+    column in their title and caption, so a reader is not misled.
+    """
+    present = {filter_column(r) for r in records
+               if r.get("phase") == "filtered" and r.get("dataset") == dataset}
+    ordered = [c for c in ("tag", "ctag") if c in present]
+    # Anything a future column adds is appended rather than dropped: a chart
+    # missing entirely is harder to notice than one with an unexpected name.
+    return ordered + sorted(present - set(ordered))
+
+
 def summarize(records: List[Dict[str, Any]],
               manifest: Optional[Dict[str, Any]] = None,
               memory: Optional[Dict[str, List[Dict[str, Any]]]] = None
@@ -139,6 +235,13 @@ def summarize(records: List[Dict[str, Any]],
         "qps_inversions": [],
         "contended_phases": [],
         "filter_strategies": [],
+        # Points the filtered budget stopped early. A record that measured 93
+        # of 500 planned queries is a real measurement of a slow
+        # configuration, not a failure -- but its recall carries the variance
+        # of 93 queries and the report must not draw it as though it carried
+        # 500. `insufficient_sample` is the stricter flag of the two: fewer
+        # than 50 queries finished.
+        "time_bounded_points": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
     }
@@ -262,11 +365,36 @@ def summarize(records: List[Dict[str, Any]],
                 "phase": r.get("phase"), "m": r.get("m"),
                 "ef_search": r.get("ef_search"),
                 "selectivity": r.get("selectivity"),
+                # `explain_uses_vector_index` runs per (column, selectivity)
+                # since PR 3 §3.3 item 2, because the MySQL-family optimizers
+                # can switch to `ctag_idx` or to a full scan at a different
+                # threshold than they do for `tag`. A plan failure that does
+                # not say which column it was asked about names the wrong
+                # index to go and look at.
+                "filter_column": (filter_column(r)
+                                  if r.get("phase") == "filtered" else None),
+            })
+        if (r.get("extra") or {}).get("time_bounded"):
+            extra = r.get("extra") or {}
+            summary["time_bounded_points"].append({
+                "engine": r.get("engine"), "dataset": r.get("dataset"),
+                "filter_column": filter_column(r),
+                "selectivity": r.get("selectivity"),
+                "resource_pass": r.get("resource_pass"),
+                "build_mode": r.get("build_mode"),
+                "queries_executed": r.get("queries_executed"),
+                "queries_planned": extra.get("queries_planned"),
+                "budget_s": extra.get("filtered_budget_s"),
+                "insufficient_sample": bool(extra.get("insufficient_sample")),
             })
         if (r.get("extra") or {}).get("returned_fewer_than_k"):
             summary["short_result_cases"].append({
                 "engine": r.get("engine"), "dataset": r.get("dataset"),
                 "selectivity": r.get("selectivity"),
+                # Without the column, `tag` at 10% and `ctag` at 10.85% are
+                # two rows differing only in a selectivity a reader cannot
+                # attribute to a predicate.
+                "filter_column": filter_column(r),
                 # Without these, four measurements of one engine are one row
                 # printed four times and the table reads as broken.
                 "resource_pass": r.get("resource_pass"),
@@ -337,13 +465,54 @@ def summarize(records: List[Dict[str, Any]],
     # showed 18.2 ms at 10% selectivity and 120.6 ms at 1% -- six times more
     # work for a tenth of the candidates, which is inline filtering and not a
     # planner choosing to pre-filter.
+    # The key has to hold constant everything that changes the answer, because
+    # the derivation takes the narrowest and the widest point of a series and
+    # divides their latencies. Anything pooled into one series is a pair of
+    # points that may never have run together, and the result is published as
+    # a verdict about an engine.
+    #
+    # Four kinds of confound, all reachable in configured profiles:
+    #
+    # * The filter COLUMN. A series holding both can pair a `ctag` point
+    #   against a `tag` one -- two different predicates over two different
+    #   qualifying sets. `tag` at 1% and `ctag` at 1.9% (the share a nominal
+    #   1% actually delivers on the 2,000-row fixture) are not two points on
+    #   one curve.
+    # * The iterative-scan MODE. pgvector with index iteration off and with it
+    #   on walk different amounts of graph, which is the entire reason the
+    #   mode is recorded.
+    # * The OPS UNIT -- M, build mode, storage engine. `_run_unit` loops
+    #   `m_values x build_modes x storage_engines` and each pass through it
+    #   reloads the corpus, rebuilds the index and writes its own full grid.
+    #   pgvector's `post` and `incremental` builds are different indexes;
+    #   MariaDB's InnoDB and MyISAM are different storage. Measured, one
+    #   engine and one column over two build modes: 0.20x "pre-filter" and
+    #   1.00x "post-filter, abandons the query" separately, against a pooled
+    #   50.0x "post-filter, exhaustive" that neither produced.
+    # * The RESOURCE PASS. normalized and tuned give the engine different
+    #   memory and cpusets; pairing a normalized 1% point against a tuned 50%
+    #   one published a ratio of 100.0x on the same fixture.
+    #
+    # The report has already been wrong about exactly this class of thing
+    # once, asserting for weeks that Valkey "chooses its filtering strategy
+    # per query" on the strength of its documentation.
     by_engine: Dict[Any, List[Dict[str, Any]]] = {}
     for r in records:
         if (r.get("phase") == "filtered" and r.get("selectivity")
                 and r.get("latency_p50_ms")):
-            by_engine.setdefault((r.get("engine"), r.get("dataset")),
-                                 []).append(r)
-    for (engine, dataset), points in sorted(by_engine.items(), key=lambda kv: str(kv[0])):
+            key = ((r.get("engine"), r.get("dataset"), filter_column(r),
+                    (r.get("extra") or {}).get("iterative_scan"))
+                   + ops_unit(r))
+            by_engine.setdefault(key, []).append(r)
+    for key, points in sorted(by_engine.items(), key=lambda kv: str(kv[0])):
+        engine, dataset, column, scan_mode = key[:4]
+        # Zipped rather than unpacked positionally, so the key can carry
+        # however many axes `OPS_UNIT_FIELDS` names. A fixed-length unpack
+        # here made the obvious regression -- dropping an axis from the key --
+        # raise a ValueError instead of publishing a wrong ratio, which is a
+        # mutant that cannot be injected and therefore a guard that cannot be
+        # proven.
+        unit = dict(zip(OPS_UNIT_FIELDS, key[4:]))
         if len(points) < 2:
             continue
         points.sort(key=lambda r: r["selectivity"])
@@ -363,6 +532,17 @@ def summarize(records: List[Dict[str, Any]],
             observed = "post-filter, exhaustive"
         summary["filter_strategies"].append({
             "engine": engine, "dataset": dataset,
+            "filter_column": column, "iterative_scan": scan_mode,
+            # Carried so the rendered row can say which unit it describes.
+            # A table that cannot tell two units apart prints the same row
+            # twice and reads as a rendering fault -- which is the reason the
+            # `short_result_cases` block beside this one carries them.
+            # `.get`, not `[...]`: an axis absent from OPS_UNIT_FIELDS is
+            # reported as None rather than crashing, so the rendered table
+            # shows a blank cell where the pooling happened.
+            "m": unit.get("m"), "build_mode": unit.get("build_mode"),
+            "storage_engine": unit.get("storage_engine"),
+            "resource_pass": unit.get("resource_pass"),
             "narrow": narrow["selectivity"], "wide": wide["selectivity"],
             "narrow_p50": narrow["latency_p50_ms"],
             "wide_p50": wide["latency_p50_ms"],
@@ -370,7 +550,13 @@ def summarize(records: List[Dict[str, Any]],
             "ratio": round(ratio, 2), "span": round(span, 1),
             "observed": observed,
         })
-    summary["filter_strategies"].sort(key=lambda s: s["ratio"])
+    summary["filter_strategies"].sort(
+        key=lambda s: (s["ratio"], s["engine"] or "", s["filter_column"],
+                       str(s["resource_pass"]),
+                       # Numeric, so M 8/16/32 does not come out 16, 32, 8 --
+                       # which `full`'s `m_values: [8, 16, 32]` would produce.
+                       s["m"] or 0,
+                       str(s["build_mode"]), str(s["storage_engine"])))
 
     # Build-cost and concurrency headlines.
     for phase, key in _PHASE_GROUPS:
@@ -643,6 +829,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         passes_present = {r.get("resource_pass") for r in records
                           if r.get("dataset") == dataset and r.get("resource_pass")}
 
+        # One filtered chart per column, or -- when there are no filtered
+        # records at all -- the single `filtered` entry this always had, so
+        # that `needs` below still matches it and still prints the shared
+        # "not in this profile's workloads" skip line. Without the fallback a
+        # profile that runs no filtered workload would generate no chart and
+        # say nothing about why, which is the one case the log line exists
+        # for.
+        filtered_charts = filtered_chart_entries(records, dataset)
+
         for name, fn, payload in (
             ("pareto", charts.pareto, (dict(by_engine), dataset, k)),
             # 0.95, not 0.85. With the main chart on a logit axis the whole
@@ -656,7 +851,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             ("build", charts.build_cost, (records, dataset)),
             ("storage", charts.storage_breakdown, (records, dataset)),
             ("concurrency", charts.concurrency, (records, dataset)),
-            ("filtered", charts.filtered, (records, dataset)),
+            # One per filter column present. PR 3's acceptance asks for "a
+            # column selector (or two charts)"; two charts is the option that
+            # survives being rendered to Markdown, which this report also is.
+            # Derived from the records rather than from FILTER_COLUMNS: an
+            # archived run carries no `filter_column` and must keep producing
+            # the one chart it always produced, and a profile narrowed to
+            # `filter_columns: [tag]` must not emit an empty `ctag` panel.
+            *filtered_charts,
             ("churn", charts.churn, (records, dataset)),
             ("churnimpact", charts.churn_impact, (records, dataset)),
             ("passcompare", charts.pass_comparison, (records, dataset)),
@@ -672,7 +874,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                       f"{', '.join(sorted(passes_present)) or 'one'} pass ran "
                       f"(needs normalized and tuned)")
                 continue
-            required = needs.get(name)
+            # Split on "-" so `filtered-tag` and `filtered-ctag` find the
+            # `filtered` entry. No other chart name contains a hyphen, and a
+            # future one that does would want the same prefix behaviour.
+            required = needs.get(name) or needs.get(name.split("-")[0])
             if required and required not in phases_present:
                 print(f"[report] skipping {name}: no {required} records "
                       f"(not in this profile's workloads)")

@@ -140,12 +140,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="measure each client count N times and record the "
                         "median window with the spread beside it")
     p.add_argument("--selectivities", default="0.01,0.10,0.50")
+    # Both filter columns by default, because `build` loads both: measuring
+    # one would leave a column in the table that nothing ever queries, and
+    # choosing between them per run would cost a full reload -- hours for
+    # MHNSW and VIDX at 1M rows.
+    p.add_argument("--filter-columns",
+                   default=",".join(filtered_workload.DEFAULT_COLUMNS),
+                   help="comma-separated filter columns the filtered "
+                        f"workload measures; any of "
+                        f"{','.join(filtered_workload.DEFAULT_COLUMNS)}")
+    # The same reason --churn-budget exists, for the workload that turned out
+    # to need it more. Filtered search answers one query at a time and a
+    # selective predicate can take an engine from 326 QPS to 0.9, so the
+    # profile's query count is a cost nothing bounded: 500 queries at 0.9 QPS
+    # is 9 minutes, and it was 37 minutes at the 2,000 that `full` asks for --
+    # per point, per column, per ops unit.
+    p.add_argument("--filtered-budget", type=float,
+                   default=filtered_workload.DEFAULT_BUDGET_S,
+                   help="seconds per (column, selectivity, iterative-scan "
+                        "mode) point in the filtered workload")
     p.add_argument("--churn-fractions", default="0.10,0.25")
     # An engine that stalls re-inserting must release the machine and record
     # what it managed, rather than holding the run until someone notices.
     p.add_argument("--churn-budget", type=float, default=1800.0)
+    # Comma-separated, and the workload loops whatever it is given: PR 3 §3.4
+    # item 4 measures the filtered grid once per declared mode, against ONE
+    # loaded index. Looping in the orchestrator instead would re-run build,
+    # concurrency and churn per mode and double pgvector's ingest to vary a
+    # query-time setting.
     p.add_argument("--iterative-scan", default=None,
-                   help="pgvector only: off | relaxed_order | strict_order")
+                   help="pgvector only: one or more of off | relaxed_order | "
+                        "strict_order, comma-separated")
 
     p.add_argument("--run-id", required=True)
     p.add_argument("--resource-pass", default="normalized",
@@ -163,6 +188,10 @@ def _floats(csv: str) -> List[float]:
 
 def _ints(csv: str) -> List[int]:
     return [int(x) for x in csv.split(",") if x.strip()]
+
+
+def _strings(csv: str) -> List[str]:
+    return [x.strip() for x in csv.split(",") if x.strip()]
 
 
 def _detect_march() -> str:
@@ -306,9 +335,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ctx, driver, dataset, index,
                 ef_search=ef_search,
                 selectivities=_floats(args.selectivities),
+                columns=_strings(args.filter_columns),
                 max_queries=args.max_queries,
                 iterative_scan=args.iterative_scan,
                 indexed_rows=indexed_rows,
+                budget_s=args.filtered_budget,
             )
 
         # Churn mutates the table, so it runs last: everything before it sees a

@@ -168,6 +168,41 @@ SCHEMA_VERSION = 1
 # series. Two ingest figures both stamped version 4 -- one from a three-column
 # table and one from a four-column table -- load together with no refusal and
 # land on the same bar chart of rows per second.
+#
+# VERSION 5 ALSO COVERS PR 3's FILTERED WORKLOAD, and this paragraph exists
+# because the enumeration above lists only the `ctag` COLUMN's effects, which
+# is not all of what moved. Two of the changes are to `Record` fields rather
+# than to `extra`, so a reader who took "the rest is additive" from the list
+# above would be wrong:
+#
+#   * `selectivity` moves, materially, for the SAME request. It used to be
+#     `threshold / 100.0` -- the nominal share -- and is now the counted share
+#     of rows the predicate actually selects. For `tag` the correction is
+#     small (glove's 1,183,514 rows make a 1% request deliver 1.000073%); for
+#     `ctag` it is not, because the clusters are unequal: on a 2,000-row
+#     corpus a nominal 1% records 0.0190 where the old code recorded 0.0200,
+#     and a nominal 10% records 0.1085 against 0.1200. The PREDICATE is
+#     unchanged -- same threshold, same qualifying rows -- so recall, QPS and
+#     the percentiles beside it are the same quantity measured the same way.
+#     Only the x axis stops lying. That is why it did not earn a bump of its
+#     own, and why it has to be written down somewhere: a reader diffing two
+#     archived `selectivity` values could otherwise read a label correction as
+#     a change of measurement.
+#   * `recall_at_k` can now be NULL, and can be a mean over fewer queries than
+#     the profile asked for. `ops.filtered_budget_s` stops the query loop when
+#     it is spent, so a filtered record may carry recall over 93 of 500
+#     planned queries -- `queries_executed`, `extra.queries_planned`,
+#     `extra.time_bounded` and `extra.insufficient_sample` say which, and the
+#     report greys those points out. A point that managed no queries at all
+#     records no recall rather than a zero. The precedent is version 3, which
+#     likewise counts only the queries finishing inside each concurrency
+#     window and sits inside that version rather than earning a fourth.
+#
+# Neither needs a bump, and the reason is the same in both cases: the quantity
+# is unchanged and the record says what it is. Version 5 was introduced by
+# T3b inside this same change set, so nothing has ever been MEASURED at a
+# version 5 that lacked these, and the cross-version guard already refuses to
+# chart a version 1 record beside a version 5 one.
 OPS_MEASUREMENT_VERSION = 5
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.

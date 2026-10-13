@@ -35,4 +35,25 @@ ops:
   client_counts: [1, 2]
   concurrency_duration_s: 4
   selectivities: [0.10, 0.50]
+  # Sixty seconds a point, not the 300 s default, and the reason is this
+  # profile's whole contract: "a full ops cycle runs in about a minute". Two
+  # columns x two selectivities is four filtered points per engine, so the
+  # default budget would print a 2.0 h worst case for a run that takes about
+  # six minutes across six engines -- 20x the real cost, for the profile
+  # people run most often, and over the 1 h threshold below which
+  # `print_load_estimate` prints nothing at all. At 60 s the worst case is
+  # 0.41 h and `dev` stays silent, which is what it should be: an estimate
+  # for a framework exercise is noise.
+  #
+  # Note this is NOT the `long_run` warning, which is keyed on ingest above
+  # 12 h and is False for `dev` either way. The 1 h threshold decides whether
+  # the estimate BLOCK is printed; `long_run` decides whether that block
+  # carries the "each M value reloads the corpus" caveat.
+  #
+  # Sixty seconds still bounds it: 100 queries in 60 s is a 1.7 QPS floor,
+  # and the only engines that have ever gone near that were on a million rows
+  # at 1% selectivity, not on this corpus. A dev point that does truncate is
+  # recorded with `insufficient_sample` rather than dropped, so the failure
+  # mode is a flagged point and not a missing one.
+  filtered_budget_s: 60
   churn_fractions: [0.10]

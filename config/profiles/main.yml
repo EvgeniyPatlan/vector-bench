@@ -20,9 +20,20 @@
 #                                engine-dataset pair plus warm-up, which buys
 #                                an error bar on the one measurement here that
 #                                has been seen to move 21% between windows.
-#   * filtered starts at 10%    — 1% selectivity measured 0.9 QPS on MariaDB,
-#                                so 2000 queries there costs 37 minutes per
-#                                configuration for one point on a curve.
+#   * filtered at 1/10/50%      — 1% is back. It measured 0.9 QPS on MariaDB
+#                                against 326 unfiltered, so 2000 queries there
+#                                cost 37 minutes for one point; what makes it
+#                                affordable now is `filtered_budget_s`, which
+#                                caps every point at five minutes and records
+#                                what it managed instead of running until it
+#                                finishes. The low-selectivity case is where
+#                                pre-filtering, post-filtering and index
+#                                iteration actually diverge, so omitting it
+#                                dropped the measurement this dimension is for.
+#   * both filter columns        — `tag` and `ctag`, which doubles the number
+#                                of filtered points. `ctag` follows the vector
+#                                space, so it is the one that shows an engine
+#                                abandoning a query; `tag` is the control.
 #   * fewer filtered queries    — 500, not 2000. At sub-1 QPS the query count
 #                                is the whole cost.
 name: main
@@ -77,9 +88,26 @@ ops:
   # exists to show. It exists for reproducing a pre-version-3 run, not for
   # tuning this one.
   concurrency_repeats: 3
-  # 1% is deliberately absent: it cost 37 minutes per configuration on MariaDB
-  # at 0.9 QPS. Measure it separately with --profile full if the low-selectivity
-  # case matters to you.
-  selectivities: [0.10, 0.50]
+  # All three, 1% included. It was dropped because it cost 37 minutes per
+  # configuration on MariaDB at 0.9 QPS with nothing bounding the loop; the
+  # budget below is what bounds it, so the cost of the point is now five
+  # minutes whatever the engine does inside them and the record says how many
+  # of the 500 queries it managed. A truncated point is greyed out in the
+  # report rather than averaged in.
+  selectivities: [0.01, 0.10, 0.50]
+  # Five minutes per (column, selectivity, iterative-scan mode) point. The
+  # worst case this profile can reach per engine-dataset is 2 columns x 3
+  # selectivities x 1 mode x 300 s = 30 minutes, against the ~51 h of ingest
+  # it pays before a single query runs. Without it the same grid was
+  # unbounded: the run estimate printed its shape and refused to call the
+  # total a ceiling, which is the honest thing to print and a bad thing to
+  # have to.
+  #
+  # One mode, not two. `pgvector_iterative_scan` below declares two and
+  # `cli.py:_ops_iterative_scan` pins the first, so the grid runs once; the
+  # workload loops whatever it is handed. If that call site is ever changed to
+  # pass the whole list, this worst case doubles for pgvector alone and the
+  # estimate's filtered term has to gain the factor with it.
+  filtered_budget_s: 300
   churn_fractions: [0.10, 0.25]
   pgvector_iterative_scan: [off, relaxed_order]

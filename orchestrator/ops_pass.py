@@ -17,7 +17,7 @@ import os
 import shutil
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from . import docker_ctl
 from . import engines as engines_mod
@@ -450,13 +450,96 @@ def _concurrency_queries(ops: Dict[str, Any]) -> int:
     return int(ops.get("concurrency_queries", DEFAULT_CONCURRENCY_QUERIES))
 
 
+#: Seconds per (column, selectivity, iterative-scan mode) point in the
+#: filtered workload. Declared here as well as in
+#: `harness.workloads.filtered` for the reason DEFAULT_EF_MODE is: this module
+#: runs on the host, whose only Python dependency is pyyaml, and the workload
+#: reaches numpy through `harness.datasets`. `tests/test_t3c_filtered.py` pins
+#: the two declarations together, as `tests/test_calibrate.py` already does
+#: for the ef policy.
+DEFAULT_FILTERED_BUDGET_S = 300
+
+#: The filter columns the filtered workload measures when a profile says
+#: nothing. Both, matching `harness.datasets.FILTER_COLUMNS`, and pinned
+#: against it by the same test.
+DEFAULT_FILTER_COLUMNS = ("tag", "ctag")
+
+
+def _budget_arg(ops: Dict[str, Any], key: str, default: Any) -> str:
+    """A budget key as a command-line value, with YAML `null` meaning no cap.
+
+    `str(ops.get(key, default))` -- the idiom every other numeric key here
+    uses -- turns a key PRESENT with value null into the string "None", which
+    argparse rejects with `invalid float value: 'None'` and `SystemExit(2)`.
+    That kills the whole ops unit, not just the workload: `harness/main.py`
+    wraps concurrency, filtered and churn in one `except`, so a reader who
+    wrote `filtered_budget_s: null` to turn the cap off lost two other
+    workloads with it.
+
+    `null` and `0` both mean no cap, which is what `_filtered_search` in the
+    estimate has always assumed (it treats `budget > 0` as the only bounded
+    case) and what the workload now implements.
+
+    Deliberately NOT applied to `ops.churn_budget_s`, which shares the same
+    hole verbatim one line below. Changing it would change
+    `harness/workloads/churn.py`'s behaviour, and that file belongs to T4a --
+    a churn budget of null currently crashes the unit the same way, and
+    fixing it here without fixing the enforcement there would move the
+    failure rather than remove it.
+    """
+    value = ops.get(key, default)
+    return "0" if value is None else str(value)
+
+
+def _filter_columns(ops: Dict[str, Any]) -> List[str]:
+    """The filter columns to measure, as the harness spells them.
+
+    Its own function because a profile may legitimately narrow this -- a
+    reproduction of a pre-PR-3 run wants `[tag]` alone -- and because an empty
+    or absent key must mean "both" rather than "none". `[]` in YAML is falsy,
+    and a profile that wrote it would otherwise silently measure no filtered
+    point at all while the phase still reported success.
+    """
+    declared = ops.get("filter_columns")
+    if not declared:
+        return list(DEFAULT_FILTER_COLUMNS)
+    return [str(column) for column in declared]
+
+
+def _iterative_scan_modes(iterative_scan) -> Optional[str]:
+    """The `--iterative-scan` value, from one mode or several.
+
+    A plain string passes through verbatim, which is what keeps a single-mode
+    call site emitting exactly what it asked for; a sequence is joined with
+    commas and the workload splits it again. `str` is checked first on purpose
+    -- a string IS a sequence, and joining one gives "o,f,f".
+    """
+    if iterative_scan is None:
+        return None
+    if isinstance(iterative_scan, str):
+        return iterative_scan or None
+    modes = [str(mode) for mode in iterative_scan if str(mode)]
+    return ",".join(modes) or None
+
+
 def harness_args(profile: Dict[str, Any], m: int, engine: str,
                  resolved: ResolvedResources,
                  resource_pass: str, resources: Dict[str, Any],
                  build_mode: str = "post",
                  storage_engine: str = "InnoDB",
-                 iterative_scan: Optional[str] = None) -> List[str]:
-    """Translate a profile into ops-harness command-line arguments."""
+                 iterative_scan: Optional[Union[str, Sequence[str]]] = None
+                 ) -> List[str]:
+    """Translate a profile into ops-harness command-line arguments.
+
+    `iterative_scan` takes one mode or several. One is emitted verbatim, which
+    is what the only call site in `cli.py` passes today -- it resolves the
+    FIRST declared mode and pins it. Several are comma-joined for the workload
+    to loop, which is the shape PR 3 §3.4 item 4 costs out; nothing in the
+    orchestrator produces that shape yet, and turning it on is one line in
+    `cli.py:_ops_iterative_scan` (return the whole declared list rather than
+    `list(declared)[0]`). It is wired from this end so that the day it is
+    turned on, the carriage is already tested.
+    """
     ops = profile.get("ops", {}) or {}
     ann = profile.get("ann", {}) or {}
 
@@ -489,6 +572,13 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         "--concurrency-repeats", str(ops.get("concurrency_repeats", 1)),
         "--concurrency-queries", str(_concurrency_queries(ops)),
         "--selectivities", ",".join(str(s) for s in ops.get("selectivities", [0.1])),
+        "--filter-columns", ",".join(_filter_columns(ops)),
+        # Emitted unconditionally, including the default, for the reason
+        # --ef-mode is: the harness command line in a run's phase log should
+        # say what bounded the filtered loop rather than leaving a reader to
+        # infer it from whatever the workload's default was at the time.
+        "--filtered-budget", _budget_arg(ops, "filtered_budget_s",
+                                         DEFAULT_FILTERED_BUDGET_S),
         "--churn-fractions", ",".join(str(c) for c in ops.get("churn_fractions", [0.1])),
     ]
     if ops.get("subset_rows"):
@@ -496,6 +586,7 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     if engine == "pgvector":
         ef_construction = ann.get("pgvector_ef_construction", 200)
         args += ["--ef-construction", str(ef_construction)]
-        if iterative_scan:
-            args += ["--iterative-scan", iterative_scan]
+        modes = _iterative_scan_modes(iterative_scan)
+        if modes:
+            args += ["--iterative-scan", modes]
     return args

@@ -1198,7 +1198,7 @@ class TestFilteredWorkload:
         filtered_workload.run(
             ctx, driver, dataset, index_spec(dataset), ef_search=64,
             selectivities=(0.01, 0.50), max_queries=N_QUERIES, warmup=2,
-            indexed_rows=N_ROWS,
+            indexed_rows=N_ROWS, columns=(ds.FILTER_TAG,),  # T3c: this test is about `tag`
         )
 
         rows = written(ctx)
@@ -1233,7 +1233,7 @@ class TestFilteredWorkload:
         filtered_workload.run(
             ctx, driver, angular_dataset, index_spec(angular_dataset),
             ef_search=64, selectivities=(0.50,), max_queries=N_QUERIES,
-            warmup=2, indexed_rows=N_ROWS,
+            warmup=2, indexed_rows=N_ROWS, columns=(ds.FILTER_TAG,),  # T3c: this test is about `tag`
         )
         row = written(ctx)[0]
         assert row["metric_space"] == ds.ANGULAR
@@ -1248,7 +1248,7 @@ class TestFilteredWorkload:
         filtered_workload.run(
             ctx, driver, dataset, index_spec(dataset), ef_search=64,
             selectivities=(0.50,), max_queries=N_QUERIES, warmup=2,
-            indexed_rows=N_ROWS,
+            indexed_rows=N_ROWS, columns=(ds.FILTER_TAG,),  # T3c: this test is about `tag`
         )
         assert written(ctx)[0]["vector_index_used"] is False
 
@@ -1337,7 +1337,9 @@ class TestWorkloadsShareOneSchema:
             max_queries=N_QUERIES)
         filtered_workload.run(
             ctx, driver, dataset, index, ef_search=64, selectivities=(0.50,),
-            max_queries=N_QUERIES, warmup=2, indexed_rows=indexed_rows)
+            max_queries=N_QUERIES, warmup=2, indexed_rows=indexed_rows,
+            # T3c: this test is about `tag`
+            columns=(ds.FILTER_TAG,))
         churn_workload.run(
             ctx, driver, dataset, index, ef_search=64, fractions=(0.10,),
             max_queries=N_QUERIES, indexed_rows=indexed_rows)
