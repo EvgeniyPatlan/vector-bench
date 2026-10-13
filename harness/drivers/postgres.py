@@ -49,9 +49,27 @@ COPY_SQL = (
 )
 
 
+#: The table option `prepare_churn` turns off and `maintain` gives back.
+#: Named once because the two statements have to agree about the spelling and
+#: they are forty lines apart; `SET (...)` and `RESET (...)` disagreeing is a
+#: table left with autovacuum off for the life of the container.
+AUTOVACUUM_OPTION = "autovacuum_enabled"
+
+#: What `maintain()` reports it ran. The statement text rather than a verb,
+#: because it lands in `extra.maintenance` and is read by a human comparing
+#: engines -- "VACUUM (ANALYZE)" says what to go and read about; "vacuumed"
+#: does not say whether the planner statistics moved too.
+MAINTENANCE_DESCRIPTION = "VACUUM (ANALYZE)"
+
+
 class PostgresDriver(EngineDriver):
     name = "pgvector"
     incremental_index = False
+    # The one engine in the set with a repair path the churn workload runs.
+    # MHNSW and VIDX would need OPTIMIZE TABLE, which rebuilds the whole
+    # vector index at 1M rows -- a separate experiment, not a churn step --
+    # and mongot merges its Lucene segments on its own schedule.
+    repair_path = "vacuum_analyze"
 
     def __init__(self, spec: ConnectionSpec):
         super().__init__(spec)
@@ -203,6 +221,75 @@ class PostgresDriver(EngineDriver):
     def count_rows(self) -> int:
         self._cur.execute(f"SELECT count(*) FROM {TABLE}")
         return int(self._cur.fetchone()[0])
+
+    # ------------------------------------------------------------------
+    # Churn
+    # ------------------------------------------------------------------
+
+    def prepare_churn(self) -> None:
+        """Take autovacuum off the table, so the churn measurement is ours.
+
+        Autovacuum runs on its own schedule against its own thresholds. A
+        churn that deletes 10% of a million rows crosses those thresholds, so
+        whether the tombstones are still in the heap when recall is
+        re-measured depends on when the daemon last looked -- and the record
+        said nothing about it either way. Two runs of the same profile could
+        therefore differ by the whole size of the effect PR 4 measures, with
+        the difference attributed to the engine.
+
+        Deliberately not wrapped in a try: a DDL statement that fails here has
+        not put the table in the state the following measurements claim, and a
+        swallowed failure would publish a churn curve labelled "autovacuum
+        off" that was taken with autovacuum on. `explain_uses_vector_index`
+        swallows exceptions because a plan check must not end a run; this is
+        not a check, it is the setup the measurement is defined in terms of.
+        """
+        self._cur.execute(
+            f"ALTER TABLE {TABLE} SET ({AUTOVACUUM_OPTION} = false)"
+        )
+
+    def maintain(self) -> Optional[str]:
+        """VACUUM (ANALYZE) the table, then give autovacuum back.
+
+        ANALYZE as well as VACUUM because the churn changes the statistics the
+        planner uses to decide between the HNSW index and a scan, and a VACUUM
+        that reclaimed the tombstones while leaving stale statistics would
+        measure the repaired index through a planner still describing the old
+        table.
+
+        **The RESET is in a `finally` and that is a tested promise, not a
+        tidiness.** `prepare_churn` turns off a persistent TABLE option: it
+        survives the session, the connection and this process, so a VACUUM
+        that raises -- disk full, a lock timeout, the server restarting under
+        it -- would otherwise leave `t1` with autovacuum off for as long as
+        the table exists, and the next thing to measure it would be measuring
+        a table nobody configured that way. The exception itself is re-raised:
+        a repair path that failed must not be recorded as a repair that ran.
+
+        One gap worth knowing about, because it is the half this `finally`
+        cannot close: if the WORKLOAD raises between `prepare_churn` and here
+        -- a failed delete, a re-insert that dies -- `maintain` is never
+        called and the option stays off. It is bounded rather than fixed, and
+        the binding is worth naming precisely, because the obvious argument is
+        the weaker one. Inside the unit, `build.run` drops and recreates the
+        table and `main.py` runs churn last, so nothing in the same unit
+        measures it afterwards -- but that says nothing about any LATER unit.
+        What covers those is `orchestrator/ops_pass.py:OpsRun.teardown()`,
+        which removes the Docker volume and its bind directory -- the whole
+        PostgreSQL data directory -- per ops unit, the volume being named
+        `{run_id}-{engine}-m{M}-{build_mode}[-{storage}]-data`. The table and
+        its options do not survive the unit at all, so no later unit, no later
+        resource pass and no orchestrated re-run can measure a table with
+        autovacuum still off. Closing the gap properly, for a server someone
+        keeps by hand, needs a fourth hook, which PR 4 §4.1 does not define.
+        """
+        try:
+            self._cur.execute(f"VACUUM (ANALYZE) {TABLE}")
+        finally:
+            self._cur.execute(
+                f"ALTER TABLE {TABLE} RESET ({AUTOVACUUM_OPTION})"
+            )
+        return MAINTENANCE_DESCRIPTION
 
     # ------------------------------------------------------------------
     # Query

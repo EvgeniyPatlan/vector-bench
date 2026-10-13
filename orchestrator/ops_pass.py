@@ -459,6 +459,13 @@ def _concurrency_queries(ops: Dict[str, Any]) -> int:
 #: for the ef policy.
 DEFAULT_FILTERED_BUDGET_S = 300
 
+#: Seconds one churn re-insertion may spend. Matches
+#: `harness/workloads/churn.py:DEFAULT_CHURN_BUDGET_S`, which is not
+#: importable here -- the orchestrator runs on the host and the harness runs
+#: in a container -- and was a bare literal in the argument list until the
+#: `null` fix needed to pass it to `_budget_arg` as a default.
+DEFAULT_CHURN_BUDGET_S = 1800
+
 #: The filter columns the filtered workload measures when a profile says
 #: nothing. Both, matching `harness.datasets.FILTER_COLUMNS`, and pinned
 #: against it by the same test.
@@ -480,12 +487,21 @@ def _budget_arg(ops: Dict[str, Any], key: str, default: Any) -> str:
     estimate has always assumed (it treats `budget > 0` as the only bounded
     case) and what the workload now implements.
 
-    Deliberately NOT applied to `ops.churn_budget_s`, which shares the same
-    hole verbatim one line below. Changing it would change
-    `harness/workloads/churn.py`'s behaviour, and that file belongs to T4a --
-    a churn budget of null currently crashes the unit the same way, and
-    fixing it here without fixing the enforcement there would move the
-    failure rather than remove it.
+    Applied to `ops.churn_budget_s` as well, as of T4a. T3c left that one
+    alone on purpose: the enforcement lives in `harness/workloads/churn.py`
+    and fixing the emission without it would have moved the failure from
+    argparse into a workload whose first deadline check fires immediately,
+    which is the shape that made every filtered point record ZERO queries.
+    `churn.run` now converts a non-positive budget into an infinite deadline,
+    so both halves are in place and both spellings mean no cap.
+
+    One place still raises on `null` and it is not reachable from here:
+    `orchestrator/estimate.py:_churn_reinsert` reads
+    `float(plan.ops.get("churn_budget_s", 1800))` with no `or 0.0`, so the
+    estimate -- which runs on the host, before the run starts -- dies with
+    `TypeError: float() argument must be a string or a real number, not
+    'NoneType'`. `_filtered_search` two functions above it has the `or 0.0`.
+    Fixing that is a one-line change in a file T4a does not own.
     """
     value = ops.get(key, default)
     return "0" if value is None else str(value)
@@ -558,7 +574,8 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
             (ops.get("ef_calibration") or DEFAULT_EF_CALIBRATION)),
         "--storage-engine", storage_engine,
         "--build-mode", build_mode,
-        "--churn-budget", str(ops.get("churn_budget_s", 1800)),
+        "--churn-budget", _budget_arg(ops, "churn_budget_s",
+                                      DEFAULT_CHURN_BUDGET_S),
         # Read from the same extras render_config uses for the recall path, so
         # both measurement paths in one run build the same index. Only Percona
         # Search has the knob; the flag is omitted for everything else.

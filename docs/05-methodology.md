@@ -306,6 +306,63 @@ Recall and QPS re-measured after deleting and re-inserting 10% and 25% of rows.
 HNSW graphs degrade under deletion; how much, and whether the engine offers a
 repair path, differs.
 
+Three things about the post-churn state are decided here rather than left to
+the engine's own timing, because each of them was previously deciding what got
+measured.
+
+**Autovacuum is off for the whole churn phase on pgvector.** `prepare_churn()`
+runs `ALTER TABLE ... SET (autovacuum_enabled = false)` once, before the
+baseline, and `maintain()` runs `VACUUM (ANALYZE)` and then `RESET`s the
+option. Without this, whether a churned index still held its tombstones when
+recall was re-measured depended on when the autovacuum daemon last looked at
+the table, and nothing in the record said which it had been — two runs of the
+same profile could differ by the whole size of the effect being measured, with
+the difference read as a property of the engine.
+
+**An asynchronous index is confirmed caught up before re-measuring.**
+`wait_index_synced(rows)` runs after the re-insert, and its cost is recorded as
+`extra.index_sync_s`. For Valkey it waits on FT.INFO's mutation queue; for
+Percona Search it polls `$vectorSearch` for the newest written document until
+the index returns it. The other four engines maintain their index on the write
+path and record `0.0`. "The engine is slow and inaccurate" and "we asked before
+the index was ready" are the same numbers in a record otherwise.
+
+**A small `index_sync_s` for Valkey is weaker evidence than it looks**, and a
+reader of the published number needs to know which way. The shared wait it
+delegates to tests two conditions — the mutation queue, and the indexed
+document count against the row count expected — but the count comparison was
+written for the delete path, where the count falls *to* the target. A
+re-insert raises it towards the target instead, so that half is already
+satisfied when the wait begins and stops binding unless the index is
+*over*counting. The queue is then the only signal in force, and the queue has
+been observed drained while the index still disagreed with the keyspace by 481
+documents. So a near-zero `index_sync_s` on Valkey means "the mutation queue
+was empty", not "the index had absorbed the writes"; every record carries
+`extra.index_sync_note` saying which of the two it rested on.
+
+**The engines with a repair path are measured twice per churn step, and the
+second fraction starts from the post-maintenance state.** Each step writes a
+record stamped `extra.maintenance_state = "before"`, and then, if the engine
+has a repair path, runs it, times it, and writes a second record stamped
+`"after"` carrying `extra.maintenance` and `extra.maintenance_s`. Engines with
+no repair path (MariaDB, AliSQL, Valkey, Percona Search) write one record per
+step and carry `extra.repair_path = "none"`; pgvector carries
+`"vacuum_analyze"`. `OPTIMIZE TABLE` is not used for MHNSW or VIDX: at 1M rows
+it rebuilds the whole vector index, which is a separate experiment and not a
+churn step.
+
+That the 25% step therefore starts from a *repaired* index on pgvector and from
+a degraded one everywhere else is a choice, and the alternative is defensible:
+never maintaining between steps would measure cumulative degradation under a
+realistic write pattern, which is arguably the more interesting question. It is
+written down here because it is not derivable from the numbers. The reason for
+this choice is comparability in the other direction — the sequence is "churn,
+measure, repair, measure" per step, so every record states which of the two
+states it describes, and a reader who wants the un-repaired cumulative curve
+reads the `"before"` records across fractions and gets exactly it. Under the
+alternative, the repaired state would exist only at the end and pgvector's
+repair cost could not be attributed to a fraction at all.
+
 ## 3. Fairness
 
 Two passes are run. Both are reported; neither alone is the answer.

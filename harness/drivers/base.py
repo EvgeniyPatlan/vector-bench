@@ -241,6 +241,21 @@ class EngineDriver(abc.ABC):
     #: returns, so build cost is load time plus time-to-ready and the two
     #: overlap. Neither value of incremental_index describes that.
     async_index_build: bool = False
+    #: Short name of the repair path `maintain()` runs, or "none" for an
+    #: engine that has none. Declared rather than inferred from `maintain()`'s
+    #: return value, because the churn workload has to stamp it onto the
+    #: record it writes BEFORE maintenance runs -- that record is the
+    #: "before maintenance" measurement, and writing it first is what keeps a
+    #: completed measurement on disk when `maintain()` itself fails. A value
+    #: derived from a call that has not happened yet would be "none" for
+    #: pgvector too, which is the one thing PR 4 §4.1 item 4 asks this key to
+    #: be able to say apart.
+    #:
+    #: A class attribute next to the two above because it is the same kind of
+    #: fact: a property of the engine, not of a measurement. MariaDB, AliSQL,
+    #: Valkey and Percona Search inherit "none" and need no edit, which is
+    #: what "No hooks" in §4.1 item 4 means.
+    repair_path: str = "none"
 
     def __init__(self, spec: ConnectionSpec):
         self.spec = spec
@@ -299,6 +314,57 @@ class EngineDriver(abc.ABC):
 
     @abc.abstractmethod
     def count_rows(self) -> int: ...
+
+    # -- churn ----------------------------------------------------------
+    # Three optional hooks with no-op defaults, so an engine that has no
+    # mechanism for one of them needs no code at all. The defaults are what
+    # MariaDB, AliSQL and (for two of the three) Valkey and Percona Search
+    # use, and a driver that overrides none of them measures exactly what the
+    # churn workload measured before these existed.
+
+    def prepare_churn(self) -> None:
+        """Put the engine in a deterministic state before the deletes.
+
+        Called once per churn run, before the baseline measurement, so that
+        whatever it changes is in force for the baseline as well as for the
+        post-churn measurements -- a knob flipped between the two would make
+        the comparison a comparison of knobs.
+
+        pgvector is the engine this exists for: autovacuum decides on its own
+        schedule whether the tombstones a churn leaves behind are still there
+        when recall is re-measured, so the "before maintenance" number was
+        partly a vacuumed index and partly not, with nothing in the record to
+        say which.
+        """
+
+    def wait_index_synced(self, expected_rows: int) -> float:
+        """Block until an asynchronously maintained index reflects the writes.
+
+        Returns the seconds spent waiting -- 0.0 for the engines that maintain
+        their index on the write path, where there is nothing to wait for.
+
+        The return value is a measurement and not a status: the churn workload
+        records it as `extra.index_sync_s`, so an engine whose index lags by
+        minutes after a re-insert says so in the record rather than reporting
+        a recall taken against an index that had not caught up. A hook that
+        returned nothing would make "the index was ready" and "nobody asked"
+        the same observation.
+        """
+        return 0.0
+
+    def maintain(self) -> Optional[str]:
+        """Run the engine's repair path; return a short description of what ran.
+
+        `None` means this engine has no repair path, and the churn workload
+        then writes one record per fraction instead of a before/after pair.
+        A description is what the record carries as `extra.maintenance`, so it
+        is read by a human: "VACUUM (ANALYZE)", not a row count.
+
+        Deliberately not timed here. The caller times the call, because the
+        number belongs beside the recall figures it explains and a driver that
+        timed itself would have to be trusted about the clock it used.
+        """
+        return None
 
     # -- query ----------------------------------------------------------
 

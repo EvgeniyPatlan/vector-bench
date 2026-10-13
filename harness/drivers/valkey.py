@@ -79,6 +79,18 @@ METRIC = {"angular": "COSINE", "euclidean": "L2"}
 # million rows is one DEL of 99,000 keys and one pipeline holding 600 MB.
 CHURN_BATCH = int(os.environ.get("VB_VALKEY_CHURN_BATCH", "1000"))
 
+#: The ceiling `wait_index_synced` gives the index to absorb a re-insert.
+#: Numerically `_wait_for_mutations`' own default, and passed EXPLICITLY for a
+#: reason that is not style: that function signals its timeout only by
+#: printing to stderr -- the value it returns on giving up is a plain elapsed
+#: time, indistinguishable from a successful long wait. Holding the ceiling
+#: here is what lets the note below say "this wait timed out" instead of
+#: publishing `index_sync_s: 900.0` beside a sentence implying the queue
+#: drained. Measured before this constant existed: with the wait returning
+#: 900.0, the note named none of timeout / timed out / still catching up /
+#: WARNING / had not.
+INDEX_SYNC_TIMEOUT_S = 900.0
+
 # Long enough that no honest write hits it, short enough that a reply which is
 # never coming does not hold the machine until someone notices. Never None:
 # that is what turned a stalled churn into a run that hung overnight.
@@ -154,6 +166,11 @@ class ValkeyDriver(EngineDriver):
         self._write_conn = None
         self._probed = False
         self._largest_working = 0
+        # Why `index_sync_s` came out the way it did, for the churn record.
+        # Read by `harness/workloads/churn.py` through `getattr`, the same way
+        # it already reads `write_batch_used` below: an engine with nothing to
+        # say simply has no such attribute. See `wait_index_synced`.
+        self.index_sync_note: Optional[str] = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -527,6 +544,67 @@ class ValkeyDriver(EngineDriver):
               f"{waited:.0f}s. Writing into it anyway; treat what follows as a "
               f"measurement of an index that was still catching up.",
               file=sys.stderr, flush=True)
+        return waited
+
+    def wait_index_synced(self, expected_rows: int) -> float:
+        """Let the index absorb the re-inserted rows before re-measuring.
+
+        Delegates to `_wait_for_mutations`, which already waits on the one
+        signal this build publishes -- FT.INFO's mutation queue -- and already
+        knows that the queue alone has been caught reading drained while the
+        index disagreed with the keyspace by 481 documents.
+
+        **The document-count half of that wait does not bind on an insert,
+        and a reader of `extra.index_sync_s` needs to know it.** The condition
+        there is `docs <= expected_docs`, written for the delete path it was
+        added for, where the count falls TO the target. After a re-insert the
+        count rises to the target, so it starts below it and the comparison is
+        satisfied by an index that has absorbed none of the writes. What is
+        left guarding this call is the mutation queue, which is the weaker of
+        the two signals by the measurement that put the document count there.
+        PR 4 §4.1 item 2 asks for the delegation in those words, so the
+        delegation is what this does; a direction-aware comparison is a change
+        to `_wait_for_mutations` and to the delete path that shares it.
+
+        So the limitation is published rather than left to be inferred from
+        this docstring: `index_sync_note` says what the wait rested on, and
+        `churn.run` carries it into the record beside `index_sync_s`. Without
+        it this engine would routinely publish a bare `index_sync_s: 0.0` --
+        indistinguishable from a synchronous engine and from a hook nobody
+        implemented -- in the one engine where that zero is most misleading,
+        because Valkey is the engine whose writes have actually stopped
+        returning mid-churn and cost two runs.
+
+        **The note hedges the direction claim rather than asserting it, and
+        the hedge is a measurement.** The document half is not dead on the
+        insert path; it is dead only while the index UNDERCOUNTS. Driving the
+        real `_wait_for_mutations` with FT.INFO readings and no sleeping: a
+        count of 1,800 against an expected 2,000 ends the wait in **1 poll**,
+        while a count of 2,481 against the same 2,000 -- the 481-document
+        overcount this file's own docstring is built around -- takes **4
+        polls**, so there the count is exactly what bound it. A note saying
+        "the queue was the only signal" would be false in the one case the
+        surrounding prose cares most about.
+        """
+        waited = self._wait_for_mutations(expected_docs=int(expected_rows),
+                                         timeout_s=INDEX_SYNC_TIMEOUT_S)
+        if waited >= INDEX_SYNC_TIMEOUT_S:
+            # `_wait_for_mutations` warns on stderr and returns anyway, so
+            # without this branch the record would carry the timeout's elapsed
+            # time under a sentence describing a wait that finished.
+            self.index_sync_note = (
+                f"the index had not absorbed the re-insert after "
+                f"{waited:.0f}s and the wait gave up; what follows measures "
+                f"an index that was still catching up")
+        else:
+            self.index_sync_note = (
+                f"settled in {waited:.1f}s. `_wait_for_mutations` waits on "
+                f"FT.INFO's mutation queue and on `num_docs <= "
+                f"{int(expected_rows):,}`; the count half was written for the "
+                f"delete path, where the count falls TO the target, so after a "
+                f"re-insert it binds only while the index is OVERCOUNTING "
+                f"(measured 4 polls at 2,481 docs against 2,000, 1 poll at "
+                f"1,800) and otherwise the queue is the only signal left")
         return waited
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
