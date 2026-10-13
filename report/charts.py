@@ -503,6 +503,28 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                          color=style["color"], marker=style["marker"],
                          linestyle=style["linestyle"], linewidth=1.8, markersize=6)
 
+        # A point where the CLIENT container ran out of CPU, hollowed the same
+        # way the filtered chart hollows a short result set. Both panels,
+        # because both carry the misreading: the throughput panel shows a
+        # curve flattening and the efficiency panel shows it falling away from
+        # linear, and for a client-bound point neither is evidence about the
+        # engine. The clients are Python threads serializing vectors in a
+        # container pinned to a few CPUs, and at 16-32 clients against a fast
+        # engine that is a real ceiling of this harness rather than of the
+        # database under it.
+        for r in rows:
+            extra = r.get("extra") or {}
+            if not extra.get("client_bound"):
+                continue
+            axes[0].scatter([r["clients"]], [r["qps"]], s=140,
+                            facecolors="none", edgecolors=style["color"],
+                            linewidths=1.6, zorder=5)
+            efficiency = extra.get("scaling_efficiency")
+            if efficiency is not None:
+                axes[2].scatter([r["clients"]], [efficiency], s=140,
+                                facecolors="none", edgecolors=style["color"],
+                                linewidths=1.6, zorder=5)
+
     # Linear-scaling reference so the efficiency panel has a meaning without
     # the reader having to remember what 1.0 represents.
     axes[2].axhline(1.0, color="#888888", linewidth=1.0, linestyle=":")
@@ -513,7 +535,10 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=10,
                    loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
-    fig.suptitle(f"Concurrency scaling — {dataset}", fontsize=13, y=1.14)
+    fig.suptitle(
+        f"Concurrency scaling — {dataset}   "
+        f"○ = client CPU-bound (>80% of the client container's CPUs)",
+        fontsize=12, y=1.14)
     fig.tight_layout()
     return _save(fig, out_dir, stem)
 

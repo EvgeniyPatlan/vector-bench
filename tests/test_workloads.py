@@ -1352,3 +1352,233 @@ class TestWorkloadsShareOneSchema:
         # Recorder.write refuses an unknown phase, so getting this far proves
         # every phase these workloads emit is in ALL_PHASES.
         assert set(phases) <= set(records.ALL_PHASES)
+
+
+#: Warm-up queries per client for the bracketing test below, and the client
+#: count and window it uses. Large enough that the warm-up is a visible
+#: fraction of the window: at `wide_dataset`'s 1,000 queries each of two
+#: clients gets a 500-query shard, so 300 warm-up queries each is 600 queries
+#: of CPU spent before the window opens, against roughly a thousand inside it.
+BRACKET_WARMUP = 300
+BRACKET_CLIENTS = 2
+BRACKET_WINDOW_S = 0.15
+
+#: Microseconds of virtual CPU the bracketing tests charge per completed
+#: query. One millisecond, so `extra.client_cpu_seconds` -- rounded to three
+#: decimals -- carries exactly one query per unit and the delta reads back out
+#: of the record without a tolerance of its own.
+USEC_PER_QUERY = 1000
+
+
+class TestTheClientsOwnCpuIsRecorded:
+    """§1.4. The clients are Python threads in a container pinned to a few
+    CPUs; for a fast engine at 16-32 clients they can run out of CPU before
+    the server does, and a curve that flattens for that reason is
+    indistinguishable from one that flattens because the engine stopped
+    scaling -- except that the first is a property of this harness rather than
+    a finding about the database.
+    """
+
+    def _run(self, ctx, dataset, factory, **kw):
+        options = dict(client_counts=(2,), duration_s=0.15, warmup=2,
+                       max_queries=concurrency_workload.WHOLE_TEST_SET)
+        options.update(kw)
+        concurrency_workload.run(
+            ctx, factory, dataset, index_spec(dataset), ef_search=32,
+            **options)
+        return written(ctx)[-1]
+
+    def test_the_record_carries_the_ratio_and_both_of_its_inputs(self, ctx,
+                                                                 dataset):
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32)
+        extra = self._run(ctx, dataset, driver.clone)["extra"]
+        # The denominator is the cpuset the process may actually run on rather
+        # than the host's CPU count, which in the normalized pass differ by
+        # five times.
+        assert extra["client_cpus"] == len(os.sched_getaffinity(0))
+        assert extra["client_cpus"] > 0
+        # A window that executed queries spent CPU doing it. Zero here would
+        # be the measurement silently absent.
+        assert extra["client_cpu_seconds"] > 0.0
+        assert extra["client_cpu_util"] > 0.0
+        assert isinstance(extra["client_bound"], bool)
+
+    def test_an_unreadable_counter_is_unknown_rather_than_not_bound(
+            self, ctx, dataset, monkeypatch):
+        """None, not False.
+
+        False is the claim "the clients were measured and were not the limit".
+        On a container where the counter cannot be read -- which is what
+        routing the reading through `docker exec` produces on every run -- that
+        claim is wrong and nothing says so. A None in the record and an em dash
+        in the report are the honest shape, and the report's footnote counts
+        them.
+        """
+        monkeypatch.setattr(concurrency_workload, "read_own_cpu_usec",
+                            lambda: None)
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32)
+        extra = self._run(ctx, dataset, driver.clone)["extra"]
+        assert extra["client_cpu_seconds"] is None
+        assert extra["client_cpu_util"] is None
+        assert extra["client_bound"] is None
+        # The cpuset is still known; only the counter was missing.
+        assert extra["client_cpus"] == len(os.sched_getaffinity(0))
+
+    def test_a_saturated_client_container_is_flagged_and_says_so(
+            self, ctx, dataset, monkeypatch, capsys):
+        """A counter that advances by one CPU-second per CPU per wall second.
+
+        That is a container using every CPU it has, whatever the window turned
+        out to be, so the expected utilisation is 1.0 by construction rather
+        than by measurement -- the calibration of the real counter against a
+        known number of saturated cores lives in tests/test_harness.py.
+        """
+        cpus = len(os.sched_getaffinity(0))
+        monkeypatch.setattr(
+            concurrency_workload, "read_own_cpu_usec",
+            lambda: int(time.perf_counter() * 1e6) * cpus)
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32)
+        extra = self._run(ctx, dataset, driver.clone,
+                          client_counts=(4,))["extra"]
+        assert extra["client_cpu_util"] == pytest.approx(1.0, abs=0.02)
+        assert extra["client_bound"] is True
+        err = capsys.readouterr().err
+        assert "CLIENT CPU-BOUND" in err, err
+        # Naming the point, because the remedy is more client CPUs for that
+        # point rather than a change anywhere in the code.
+        assert "4 client(s)" in err, err
+
+    def test_an_idle_client_container_is_not_flagged(self, ctx, dataset,
+                                                     monkeypatch, capsys):
+        """The other branch, and the reason False above is a measurement.
+
+        A tenth of one CPU, against a cpuset of at least one: below the limit
+        however many CPUs the box has.
+        """
+        monkeypatch.setattr(
+            concurrency_workload, "read_own_cpu_usec",
+            lambda: int(time.perf_counter() * 1e5))
+        driver = loaded_driver(dataset, ef_half=64.0, ef_search=32)
+        extra = self._run(ctx, dataset, driver.clone)["extra"]
+        assert extra["client_cpu_util"] < concurrency_workload.CLIENT_BOUND_UTIL
+        assert extra["client_bound"] is False
+        assert "CLIENT CPU-BOUND" not in capsys.readouterr().err
+
+    def _counting(self, base, state, lock):
+        """A driver factory that charges one virtual query per query answered.
+
+        The virtual counter below returns `state["queries"] * USEC_PER_QUERY`,
+        so the CPU delta the workload computes has a unit the record also
+        reports independently -- queries -- and the assertion can be against
+        `queries_executed` rather than against a tolerance of its own.
+        """
+        def clone():
+            client = base.clone()
+            answer = client.query
+
+            def query(vector, k):
+                result = answer(vector, k)
+                with lock:
+                    state["queries"] += 1
+                return result
+
+            client.query = query
+            return client
+
+        return clone
+
+    def test_the_counter_brackets_the_window_and_not_the_warm_up(
+            self, ctx, wide, monkeypatch):
+        """The CPU delta covers the measured window only.
+
+        Both readings are taken where the wall's own endpoints are taken: the
+        first inside the barrier action, which runs after every client has
+        finished warming up and before any is released, and the second
+        immediately after the stop instant and before the stop flag goes up.
+        Read anywhere earlier, the delta would include the warm-up -- hundreds
+        of queries per client, charged to a window that did not run them --
+        and the utilisation would be high for a reason the record could not
+        show.
+        """
+        lock = threading.Lock()
+        state = {"queries": 0}
+        base = loaded_driver(wide, ef_half=64.0, ef_search=32)
+        monkeypatch.setattr(concurrency_workload, "read_own_cpu_usec",
+                            lambda: state["queries"] * USEC_PER_QUERY)
+
+        concurrency_workload.run(
+            ctx, self._counting(base, state, lock), wide, index_spec(wide),
+            ef_search=32, client_counts=(BRACKET_CLIENTS,),
+            duration_s=BRACKET_WINDOW_S, warmup=BRACKET_WARMUP,
+            max_queries=concurrency_workload.WHOLE_TEST_SET)
+
+        row = written(ctx)[-1]
+        charged = round(row["extra"]["client_cpu_seconds"]
+                        * 1e6 / USEC_PER_QUERY)
+        executed = row["queries_executed"]
+        warmed = BRACKET_CLIENTS * BRACKET_WARMUP
+        # The warm-up really happened, so there was something to exclude.
+        assert state["queries"] >= executed + warmed
+        # And the charge is the window's own queries, within the handful each
+        # client can complete between the stop instant and the second reading.
+        assert executed <= charged <= executed + BRACKET_CLIENTS + 2, (
+            f"charged {charged} queries of CPU against {executed} executed; "
+            f"the warm-up was {warmed} queries, so a charge near "
+            f"{executed + warmed} means a reading taken before the clients "
+            f"warmed up")
+
+    def test_the_figure_is_the_median_windows_and_not_another_windows(
+            self, ctx, dataset, monkeypatch):
+        """Three windows of deliberately different speed, so the median is
+        known in advance rather than whichever one the scheduler produced.
+
+        One client per window, each slower than the last, so sorting the three
+        by throughput puts the second one in the middle every time. The CPU
+        charged per window is then a label: 100 CPU-seconds is the median
+        window's, 1 is the fastest window's and 10,000 is the slowest's. A
+        figure taken from any window but the one whose QPS was reported names
+        itself.
+        """
+        latencies = (0.0005, 0.001, 0.002)
+        charges = (1.0, 100.0, 10_000.0)
+        base = loaded_driver(dataset, ef_half=64.0, ef_search=32)
+        made = {"n": -1}
+
+        def clone():
+            made["n"] += 1
+            sibling = base.clone()
+            # Call 0 is `run`'s metadata driver, which issues no queries;
+            # calls 1..3 are the single client of each successive window.
+            if 1 <= made["n"] <= len(latencies):
+                sibling.latency_s = latencies[made["n"] - 1]
+            return sibling
+
+        reads = {"n": -1}
+
+        def window_cpu():
+            # Twice per window: the open reads zero, the close reads that
+            # window's charge.
+            reads["n"] += 1
+            if reads["n"] % 2 == 0:
+                return 0
+            return int(charges[reads["n"] // 2] * 1e6)
+
+        monkeypatch.setattr(concurrency_workload, "read_own_cpu_usec",
+                            window_cpu)
+        # Long enough that even the slowest window covers the whole
+        # 50-query pool. Shorter, and the three windows measure recall over
+        # different numbers of queries, which trips the workload's own
+        # recall-spread check -- a loud and correct complaint about a fixture
+        # artefact, printed by a test that is not about recall at all.
+        row = self._run(ctx, dataset, clone, client_counts=(1,),
+                        duration_s=0.3, repeats=3)
+        # The three windows really did differ in throughput, or there was no
+        # median to pick: a flat set of samples would make the assertion below
+        # pass for any selection rule.
+        samples = sorted(row["extra"]["qps_samples"])
+        assert samples[-1] > samples[0] * 1.5, samples
+        assert row["extra"]["client_cpu_seconds"] == pytest.approx(100.0), (
+            f"the reported CPU figure is "
+            f"{row['extra']['client_cpu_seconds']}, which is the "
+            f"{'fastest' if row['extra']['client_cpu_seconds'] < 50 else 'slowest'} "
+            f"window's rather than the median window's")

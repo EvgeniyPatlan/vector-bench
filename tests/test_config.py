@@ -7004,3 +7004,576 @@ class TestTheRefusalMachineryMovedWithoutLoss:
             assert len(loaders.load_ops_records(str(run))) == 2
         finally:
             measurement_versions.refuse_mixed_measurement_versions = honest
+
+
+# ---------------------------------------------------------------------------
+# T1d: the concurrency surfaces (§1.1's recall column, §1.4's client CPU)
+# ---------------------------------------------------------------------------
+
+def _table_cells(table: str):
+    """A Markdown table as a list of rows of cells, separator row dropped.
+
+    Cells rather than a substring search, because "Recall@k" appears in four
+    of this report's tables and `recall_at_k` appears in the raw records: a
+    membership test against the whole fragment is satisfied by a table that
+    does not have the column, and a value test against the whole fragment is
+    satisfied by the value turning up in some other column.
+    """
+    rows = []
+    for line in table.strip().splitlines():
+        line = line.strip()
+        if not (line.startswith("|") and line.endswith("|")):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(c and set(c) <= set("-: ") for c in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _concurrency_record(**over):
+    """One concurrency record as the workload writes it today."""
+    extra = {
+        "scaling_efficiency": 0.43, "duration_s": 30,
+        "warmup_queries_per_client": 50, "repeats": 3,
+        "qps_samples": [4800.0, 5820.0, 5100.0], "qps_spread_pct": 21.3,
+        "recall_queries": 10_000, "recall_spread": 0.0003,
+        "query_pool": 10_000, "query_reuse": 15.3,
+        "inflight_discarded": 32, "prewindow_discarded": 0,
+        "client_cpu_seconds": 48.0, "client_cpus": 4,
+        "client_cpu_util": 0.40, "client_bound": False,
+    }
+    extra.update(over.pop("extra", {}))
+    record = {"phase": "concurrency", "engine": "pgvector", "dataset": "d",
+              "resource_pass": "normalized", "storage_engine": "heap",
+              "m": 16, "ef_search": 100, "clients": 32, "qps": 5100.0,
+              "recall_at_k": 0.9812, "latency_p50_ms": 5.1,
+              "latency_p95_ms": 9.9, "latency_p99_ms": 14.2,
+              "queries_executed": 153_000}
+    record.update(over)
+    record["extra"] = extra
+    return record
+
+
+class TestTheConcurrencyTableCarriesItsQualityFigure:
+    """A concurrency point had QPS and latency and no recall beside it.
+
+    The workload has recorded `recall_at_k` on every concurrency record since
+    §1.1, and the table listed Engine, Dataset, Storage, Clients, QPS, Spread
+    and three percentiles -- so a record carrying 0.9812 rendered nowhere at
+    all. §1.1 exists so the report stops presenting two engines at one
+    `ef_search` as comparable when they sit at 0.98 and 0.80; without the
+    column it still did.
+    """
+
+    def _cells(self, *records):
+        from report.render import _concurrency_table
+        return _table_cells(_concurrency_table({"concurrency": list(records)}))
+
+    def test_the_recall_column_holds_the_records_recall(self):
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert "Recall@k" in header
+        assert body[0][header.index("Recall@k")] == "0.9812"
+
+    def test_a_point_with_no_recall_renders_a_dash_rather_than_a_zero(self):
+        rows = self._cells(_concurrency_record(recall_at_k=None))
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Recall@k")] == "—"
+
+    def test_the_pool_and_the_reuse_are_shown(self):
+        """A reader comparing a version-2 report with a version-3 one needs
+        both to see why the throughput moved: the same QPS over a pool of 500
+        and a pool of 10,000 are measurements of two different things."""
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Query pool")] == "10,000"
+        assert body[0][header.index("Reuse")] == "15.30x"
+
+    def test_the_client_cpu_column_holds_the_utilisation(self):
+        rows = self._cells(_concurrency_record())
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Client CPU")] == "0.40"
+
+    def test_a_client_bound_point_is_marked_in_its_own_cell(self):
+        from report.render import CLIENT_BOUND_MARK
+        bound = _concurrency_record(
+            extra={"client_cpu_util": 0.93, "client_bound": True})
+        rows = self._cells(bound)
+        header, body = rows[0], rows[1:]
+        cell = body[0][header.index("Client CPU")]
+        assert cell == f"0.93 {CLIENT_BOUND_MARK}"
+
+    def test_an_unmeasured_client_cpu_is_a_dash_not_a_zero(self):
+        """None means no counter was readable, which is not the claim that the
+        clients were idle."""
+        rows = self._cells(_concurrency_record(
+            extra={"client_cpu_util": None, "client_bound": None}))
+        header, body = rows[0], rows[1:]
+        assert body[0][header.index("Client CPU")] == "—"
+
+    def test_every_body_cell_is_filled(self):
+        """A column added to the header and not to the row shifts every cell
+        after it, which renders as a plausible table of wrong numbers."""
+        rows = self._cells(_concurrency_record(), _concurrency_record(clients=1))
+        header, body = rows[0], rows[1:]
+        assert len(body) == 2
+        for row in body:
+            assert len(row) == len(header), list(zip(header, row))
+
+
+class TestTheConcurrencyNotesExplainTheNewColumns:
+    def _notes(self, *records):
+        from report.render import _concurrency_notes
+        return _concurrency_notes({"concurrency": list(records)})
+
+    def test_the_in_flight_correction_is_named_without_a_column(self):
+        """T1c's `extra.inflight_discarded` had no reader at all.
+
+        It does not earn a column -- at most one query per client, 0.005% of a
+        30-second window's throughput -- but the correction it evidences has
+        to be stated or the QPS reads as the uncorrected one.
+        """
+        notes = self._notes(_concurrency_record())
+        assert "inflight_discarded" in notes
+        assert "began and ended inside the window" in notes
+
+    def test_the_client_cpu_definition_names_all_three_of_its_inputs(self):
+        notes = self._notes(_concurrency_record())
+        assert "cpuset" in notes
+        assert "not evidence about where the engine" in notes
+
+    def test_the_footnote_says_the_flag_is_sufficient_and_not_necessary(self):
+        """Measured, not supposed: against the synthetic driver this harness
+        flattens at 2.06 cores -- 0.51 of a four-CPU container -- while its
+        throughput peaks at two clients and halves by thirty-two. The flag
+        would not have fired on any of those points, because the binding
+        resource is one interpreter lock rather than the cpuset. A footnote
+        that only warned about marked points would let an unmarked one be read
+        as proof the engine was the limit."""
+        notes = self._notes(_concurrency_record())
+        assert "an unmarked point is not a guarantee" in notes.lower()
+        assert "2.06 cores" in notes
+
+    def test_the_footnote_says_WHY_the_flag_is_blind_to_a_gil_ceiling(self):
+        """The mechanism, not just the caveat.
+
+        A reader told only "an unmarked point may still be client-bound" notes
+        it and moves on. A reader told that the lock prevents the very CPU
+        consumption the threshold looks for -- so that a flat Client CPU column
+        beside a falling QPS curve IS the signature -- can act on it, and knows
+        that moving the 0.80 limit would not help. This sentence is the
+        difference, so it is pinned.
+        """
+        notes = self._notes(_concurrency_record())
+        assert "cannot see an interpreter-lock ceiling" in notes
+        assert "prevents the very CPU consumption the threshold looks for" \
+            in notes
+        # And the actionable form of it: what the reader should look for.
+        assert "flat Client CPU column beside a falling QPS curve" in notes
+
+    def test_a_client_bound_run_names_the_points(self):
+        notes = self._notes(
+            _concurrency_record(clients=16, extra={"client_cpu_util": 0.88,
+                                                   "client_bound": True}),
+            _concurrency_record(clients=4))
+        assert "Client-bound points in this run" in notes
+        assert "at 16 clients" in notes
+        assert "at 4 clients" not in notes
+
+    def test_a_clean_run_claims_nothing(self):
+        notes = self._notes(_concurrency_record())
+        assert "Client-bound points in this run" not in notes
+        assert "prewindow_discarded" not in notes
+        assert "no client-CPU figure" not in notes
+
+    def _unmeasured(self, **over):
+        return _concurrency_record(
+            extra={"client_cpu_util": None, "client_bound": None}, **over)
+
+    def test_some_points_without_a_client_cpu_figure_is_loud(self):
+        """A counter that was readable and then was not.
+
+        The harness lost a measurement part-way through a sweep, so the points
+        either side of it were not measured the same way. That is a fault and
+        it is named, with both counts, so a reader can see it is partial.
+        """
+        notes = self._notes(self._unmeasured(clients=16),
+                            _concurrency_record(clients=4),
+                            _concurrency_record(clients=8))
+        assert "1 of 3 points have no client-CPU figure" in notes
+        assert "readable for some windows of this run and not for others" \
+            in notes
+
+    def test_no_point_having_the_figure_says_nothing_at_all(self):
+        """A run measured end to end by a harness older than this column.
+
+        Every point lacks the figure for one uniform reason, the column is an
+        unbroken row of em dashes that says so by itself, and there is no gap
+        to report. Emitted anyway, this paragraph lands on every report of
+        every pre-existing run directory and trains a reader to skip the
+        footnote -- after which it is also unread on the run where the partial
+        case above actually matters.
+        """
+        notes = self._notes(self._unmeasured(clients=4),
+                            self._unmeasured(clients=8))
+        assert "no client-CPU figure" not in notes
+        # The definition of the column is still there; only the gap note goes.
+        assert "**Client CPU**" in notes
+
+    def test_a_record_predating_the_column_entirely_is_also_silent(self):
+        """Not just `client_cpu_util: None` -- the key absent altogether, which
+        is the shape a pre-T1d record actually has."""
+        old = _concurrency_record()
+        del old["extra"]["client_cpu_util"]
+        del old["extra"]["client_bound"]
+        assert "no client-CPU figure" not in self._notes(old)
+
+    def test_a_non_zero_prewindow_count_is_loud(self):
+        """Zero by construction: the window opens at the barrier release and
+        no measured query can precede it. A number there means the window's two
+        ends disagree about when it began, which is a framework fault and not
+        an engine result -- and until now nothing read the field."""
+        notes = self._notes(_concurrency_record(
+            extra={"prewindow_discarded": 7}))
+        assert "prewindow_discarded" in notes
+        assert "framework fault" in notes
+        # Anchored on the left. "1 point(s)" is a substring of "11 point(s)",
+        # and a count that renders eleven where one is meant would satisfy the
+        # bare membership test; it is exact here only because the fixture
+        # passes a single record.
+        assert "**1 point(s) report" in notes
+
+
+class TestTheConcurrencyChartMarksAClientBoundPoint:
+    """A client-bound point flattens the throughput curve and pulls the
+    efficiency curve away from linear, and neither movement is about the
+    engine. Hollowed the way the filtered chart hollows a short result set."""
+
+    def _axes(self, records):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+        from report import charts
+        captured = {}
+        original = charts._save
+
+        def spy(fig, out_dir, stem):
+            captured["axes"] = list(fig.axes)
+            captured["title"] = fig._suptitle.get_text()
+            return original(fig, out_dir, stem)
+
+        charts._save = spy
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                charts.concurrency(records, "d", d, "t")
+        finally:
+            charts._save = original
+            plt.close("all")
+        return captured
+
+    def _series(self, bound_at=()):
+        return [_concurrency_record(
+            clients=c, qps=1000.0 * c,
+            extra={"scaling_efficiency": 1.0 / c,
+                   "client_cpu_util": 0.95 if c in bound_at else 0.2,
+                   "client_bound": c in bound_at})
+                for c in (1, 2, 4, 8, 16, 32)]
+
+    @staticmethod
+    def _rings(ax):
+        """Where this panel's hollow rings actually sit, sorted by x.
+
+        `get_offsets()` rather than `len(collections)`. A count says that some
+        number of rings were drawn; it does not say they were drawn ON the
+        points, and a ring parked at the axis marks nothing at all on the one
+        chart whose purpose is to say whose ceiling the curve shows. A mutant
+        scattering every ring at y=0 passed the count assertions five times
+        out of five.
+        """
+        points = []
+        for collection in ax.collections:
+            points.extend([float(x), float(y)]
+                          for x, y in collection.get_offsets())
+        return sorted(points)
+
+    @needs_matplotlib
+    def test_a_bound_point_is_ringed_on_throughput_and_on_efficiency(self):
+        captured = self._axes(self._series(bound_at=(16, 32)))
+        throughput, _latency, efficiency = captured["axes"]
+        assert len(throughput.collections) == 2
+        assert len(efficiency.collections) == 2
+
+    @needs_matplotlib
+    def test_each_ring_sits_on_the_point_it_marks(self):
+        """The coordinates, not the count.
+
+        The throughput panel's rings belong at (clients, qps) and the
+        efficiency panel's at (clients, scaling_efficiency) -- two different
+        y values for the same two x values, so a ring taken from the wrong
+        series is caught as well as one parked at zero.
+        """
+        bound = (16, 32)
+        captured = self._axes(self._series(bound_at=bound))
+        throughput, _latency, efficiency = captured["axes"]
+        assert self._rings(throughput) == [[16.0, 16000.0], [32.0, 32000.0]]
+        assert self._rings(efficiency) == [[16.0, 1.0 / 16], [32.0, 1.0 / 32]]
+        # The two panels are not the same ring drawn twice: same x, different
+        # y, so a copy of one onto the other would fail one of the two.
+        assert self._rings(throughput) != self._rings(efficiency)
+
+    @needs_matplotlib
+    def test_a_ring_is_drawn_for_each_bound_point_and_no_other(self):
+        """One client count bound, not two: the ring count and the ring
+        positions both follow the flag rather than the series length."""
+        captured = self._axes(self._series(bound_at=(8,)))
+        throughput, _latency, efficiency = captured["axes"]
+        assert self._rings(throughput) == [[8.0, 8000.0]]
+        assert self._rings(efficiency) == [[8.0, 0.125]]
+
+    @needs_matplotlib
+    def test_an_unbound_series_is_ringed_nowhere(self):
+        captured = self._axes(self._series())
+        for ax in captured["axes"]:
+            assert self._rings(ax) == []
+
+    @needs_matplotlib
+    def test_the_ring_is_hollow(self):
+        """A filled marker would read as an ordinary emphasised point."""
+        captured = self._axes(self._series(bound_at=(32,)))
+        ring = captured["axes"][0].collections[0]
+        assert ring.get_facecolors().size == 0
+        assert ring.get_edgecolors().size > 0
+
+    @needs_matplotlib
+    def test_the_caption_says_what_the_ring_means(self):
+        """An unexplained symbol on a chart is read as a rendering artefact."""
+        captured = self._axes(self._series(bound_at=(32,)))
+        assert "○" in captured["title"]
+        assert "client CPU-bound" in captured["title"]
+
+
+class TestTheWebUiCanPlotConcurrencyRecall:
+    """`webui/static/fields.js` gives each view a CLOSED `ys` allowlist and
+    `explore.js` consumes it as closed, so a field absent from the list cannot
+    be plotted however many records carry it."""
+
+    def _view_ys(self, view_id):
+        path = os.path.join(VB_ROOT, "webui", "static", "fields.js")
+        with open(path) as fh:
+            source = fh.read()
+        # Scoped to this view's own object. The `filtered` view two entries
+        # below already lists recall_at_k, so a whole-file search for it
+        # passes whether or not the concurrency view was touched.
+        chunks = source.split('id: "')
+        chunk = next(c for c in chunks[1:] if c.startswith(view_id + '"'))
+        body = re.search(r"ys:\s*\[(.*?)\]", chunk, re.S)
+        assert body, f"the {view_id} view has no ys array"
+        return re.findall(r'"([a-z_0-9]+)"', body.group(1))
+
+    def test_the_concurrency_view_offers_recall(self):
+        assert "recall_at_k" in self._view_ys("concurrency")
+
+    def test_throughput_is_still_the_default_axis(self):
+        """`explore.js` picks `ys[0]` when nothing is chosen, so the order is
+        the default and reordering it would change what the tab opens on."""
+        assert self._view_ys("concurrency")[0] == "qps"
+
+    def test_the_allowlist_is_what_the_picker_is_built_from(self):
+        """Why one entry was enough, stated against the consumer rather than
+        assumed."""
+        path = os.path.join(VB_ROOT, "webui", "static", "explore.js")
+        with open(path) as fh:
+            source = fh.read()
+        assert "ys: view.ys.filter(" in source
+
+    def test_the_field_has_a_readers_label(self):
+        assert '"Recall@k"' in open(
+            os.path.join(VB_ROOT, "webui", "static", "fields.js")).read()
+
+
+class TestTheSyntheticRunExercisesTheConcurrencySurfaces:
+    """`tests/synthetic.py` is what `make-demo-report` renders for reviewing
+    layout before any real data exists. Its concurrency records carried
+    neither recall nor any of §1.1's and §1.4's extra keys, so a synthetic
+    report showed an em dash exactly where the new columns are -- which reads
+    as a report bug rather than as a fixture gap."""
+
+    def _points(self):
+        from .synthetic import make_records
+        return [r for r in make_records("synthetic-run")
+                if r.get("phase") == "concurrency"]
+
+    def test_every_point_carries_what_the_table_reads(self):
+        """Present AND populated.
+
+        Membership alone is satisfied by a key whose value is None, which is
+        exactly what renders the em dash this class exists to keep out of the
+        demo report -- so every key that has no legitimate null in a synthetic
+        run is checked for a value, not just for existence.
+        """
+        for row in self._points():
+            assert row["recall_at_k"] is not None, row["engine"]
+            for key in ("query_pool", "query_reuse", "recall_queries",
+                        "inflight_discarded", "prewindow_discarded",
+                        "client_cpu_seconds", "client_cpus",
+                        "client_cpu_util", "client_bound", "repeats",
+                        "qps_samples", "qps_spread_pct"):
+                assert key in row["extra"], (row["engine"], row["clients"], key)
+            # `prewindow_discarded` is legitimately 0 and `client_bound` is
+            # legitimately False, so those two are checked for not-None rather
+            # than for truthiness; everything else is a measured quantity that
+            # a fixture has no reason to leave null.
+            for key in ("query_pool", "query_reuse", "recall_queries",
+                        "client_cpu_seconds", "client_cpus",
+                        "client_cpu_util", "repeats", "qps_spread_pct",
+                        "inflight_discarded", "prewindow_discarded",
+                        "client_bound"):
+                assert row["extra"][key] is not None, (
+                    row["engine"], row["clients"], key)
+
+    def test_recall_does_not_depend_on_the_client_count(self):
+        """Recall is a property of the index and the ef, so a fixture whose
+        recall moved across the sweep would make the workload's own
+        recall-spread check look as though it were firing on nothing."""
+        by_engine = {}
+        for row in self._points():
+            by_engine.setdefault(row["engine"], set()).add(row["recall_at_k"])
+        assert by_engine, "no concurrency points in the synthetic run"
+        for engine, values in by_engine.items():
+            assert len(values) == 1, (engine, values)
+
+    def test_the_engines_differ_in_recall_at_one_ef_search(self):
+        """The whole reason the column exists: 0.98 against 0.80 is the
+        ordinary spread of these implementations at a shared ef."""
+        recalls = {r["engine"]: r["recall_at_k"] for r in self._points()}
+        assert max(recalls.values()) - min(recalls.values()) > 0.15, recalls
+
+    def test_both_branches_of_the_client_bound_flag_are_rendered(self):
+        flags = [(r["engine"], r["clients"])
+                 for r in self._points() if r["extra"]["client_bound"]]
+        assert flags, "no client-bound point, so the hollow marker is untested"
+        assert len(flags) < len(self._points()), "every point is bound"
+
+    def _rendered(self):
+        """The synthetic run's concurrency table, as header and body cells."""
+        from report.generate import summarize
+        from report.render import _concurrency_table
+        from .synthetic import make_records
+        summary = summarize(make_records("synthetic-run"), {})
+        rows = _table_cells(_concurrency_table(summary))
+        return rows[0], rows[1:]
+
+    def test_the_rendered_table_shows_the_recall_rather_than_a_dash(self):
+        """The fixture and the renderer, end to end. Either half alone passed
+        while the pair produced an em dash."""
+        header, body = self._rendered()
+        column = header.index("Recall@k")
+        values = {row[column] for row in body}
+        assert "—" not in values, values
+        assert "0.9812" in values, values
+        pool = header.index("Query pool")
+        assert {row[pool] for row in body} == {"10,000"}
+
+    def test_the_rendered_table_shows_the_client_cpu_rather_than_a_dash(self):
+        """The same end-to-end check for the column §1.4 adds, which the
+        Recall@k one did not reach.
+
+        Nulling `client_cpu_util` on every synthetic point while leaving
+        `client_bound` as computed turned all six Client CPU cells into em
+        dashes while the footnote went on naming two client-bound points -- a
+        demo report contradicting itself, with the whole class still green,
+        because the end-to-end assertion stopped at Recall@k and Query pool
+        and the field check above was membership-only. This is defect C
+        recurring inside the column the task added, so it is checked the same
+        way: the cells carry values, and at least one carries the mark.
+        """
+        from report.render import CLIENT_BOUND_MARK
+        header, body = self._rendered()
+        column = header.index("Client CPU")
+        cells = [row[column] for row in body]
+        assert "—" not in cells, cells
+        marked = [c for c in cells if CLIENT_BOUND_MARK in c]
+        assert marked, cells
+        # And the marked cells are the ones the footnote names, so the table
+        # and the prose below it cannot disagree about which points are bound.
+        bound_clients = {str(r["clients"]) for r in self._points()
+                         if r["extra"]["client_bound"]}
+        clients_column = header.index("Clients")
+        marked_clients = {row[clients_column] for row in body
+                          if CLIENT_BOUND_MARK in row[column]}
+        assert marked_clients == bound_clients, (marked_clients, bound_clients)
+
+    def test_the_rendered_notes_name_the_client_bound_points(self):
+        from report.generate import summarize
+        from report.render import _concurrency_table
+        from .synthetic import make_records
+        summary = summarize(make_records("synthetic-run"), {})
+        table = _concurrency_table(summary)
+        assert "Client-bound points in this run" in table
+        assert "at 32 clients" in table
+
+
+class TestEachConcurrencyPointIsRepeated:
+    """§1.5. Every figure in this framework was a single sample until a Valkey
+    point was re-measured by accident, five hours later on the same build, and
+    came back 21% higher at sixteen and thirty-two clients. Nothing else had
+    ever been repeated, so nothing else had an error bar, and two engines
+    differing by less than that were being presented as ordered."""
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_profile_repeats_each_point(self, name):
+        assert load_profile(name)["ops"]["concurrency_repeats"] == 3
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_query_pool_is_left_at_the_whole_test_set(self, name):
+        """`ops.concurrency_queries` defaults to every query the dataset ships.
+
+        Setting it is the way BACK to a small pool -- the state in which every
+        graph cache in the comparison was measured against a hot set it could
+        hold entirely -- so a profile that wants the current behaviour must
+        leave the key absent rather than "enable" it.
+        """
+        assert "concurrency_queries" not in load_profile(name)["ops"]
+
+    @pytest.mark.parametrize("name", ("main", "full"))
+    def test_the_runner_already_passes_the_key(self, name):
+        """No code change was needed, and this is what says so.
+
+        `ops_pass.harness_args` has passed `--concurrency-repeats` since the
+        flag existed, defaulting to 1, and `harness/main.py` forwards it to
+        the workload's `repeats`. The profile key is the whole change.
+        """
+        from orchestrator.config import (load_resources, resolve_resources)
+        from orchestrator.ops_pass import harness_args
+        info = sysinfo.collect()
+        res = load_resources("normalized")
+        args = harness_args(load_profile(name), 16, "pgvector",
+                            resolve_resources(res, "pgvector", info),
+                            "normalized", res, storage_engine="heap")
+        assert args[args.index("--concurrency-repeats") + 1] == "3"
+        # And the pool stays the sentinel for "all of them".
+        from harness.workloads.concurrency import WHOLE_TEST_SET
+        assert (args[args.index("--concurrency-queries") + 1]
+                == str(WHOLE_TEST_SET))
+
+    def test_the_estimate_follows_the_profile_key(self):
+        """TE's `_concurrency_windows` already multiplies by the key, so the
+        printed estimate had to move without a line changing in
+        orchestrator/. Checked as a ratio against the same profile with the
+        key removed, so it measures the multiplication rather than restating
+        today's hours."""
+        from orchestrator.estimate import estimate_load_hours
+
+        def windows(profile):
+            e = estimate_load_hours(profile, ["pgvector"],
+                                    ["glove-100-angular"], ["normalized"],
+                                    ["ops"])
+            return next(t["typical_seconds"] for t in e["query_terms"]
+                        if t["name"] == "concurrency windows")
+
+        shipped = load_profile("main")
+        once = {**shipped, "ops": {k: v for k, v in shipped["ops"].items()
+                                   if k != "concurrency_repeats"}}
+        assert windows(shipped) == windows(once) * 3

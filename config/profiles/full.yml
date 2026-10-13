@@ -48,6 +48,12 @@ ops:
   max_queries: 2000
   client_counts: [1, 2, 4, 8, 16, 32]
   concurrency_duration_s: 30
+  # See main.yml for why: a single window has no error bar, and two engines
+  # differing by less than the window-to-window spread were being presented
+  # as ordered. 6 points x 30 s x 3 is 9 minutes per engine-dataset pair plus
+  # warm-up. `concurrency_queries` stays unset here too — its default is the
+  # whole test set, and setting it is the way back to a small pool.
+  concurrency_repeats: 3
   selectivities: [0.01, 0.10, 0.50]
   churn_fractions: [0.10, 0.25]
   # pgvector 0.8 only. Filtered search behaves very differently per mode, so all

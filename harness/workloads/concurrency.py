@@ -34,6 +34,21 @@ made the chart above misleading until they were added:
    client repeated for thirty seconds, and every graph cache in the
    comparison sees a hot set small enough to hold entirely. `ops.
    concurrency_queries` separates the two, defaulting to the whole test set.
+
+3. **How busy the clients themselves were.** The clients are Python threads
+   in a container pinned to a few CPUs, and they serialize vectors and hold
+   the GIL between socket calls. For a fast engine at 16-32 clients the
+   client container can run out of CPU before the server does, and a
+   throughput curve that flattens for that reason is indistinguishable from
+   one that flattens because the engine stopped scaling -- except that the
+   first is a property of this harness and the second is the finding the
+   chart exists to report. Every window therefore records the client
+   container's own cgroup CPU over the window, as `extra.client_cpu_seconds`,
+   `extra.client_cpus`, `extra.client_cpu_util` and the derived
+   `extra.client_bound`. The report draws a bound point hollow and the run
+   says so on stderr while it happens. See `CLIENT_BOUND_UTIL` for what that
+   flag can and cannot see -- it catches a saturated cpuset and not a
+   saturated interpreter lock, and the difference has been measured.
 """
 
 from __future__ import annotations
@@ -52,6 +67,7 @@ from ..metrics.latency import (INFLIGHT_DISCARDED, PREWINDOW_DISCARDED,
                                LatencyCollector, merge_collectors,
                                span_disposition)
 from ..metrics.records import PHASE_CONCURRENCY, Record
+from ..metrics.resources import own_cpu_count, read_own_cpu_usec
 from ..progress import Heartbeat
 from .context import RunContext
 
@@ -69,6 +85,42 @@ WHOLE_TEST_SET = 0
 #: offsets-to-truth mapping is wrong or the index moved underneath the
 #: measurement. Either way the QPS beside it is not what it claims to be.
 RECALL_SPREAD_LIMIT = 0.005
+
+#: Share of the client container's CPUs above which the point is reported as
+#: client-bound. Not a measured constant and not claimed to be one: it is the
+#: level at which this harness stops being able to say whose ceiling the curve
+#: shows. Python threads serializing vectors do not scale smoothly to the last
+#: percent of a cpuset, so a point at 0.8 is already one where the client may
+#: be contributing to the flattening, and the honest report is "this number is
+#: not evidence about the engine" rather than a correction factor nobody can
+#: justify.
+#:
+#: SUFFICIENT, NOT NECESSARY, and the gap is structural rather than a question
+#: of where the limit was set. **A CPU-utilisation threshold cannot see a GIL
+#: ceiling, because the GIL prevents the CPU consumption the threshold looks
+#: for.** A thread waiting its turn to hold the lock is not running, so it
+#: costs nothing this counter can measure: the harness stops scaling while its
+#: utilisation stays flat, and no ratio of CPU-seconds to CPUs can distinguish
+#: that from an engine that stopped scaling. Raising or lowering 0.80 does not
+#: help, because the quantity itself is blind to the case.
+#:
+#: The signature is throughput falling with more clients while the utilisation
+#: does not move, and it is measured rather than supposed. Run against
+#: `tests/fake_driver.py` on a twenty-CPU box, this workload's own CPU flattens
+#: at 2.06 cores from four clients upwards -- 0.51 of a four-CPU client
+#: container at 4, 8, 16 and 32 clients alike -- while aggregate throughput
+#: peaks at two clients (16,614 q/s) and falls to 8,127 by thirty-two. That is
+#: the exact shape a reader would call an engine ceiling, and this flag would
+#: not have fired on any of those points.
+#:
+#: So a marked point is evidence that the harness was part of the limit, and an
+#: unmarked one is not evidence that the engine was. The fake's queries are
+#: numpy-bound in-process, whereas a real driver spends most of a query blocked
+#: on a socket with the lock released, so the figure above overstates a real
+#: client's cost and the synthetic shape may not reproduce -- which is why the
+#: decision to run the clients as processes waits on a real dev or smoke run
+#: rather than on this measurement.
+CLIENT_BOUND_UTIL = 0.80
 
 
 class _Answer(NamedTuple):
@@ -104,6 +156,15 @@ class _Window(NamedTuple):
     recall_queries: int
     inflight_discarded: int
     prewindow_discarded: int
+    #: The client container's own CPU over this window, the size of the cpuset
+    #: it was measured against, and their ratio. All three are carried rather
+    #: than the ratio alone: the ratio is a cgroup counter divided by a wall
+    #: clock and a CPU count, each of which can be wrong while the quotient
+    #: stays plausibly between 0 and 1, so the record keeps the numerator and
+    #: the denominator beside it.
+    client_cpu_seconds: Optional[float]
+    client_cpus: int
+    client_cpu_util: Optional[float]
 
 
 class _Client(threading.Thread):
@@ -305,6 +366,17 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             baseline_qps = qps
         efficiency = (qps / (clients * baseline_qps)) if baseline_qps else None
 
+        # The median window's, by the same rule as its recall: the figure
+        # beside a throughput number has to come from the window that
+        # produced it. `None` -- not False -- when there was no counter to
+        # read, because "the clients were not the limit" and "nobody looked"
+        # are different statements and only one of them is a measurement.
+        client_bound = (None if window.client_cpu_util is None
+                        else window.client_cpu_util > CLIENT_BOUND_UTIL)
+        if client_bound:
+            _warn_client_bound(clients, window.client_cpu_util,
+                               window.client_cpus, window.client_cpu_seconds)
+
         _print_point(common["engine"], clients, ctx.k, qps, recall, merged,
                      efficiency, spread, len(samples))
 
@@ -356,6 +428,21 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 # began.
                 INFLIGHT_DISCARDED: window.inflight_discarded,
                 PREWINDOW_DISCARDED: window.prewindow_discarded,
+                # Whose ceiling this point shows. The clients are Python
+                # threads in a container pinned to a few CPUs; for a fast
+                # engine at 16-32 clients they can run out of CPU first, and
+                # a curve that flattens for that reason looks exactly like
+                # one that flattens because the engine stopped scaling. The
+                # numerator and the denominator are recorded beside the
+                # ratio so a reader can see which of the three moved.
+                "client_cpu_seconds": (round(window.client_cpu_seconds, 3)
+                                       if window.client_cpu_seconds is not None
+                                       else None),
+                "client_cpus": window.client_cpus,
+                "client_cpu_util": (round(window.client_cpu_util, 4)
+                                    if window.client_cpu_util is not None
+                                    else None),
+                "client_bound": client_bound,
             },
         ))
 
@@ -450,6 +537,58 @@ def _warn_nothing_finished(clients: int, duration_s: float,
         f"Raise ops.concurrency_duration_s above this configuration's query "
         f"latency — a window shorter than a single query cannot measure "
         f"throughput.",
+        file=sys.stderr, flush=True)
+
+
+def _client_cpu(cpu_start: Optional[int], cpu_end: Optional[int],
+                wall_s: float,
+                cpus: int) -> Tuple[Optional[float], Optional[float]]:
+    """The clients' own CPU over the window, in seconds and as a utilisation.
+
+    Both numbers from one place because the second is the first divided by
+    `wall_s * cpus`, and a record that carried only the ratio would leave a
+    reader unable to tell a busy window from a short one or from a narrow
+    cpuset. Each of those three inputs can be wrong in a way that still
+    produces a number between 0 and 1: the counter in the wrong unit (cgroup
+    v1 publishes nanoseconds), the wall taken around the wrong interval, or
+    the CPU count taken from the host rather than from the cpuset. So all
+    three are recorded and the arithmetic is one expression in one function
+    that a test can calibrate against a known number of saturated cores.
+
+    `(None, None)`, never `(0.0, 0.0)`, when the counter is unavailable or the
+    window is degenerate. Zero is the claim "the clients did nothing", which
+    is the one thing that cannot be true of a window that executed queries,
+    and it would make the client-bound flag read false on a run where nothing
+    was ever measured.
+    """
+    if cpu_start is None or cpu_end is None or wall_s <= 0 or cpus <= 0:
+        return None, None
+    # Clamped at zero: the counter is monotonic, so a negative delta means the
+    # two readings did not come from the same cgroup and the magnitude is
+    # meaningless either way.
+    seconds = max(0.0, (cpu_end - cpu_start) / 1e6)
+    return seconds, seconds / (wall_s * cpus)
+
+
+def _warn_client_bound(clients: int, util: float, cpus: int,
+                       cpu_seconds: Optional[float]) -> None:
+    """Say so when the clients, and not the engine, may be the ceiling.
+
+    On stderr and while the run is happening, like the recall-spread check,
+    because the remedy is a different machine or a different client count and
+    neither is available to someone reading the report a day later. The point
+    is still recorded: it is a real measurement of this harness against this
+    engine, and the flag says what it is evidence about.
+    """
+    print(
+        f"[concurrency] CLIENT CPU-BOUND: at {clients} client(s) the client "
+        f"container used {util:.0%} of its {cpus} CPU(s)"
+        + (f" ({cpu_seconds:.1f} CPU-seconds)" if cpu_seconds is not None
+           else "")
+        + f", above the {CLIENT_BOUND_UTIL:.0%} limit. The throughput at this "
+        f"point is bounded by the clients as well as by the engine, so it is "
+        f"not evidence about where the engine saturates. The report draws it "
+        f"hollow. Re-measure with more client CPUs if the point matters.",
         file=sys.stderr, flush=True)
 
 
@@ -556,9 +695,24 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
     # release onwards the clients are querying, so the time this thread spends
     # getting back to `time.sleep` is time the window contains and its queries
     # are counted in.
-    opened: List[float] = []
-    ready = threading.Barrier(
-        clients + 1, action=lambda: opened.append(time.perf_counter()))
+    # The CPU counter is read in the same barrier action, immediately before
+    # the wall instant, so the two readings bracket one interval instead of
+    # two. Reading it in this thread after `ready.wait()` returns would put
+    # the clients' first queries' CPU outside a window whose denominator
+    # covers them -- the same gap that took the first query of each client out
+    # of the recall coverage, in the other direction. Reading it before the
+    # barrier would include every client's warm-up, which is hundreds of
+    # queries of CPU charged to a window that did not run them.
+    #
+    # CPU first, then the wall: the file read costs microseconds, and spending
+    # them before the wall starts means the window contains no CPU that its
+    # start reading has already counted.
+    opened: List[Tuple[Optional[int], float]] = []
+
+    def _open_window() -> None:
+        opened.append((read_own_cpu_usec(), time.perf_counter()))
+
+    ready = threading.Barrier(clients + 1, action=_open_window)
     stop = threading.Event()
 
     workers = [
@@ -580,7 +734,7 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
         ready.abort()
         raise RuntimeError("a client failed during warm-up")
 
-    wall_start = opened[0]
+    cpu_start, wall_start = opened[0]
     time.sleep(duration_s)
     # The stop instant, read BEFORE the flag is set and used as both the
     # denominator's end and the numerator's cutoff. Those were different
@@ -588,8 +742,15 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
     # client went on to finish the query it was holding and record it, so QPS
     # counted up to one query per client that its own wall did not cover.
     stop_at = time.perf_counter()
+    # And the CPU counter immediately after, for the same reason in the same
+    # direction: read after `stop.set()`, it would include whatever the
+    # clients burned finishing the query each was holding -- work the wall
+    # above deliberately excludes.
+    cpu_end = read_own_cpu_usec()
     stop.set()
     wall = stop_at - wall_start
+    client_cpus = own_cpu_count()
+    cpu_seconds, cpu_util = _client_cpu(cpu_start, cpu_end, wall, client_cpus)
 
     for w in workers:
         w.join(timeout=120)
@@ -630,4 +791,7 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
         merged=merged,
         recall=recall,
         recall_queries=recall_queries,
+        client_cpu_seconds=cpu_seconds,
+        client_cpus=client_cpus,
+        client_cpu_util=cpu_util,
     )

@@ -219,7 +219,7 @@ class TestTotalHoursStillMeansIngest:
         would be the wrong thing to print about it."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.68
-        assert e["worst_case_total_hours"] == 4.88
+        assert e["worst_case_total_hours"] == 5.28
         assert e["long_run"] is False
 
 
@@ -228,22 +228,23 @@ class TestTotalHoursStillMeansIngest:
 # ---------------------------------------------------------------------------
 
 class TestTheConcurrencyTermIsTimeNotQueries:
-    """`main` runs client_counts [1, 2, 4, 8, 16, 32] for 30 s each. Each point
-    runs for a fixed span whatever the engine manages, so this term is exact.
+    """`main` runs client_counts [1, 2, 4, 8, 16, 32] for 30 s each, three
+    times per point. Each point runs for a fixed span whatever the engine
+    manages, so this term is exact.
 
     By hand, for `main`, one pass, six engines, two datasets:
-        6 points x 30 s                           =   180 s per ops unit
+        6 points x 30 s x 3 repeats               =   540 s per ops unit
         ops units per (engine, dataset): 1 each,
             except pgvector, which runs both
             pgvector_build_modes               -> 7 units per dataset
         7 units x 2 datasets x 1 pass             =    14 unit-instances
-        14 x 180 s = 2,520 s                      =  0.70 h
+        14 x 540 s = 7,560 s                      =  2.10 h
     """
 
     def test_main(self):
         t = term(est("main"), "concurrency windows")
-        assert t["typical_hours"] == 0.70
-        assert t["worst_hours"] == 0.70
+        assert t["typical_hours"] == 2.10
+        assert t["worst_hours"] == 2.10
         assert t["bounded"] is True
 
     def test_the_client_count_list_is_counted_not_summed(self):
@@ -768,7 +769,7 @@ class TestACapIsPrintedAsACapNotADuration:
 
 class TestTheWholeQueryEstimateForMain:
     """The aggregate, so a reader can see the number the convention now refers
-    to and check it against the parts: 0.70 h of concurrency windows and 4.77 h
+    to and check it against the parts: 2.10 h of concurrency windows and 4.77 h
     of modelled churn re-insert, against a 14.00 h churn ceiling."""
 
     def test_the_parts_and_the_totals(self):
@@ -777,10 +778,10 @@ class TestTheWholeQueryEstimateForMain:
             "concurrency windows", "filtered search", "churn re-insert"]
         assert term(e, "churn re-insert")["typical_hours"] == 4.77
         assert term(e, "churn re-insert")["worst_hours"] == 14.00
-        assert e["query_hours"] == 5.47
-        assert e["query_hours_worst"] == 14.70
-        assert e["typical_total_hours"] == 75.24
-        assert e["worst_case_total_hours"] == 84.47
+        assert e["query_hours"] == 6.87
+        assert e["query_hours_worst"] == 16.10
+        assert e["typical_total_hours"] == 76.64
+        assert e["worst_case_total_hours"] == 85.87
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -792,8 +793,8 @@ class TestTheWholeQueryEstimateForMain:
     def test_the_per_engine_split_mirrors_the_ingest_one(self):
         e = est("main")
         assert e["query_per_engine_hours"] == {
-            "mariadb": 1.20, "alisql": 2.10, "pgvector": 0.31,
-            "mariadb123": 1.65, "mongodb": 0.10, "valkey": 0.10,
+            "mariadb": 1.40, "alisql": 2.30, "pgvector": 0.71,
+            "mariadb123": 1.85, "mongodb": 0.30, "valkey": 0.30,
         }
 
     def test_ops_disabled_means_no_ops_terms(self):
@@ -883,7 +884,7 @@ class TestTheExtensionPoint:
     def test_a_term_may_decline_this_profile(self, monkeypatch):
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
                             tuple(est_mod._QUERY_TERMS) + (lambda plan: None,))
-        assert est("main")["query_hours"] == 5.47
+        assert est("main")["query_hours"] == 6.87
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 7 ops units per dataset x 2 datasets = 14 per pass."""
@@ -994,8 +995,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~84.5 h worst case" in out
-        assert "~75.2 h typical" in out
+        assert "~85.9 h worst case" in out
+        assert "~76.6 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run

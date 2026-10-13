@@ -100,8 +100,8 @@ engines:
 | `dev` | 1 | ~0.0 h | ~0.0 h | ~0.0 h | **~0.0 h** |
 | `smoke` | 1 | ~0.3 h | ~0.0 h | ~2.0 h | **~2.3 h** |
 | `quick` | 1 | ~36.2 h | ~1.8 h | ~8.2 h | **~44.4 h** |
-| `main` | 1 | ~51.1 h | ~3.6 h | ~8.4 h | **~59.5 h** |
-| `full` | 2 | ~532.0 h | ~37.4 h | ~100.8 h | **~632.8 h** |
+| `main` | 1 | ~51.1 h | ~4.4 h | ~9.2 h | **~60.3 h** |
+| `full` | 2 | ~532.0 h | ~47.0 h | ~110.4 h | **~642.4 h** |
 | `mariadb-blog` | 1 | ~21.3 h | ~1.2 h | ~1.8 h | **~23.1 h** |
 
 The ingest column differs from the table above it because that one was computed
@@ -139,15 +139,15 @@ estimated ingest time (loading only, before any queries):
     ann.m_values or the dataset list to cut it roughly proportionally.
 
 estimated query time (the parts the profile puts a clock on):
-  concurrency windows  ~0.4 h
-                         6 client count(s) x 30s per ops unit, fixed by the profile not by the engine
+  concurrency windows  ~1.2 h
+                         6 client count(s) x 30s x 3 repeat(s) per ops unit, fixed by the profile not by the engine
   filtered search      cost not quantified
                          2 selectivities x 500 queries = 1,000 queries per ops unit, one iterative-scan mode, at a rate nothing here has measured and with no budget anywhere in the run to cap it
   churn re-insert      ~3.2 h typical, ~8.0 h worst case
                          e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
-  subtotal ~3.6 h typical, ~8.4 h worst case
+  subtotal ~4.4 h typical, ~9.2 h worst case
 
-estimated run time ~54.7 h typical, ~59.5 h worst case
+estimated run time ~55.5 h typical, ~60.3 h worst case
   ! Not yet a ceiling: nothing caps filtered search, so a run can exceed the worst case until that is fixed.
   Plan against it all the same: it is the largest figure this configuration justifies.
   ! Neither figure includes the costs below. They are a number of queries, and

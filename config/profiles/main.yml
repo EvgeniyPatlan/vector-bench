@@ -16,6 +16,10 @@
 #   * concurrency to 32 clients — the smoke run's most striking result was
 #                                MariaDB saturating at 2 clients; this is where
 #                                that gets confirmed or overturned.
+#   * each point three times     — 6 points x 30 s x 3 is ~9 minutes per
+#                                engine-dataset pair plus warm-up, which buys
+#                                an error bar on the one measurement here that
+#                                has been seen to move 21% between windows.
 #   * filtered starts at 10%    — 1% selectivity measured 0.9 QPS on MariaDB,
 #                                so 2000 queries there costs 37 minutes per
 #                                configuration for one point on a curve.
@@ -56,6 +60,23 @@ ops:
   max_queries: 500
   client_counts: [1, 2, 4, 8, 16, 32]
   concurrency_duration_s: 30
+  # Three windows per point, and the median reported with the spread beside
+  # it. Every figure in this framework was a single sample until a Valkey
+  # point was re-measured by accident, five hours later on the same build and
+  # configuration, and came back 21% higher at sixteen and thirty-two clients.
+  # Concurrency is the headline finding, the noisiest measurement here, and
+  # the cheapest to repeat: 6 points x 30 s x 3 is 9 minutes per
+  # engine-dataset pair plus warm-up, against the ~51 h of ingest this
+  # profile pays before a single query runs. Two engines differing by less
+  # than the window-to-window spread were being presented as ordered.
+  #
+  # `concurrency_queries` is deliberately NOT set. It defaults to the whole
+  # test set (10,000 queries for both datasets here); setting it is the way
+  # BACK to a small pool, which measures every graph cache against a hot set
+  # it can hold entirely and erases the difference the concurrency chart
+  # exists to show. It exists for reproducing a pre-version-3 run, not for
+  # tuning this one.
+  concurrency_repeats: 3
   # 1% is deliberately absent: it cost 37 minutes per configuration on MariaDB
   # at 0.9 QPS. Measure it separately with --profile full if the low-selectivity
   # case matters to you.
