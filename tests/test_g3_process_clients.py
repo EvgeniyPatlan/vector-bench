@@ -56,16 +56,19 @@ not move either, so the transport, the barrier and the merge did not cost the
 pool anything.
 
 **The lock-holding row is a C call that WAITS with the lock held, not one
-that burns CPU with it held, and that is load-bearing.** §7's table holds the
-lock with an atomic C call over a large tuple and with a Python spin, both of
-which cost a core per client for the whole query -- so four client PROCESSES
-in those regimes achieve their concurrency only if the box has four cores
-spare, and the first version of this file asserted exactly that and failed at
-8-18 busy cores of 20. A real client library holding the lock across a socket
-wait burns nothing: `ctypes.PyDLL`'s `usleep` costs a measured 0.034 cores and
-serializes four threads just the same. The strict verdicts are keyed to that
-row; §7's spinning row is kept and reported, with only the part of it that is
-about the lock asserted. See `_HELD_USLEEP` and `LOAD_INSENSITIVE_SERIALIZES`.
+that burns CPU with it held, and that is load-bearing.** The regime this file
+replaced held the lock with an atomic C call over a large tuple, and §7's
+table named it that way until this file's `usleep` pair superseded it -- §7
+now names `ctypes.PyDLL` `usleep` on the C-call row and keeps a Python spin as
+a second row. Both of the CPU-burning forms cost a core per client for the
+whole query, so four client PROCESSES in those regimes achieve their
+concurrency only if the box has four cores spare, and the first version of
+this file asserted exactly that and failed at 8-18 busy cores of 20. A real
+client library holding the lock across a socket wait burns nothing:
+`ctypes.PyDLL`'s `usleep` costs a measured 0.034 cores and serializes four
+threads just the same. The strict verdicts are keyed to that row; §7's
+spinning row is kept and reported, with only the part of it that is about the
+lock asserted. See `_HELD_USLEEP` and `LOAD_INSENSITIVE_SERIALIZES`.
 
 **The saturated regime's queue is a `multiprocessing.Value` and not a
 `threading.Lock`, and that is load-bearing rather than a detail.**
@@ -75,12 +78,29 @@ at depth one, every query would cost the base latency, the pool would scale
 and the row would protect nothing. One shared counter is used in BOTH arms so
 the two columns above are the same regime measured twice.
 
-**Mutation discipline (R4).** Every assertion below was checked by injecting
-the regression AT RUN TIME -- a monkeypatch, a driver factory, or a flag set
-before the fork -- never by editing a file on disk. Each docstring carries the
+**Mutation discipline (R4), and the scope of the claim is narrower than an
+earlier revision of this paragraph said.** It claimed "every assertion below"
+carried an honest/mutant pair. It does not, and could not: this file also
+holds **source-text and structural assertions**, which have no run-time
+mutant because the thing they assert is the text of a file or the shape of an
+interface. Those are
+`test_the_parent_flag_is_set_before_the_one_the_clients_watch`,
+`test_the_version_six_block_names_what_moved_and_why`,
+`test_the_stale_version_five_claim_was_corrected`,
+`test_the_three_modules_are_each_inside_the_line_ceiling`,
+`test_the_names_the_workloads_import_all_resolve`,
+`test_the_signatures_are_byte_for_byte_the_old_ones`,
+`test_the_tuples_the_report_reads_keep_their_fields` and
+`test_the_two_barrier_timeouts_still_read_together`. Each is a guard on prose
+or on a signature, each says so in its own docstring, and a reader should not
+expect a mutant beside it.
+
+**Every BEHAVIOURAL assertion below** was checked by injecting the regression
+AT RUN TIME -- a monkeypatch, a driver factory, or a flag set before the fork
+-- never by editing a file on disk. Each of those docstrings carries the
 honest value and the mutant value, both read back out of the pool or the
-record. An identical pair is called out as a dead probe rather than reported as
-a guard that holds.
+record. An identical pair is called out as a dead probe rather than reported
+as a guard that holds.
 
 **Load.** This box is shared, and a process pool on a busy box gives noisy
 absolute timings. So nothing here asserts a latency or a throughput: the
@@ -172,8 +192,10 @@ def _spin(seconds: float) -> None:
 #: the controlled pair §7's table is built out of.
 #:
 #: **This is the faithful model of the defect and it replaced a CPU-bound
-#: one.** §7's table holds the lock with an atomic C call over a large tuple
-#: and a Python spin, both of which BURN CPU for the whole query. A real
+#: one.** The replaced regime held the lock with an atomic C call over a large
+#: tuple; §7's table named that until this pair superseded it and now names
+#: `ctypes.PyDLL` `usleep` on its C-call row, keeping a Python spin as a
+#: second row. Both CPU-burning forms BURN CPU for the whole query. A real
 #: client library holding the lock across a socket wait burns none -- it is
 #: blocked in C -- and the difference decides whether this file's headline
 #: assertion is about the lock or about the box. Measured: a held `usleep`
@@ -656,9 +678,14 @@ class TestASaturatedServerIsStillNotFlagged:
     def test_it_achieves_its_concurrency_in_both_arms(self, table):
         """Honest in both arms, and that identity is the assertion.
 
-        Measured: `served / clients` 0.976 under threads and 0.977 under
-        processes. The pair being identical is the result here, not a dead
-        probe: the two rows above show the same comparison separating the
+        `served / clients` **0.977 under threads and 1.004 under processes**
+        -- the `saturated` row of this module's docstring, which is the one
+        table in this file and the one `docs/05-methodology.md` §7 publishes.
+        An earlier revision of this docstring carried 0.976 and 0.977, a
+        revision behind its own source.
+
+        The pair being near-identical is the result here, not a dead probe:
+        the two rows above show the same comparison separating the
         lock-holding regimes by a factor of four over the same fixture, so
         this probe demonstrably can move.
         """
@@ -670,9 +697,11 @@ class TestASaturatedServerIsStillNotFlagged:
         """Non-vacuity. If `saturated` happened to scale, "not flagged" would
         be trivially true and the protection would be untested.
 
-        Measured at 0.275 in both arms against a modelled 1/4, so the guard is
-        being offered a point that looks exactly like the defect and is
-        declining it -- before and after.
+        Efficiency **0.276 under threads and 0.272 under processes** against a
+        modelled 1/4 -- the `saturated` row of this module's docstring -- so
+        the guard is being offered a point that looks exactly like the defect
+        and is declining it, before and after. An earlier revision rounded
+        both arms to a single 0.275.
         """
         row = table["saturated"]
         assert row["threads"]["efficiency"] < 0.5, _report(table)
@@ -681,9 +710,14 @@ class TestASaturatedServerIsStillNotFlagged:
     def test_the_lock_releasing_regime_is_unchanged(self, table):
         """The transport, the barrier and the merge cost the pool nothing.
 
-        Measured: efficiency 0.989 -> 1.000 and `served / clients`
-        0.985 -> 0.985. A process pool that had paid for its pipes would show
-        it here, in the one regime where there was never a lock to remove.
+        Efficiency **1.006 -> 1.009** and `served / clients`
+        **0.975 -> 0.983** -- the `releases the lock (sleep)` row of this
+        module's docstring. An earlier revision of this docstring carried
+        0.989 -> 1.000 and 0.985 -> 0.985, which matched no row of the table
+        above it.
+
+        A process pool that had paid for its pipes would show it here, in the
+        one regime where there was never a lock to remove.
         """
         row = table["releasing"]
         assert row["threads"]["efficiency"] > 0.5, _report(table)
@@ -1499,15 +1533,39 @@ class TestPerfCounterIsComparableAcrossTheFork:
     garbage and the trimming would drop whichever side was behind.
     """
 
+    #: Forks per probe below, and it is **200 because that is the number the
+    #: claim names**. `client_process.py` and `docs/05-methodology.md` §7 both
+    #: say "over 200 forks" and "200 times out of 200"; these probes ran 40,
+    #: so the published figure was five times the evidence. 200 forks of this
+    #: shape cost a measured 0.302 s on a box at 20 busy cores of 20, so
+    #: raising the count was the cheaper half of making the two agree.
+    CLOCK_TRIALS = 200
+
+    #: What the offset probe asserts, and it is **two orders of magnitude
+    #: looser than the figure the prose reports, on purpose**. The quantity is
+    #: a difference of two offsets, each taken across two consecutive clock
+    #: reads, so a thread descheduled between them widens it by milliseconds
+    #: for a reason that is not the clock -- which is why the prose now
+    #: reports 4.2-8.05 us as an observation and names this as the assertion
+    #: rather than implying 4.2 us is enforced. It still separates the two
+    #: clocks by four orders of magnitude: `time.process_time` is the control
+    #: and a child reads near zero against the parent's whole process age, so
+    #: a per-process `perf_counter` fails this by seconds and not by
+    #: microseconds.
+    CLOCK_AGREEMENT_S = 0.01
+
     def test_the_two_processes_share_the_clocks_reference_point(self):
         """Measured, not assumed, and measured as an OFFSET.
 
         `perf_counter` is `clock_gettime(CLOCK_MONOTONIC)` on this platform,
         which is the machine's clock rather than the process's. So
         `perf_counter - CLOCK_MONOTONIC` is a constant, and the test is
-        whether the child's constant equals the parent's: measured over 40
-        forks, they agree to within microseconds, which is the cost of reading
-        two clocks back to back rather than an offset.
+        whether the child's constant equals the parent's: over
+        `CLOCK_TRIALS` forks they agree to within microseconds, which is the
+        cost of reading two clocks back to back rather than an offset. The
+        worst reading here was **8.05 us** on a box at 20 busy cores of 20,
+        against the 4.2 us the original change measured; both are reported by
+        the prose and neither is asserted -- see `CLOCK_AGREEMENT_S`.
 
         `time.process_time` is the control: it IS per-process, and a child's
         reading of it is near zero whatever the parent's. A probe that could
@@ -1519,7 +1577,7 @@ class TestPerfCounterIsComparableAcrossTheFork:
         parent_offset = (time.perf_counter()
                          - time.clock_gettime(time.CLOCK_MONOTONIC))
         worst = 0.0
-        for _ in range(40):
+        for _ in range(self.CLOCK_TRIALS):
             recv, send = MP.Pipe(duplex=False)
             proc = MP.Process(target=_clock_child, args=(send,))
             proc.start()
@@ -1528,10 +1586,12 @@ class TestPerfCounterIsComparableAcrossTheFork:
             proc.join(10)
             recv.close()
             worst = max(worst, abs((child_pc - child_mono) - parent_offset))
-        assert worst < 0.01, (
-            f"the child's perf_counter reference point differs from the "
-            f"parent's by up to {worst:.6f}s, so a span and the window it is "
-            f"inside are being compared on two different clocks")
+        assert worst < self.CLOCK_AGREEMENT_S, (
+            f"over {self.CLOCK_TRIALS} forks the child's perf_counter "
+            f"reference point differs from the parent's by up to "
+            f"{worst * 1e6:.2f}us, past the {self.CLOCK_AGREEMENT_S * 1e3:.0f}"
+            f"ms bound, so a span and the window it is inside are being "
+            f"compared on two different clocks")
         # The control: a clock that really is per-process.
         assert time.process_time() > 0.0
         assert time.get_clock_info("process_time").monotonic
@@ -1542,10 +1602,12 @@ class TestPerfCounterIsComparableAcrossTheFork:
         The parent reads the clock, forks, the child reads it, the parent
         reads it again. The child's reading must lie between the two -- that
         is exactly the relation `span_disposition` relies on between a
-        window's instants and a client's spans. Measured 40 times out of 40.
+        window's instants and a client's spans. Measured `CLOCK_TRIALS` times
+        out of `CLOCK_TRIALS`, which is the "200 times out of 200" the prose
+        claims: it used to run 40.
         """
         inside = 0
-        trials = 40
+        trials = self.CLOCK_TRIALS
         for _ in range(trials):
             recv, send = MP.Pipe(duplex=False)
             before = time.perf_counter()
@@ -1760,21 +1822,56 @@ class TestTheShmFootprintIsIndependentOfTheClientCount:
     immediately after `sem_open`, so its semaphores NEVER appear in a
     `/dev/shm` directory listing while their pages stay charged to the tmpfs.
     A probe that counted files would report zero and conclude there was
-    nothing to worry about for the wrong reason. So this measures the
-    filesystem's used bytes.
+    nothing to worry about for the wrong reason. So this measures PAGES and
+    not a directory listing.
+
+    **It measures this process's pages rather than the filesystem's, and that
+    is a repair.** It used to read `shutil.disk_usage("/dev/shm").used`, which
+    is a machine-global tmpfs: every figure below was a difference of two
+    global readings, so anything else on a shared box allocating or freeing
+    `/dev/shm` between them landed in the result, and `pipe_cost == 0` --
+    asserted exactly -- failed for a reason that was not the pipes. The
+    `/dev/shm` mappings in `/proc/self/maps` are the same pages attributed to
+    the one process that made them, so a sibling suite, a browser or another
+    worktree's run cannot reach them. It is also exact rather than merely
+    robust: the figures it reports are the published ones to the byte, because
+    a POSIX semaphore is one page and `multiprocessing` maps each of them.
     """
 
+    #: Bytes a `/dev/shm` mapping covers. One page per POSIX semaphore, which
+    #: is why the totals below are whole multiples of it.
+    PAGE = 4096
+
     def _used(self) -> int:
-        import shutil
-        return shutil.disk_usage("/dev/shm").used
+        """Bytes of `/dev/shm` mapped by THIS process, from `/proc/self/maps`.
+
+        The mappings read `/dev/shm/sem.XXXXXX (deleted)` -- deleted because
+        of the `sem_unlink` the class docstring describes, which is exactly
+        why a directory listing sees nothing and this does.
+        """
+        total = 0
+        with open("/proc/self/maps") as handle:
+            for line in handle:
+                if "/dev/shm" not in line:
+                    continue
+                span = line.split()[0]
+                lo, _, hi = span.partition("-")
+                total += int(hi, 16) - int(lo, 16)
+        return total
 
     def test_two_events_are_the_whole_pools_cost(self):
         """Honest and the design that was rejected, both in bytes.
 
         Honest (two `Event`s for the POOL): **40,960 bytes**, whatever the
-        client count. Rejected (two per CLIENT): 1,310,720 bytes at 32
-        clients, measured by creating the 64 extra Events the design would
-        have needed. Thirty-two pipes cost **0**.
+        client count -- ten pages, because a `multiprocessing.Event` is five
+        semaphores (its flag, and its condition's lock and three counters).
+        Rejected (two per CLIENT): 1,310,720 bytes at 32 clients, measured by
+        creating the 64 extra Events the design would have needed. Thirty-two
+        pipes cost **0**, because a pipe is not a tmpfs object at all.
+
+        Both figures are reproduced here rather than quoted: this is the
+        measurement, taken per process, and it came back at exactly those
+        numbers on a box at 20 busy cores of 20.
 
         Against the harness container's `shm_size`, which
         `orchestrator/ops_pass.py` takes from the resource pass -- 2g
@@ -1790,10 +1887,19 @@ class TestTheShmFootprintIsIndependentOfTheClientCount:
         pipe_cost = self._used() - baseline - pooled - per_client
         try:
             assert pooled > 0, (
-                "two Events cost no tmpfs at all, so this probe is not "
+                "two Events cost no tmpfs pages at all, so this probe is not "
                 "measuring the thing /dev/shm would run out of")
             assert per_client > 2.0 * pooled, (pooled, per_client)
+            # Still EXACTLY zero, and it can stay exact now that the reading
+            # is this process's own: a pipe maps nothing in /dev/shm, so any
+            # non-zero here is a real change in what a pool costs rather than
+            # a neighbour's tmpfs traffic.
             assert pipe_cost == 0, pipe_cost
+            # Whole pages, which is the non-vacuity check on the reader
+            # itself: a parse that picked up the wrong column would not land
+            # on a multiple of the page size.
+            assert pooled % self.PAGE == 0, pooled
+            assert per_client % self.PAGE == 0, per_client
             # The number that matters: one pool against the smallest
             # configured container.
             assert pooled < 2 * 1024 ** 3 / 1000, pooled

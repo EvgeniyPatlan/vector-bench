@@ -45,7 +45,7 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

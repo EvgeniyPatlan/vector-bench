@@ -247,7 +247,9 @@ DRIVERS = {"releasing": releasing, "holding": holding,
            "saturated": saturated, "half": half_and_half}
 
 #: Which families the LIVE pool must be able to run at the client count.
-#: Named here so a family added above has to be classified.
+#: Every key of `DRIVERS` appears here, which is what makes a family added
+#: above a test failure rather than a row nothing runs -- see
+#: `test_every_driver_family_is_classified`.
 #:
 #: **ALL FOUR, SINCE G3, AND THAT IS THE CHANGE RATHER THAN A LOOSENING.**
 #: `holding` was in `SERIALIZES` until the clients became OS processes: it
@@ -266,7 +268,16 @@ SCALES = ("releasing", "saturated", "half", "holding")
 #: rather than an expected finding -- `tests/retired_thread_pool.py`'s
 #: docstring has the argument.
 SERIALIZES_UNDER_THREADS = ("holding",)
-SERIALIZES = ()
+
+#: **`SERIALIZES = ()` is GONE rather than kept empty.** It used to name the
+#: families that serialize the live pool and it carried the comment "Named
+#: here so a family added above has to be classified" -- which stopped being
+#: true twice over: no `parametrize` referenced it any more, so an added
+#: family was classified by `SCALES` alone, and an empty tuple parametrizes
+#: nothing, so even a reference would have run no test. An empty collection
+#: that reads as a classification is the dead-probe shape this file records
+#: elsewhere, so the classification duty it claimed is now discharged by an
+#: assertion that every `DRIVERS` key is in `SCALES`.
 
 
 #: What every synthetic query returns. Fixed ids rather than the fake's real
@@ -1332,9 +1343,12 @@ class TestTheClientBoundFlagIsKeptAndDocumentsItsBlindness:
 class TestTheChurnReadersCarryItToo:
     """§4. `churn_readers` builds the same pool, and
     `extra.reinsert_rows_per_s` is a version-5 quantity measured against
-    concurrent readers. The readers are threads in the WRITER's own
-    interpreter, so readers that serialize starve the writer in the client and
-    that rate becomes a measurement of Python.
+    concurrent readers -- so a reader pool that served one read at a time
+    leaves that rate describing an unknown amount of read load. Until version
+    6 the readers were threads in the WRITER's own interpreter, which made it
+    worse: readers that serialized starved the writer in the client and the
+    rate became a measurement of Python. Each reader is a forked OS process
+    now, so the dependency is what is left and the attribution is not.
     """
 
     @staticmethod
@@ -1511,10 +1525,19 @@ class TestTheDuringWritesTableSaysIt:
 #: pattern tight enough to demand one sentence gets deleted by the next
 #: author, and then it is also absent on the edit it existed to catch.
 PROSE_CLAIMS = {
+    # **The claim this pins was NARROWED, and the pattern with it.** What was
+    # measured is a saturated server whose service time is DETERMINISTIC --
+    # every calibration driver has a fixed per-query cost -- so "a genuinely
+    # saturated server is not flagged" claimed more than the calibration
+    # supports. The optional qualifier is therefore part of the pattern rather
+    # than a reword it has to tolerate, and the reject rows below include the
+    # form that would satisfy a looser pattern while reversing the claim.
     "a saturated server is not flagged": dict(
-        pattern=r"(?:genuinely )?saturated server is (?:deliberately )?not "
-                r"flagged",
+        pattern=r"(?:genuinely )?saturated server"
+                r"(?: with [a-z ]{0,40})? is (?:deliberately )?not flagged",
         accepts=[
+            "A saturated server with deterministic service time is not "
+            "flagged, and that is the case the threshold protects.",
             "A genuinely saturated server is not flagged, and that is the "
             "case the threshold was chosen to protect.",
             "A saturated server is not flagged: a real queue raises the "
@@ -1526,6 +1549,10 @@ PROSE_CLAIMS = {
             "A saturated server is flagged the same way.",
             "A saturated server is also refused, because its efficiency "
             "falls.",
+            # The form a lazy wildcard between the noun and the verb would
+            # have accepted: it reverses the claim and keeps the words.
+            "A saturated server is flagged, and only a lock-bound client is "
+            "not flagged.",
         ],
     ),
     "the efficiency needs the concurrency to have happened": dict(

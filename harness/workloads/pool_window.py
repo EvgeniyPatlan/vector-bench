@@ -34,8 +34,8 @@ from ..metrics.latency import scaling_status, served_fraction
 #: Share of the client container's CPUs above which a point is reported as
 #: client-bound. Not a measured constant and not claimed to be one: it is the
 #: level at which this harness stops being able to say whose ceiling a figure
-#: shows. Python threads serializing vectors do not scale smoothly to the last
-#: percent of a cpuset, so a point at 0.8 is already one where the clients may
+#: shows. Client processes serializing vectors do not scale smoothly to the
+#: last percent of a cpuset, so a point at 0.8 is already one where they may
 #: be contributing, and the honest report is "this number is not evidence about
 #: the engine" rather than a correction factor nobody can justify.
 #:

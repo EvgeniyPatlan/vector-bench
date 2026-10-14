@@ -309,12 +309,12 @@ SCHEMA_VERSION = 1
 # AND THE INSTRUMENT STILL REFUSES WHAT IT REFUSED, which is the half a bump
 # could quietly break. Five synthetic drivers of identical per-query cost
 # through the real pool at 1 and 4 clients, `served / clients` at 4, threads
-# then processes: lock-releasing 0.985 -> 0.985; **saturated server 0.976 ->
-# 0.977 at efficiency 0.275, still not flagged**; atomic C call holding the
-# lock 0.219 -> 0.950; Python spin holding the lock 0.263 -> 0.996. Only the
-# lock-holding rows moved, which is the whole claim; the saturated-server row
-# is the one `SERVED_CONCURRENCY_FLOOR` exists to protect and a version that
-# had started flagging real engine ceilings would be worse than the defect.
+# then processes -- CITED from the table `docs/05-methodology.md` §7 publishes
+# and `tests/test_g3_process_clients.py` builds, not re-measured here:
+# lock-releasing 0.975 -> 0.983; **saturated server 0.977 -> 1.004 at
+# efficiency 0.272, still not flagged**; a `ctypes.PyDLL` `usleep` holding the
+# lock 0.243 -> 0.982; Python spin holding the lock 0.264 -> 0.995. Only the
+# lock-holding rows moved, which is this version's whole claim.
 OPS_MEASUREMENT_VERSION = 6
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.

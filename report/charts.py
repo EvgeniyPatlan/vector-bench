@@ -947,10 +947,13 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         # because both carry the misreading: the throughput panel shows a
         # curve flattening and the efficiency panel shows it falling away from
         # linear, and for a client-bound point neither is evidence about the
-        # engine. The clients are Python threads serializing vectors in a
-        # container pinned to a few CPUs, and at 16-32 clients against a fast
-        # engine that is a real ceiling of this harness rather than of the
-        # database under it.
+        # engine. The clients are forked OS processes serializing vectors
+        # inside one container's cpuset, and at 16-32 clients against a fast
+        # engine that cpuset is a real ceiling of this harness rather than of
+        # the database under it. Since `ops_measurement_version` 6 it is the
+        # only client-side ceiling this flag is about: the clients no longer
+        # share an interpreter, so a point is hollow because the CPUs ran out
+        # and not because a lock serialized them.
         for r in rows:
             extra = r.get("extra") or {}
             if not extra.get("client_bound"):

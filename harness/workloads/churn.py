@@ -325,11 +325,11 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             inserted, insert_seconds = _reinsert(
                 driver, new_ids, vectors, attrs, effective_budget)
         finally:
-            # In a `finally` because the readers are threads holding
-            # connections: a writer that raises must not leave them querying
-            # for the rest of the run. `stop()` is also where a reader
-            # exception surfaces, so it is caught rather than allowed to
-            # replace whatever the writer was already failing with.
+            # In a `finally` because the readers are separate OS processes
+            # holding connections: a writer that raises must not leave them
+            # querying -- or alive -- for the rest of the run. `stop()` is
+            # also where a reader exception surfaces, so it is caught rather
+            # than allowed to replace what the writer was already failing with.
             if reader_pool is not None:
                 try:
                     reader_during = reader_pool.stop()

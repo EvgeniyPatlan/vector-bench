@@ -218,10 +218,13 @@ def during_writes_rows(records: List[Dict[str, Any]]
             # Whether the readers ran the queries their count implies. Carried
             # because EVERY figure on this row depends on it -- the p99 ratio,
             # both throughputs and the writer rate beside them. A pool that
-            # served one query at a time measures a p99 of a read that waited
-            # for Python's interpreter lock, not of one the engine was slow to
-            # answer; and the readers are threads in the writer's own
-            # interpreter, so the same stall starves the writer in the client.
+            # served one read at a time measures a p99 of a read that spent
+            # its time queued somewhere rather than of one the engine was slow
+            # to answer, and the writer rate beside it was taken against those
+            # same reads. Until `ops_measurement_version` 6 the somewhere was
+            # Python's interpreter lock, which the readers shared with the
+            # writer; each reader is a forked OS process now, so a low reading
+            # here is no longer attributable to it.
             # `extra.scaling_status` on this record is the DURING-WRITES
             # window's, which is the window every published figure here comes
             # from; the baseline's is carried separately so a reader can see
