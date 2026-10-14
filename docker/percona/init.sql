@@ -1,0 +1,65 @@
+-- Runs via --init-file on every Percona Server start. Must be idempotent.
+--
+-- Creates the account the benchmark connects with. As in the MariaDB and AliSQL
+-- images we deliberately do NOT use --skip-grant-tables: on MySQL 8 and later
+-- that option implicitly enables --skip-networking, which would make the server
+-- unreachable over TCP from the harness container.
+--
+-- THE ONE LINE THAT MUST NOT BE COPIED FROM docker/alisql/init.sql.
+--
+-- AliSQL's init.sql asks for the auth plugin by name:
+--
+--     CREATE USER IF NOT EXISTS 'bench'@'%'
+--       IDENTIFIED WITH mysql_native_password BY 'bench';
+--
+-- On this server that is a hard error, not a deprecation warning. The
+-- `vector-mvp` branch is MySQL 9.7.1 based and the plugin has been removed from
+-- the server — the pinned tree carries a test for its absence,
+-- mysql-test/r/mysql_native_password_removed.result, whose lines 4-5 are:
+--
+--     CREATE USER native_password_user IDENTIFIED WITH mysql_native_password BY 'abcd';
+--     ERROR HY000: Plugin 'mysql_native_password' is not loaded
+--
+-- and :7-8 show ALTER USER failing the same way. (libmysql/authentication_native_password/
+-- still exists on that tree, but it is the *client* plugin, so that a 9.7 client
+-- can still reach an older server. It does not make the server accept the
+-- plugin.) An --init-file statement that errors is fatal to startup, so copying
+-- AliSQL's line would make the container fail to boot rather than fail later.
+--
+-- So the account is created with no plugin named, which gives it the server
+-- default, caching_sha2_password. The consequence is an auth-path difference the
+-- comparison has to own rather than hide: MariaDB and AliSQL authenticate the
+-- bench account with a native-password handshake and Percona cannot. It is a
+-- per-connection cost, not a per-query one, and both measurement paths hold a
+-- connection open for the length of a configuration, so it is not expected to
+-- reach any reported figure — but it has not been measured, and
+-- docs/09-adding-percona-server.md §7 keeps it on the smoke-run list because the
+-- ops harness connects over TCP, where caching_sha2_password needs either TLS or
+-- the server's RSA public key before it will complete at all.
+CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED BY 'bench';
+GRANT ALL PRIVILEGES ON *.* TO 'bench'@'%' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS 'bench'@'localhost' IDENTIFIED BY 'bench';
+GRANT ALL PRIVILEGES ON *.* TO 'bench'@'localhost' WITH GRANT OPTION;
+
+-- NOTHING VECTOR-RELATED IS SET HERE, AND THE ASYMMETRY WITH AliSQL IS
+-- DELIBERATE RATHER THAN AN OMISSION.
+--
+-- docker/alisql/init.sql:13-15 repeats its make-or-break global in the init
+-- file as well as in the entrypoint flag — "the server flag covers startup,
+-- this covers a server someone restarted without it" — and that precedent does
+-- transfer: Percona's compiled-in `innodb_hnsw_max_memory` of 1 GiB will refuse
+-- INSERTs partway through any corpus worth loading, so a by-hand `docker run`
+-- from docs/03-running-manually.md needs a working value too.
+--
+-- It must not be done from here, though. `vidx_disabled = OFF` is the only sane
+-- value, so repeating it is harmless. `innodb_hnsw_max_memory` is a measurement
+-- parameter chosen per resource pass, and --init-file runs AFTER the server
+-- flags are applied — a `SET GLOBAL innodb_hnsw_max_memory = …` on this line
+-- would silently overwrite the orchestrator's value and leave the manifest
+-- recording a number that was not in force. The fallback therefore lives in
+-- entrypoint-percona.sh, which applies it only when no flag arrived; see its
+-- note 2.
+--
+-- Percona's HNSW index itself needs no switch, so unlike AliSQL there is
+-- nothing here to enable.
+FLUSH PRIVILEGES;

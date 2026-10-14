@@ -1,0 +1,49 @@
+# Default (full-profile) Percona Server sweep.
+#
+# scripts/render-configs.py overwrites this file in the working copy according to
+# the selected profile, so editing it here only changes the standalone default.
+#
+# REVIEW STATUS: never run. See docs/09-adding-percona-server.md.
+#
+# Percona's HNSW index is InnoDB's, implemented in storage/innobase, so there is
+# one run group and no MyISAM curve — the same shape as alisql/config.yml and
+# not mariadb/config.yml.
+#
+# `M` is passed as an index option in DDL, matching how MariaDB and AliSQL take
+# it. Accepted range is 2..200 (storage/innobase/include/vec0vec.h:64-65), which
+# contains the swept values.
+#
+# `efConstruction` IS present here, and that makes this the third engine in this
+# benchmark to expose a build-effort knob — after pgvector and Valkey, and
+# unlike MariaDB MHNSW and AliSQL VIDX, whose configs both carry a comment
+# saying the knob does not exist. It is pinned to Percona's own default of 200
+# (storage/innobase/include/vec0vec.h:56) rather than swept, for the same reason
+# the smoke profile pins pgvector_ef_construction: a knob only one engine has
+# adds a dimension to the grid that cannot be compared across engines, and the
+# fair reading of a Percona curve beside a MariaDB one is at the vendor default.
+# Sweeping it is a deliberate choice for a Percona-only study, and the arg group
+# below is the place to make it.
+#
+# One thing efConstruction is NOT: a substitute for the recall/QPS sweep.
+# Percona exposes ef_search as a session variable (innodb_hnsw_ef_search), so
+# the query-time frontier is swept in query_args exactly as it is for every
+# other engine here. efConstruction is a build-time parameter and raising
+# ef_search later cannot recover edges a low efConstruction never created
+# (Docs/percona-hnsw.md:1204-1207).
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: PerconaServer
+    disabled: false
+    docker_tag: vector-bench/percona-bench
+    module: ann_benchmarks.algorithms.percona
+    name: percona
+    run_groups:
+      innodb:
+        arg_groups: [{M: [6, 8, 16, 24, 32], efConstruction: [200], engine: 'InnoDB'}]
+        args: {}
+        # innodb_hnsw_ef_search accepts 1..100000 and clamps outside that with a
+        # warning (mysql-test/suite/sys_vars/r/innodb_hnsw_ef_search_basic.result:31-50),
+        # so every value below is taken verbatim. The grid matches the MariaDB
+        # and AliSQL ones so the three curves are sampled at the same points.
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
