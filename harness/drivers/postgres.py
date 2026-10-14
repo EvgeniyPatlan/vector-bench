@@ -7,7 +7,10 @@ Connector/C's, so it is what is used here.
 
 The substantive difference from MHNSW and VIDX is that pgvector builds its HNSW
 index as a bulk operation after the data is loaded, rather than incrementally on
-INSERT. `build_mode` selects which of the two comparisons is being made.
+INSERT. `build_mode` selects which of the two comparisons is being made -- and
+with it how this driver ingests, because in incremental mode the ingest is part
+of the build being compared: bulk mode loads through COPY, incremental mode
+through batched INSERT. Argued at length beside `INSERT_SQL`.
 """
 
 from __future__ import annotations
@@ -39,14 +42,111 @@ OPERATOR = {"angular": "<=>", "euclidean": "<->"}
 #: up with one index between them. `create_schema` creates every entry.
 SCALAR_INDEXES = {column: f"{TABLE}_{column}_idx" for column in FILTER_COLUMNS}
 
-#: One COPY statement for the bulk load and for churn's re-insert. They each
-#: had their own copy of this string; PR 3 adds a column to both, and a COPY
-#: whose column list and `write_row` tuple disagree in width raises inside the
-#: copy block, which on the bulk path happens after an unknown number of rows
-#: have already been streamed.
+#: The COPY the BULK-mode load streams, and now its only caller. Two write
+#: paths shared this string -- the bulk load and churn's re-insert -- because
+#: each had held its own copy of it and PR 3 had to add a column to both. C4
+#: ended that sharing from the other end: the incremental load and churn's
+#: re-insert both go through `INSERT_SQL` below, leaving COPY on the one path
+#: where it is the honest ingest -- the load whose index is built afterwards.
+#:
+#: The width hazard is unchanged for the path that is left: a COPY whose
+#: column list and `write_row` tuple disagree raises inside the copy block,
+#: which on the bulk path happens after an unknown number of rows have
+#: already been streamed.
+#:
+#: What moved rather than went away is the PARITY requirement. It used to be
+#: "one string, so the two write paths cannot disagree about a column list".
+#: It is now "two strings, which must name the same columns in the same
+#: order". What holds them together is `tests/test_t3b_drivers.py`'s
+#: `test_both_write_paths_name_the_same_columns_in_the_same_order`, which
+#: parses the column list out of each statement and compares the two. A
+#: divergence fails against a four-column table -- on the churn path, after
+#: the delete has already happened.
 COPY_SQL = (
     f"COPY {TABLE} (id, {FILTER_TAG}, {FILTER_CTAG}, embedding) FROM STDIN"
 )
+
+#: The INSERT the INCREMENTAL-mode load and churn's re-insert both go
+#: through. Three figures this repo publishes depend on these not being
+#: COPYs: pgvector's incremental `build_wall_s`, its `ingest_rows_per_s` in
+#: that mode, and churn's `reinsert_rows_per_s`.
+#:
+#: In incremental mode `create_schema` creates the HNSW index BEFORE the load,
+#: so the graph is maintained row by row as the rows arrive and the load time
+#: IS the build time -- `workloads/build.py` records `load.wall_seconds` as
+#: `build_wall_s` and says so in its own docstring. That number is then set
+#: against MHNSW's and VIDX's, which are ingested through
+#: `mysql_family.INSERT_SQL` in batches (`_load_range`). COPY is Postgres's
+#: bulk fast-path: one statement streaming rows, with no per-row statement to
+#: parse and no per-row result to return. Driving the incremental load through
+#: it charged pgvector for a cheaper ingest than every engine it was being
+#: compared against, and the difference landed inside build.py's second claim,
+#: "pgvector's incremental build costs X versus MHNSW's Y" -- the ingest
+#: mechanism was part of X and not part of Y.
+#:
+#: BULK mode keeps COPY, and that distinction is part of the correction rather
+#: than an omission in it. There `create_index` runs AFTER the load, so the
+#: load is pure ingest with no graph work inside it, and COPY is what anyone
+#: loading a corpus into pgvector actually writes; using INSERT there would
+#: measure an ingest nobody uses, and would turn build.py's FIRST claim --
+#: "pgvector's bulk build is N times cheaper than its own incremental build"
+#: -- into a comparison of two statement kinds.
+#:
+#: Found by a fork rather than here: villagesql/vector-bench, branch
+#: `tomas/villagesql-build-fairness`, commit 96bdcb711, which measured its
+#: 60k-row pgvector incremental build at ~208 s on COPY against ~245 s on
+#: batched INSERT. Those are their figures on their hardware, recorded as the
+#: reason to expect this correction to MOVE the number -- and to move it
+#: against pgvector -- not as a result of this repo. Nothing here has been run
+#: against a live engine.
+#:
+#: **What this controls for and what it cannot**, stated plainly because a
+#: vendor build-cost comparison is published off these numbers and a reader
+#: has to know which difference they are looking at.
+#:
+#: CONTROLLED, after this change: the statement kind -- every engine's rows
+#: now arrive as INSERTs against a live index on the paths where the graph is
+#: maintained during the write; the rows per batch, 500 on both sides; and
+#: therefore the number of client/server ROUND TRIPS per row.
+#:
+#: NOT CONTROLLED, and not controllable here: the SERVER-SIDE EXECUTIONS per
+#: row, and the wire encoding they come from. psycopg3's `executemany` sends
+#: one execution per row inside a pipeline, and a pipeline saves round trips
+#: rather than executions; Connector/C can turn a 500-row batch into a
+#: single bulk operation. "The same batch size" therefore means the two
+#: clients flush at the same points, not that the server is asked to do the
+#: same number of things. The two client stacks are two client stacks, which
+#: the module docstring names as the asymmetry no config removes.
+#:
+#: Which way the residual leans, because a publication needs that and not
+#: just its existence: it now plausibly runs AGAINST pgvector. Connector/C
+#: can collapse a batch into one execution and psycopg3 cannot, so this
+#: correction removes a pgvector advantage and may overshoot by the size of
+#: that difference. The residual gap between pgvector's incremental build
+#: and MHNSW's is therefore per-row graph-build cost PLUS a client-library
+#: term of unknown size and probably unfavourable sign. Before this change
+#: it was per-row graph-build cost plus a bulk fast-path: a much larger term
+#: whose sign was certainly in pgvector's favour. Anyone quoting the
+#: difference should quote it as the first of those, and should read
+#: `report/render.py:_known_asymmetries`' "Client stacks differ for
+#: PostgreSQL" row -- "its client overhead differs by an unmeasured amount"
+#: -- as load-bearing rather than decorative.
+INSERT_SQL = (
+    f"INSERT INTO {TABLE} (id, {FILTER_TAG}, {FILTER_CTAG}, embedding) "
+    f"VALUES (%s, %s, %s, %s)"
+)
+
+#: Rows per `executemany`, copied from the engines this measurement is
+#: compared against rather than chosen here: `mysql_family._load_range`
+#: batches at 500 and its `insert_rows` chunks at 500. A batch of a different
+#: size is a different number of client/server round trips for the same rows,
+#: which is the cost this whole change exists to stop charging to one side
+#: only. `tests/test_c4_pgvector_ingest.py` reads the number out of
+#: `mysql_family._load_range`'s signature and fails if the two drift, because
+#: nothing else here would notice: the fork this was ported from used 1000,
+#: stating that 1000 was the MySQL-family batch, and 1000 against 500 would
+#: have put back part of the asymmetry it was removing.
+INSERT_BATCH_ROWS = 500
 
 
 #: The table option `prepare_churn` turns off and `maintain` gives back.
@@ -163,7 +263,65 @@ class PostgresDriver(EngineDriver):
         total = len(vectors)
         threads = max(1, threads)
         attrs = RowAttrs.coerce(attrs)
+        # Which ingest this load is allowed to use -- the one decision in this
+        # file that moves a published build number.
+        #
+        # `is not None` rather than a truthiness test on `self._index`, for
+        # the reason `_select`'s docstring gives at length: that function read
+        # `if column else ""` for a review cycle and silently returned an
+        # unfiltered query. An `IndexSpec` is never falsy today, so this is
+        # habit rather than a live bug -- and habit is what the last one cost.
+        #
+        # The None branch is DEFENSIVE, and labelled so rather than
+        # attributed to a caller, because it has none in this tree:
+        # `build.run` calls `create_schema` before `load`, `main.py`'s
+        # no-build path assigns `driver._index` directly (`main.py:281`), and
+        # nothing in `scripts/` constructs this driver at all. What it buys
+        # is that a future caller -- or a test -- loading without a schema
+        # gets COPY, which is the right answer when there is no HNSW index to
+        # maintain, instead of an AttributeError.
+        #
+        # One coupling worth naming: `capabilities()` reports
+        # `incremental_index: False`, so `build.run`'s own `incremental` flag
+        # reduces to exactly this condition (`workloads/build.py:93-95`). The
+        # record that says "incremental: build cost is the load cost" and the
+        # driver that chose INSERT are decided by one test, so there is no
+        # configuration in which they disagree.
+        incremental = (self._index is not None
+                       and self._index.build_mode == "incremental")
         start = time.perf_counter()
+
+        def insert_range(lo: int, hi: int, cur, report: bool = False) -> None:
+            span = hi - lo
+            began = time.perf_counter()
+            next_report = began + PROGRESS_INTERVAL_S
+            rows: List[Tuple[Any, ...]] = []
+            for i in range(lo, hi):
+                rows.append((start_id + i, *attrs.row(i), vectors[i]))
+                if len(rows) >= INSERT_BATCH_ROWS:
+                    cur.executemany(INSERT_SQL, rows)
+                    # Rebound rather than cleared, as `mysql_family` does and
+                    # for its reason: the list was handed to the driver, and
+                    # emptying the object it was given bets on executemany
+                    # having finished reading it.
+                    rows = []
+                    if report:
+                        now = time.perf_counter()
+                        if now >= next_report:
+                            done = i - lo + 1
+                            rate = done / max(now - began, 1e-9)
+                            eta = (span - done) / max(rate, 1e-9)
+                            print(f"[pgvector]   {done:,}/{span:,} rows, "
+                                  f"{rate:,.0f} rows/s (INSERT), "
+                                  f"ETA {eta / 60:.1f} min", flush=True)
+                            next_report = now + PROGRESS_INTERVAL_S
+            if rows:
+                cur.executemany(INSERT_SQL, rows)
+            # No COMMIT: `_open` connects with autocommit, so each batch has
+            # already committed. `mysql_family._load_range` ends with one
+            # against an autocommit connection too, so both paths commit per
+            # batch -- the difference between them is the statement count, not
+            # how much durability either side was charged for.
 
         def copy_range(lo: int, hi: int, cur, report: bool = False) -> None:
             span = hi - lo
@@ -183,8 +341,15 @@ class PostgresDriver(EngineDriver):
                                   flush=True)
                             next_report = now + PROGRESS_INTERVAL_S
 
+        # The correction, in one line; `INSERT_SQL` above is the argument for
+        # it. Chosen once and used by both the single- and the multi-threaded
+        # path below, because `load_threads: 8` is live in two profiles and a
+        # port that switched only the single-threaded call site would leave
+        # those runs measuring COPY under a record that says INSERT.
+        load_range = insert_range if incremental else copy_range
+
         if threads == 1:
-            copy_range(0, total, self._cur, report=True)
+            load_range(0, total, self._cur, report=True)
         else:
             bounds = [(total * i // threads, total * (i + 1) // threads)
                       for i in range(threads)]
@@ -193,7 +358,7 @@ class PostgresDriver(EngineDriver):
                 lo, hi = bound
                 conn = self._open()
                 try:
-                    copy_range(lo, hi, conn.cursor(), report=(lo == 0))
+                    load_range(lo, hi, conn.cursor(), report=(lo == 0))
                 finally:
                     conn.close()
 
@@ -214,9 +379,52 @@ class PostgresDriver(EngineDriver):
                     attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]
                     ) -> None:
         attrs = RowAttrs.coerce(attrs)
-        with self._cur.copy(COPY_SQL) as copy:
-            for i, row_id in enumerate(ids):
-                copy.write_row((int(row_id), *attrs.row(i), vectors[i]))
+        # Batched INSERT rather than COPY, and NOT conditional on
+        # `build_mode`, which is the one thing to understand before changing
+        # this back. Churn runs after `build.run`, so the HNSW index exists by
+        # the time anything re-inserts -- in BOTH modes, because incremental
+        # creates it in `create_schema` and bulk creates it in `create_index`
+        # before churn is reached. Every re-inserted row therefore has its
+        # graph work done inside this write, exactly as MHNSW's and VIDX's
+        # does, and they re-insert through `executemany(INSERT_SQL, ...)` at
+        # the same batch size. This path had no honest claim on the bulk
+        # fast-path at all: unlike `load` in bulk mode, there is no later
+        # CREATE INDEX for it to be the cheap prelude to.
+        #
+        # A second reason the first does not cover: `--workloads churn`
+        # without `build` is a supported invocation -- `main.py`'s no-build
+        # branch, which refuses to run unless the table already holds rows
+        # from an earlier one. No schema is created in that process;
+        # `main.py:281` assigns `driver._index` straight from the profile. A
+        # `build_mode` gate here would therefore choose the write mechanism
+        # from a DECLARED mode while the table's actual state -- a live HNSW
+        # index left behind by that earlier invocation -- is not knowable
+        # from it, and in `post` mode would stream a COPY into that index, in
+        # the one configuration that has no build record to notice.
+        #
+        # The figure it was distorting is `churn.py`'s `reinsert_rows_per_s`,
+        # and where that surfaces is narrower than "the report compares it",
+        # so it is worth stating as measured: `report/render.py:_churn_table`
+        # carries no rate column, and `_churn_notes` tabulates the rate per
+        # engine only for engines whose re-insert did not finish. For a
+        # completed churn it travels in the record's `extra` --
+        # `records.jsonl`, the export bundle, anything reading records. The
+        # unfairness was live in the data either way, which is reason enough.
+        #
+        # No COMMIT, for the reason `insert_range` gives: `_open` connects
+        # with autocommit, so each batch has already committed.
+        total = len(ids)
+        for begin in range(0, total, INSERT_BATCH_ROWS):
+            end = min(begin + INSERT_BATCH_ROWS, total)
+            # `ids[i]` paired with `attrs.row(i)` and `vectors[i]`: the id
+            # comes from the caller's list, the scalars and the vector from
+            # position `i` in the arrays it was handed alongside it. Churn
+            # slices all three together (`RowAttrs.__getitem__`) precisely so
+            # that this positional pairing is the right one.
+            self._cur.executemany(INSERT_SQL, [
+                (int(ids[i]), *attrs.row(i), vectors[i])
+                for i in range(begin, end)
+            ])
 
     def count_rows(self) -> int:
         self._cur.execute(f"SELECT count(*) FROM {TABLE}")
