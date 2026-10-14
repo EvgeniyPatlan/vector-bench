@@ -74,28 +74,38 @@ rather than accepted (the §7 list this answers is in `docs/05-methodology.md`):
   IS the parent's address space. `CLIENT_START_METHOD` pins it rather than
   inheriting the interpreter default, which is `fork` on Linux today and
   becomes `forkserver` in 3.14.
-* **Memory: the cost §7 states is NOT REAL, and that is a measurement.** §7
-  says "each client becomes an OS process with its own copy of the query set,
-  so the harness container's memory grows with the client count". Under fork
-  it does not: the query set is read-only in a client, `shard_queries` hands
-  it out as a strided VIEW rather than a copy, and copy-on-write never
-  copies a page nobody writes. Measured, eight children over a 104.9 MB
-  float32 array: summed `Private_Dirty` 13.8 MB, 0.13x the array, against
-  838.9 MB if each had copied it. The control arm is what makes that a
-  measurement and not a blind probe -- eight children that WRITE the array
-  measure 851.7 MB, 8.12x, so the probe can see a copy when there is one.
-  What a client does cost is its own interpreter's private pages, ~1.7 MB.
+* **Memory: the cost §7 states is NOT REAL, and the DIRECTION is a
+  measurement.** §7 says "each client becomes an OS process with its own copy
+  of the query set, so the harness container's memory grows with the client
+  count". Under fork it does not: the query set is read-only in a client,
+  `shard_queries` hands it out as a strided VIEW rather than a copy, and
+  copy-on-write never copies a page nobody writes. Note what that does NOT
+  say: a shard is strided across the whole array, so every reader child READS
+  pages spread over the entire query set -- the write is what is absent, not
+  the touch. The figures are SUPPLIED and are a SUM OVER EIGHT CHILDREN
+  against one 104.9 MB float32 array, not per-client and not against a
+  baseline: summed `Private_Dirty` 13.8 MB, 0.13x the array, against 838.9 MB
+  if each had copied it, with a control arm of eight children that WRITE the
+  array at 851.7 MB, 8.12x, so the probe can see a copy when there is one.
+  `tests/test_g3_process_clients.py` reproduces the RATIO at four children
+  over a 33.6 MB array and asserts no absolute, which is why these are
+  supplied. A client's own cost is its interpreter's private pages, ~1.7 MB.
 * **The clock the processes agree on is still `time.perf_counter()`, and this
   was verified rather than assumed.** It is `clock_gettime(CLOCK_MONOTONIC)`
   on this platform, which is system-wide rather than per-process, so the
   reference point is shared across a fork -- unlike `time.process_time`.
   Measured over 200 forks: the child's `perf_counter - CLOCK_MONOTONIC`
-  offset matches the parent's to within **4.2 us**, which is the cost of
-  reading two clocks back to back rather than an offset, and the child's
-  reading fell inside the parent's bracketing pair **200 times out of 200**.
-  `tests/test_g3_process_clients.py` asserts both, so a platform where
-  `perf_counter` is process-local fails loudly instead of producing spans
-  that cannot be compared with the window they are inside.
+  offset matches the parent's to within a few microseconds -- 4.2 us on the
+  box this change was made on, 8.05 us re-measured on one at 20 busy cores of
+  20 -- which is the cost of reading two clocks back to back rather than an
+  offset, and the child's reading fell inside the parent's bracketing pair
+  200 times out of 200 in both. `tests/test_g3_process_clients.py` runs both
+  probes at that same 200 forks and asserts **10 ms, not the microseconds
+  above**, deliberately: the quantity is a difference of two offsets each
+  taken across two consecutive clock reads, so a descheduled thread widens it
+  by milliseconds for a reason that is not the clock. 10 ms still separates
+  the two clocks by four orders of magnitude -- `time.process_time` is the
+  control and a child reads near zero against the parent's whole process age.
 * **Client CPU accounting keeps working, for a structural reason.** `fork`
   never changes cgroup membership -- only an explicit write to
   `cgroup.procs` does -- so every client process is in the harness
@@ -159,6 +169,22 @@ DriverFactory = Callable[[], EngineDriver]
 #: turn a working pool into `AttributeError: Can't pickle local object` at the
 #: start of a measured window.
 CLIENT_START_METHOD = "fork"
+
+#: Floor on how long a client that has STARTED sending its window payload is
+#: given to finish, used by `Client._recv_by` when the pool's SHARED deadline
+#: has already run out on earlier clients.
+#:
+#: **It is a floor and not a second timeout, and without it the instrument
+#: would be nondeterministic.** `absorb` calls `_recv_by` only after `poll`
+#: said bytes are ready. Armed at zero, the watchdog would race a `recv` of
+#: an already complete payload -- the window published on one run and the
+#: client killed and the window failed on the next. A window may not depend
+#: on that. The floor makes the ready payload always win, which is what the
+#: unbounded `recv` this replaces also did; the cost is that `stop` can
+#: exceed `JOIN_TIMEOUT_S` by at most this per client in that already
+#: pathological case, where before it could exceed it without limit. One
+#: second, because what it has to beat is a pipe read of bytes already there.
+TRANSFER_GRACE_S = 1.0
 
 #: The context the clients, the pipes and the two window flags come from.
 #: One context object for the module, so nothing can half-fork: mixing
@@ -386,6 +412,13 @@ class Client(_MP.Process):
         #: Whether this client's window payload has been read off the pipe.
         #: Parent-side; `absorb` is idempotent so a second `stop` cannot hang.
         self._absorbed = False
+        #: Whether the pool's deadline, and not the client, ended the span
+        #: transfer. Parent-side, set by `_cut_off_transfer`. It exists so the
+        #: `EOFError` a cut-off produces is reported as the deadline it was
+        #: rather than as a client that died on its own -- the two have
+        #: different remedies and `_exit_description` would name SIGKILL for
+        #: both.
+        self._transfer_cut = False
 
     # -- starting it -------------------------------------------------------
 
@@ -620,6 +653,16 @@ class Client(_MP.Process):
         `deadline` is a `time.monotonic` instant and is shared across the
         whole pool, so a slow first client cannot buy the last one a fresh
         `clients.JOIN_TIMEOUT_S`.
+
+        **THE DEADLINE BOUNDS THE TRANSFER AND NOT ONLY THE WAIT FOR THE
+        FIRST BYTE, and an earlier revision bounded only the wait.** `poll`
+        respects `deadline`; `recv` takes no timeout at all. So a client that
+        started sending and then stalled while STILL ALIVE passed the `poll`
+        and then blocked the parent inside `recv` for as long as it stayed
+        alive -- `ClientPool.stop` run past `JOIN_TIMEOUT_S` by an unbounded
+        amount, on the one call an operator cannot interrupt. A client that
+        DIES mid-send was already handled: its pipe closes, `recv` raises and
+        the `except` below names it. `_recv_by` closes the gap.
         """
         if self._absorbed:
             return
@@ -636,11 +679,20 @@ class Client(_MP.Process):
                     f"client {self.name} did not return its spans within "
                     f"{self._timeouts.join_s:.0f}s of the window closing")
                 return
-            phase, text, spans, results = self._from_client.recv()
+            phase, text, spans, results = self._recv_by(deadline)
         except (EOFError, OSError):
-            self.error = ClientDied(
-                f"client {self.name} died during the measured window: "
-                f"{_exit_description(self.exitcode)}")
+            if self._transfer_cut:
+                # The deadline ended it, so say that rather than reporting
+                # the SIGKILL this method sent as the client's own failure.
+                self.error = ClientDied(
+                    f"client {self.name} stopped partway through sending its "
+                    f"spans and was ended at the pool's "
+                    f"{self._timeouts.join_s:.0f}s deadline; a partial "
+                    f"payload is not a measurement of the window")
+            else:
+                self.error = ClientDied(
+                    f"client {self.name} died during the measured window: "
+                    f"{_exit_description(self.exitcode)}")
             return
         if phase != "window":  # pragma: no cover - protocol desync
             self.error = ClientDied(
@@ -657,6 +709,58 @@ class Client(_MP.Process):
             self.collector.add_span(started, finished)
         self.results = {int(offset): Answer(list(ids), began, ended)
                         for offset, (ids, began, ended) in results.items()}
+
+    def _recv_by(self, deadline: float) -> Any:
+        """`recv` this client's payload, bounded by the pool's deadline.
+
+        Killing the client is what unblocks a parent already inside `recv`:
+        closing the parent's own descriptor does not, because on Linux a
+        `close` never wakes a reader already blocked in `read` on that open
+        file description. Measured against a child that wrote a 4 MiB length
+        header, then 1 KiB of body, then slept: `recv` returned in 2.001 s
+        with `OSError: got end of file during message` against a 2.000 s
+        watchdog, where without it it does not return at all.
+
+        A `threading.Timer` rather than an alarm, because `signal.alarm` only
+        fires in the main thread and `stop` runs on whichever thread the
+        workload is on; and rather than a non-blocking read, because a
+        `Connection` message is framed and a partial read loses the frame.
+        The timer is CANCELLED AND JOINED on the way out rather than left to
+        expire: a lingering timer thread is a live thread in the parent at
+        the instant the next pool forks, which is the condition
+        `ClientPool._join_attendants` exists for arriving from a second
+        direction. See `TRANSFER_GRACE_S` for the floor on `left` and why a
+        zero-length watchdog would make a window's fate depend on scheduling.
+        """
+        left = max(TRANSFER_GRACE_S, deadline - time.monotonic())
+        watchdog = threading.Timer(left, self._cut_off_transfer)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            return self._from_client.recv()
+        finally:
+            watchdog.cancel()
+            watchdog.join(timeout=5.0)
+
+    def _cut_off_transfer(self) -> None:
+        """End a client that is mid-send at the pool's deadline. PARENT side.
+
+        Runs on the watchdog thread. It records that the deadline did this
+        before it kills, so `absorb`'s `except` cannot race its own signal and
+        report the client as having died on its own.
+
+        `kill` and not `terminate`: a client blocked inside a `send` to a full
+        pipe is in a syscall its own handler would not run promptly, and the
+        point of this path is a bound. `reap` still runs afterwards from
+        `ClientPool.stop`'s failure path and is idempotent about an already
+        dead client.
+        """
+        self._transfer_cut = True
+        try:
+            if self.is_alive():
+                self.kill()
+        except (OSError, ValueError, AssertionError):  # pragma: no cover
+            pass
 
     def reap(self) -> None:
         """End this client and close the parent's end of its pipe.
