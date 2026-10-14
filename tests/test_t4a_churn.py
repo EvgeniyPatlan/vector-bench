@@ -494,9 +494,11 @@ class TestValkeyDelegatesToTheExistingWait:
         calls: List[Dict[str, Any]] = []
         driver = valkey_mod.ValkeyDriver(ConnectionSpec(host="h", port=6379))
 
-        def fake_wait(expected_docs=None, timeout_s=900.0):
+        def fake_wait(expected_docs=None, timeout_s=None,
+                      docs_expectation=None):
             calls.append({"expected_docs": expected_docs,
-                          "timeout_s": timeout_s})
+                          "timeout_s": timeout_s,
+                          "docs_expectation": docs_expectation})
             return 7.5
 
         driver._wait_for_mutations = fake_wait
@@ -505,9 +507,22 @@ class TestValkeyDelegatesToTheExistingWait:
         # pinned against the constant rather than against a literal 900.0 --
         # the point of passing it is that the hook can compare the returned
         # elapsed time against it, which a default it never sees cannot do.
+        # C3 added `docs_expectation`: the delegation now also says which way
+        # it expects the document count to move, because the comparison this
+        # wait applies is the delete path's unless the caller says otherwise.
+        # Still exact dict equality, and no weaker for the extra key --
+        # injected into the driver's call and run: `expected_docs + 1` fails
+        # here, half the ceiling fails here, and `DOCS_AT_MOST` fails here.
+        # The stub's `timeout_s` default is `None` rather than 900.0 for the
+        # same reason `docs_expectation`' is: while it was 900.0 it equalled
+        # `INDEX_SYNC_TIMEOUT_S`, so OMITTING the argument recorded the right
+        # number anyway and this assertion passed -- measured, that mutant
+        # passed before the default changed and fails after it.
         assert calls == [{"expected_docs": 4321,
-                          "timeout_s": valkey_mod.INDEX_SYNC_TIMEOUT_S}]
+                          "timeout_s": valkey_mod.INDEX_SYNC_TIMEOUT_S,
+                          "docs_expectation": valkey_mod.DOCS_EQUAL}]
         assert valkey_mod.INDEX_SYNC_TIMEOUT_S > 0
+        assert valkey_mod.DOCS_EQUAL != valkey_mod.DOCS_AT_MOST
 
     def test_a_settled_wait_publishes_what_it_rested_on(self):
         """§4.1 item 2's delegation is weaker than its name, and the record is
@@ -515,13 +530,17 @@ class TestValkeyDelegatesToTheExistingWait:
         `index_sync_s` with nothing beside it, in the engine whose writes have
         actually stopped returning mid-churn and cost two runs.
 
-        Honest: a note naming the queue, the `num_docs` comparison and the
-            direction it was written for, which `churn.run` carries into the
-            record as `extra.index_sync_note`.
+        Honest: a note naming the queue, the comparison the insert path now
+            waits on and the delete path's one it replaced, which `churn.run`
+            carries into the record as `extra.index_sync_note`.
         Mutant (`index_sync_note` never set -- the shipped state before this
             round, 0 occurrences of the name in `valkey.py`): `None`, the key
             is absent from the record, and a reader has a 0.0 with no way to
             tell it from a synchronous engine or an unimplemented hook.
+
+        The wait is stubbed here, so the note carries no readings; C3's own
+        file covers the rendered observation. What this one holds is the
+        delegation's prose contract.
         """
         driver = valkey_mod.ValkeyDriver(ConnectionSpec(host="h", port=6379))
         driver._wait_for_mutations = lambda expected_docs=None, **kw: 3.25
@@ -535,10 +554,10 @@ class TestValkeyDelegatesToTheExistingWait:
         assert "settled in 3.2s" in note, note
         assert "<= 2,000`" in note, note
         assert "mutation queue" in note and "delete path" in note, note
-        # And it must NOT claim the direction killed the count half outright.
-        # Measured below: at 2,481 documents against 2,000 the count is what
-        # bound the wait, so "the only signal in force" was a false claim in
-        # exactly the case this file's docstring is built around.
+        # And it must NOT say the queue is the only signal left. That was the
+        # round's first claim, and C3 made it false outright: the insert path
+        # passes `DOCS_EQUAL`, so the document count binds on every poll of
+        # every re-insert, not only while the index overcounts.
         assert "only signal in force" not in note, note
 
     def test_a_timed_out_wait_says_so_rather_than_reading_as_settled(self):
@@ -561,7 +580,7 @@ class TestValkeyDelegatesToTheExistingWait:
         driver = valkey_mod.ValkeyDriver(ConnectionSpec(host="h", port=6379))
         timeout = valkey_mod.INDEX_SYNC_TIMEOUT_S
         driver._wait_for_mutations = (
-            lambda expected_docs=None, timeout_s=None: timeout_s)
+            lambda expected_docs=None, timeout_s=None, **kw: timeout_s)
         assert driver.wait_index_synced(2000) == timeout
 
         note = driver.index_sync_note
@@ -570,22 +589,29 @@ class TestValkeyDelegatesToTheExistingWait:
         assert "settled in" not in note, note
 
     def test_the_document_half_still_binds_when_the_index_overcounts(self):
-        """Why the note hedges instead of asserting the direction.
+        """What a bare `expected_docs` means, which is the DELETE path's
+        comparison and the default of this wait.
 
-        The count half of `_wait_for_mutations` is not dead on the insert
-        path; it is dead only while the index UNDERCOUNTS. Driving the real
-        function with FT.INFO readings and no sleeping, which is the only way
-        to see which half ended the wait:
+        **Read this as a statement about `DOCS_AT_MOST`, not about the insert
+        path.** C3 made the direction an argument: `wait_index_synced` now
+        passes `DOCS_EQUAL` and the count binds there (see
+        `tests/test_c3_valkey_sync.py`). What is measured below is the
+        default, which stays `num_docs <= expected_docs` precisely so that
+        this call -- and `scripts/verify-valkey-churn.py`, and the two
+        `test_config.py` callers -- keep the behaviour they were written
+        against. Under that comparison the count is dead while the index
+        UNDERCOUNTS and binds while it overcounts, which is what these two
+        numbers say.
 
         Honest: 1 poll at `num_docs` 1,800 against an expected 2,000 (the
-            direction case -- the comparison is already true, so the queue
-            decides), and 4 polls at 2,481 against the same 2,000, which is
-            the 481-document overcount `_wait_for_mutations`' own docstring
-            was written about. There the count is what bound it.
-        Mutant (a `wait_index_synced` that returned after one reading, or a
-            note asserting the queue was the only signal): the 2,481 case
-            reads as 1 poll and the published note is false in the one case
-            the surrounding prose cares most about.
+            comparison is already true, so the queue decides), and 4 polls at
+            2,481 against the same 2,000, which is the 481-document overcount
+            `_wait_for_mutations`' own docstring was written about. There the
+            count is what bound it.
+        Mutant (the default flipped to `DOCS_EQUAL`, which is the shape that
+            would need no third argument at the insert call site): 12 polls
+            and 16 polls -- a comparison no caller of this signature asked
+            for, measured.
         """
         def polls_for(num_docs: int, expected: int) -> int:
             driver = valkey_mod.ValkeyDriver(

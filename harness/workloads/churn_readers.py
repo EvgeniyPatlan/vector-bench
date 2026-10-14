@@ -1,8 +1,8 @@
 """The reader pool that runs while the churn writer re-inserts (PR 4 §4.3).
 
 Its own module because inlining it in `churn.py` breaches this repo's stated
-800-line maximum badly -- the two files are 1,119 lines and splice back into
-one file of 1,055, which is 255 over, measured by
+800-line maximum badly -- the two files are 1,130 lines and splice back into
+one file of 1,066, which is 266 over, measured by
 `tests/test_t4b_readers.py` rather than asserted here -- and because the block
 is cohesive: one caller each, no state, and everything here is about one
 question: what does a read cost while this engine is taking writes?
