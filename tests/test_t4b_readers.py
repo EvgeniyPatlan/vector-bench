@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -1824,15 +1825,32 @@ class TestTheProseSaysWhatTheCodeDoes:
         assert "**3.74 to 4.26**" in state
         assert "**0.89 to 2.62**" in state
 
+    #: The phrase that marks a line-count figure as history rather than as a
+    #: live claim. `churn.py` uses it to keep "907 and 107 over" -- the count
+    #: before the module grew its own header -- on the record, and the
+    #: no-restatement guard below exempts the clause it introduces.
+    HISTORY_CLAUSE = "an earlier revision said"
+
     def test_the_line_count_the_split_is_justified_by_is_the_real_one(self):
         """Item 2, made executable so neither figure can drift again.
 
-        `churn.py` and `churn_readers.py` both justify the split with a line
-        count. An earlier revision said 907 and "107 over", measured before
-        the module grew its own header docstring; splicing the body back gave
-        981 and 181 over at that revision, and the files have grown since.
-        Rather than correct a number and leave it to rot, this computes the
-        splice and checks both files quote today's figures.
+        **The figures are no longer quoted in the prose, and that is the
+        fix.** `churn.py` and `churn_readers.py` used to justify the split
+        with three numbers each, and those six restatements went stale three
+        times: 907 and "107 over" before the module grew its own header
+        docstring, 1,119/1,055/255 when an unrelated four-line addition moved
+        `churn.py`, and again when PR 5 §5.1 item 4 added two interval keys.
+        Two separate tasks spent a round correcting them.
+
+        The numbers were never the argument. What a reader acts on is "the
+        inlined file would be badly over the repo's 800-line ceiling", and
+        what they need to be told about is that claim ceasing to be true. So
+        the prose now cites this test and this test keeps the one load-bearing
+        assertion, `inline > 800`. The splice is still computed and still
+        parsed -- the claim is about a real file, not an arithmetic
+        possibility -- and both files are still checked for the citation, so
+        the prose cannot quietly drop the reference and leave the
+        justification unsupported.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         churn_src = open(os.path.join(root, "harness", "workloads",
@@ -1858,30 +1876,107 @@ class TestTheProseSaysWhatTheCodeDoes:
         # The spliced file is real code, not a line-count stunt.
         import ast
         ast.parse(spliced)
-        # Both files quote the same two figures, and they are these.
+
+        # THE assertion. Everything above exists to make this one mean
+        # something: if the two files ever shrink enough that inlining them
+        # would fit inside the ceiling, the split is no longer justified by
+        # the reason both files give, and whoever notices should be this
+        # test rather than a reviewer.
+        assert inline > 800, (
+            f"splicing `churn_readers.py` back into `churn.py` gives "
+            f"{inline} lines, inside the repo's 800-line maximum -- so the "
+            f"justification both files state for the split no longer holds. "
+            f"Either the split has a different reason now, in which case say "
+            f"so in both files, or it can be undone.")
+
+        # Both files still CITE this test rather than restating its
+        # arithmetic. Anchored on the test's own name, so a file that drops
+        # the reference fails here instead of leaving a bare claim with
+        # nothing behind it.
         for source, where in ((churn_src, "churn.py"),
                               (readers_src, "churn_readers.py")):
-            # Thousands separators on all three, so one sentence does not
-            # read "1,119 lines ... of 1055". `f"{255:,}"` is "255", so the
-            # third is unaffected either way and the format can be uniform.
-            assert f"{together:,} lines" in source, (where, together)
-            # Anchored: a bare `f"{inline}"` is the substring shape that has
-            # bitten this repo ten times -- "1,055" unseparated is "1055",
-            # which "10550" satisfies, as does any longer number containing
-            # it. The two companions happened to anchor on " lines" and
-            # " over"; this one did not.
-            assert f"of {inline:,}," in source, (where, inline)
-            assert f"{inline - 800:,} over" in source, (where, inline - 800)
-        assert inline > 800, inline
+            assert "800-line maximum badly" in source, where
+            assert "test_the_line_count_the_split_is_justified_by_is_the" \
+                "_real_one" in source, (
+                f"{where} no longer points at the test that computes the "
+                f"splice, so its claim about the 800-line ceiling is "
+                f"unsupported prose again.")
+            # And no figure is back. Checked by PATTERN, not against
+            # today's value: an earlier version of this assertion compared
+            # against `f"{together:,} lines"`, which only catches a
+            # restatement that happens to be CORRECT -- and a correct
+            # restatement is the harmless case. Measured: reintroducing
+            # "the two files are 1,151 lines" passed that form, because
+            # 1,151 was not the current count. The rot is a stale figure,
+            # so the guard has to catch any figure.
+            #
+            # Three shapes, because a thousands separator is not the only
+            # way to write one of these figures and an earlier version of
+            # this pattern exempted two of the three that actually went
+            # stale. Measured by injection into the passage:
+            #
+            #   "the two files are 1,147 lines"  -> caught by \d,\d{3}
+            #   "the two files are 1147 lines"   -> needs \d{3,4}\s+lines
+            #   "which is 282 over"              -> needs \d{3,4}\s+over
+            #
+            # "282 over" was one of the three figures that rotted, so the
+            # separator-only form left the live spelling of a real defect
+            # legal.
+            #
+            # The history clause is exempted BY ITS LABEL, not by digit
+            # shape: `churn.py` correctly records that "an earlier revision
+            # said 907 and 107 over", and "107 over" is indistinguishable
+            # from a live restatement by pattern alone. Keying the exemption
+            # to the sentence that declares itself history is the only way to
+            # keep that legal while catching the same spelling used as a
+            # current claim.
+            marker = "800-line maximum badly"
+            passage = source[source.index(marker):
+                             source.index(marker) + 900]
+            # Unwrapped before scanning, and that is not a nicety: in
+            # `churn.py` this passage is a COMMENT, so the history clause
+            # reads "... three times -- an\n# earlier revision said 907 ...".
+            # The label straddles a line wrap, so a raw search for it found
+            # nothing, the exemption did not apply, and the guard flagged the
+            # history it is supposed to permit. Measured on the real file.
+            # Same defect as the one `tests/test_t5b_stats.py` guards against
+            # in rendered prose, met from the other side.
+            flat = re.sub(r"\s+", " ", re.sub(r"\s*#\s*", " ", passage))
+            scanned = flat
+            if self.HISTORY_CLAUSE in scanned:
+                head, _, tail = scanned.partition(
+                    self.HISTORY_CLAUSE)
+                # The labelled clause runs to the end of its dash-delimited
+                # aside; everything after it is live prose again.
+                _history, _, rest = tail.partition(" -- ")
+                scanned = head + rest
+            stale = re.search(r"\d,\d{3}|\d{3,4}\s+(?:over|lines)", scanned)
+            assert stale is None, (
+                f"{where} quotes a line count ({stale.group(0)!r}) in the "
+                f"paragraph justifying the split. Those figures went stale "
+                f"three times; cite this test instead of restating them. If "
+                f"this is history rather than a claim, label it with "
+                f"{self.HISTORY_CLAUSE!r} as `churn.py` does.")
+        # `together` is still computed, because the assertion above needs it
+        # to be a real measurement of the two real files.
+        assert together > inline > 800, (together, inline)
 
     def test_the_maintenance_key_counts_are_the_ones_report_actually_has(self):
         """Item 5, made executable for the same reason.
 
         `churn._record_maintenance` now states how many times each of the four
-        PR 4 keys occurs in `report/` -- 20, 13, 1 and 0 -- and that
+        PR 4 keys occurs in `report/` -- 25, 14, 1 and 0 -- and that
         `repair_path`'s single occurrence is inside a docstring rather than a
         read. All four were 0 at the base of this task, which is what made the
         pair of records indistinguishable in the first place.
+
+        The first two figures were 20 and 13 until PR 5 §5.1 item 6 grouped
+        the churn table's tie column by maintenance state -- a degraded index
+        tied to a repaired one would be this task's defect wearing §5.1's
+        clothes -- and §5.2 cited the same pairing defect in the module
+        header of `report/crosscheck.py`. The paragraph in `churn.py` says so
+        too; this test is what stops either of them drifting from the
+        directory.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         import glob
@@ -1894,11 +1989,11 @@ class TestTheProseSaysWhatTheCodeDoes:
             counts[key] = total
         # `maintenance` counts `maintenance_state` too, which is why it is the
         # larger figure rather than a separate set of sites.
-        assert counts == {"maintenance": 20, "maintenance_state": 13,
+        assert counts == {"maintenance": 25, "maintenance_state": 14,
                           "repair_path": 1, "index_sync": 0}, counts
         source = open(os.path.join(root, "harness", "workloads",
                                    "churn.py")).read()
         block = source.split("**`repair_path` and `index_sync_s` are still")[1]
-        for key, n in (("maintenance", 20), ("maintenance_state", 13),
+        for key, n in (("maintenance", 25), ("maintenance_state", 14),
                        ("repair_path", 1), ("index_sync", 0)):
             assert f"`{key}` {n}" in block, (key, n, block[:400])

@@ -137,7 +137,93 @@ def _engine_rows(manifest: Dict[str, Any]) -> List[List[str]]:
     return rows
 
 
+#: The character every table in this report is delimited by, and which no
+#: cell may contain.
+#:
+#: It is a REFUSAL rather than an escape. `_md_tables_to_html` below splits a
+#: row on this character to build the HTML page, so an escaped `\\|` would
+#: render as two literal characters in the page while the Markdown looked
+#: correct -- two renderers disagreeing about one table, which is the shape
+#: this file has already shipped twice.
+#:
+#: The defect it exists for: PR 5 §5.2 names its tolerance column `|delta|`,
+#: and writing that notation as a header cell put TWO extra pipes in the
+#: header row. The header then had two more cells than every body row, the
+#: HTML table came out shifted, and nothing in the suite noticed -- the only
+#: cell-count assertion in the repo covers the concurrency table alone, and a
+#: pipe added to a cell WITHOUT renaming it leaves every `header.index(...)`
+#: lookup working. Measured: a ten-cell header over an eight-cell body with
+#: the suite green at 1927 passed.
+#:
+#: **Headers raise; body cells are substituted**, because the two halves of
+#: the table have different authors.
+#:
+#: A HEADER is written in this file, by a literal a few lines from the call.
+#: A pipe there is a programming error, it is the same on every run, and
+#: failing fast names the column. PR 5 §5.2's `|delta|` notation was exactly
+#: that, and raising is safe because no run's data can produce it.
+#:
+#: A BODY cell can carry text this repository did not write:
+#: `extra.maintenance` is whatever a driver's `maintain()` returned, a
+#: driver's own sync note is free prose, and an engine label comes from the
+#: manifest. (The sync note's key is deliberately not spelled here:
+#: `tests/test_t4b_readers.py` counts occurrences of it across `report/` to
+#: assert it is read NOWHERE, and a prose mention would make that count 1
+#: while the claim it stands for stayed true. A count that cannot tell a
+#: mention from a read is worth not disturbing.) Raising on one of those
+#: would lose the entire report at the final
+#: step of a run that may have taken twenty hours -- the failure
+#: `harness/metrics/stats.bootstrap_ci`'s docstring refuses to risk for one
+#: error bar. So the character is replaced and the row survives.
+#:
+#: Latent today: `postgres.maintain()` returns a pipe-free string and no
+#: driver string in the tree contains one. Closed anyway, because closing it
+#: now costs this comment and not closing it costs a report.
+MD_TABLE_DELIMITER = "|"
+
+#: What a pipe inside a body cell is rendered as. A BROKEN BAR, not an escape:
+#: `_md_tables_to_html` below splits a row on the delimiter to build the HTML
+#: page, so a backslash-escaped pipe would render as two literal characters
+#: there while the Markdown looked right -- two renderers disagreeing about
+#: one table. The broken bar reads as a pipe to a human and is not the
+#: delimiter to either renderer, so the substitution is visible and loses
+#: nothing a reader needs.
+MD_TABLE_DELIMITER_SUBSTITUTE = "¦"
+
+
+def _check_no_delimiter(cells, where: str) -> None:
+    """Refuse a HEADER cell containing the table delimiter, naming the cell.
+
+    Header cells only. `_sanitise_cell` handles the body, for the reason
+    `MD_TABLE_DELIMITER`'s comment gives.
+    """
+    for cell in cells:
+        if cell is not None and MD_TABLE_DELIMITER in str(cell):
+            raise ValueError(
+                f"{where} cell {str(cell)!r} contains the table delimiter "
+                f"{MD_TABLE_DELIMITER!r}, which would split one cell into "
+                f"several and leave this row a different width from the rest "
+                f"of the table. Rename the column (PR 5 §5.2's `|delta|` "
+                f"became `Recall gap`) or format the value without it.")
+
+
+def _sanitise_cell(value) -> str:
+    """One body cell as text, with any delimiter replaced rather than refused.
+
+    Returns the em dash for the three empties `_md_table` has always treated
+    as missing, so this is the single place a body value becomes a cell.
+    """
+    if value in (None, "None", ""):
+        return "—"
+    text = str(value)
+    if MD_TABLE_DELIMITER in text:
+        return text.replace(MD_TABLE_DELIMITER,
+                            MD_TABLE_DELIMITER_SUBSTITUTE)
+    return text
+
+
 def _md_table(headers: List[str], rows: List[List[str]]) -> str:
+    _check_no_delimiter(headers, "header")
     if not rows:
         return "\n_No data._\n"
     # Leading blank line: most Markdown renderers require one between a
@@ -145,8 +231,7 @@ def _md_table(headers: List[str], rows: List[List[str]]) -> str:
     out = ["", "| " + " | ".join(headers) + " |",
            "| " + " | ".join("---" for _ in headers) + " |"]
     for row in rows:
-        out.append("| " + " | ".join("—" if c in (None, "None", "") else str(c)
-                                     for c in row) + " |")
+        out.append("| " + " | ".join(_sanitise_cell(c) for c in row) + " |")
     return "\n".join(out) + "\n"
 
 
@@ -668,11 +753,20 @@ def _build_table(summary: Dict[str, Any]) -> str:
             _fmt(ingest_rate, 0, " rows/s"),
             _fmt_bytes(r.get("peak_rss_bytes")),
             _index_size(r),
+            # The one figure every engine's build can be compared on, beside
+            # the kind that says why the raw `build_wall_s` cannot be. PR 5's
+            # added scope: for a bulk build this is ingest + build, for an
+            # incremental one it is the single figure, and for a record that
+            # does not say which it is a dash -- the two formulas differ by a
+            # whole corpus load. One derivation, shared with the chart, so the
+            # column and the figure cannot disagree.
+            _fmt(_time_to_queryable(r), 1),
             _index_build_kind(r),
         ])
     table = _md_table(
         ["Engine", "Dataset", "M", "Storage", "Build mode", "Build time",
-         "Ingest rate", "Peak server RSS", "Index size", "Index build"],
+         "Ingest rate", "Peak server RSS", "Index size",
+         "Time to queryable index (s)", "Index build"],
         rows,
     )
     return table + _build_table_notes(summary)
@@ -691,22 +785,47 @@ def _index_size(record: Dict[str, Any]) -> str:
     return size
 
 
+def _time_to_queryable(record: Dict[str, Any]):
+    """`generate.time_to_queryable_index_s`, imported in the body.
+
+    Function-local because `generate` imports this module at its own top
+    level, so the reverse import has to stay inside a call -- the same shape
+    `_filter_column` below uses.
+    """
+    from report.generate import time_to_queryable_index_s
+    return time_to_queryable_index_s(record)
+
+
 def _index_build_kind(record: Dict[str, Any]) -> str:
-    """How the index came to exist, in three kinds rather than two.
+    """How the index came to exist, in four kinds rather than two.
 
     "no" was a fair answer while every engine either maintained its graph on
     INSERT or built it with a blocking statement afterwards. An index built by
     another process, asynchronously, while the writes are still arriving is
     neither, and calling it "no" files it beside MHNSW's incremental build,
     which is a different operation that also happens to lack a bulk step.
+
+    The fourth kind is a FIX, not an addition. This read
+    `extra.separable_build` with `.get`, so a record that does not carry the
+    key at all -- every record written before it existed, which is every
+    archived run -- came out as "incremental". Those runs contain pgvector,
+    whose build is bulk, so the column asserted the opposite of the truth for
+    one engine and there was no way for a reader to tell. `generate.build_kind`
+    is the one classifier the chart uses too, so the figure and this column
+    cannot disagree about what a row measured.
     """
+    from report.generate import (BUILD_KIND_BULK, BUILD_KIND_UNRECORDED,
+                                 build_kind)
     extra = record.get("extra") or {}
     if extra.get("async_index_build") or record.get("build_mode") == "async":
         ready = extra.get("index_ready_seconds")
         if ready:
             return f"async, ready {_fmt(ready / 60, 1)} min after load"
         return "async (separate process)"
-    return "bulk after load" if extra.get("separable_build") else "incremental"
+    kind = build_kind(record)
+    if kind == BUILD_KIND_UNRECORDED:
+        return "not recorded"
+    return "bulk after load" if kind == BUILD_KIND_BULK else "incremental"
 
 
 def _build_table_notes(summary: Dict[str, Any]) -> str:
@@ -730,6 +849,19 @@ def _build_table_notes(summary: Dict[str, Any]) -> str:
             "the wall clock from the first write to the index reporting ready, "
             "because neither the load nor the wait alone is the cost of having "
             "a queryable index."
+        )
+    unrecorded = sorted({
+        _label(r.get("engine", "?")) for r in summary.get("build", [])
+        if _index_build_kind(r) == "not recorded"})
+    if unrecorded:
+        notes.append(
+            f"**The build kind was not recorded for {', '.join(unrecorded)}.** "
+            f"Those records predate the field, so nothing in them says whether "
+            f"their build time is a `CREATE INDEX` call or a whole corpus load "
+            f"— the two differ by hours at 1M rows. The figure is shown as "
+            f"measured and is **not** comparable with the rows around it; the "
+            f"build chart leaves those rows off its like-for-like axis for the "
+            f"same reason and says how many it dropped."
         )
     return ("\n" + "\n\n".join(notes) + "\n") if notes else ""
 
@@ -1217,6 +1349,116 @@ def _concurrency_notes(summary: Dict[str, Any]) -> str:
     return "".join(parts)
 
 
+#: What a tie cell says when there is nothing to compare against, and when
+#: there is but the interval cannot support the comparison. Two different
+#: facts, so two different cells -- "alone here" is the profile measuring one
+#: engine at this point, and "no interval" is a record with no usable
+#: `recall_ci95`, which is every record written before PR 5.
+TIE_ALONE_CELL = "—"
+TIE_NO_INTERVAL_CELL = "no interval"
+TIE_SEPARATED_CELL = "distinct"
+
+
+def _tie_row_name(record: Dict[str, Any], storages_differ: bool) -> str:
+    """How a tie cell names one of the rows it is tied with.
+
+    The engine label, plus the storage engine where the group holds more than
+    one of them: a MariaDB InnoDB row tied with a MariaDB MyISAM row would
+    otherwise read "tied with MariaDB", which looks like a rendering fault
+    and is the same complaint `_filtered_table` carries about M and build
+    mode being unconditional columns.
+    """
+    name = _label(record.get("engine", "?"))
+    if storages_differ:
+        name += f" ({_storage(record)})"
+    return name
+
+
+def _tie_cells(records: List[Dict[str, Any]],
+               group_of,
+               ci_key: str = "recall_ci95") -> Dict[int, str]:
+    """PR 5 §5.1 item 6: "mark two engines as tied when their intervals
+    overlap instead of ranking them".
+
+    Returns `id(record) -> cell`, so a caller can label the rows it is
+    already building in whatever order it sorts them.
+
+    `group_of(record)` is the comparison point: two records in one group are
+    directly comparable, and the ONLY difference between them is the thing
+    being compared. That is where this can go wrong the way this report has
+    gone wrong before -- the filter-strategy verdict divided a narrow point
+    from one ops unit by a wide point from another and published 50.0x, a
+    figure neither unit produced -- so each caller's group spells out every
+    axis it holds constant and the storage engine, the one axis engines
+    legitimately differ on, is NAMED in the cell rather than silently pooled.
+
+    The verdict is `stats.tie_verdict`, which is three-valued, and the three
+    values are all rendered:
+
+    * TIED -> "tied with X, Y". Two engines whose intervals overlap are not
+      distinguishable by this measurement and the table must not imply an
+      order between them.
+    * SEPARATED -> "distinct". The intervals do not overlap, so the ordering
+      the numbers suggest is supported.
+    * UNKNOWN -> "no interval". Either record lacks a usable interval, which
+      covers an archived record, a one-query point and a `nan` from a
+      measurement that did not happen. Measured: a `(nan, nan)` interval
+      against a real one is False under BOTH the closed and the strict
+      overlap test, so a two-valued version of this column would print
+      "distinct" for a point that was never measured.
+    """
+    from harness.metrics.stats import (TIE_TIED, TIE_UNKNOWN, Interval,
+                                       tie_verdict)
+
+    groups: Dict[Any, List[Dict[str, Any]]] = {}
+    for r in records:
+        groups.setdefault(group_of(r), []).append(r)
+
+    cells: Dict[int, str] = {}
+    for _key, members in groups.items():
+        storages_differ = len({_storage(m) for m in members}) > 1
+        intervals = {
+            id(m): Interval.from_field((m.get("extra") or {}).get(ci_key))
+            for m in members}
+        for row in members:
+            others = [m for m in members if m is not row]
+            if not others:
+                cells[id(row)] = TIE_ALONE_CELL
+                continue
+            verdicts = [tie_verdict(intervals[id(row)], intervals[id(m)])
+                        for m in others]
+            tied = [m for m, v in zip(others, verdicts) if v == TIE_TIED]
+            if tied:
+                cells[id(row)] = "tied with " + ", ".join(
+                    sorted(_tie_row_name(m, storages_differ) for m in tied))
+            elif all(v == TIE_UNKNOWN for v in verdicts):
+                # Every comparison at this point was unanswerable, so saying
+                # "distinct" would be an ordering claim with no measurement
+                # behind it.
+                cells[id(row)] = TIE_NO_INTERVAL_CELL
+            else:
+                cells[id(row)] = TIE_SEPARATED_CELL
+    return cells
+
+
+#: The footnote under every table that carries a tie column. One string, used
+#: by both, because two copies of an explanation drift and the churn table and
+#: the filtered table are explaining the same column.
+TIE_COLUMN_NOTE = (
+    "\n_**“Tied with”** is PR 5 §5.1 item 6: where two engines' 95% "
+    "bootstrap intervals for the recall in this row overlap, the report says "
+    "so instead of letting the two numbers imply an order. The interval is "
+    "resampled from the per-query recalls behind that one mean, so it "
+    "describes how well this measurement pins the engine's recall — not how "
+    "much the engine varies between runs. **“distinct”** means the intervals "
+    "do not overlap and the ordering the numbers suggest is supported. "
+    "**“no interval”** means at least one row at this point carries no usable "
+    "interval — an archived record, or a point that measured too few queries "
+    "for a spread to mean anything — and the comparison is therefore not "
+    "available rather than negative. A dash means no other engine was "
+    "measured at this exact point, so there was nothing to compare._\n")
+
+
 def _filtered_table(summary: Dict[str, Any]) -> str:
     """One row per (engine, dataset, ops unit, column, selectivity, mode).
 
@@ -1249,6 +1491,33 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
     1% put zero of fifty queries in near_pass, measured, because a uniform 1%
     of rows contains a query's nearest neighbour about 1% of the time.
     """
+    # §5.1 item 6's comparison point for a filtered row: everything held
+    # constant except the engine and the storage it ran on. The threshold and
+    # not the measured selectivity, because the threshold is the knob the
+    # engines were all given and is equal by construction, while the share it
+    # delivers is counted from the corpus and would make a float the group
+    # key -- `tag` at a nominal 1% delivers 1.000073% on glove, and two
+    # engines agreeing to eleven places is a coincidence to rely on, not an
+    # invariant. The ops-unit axes are all here (`m`, `build_mode`,
+    # `resource_pass`); `storage_engine` is deliberately NOT, because engines
+    # legitimately differ on it -- pgvector's heap against MariaDB's InnoDB --
+    # and a group that held it constant would never compare two engines at
+    # all. It is named in the cell instead, by `_tie_row_name`.
+    def filtered_group(r):
+        extra = r.get("extra") or {}
+        threshold = extra.get("filter_threshold")
+        if threshold is None:
+            threshold = extra.get("tag_threshold")
+        if threshold is None:
+            # Archived records carry neither. Rounded hard, so two engines'
+            # counted shares of the same corpus still land together.
+            threshold = round(r.get("selectivity") or 0.0, 6)
+        return (r.get("dataset"), _filter_column(r), threshold,
+                extra.get("iterative_scan"), r.get("resource_pass"),
+                r.get("m"), r.get("build_mode"), r.get("ef_search"))
+
+    tie_cells = _tie_cells(summary.get("filtered", []), filtered_group)
+
     rows = []
     for r in sorted(summary.get("filtered", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
@@ -1292,14 +1561,15 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
             str(extra.get("short_result_queries", 0)),
             queries,
             extra.get("iterative_scan") or "—",
+            tie_cells.get(id(r), TIE_ALONE_CELL),
         ])
     return _md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Column",
          "Selectivity", "Nominal", "Recall@k", "Recall near_pass",
          "Recall near_fail", "pass/fail n", "QPS", "p99 (ms)", "Index used",
-         "Short results", "Queries", "Iterative scan"],
+         "Short results", "Queries", "Iterative scan", "Tied with"],
         rows,
-    )
+    ) + TIE_COLUMN_NOTE
 
 
 def _filter_column(record: Dict[str, Any]) -> str:
@@ -1403,8 +1673,26 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     """
     from report.churn_state import churn_measurements, maintenance_state
 
+    measurements = list(churn_measurements(summary.get("churn", [])))
+
+    # §5.1 item 6's comparison point for a churn row. The maintenance state
+    # is in the key and that is the whole reason this table has a `Repair`
+    # column: §4.2 writes a "before" and an "after" record per fraction, and
+    # pooling them made two readings of two different indexes look like a
+    # noisy measurement of one. Tying a degraded index to a repaired one
+    # would be the same defect wearing §5.1's clothes.
+    #
+    # `storage_engine` is excluded for the reason `filtered_group` gives --
+    # engines differ on it legitimately -- and named in the cell instead.
+    def churn_group(r):
+        return (r.get("dataset"), r.get("churn_fraction"),
+                maintenance_state(r), r.get("resource_pass"), r.get("m"),
+                r.get("build_mode"), r.get("ef_search"))
+
+    tie_cells = _tie_cells(measurements, churn_group)
+
     rows = []
-    for r in sorted(churn_measurements(summary.get("churn", [])),
+    for r in sorted(measurements,
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
                                    r.get("storage_engine") or "",
                                    r.get("churn_fraction") or 0,
@@ -1426,12 +1714,14 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             _fmt(extra.get("recall_drop_vs_baseline"), 4),
             _fmt(r.get("qps"), 0),
             _fmt_bytes(r.get("index_bytes")),
+            tie_cells.get(id(r), TIE_ALONE_CELL),
         ])
     return _md_table(
         ["Engine", "Dataset", "Storage", "Churn", "Repair", "Recall@k",
-         "Recall drop vs baseline", "QPS", "Index size"],
+         "Recall drop vs baseline", "QPS", "Index size", "Tied with"],
         rows,
-    ) + _churn_notes(summary) + _churn_during_writes_table(summary)
+    ) + TIE_COLUMN_NOTE + _churn_notes(summary) \
+        + _churn_during_writes_table(summary)
 
 
 #: The order the churn states are measured in, which is the order they are
@@ -1631,6 +1921,247 @@ def _churn_notes(summary: Dict[str, Any]) -> str:
 # Markdown
 # ---------------------------------------------------------------------------
 
+#: The pass/fail marks on a cross-check row. Characters and not words, so the
+#: column stays narrow enough that the two recalls sit side by side; the
+#: footnote under the table says what each one means, and both are also
+#: spelled in the row's own "Within tolerance?" wording so a reader who
+#: cannot see the glyph is not left guessing.
+CROSSCHECK_PASS_MARK = "✓"
+
+#: Marks a cell whose axis was not part of the match. Not a failure and not a
+#: warning: the row is a real match, and this says which axis it was made
+#: without, because a reader comparing the row against the raw JSONL would
+#: otherwise find a `build_mode` the table shows and the match ignored.
+CROSSCHECK_UNMATCHED_AXIS_MARK = "°"
+CROSSCHECK_FAIL_MARK = "✗"
+
+
+def _consistency_section(summary: Dict[str, Any]) -> str:
+    """PR 5 §5.2 item 3's "Consistency checks" section.
+
+    Every match with both values and a pass/fail mark, the coverage that
+    explains an empty list, and §5.2 item 5's QPS-order inversions.
+
+    The empty case is the one this function is really for. §5.2 item 3 says
+    "An empty match list is itself reported, not hidden", and an empty list
+    has two causes that must not be printed the same way: `main` configures
+    `ann.m_values: [8, 32]` against `ops.m_values: [16]`, so on that profile
+    nothing can match and nothing is wrong, while a profile whose grids DO
+    overlap and still matches nothing has a fault. The coverage table names
+    which of the two happened, per engine and dataset.
+    """
+    consistency = summary.get("consistency") or {}
+    matches = consistency.get("matches") or []
+    coverage = consistency.get("coverage") or []
+    inversions = consistency.get("qps_inversions") or []
+    parts: List[str] = []
+
+    if matches:
+        rows = []
+        for row in matches:
+            mark = (CROSSCHECK_PASS_MARK if row["passed"]
+                    else CROSSCHECK_FAIL_MARK)
+            verdict = ("agrees" if row["passed"] else "DISAGREES")
+            rows.append([
+                _label(row.get("engine", "?")), row.get("dataset", "?"),
+                str(row.get("resource_pass") or "—"),
+                str(row.get("m") if row.get("m") is not None else "—"),
+                str(row.get("ef_search")
+                    if row.get("ef_search") is not None else "—"),
+                str(row.get("storage_engine") or "—"),
+                # The engine's own build mode, with a mark where the axis was
+                # not part of the match because the recall path never declared
+                # one. Without the mark this cell would read like a matched
+                # axis, which for the MySQL family it is not.
+                ((str(row.get("ops_build_mode") or "—")
+                  + (" " + CROSSCHECK_UNMATCHED_AXIS_MARK
+                     if row.get("build_mode_axis_dropped") else ""))),
+                _fmt(row["recall_ann"], 4),
+                _fmt(row["recall_ops"], 4),
+                _fmt(row["delta"], 4),
+                # The tolerance AND which branch of `max(0.01, 2 x half)`
+                # produced it. Without the basis a reader cannot tell a
+                # CI-derived tolerance from the 0.01 floor a record with no
+                # usable interval falls back to, and those are different
+                # statements about how well the comparison is pinned.
+                f"{_fmt(row['tolerance'], 4)} "
+                f"({'CI' if row['tolerance_basis'] == 'ci' else 'floor'})",
+                f"{mark} {verdict}",
+            ])
+        parts.append(_md_table(
+            # "Recall gap" and not the specification's "|Δ recall|".
+            # Every table here is pipe-delimited markdown and
+            # `_md_tables_to_html` splits a row on every pipe, so a header
+            # cell containing two of them became three cells and the header
+            # row carried two more than the body. Measured on the synthetic
+            # run before this was renamed.
+            ["Engine", "Dataset", "Pass", "M", "ef_search", "Storage",
+             "Build mode", "Recall (ann)", "Recall (ops)", "Recall gap",
+             "Tolerance", "Within tolerance?"],
+            rows,
+        ))
+        failed = [r for r in matches if not r["passed"]]
+        # What the sentence below may NOT claim. The MariaDB, MariaDB 12.3 and
+        # AliSQL ann modules write no `build_mode`, so for those engines the
+        # axis is dropped and the match was made without it. Saying "matched
+        # on build mode" and leaving it there would be the same class of
+        # defect as the filter-strategy verdict this report carried for weeks
+        # off a vendor's documentation, having measured nothing of the kind.
+        dropped = sorted({_label(r.get("engine", "?")) for r in matches
+                          if r.get("build_mode_axis_dropped")})
+        # Quantization is in the key and reads None on both sides for every
+        # engine in every shipped profile: `context.record_defaults` does not
+        # put `IndexSpec.quantization` on an ops record, and the ann loader
+        # does not copy the attribute the mongodb module writes into the
+        # result file. Saying the rows "matched on quantization" without
+        # saying that credits the check with a discrimination it did not make
+        # -- the same class of claim as the filter-strategy verdict above.
+        #
+        # Neither of these two comments quotes that verdict's wording, and
+        # that is a constraint rather than a style choice:
+        # `tests/test_config.py:TestFilterStrategyIsMeasuredNotQuoted`
+        # asserts the sentence is absent from this file, and the guard is a
+        # substring search -- it cannot tell a cautionary citation from the
+        # claim, which is correct of it, because the next reader cannot
+        # either. It also searches the file as written, so a quotation broken
+        # across a line wrap passes it while the sentence is still there to
+        # anyone who reflows the paragraph. That is exactly how an earlier
+        # revision of these two comments carried it.
+        quantized = sorted({str(r.get("quantization")) for r in matches
+                            if r.get("quantization") is not None})
+        if quantized:
+            quantization_note = (
+                "\n_Quantization was matched on, and the values present are "
+                + ", ".join("`%s`" % q for q in quantized) + "._\n")
+        else:
+            quantization_note = (
+                "\n_**Quantization is in the match key but told nothing "
+                "apart here**: every row on both sides reads no quantization. "
+                "Percona Search is the only engine that compresses indexed "
+                "vectors, and neither path puts the value where the other can "
+                "see it \u2014 the ops harness takes `--quantization` but does "
+                "not record it, and the recall path writes it into the result "
+                "file's attributes without the loader copying it onto the "
+                "record. The key carries it so that a path which starts "
+                "recording it cannot silently pool two quantizations, not "
+                "because this table distinguished them._\n")
+
+        dropped_axis_note = ""
+        if dropped:
+            dropped_axis_note = (
+                f"\n_A **{CROSSCHECK_UNMATCHED_AXIS_MARK}** beside a build "
+                f"mode means the axis was **not** matched on for that row. "
+                f"{', '.join(dropped)} expose one build mode and their "
+                f"ann-benchmarks modules declare none, while the ops harness "
+                f"stamps `post` on every record from its own default "
+                f"regardless of what the engine did \u2014 for MHNSW and VIDX "
+                f"the graph is maintained on every INSERT whatever that field "
+                f"says. Requiring the two to agree would empty this table for "
+                f"those engines on a field neither side measures, so the axis "
+                f"is dropped wherever the recall sweep is silent about it and "
+                f"kept wherever it is not._\n")
+        parts.append(
+            f"\n_{len(matches)} matched point(s), {len(failed)} outside "
+            f"tolerance._\n"
+            f"\n_The two paths measure the same index with different code in "
+            f"different containers over different query sets — ann-benchmarks "
+            f"computes its own recall over **all** test vectors in-process, "
+            f"while the ops calibration sweep scores the **first 1,000** over "
+            f"a TCP connection. A gap is therefore expected to be small but "
+            f"not zero, which is why the tolerance is "
+            f"`max(0.01, 2 × the ops 95% CI half-width)` rather than a bare "
+            f"equality: one recall point is allowed unconditionally, and a "
+            f"noisier ops measurement is allowed proportionally more. "
+            f"A **{CROSSCHECK_FAIL_MARK}** is the two paths disagreeing by "
+            f"more than the ops measurement's own uncertainty can account "
+            f"for, which is a result about this framework and not about the "
+            f"engine._\n"
+            f"\n_Matched on engine, dataset, resource pass, M, `ef_search`, "
+            f"quantization and build mode. **Not** on storage engine: the ops "
+            f"harness stamps `InnoDB` on every engine from its own default "
+            f"while the ann modules report `heap`, `memory` and `wiredTiger`, "
+            f"so requiring equality there would empty this table for three of "
+            f"six engines for a naming reason. The Storage column carries the "
+            f"normalised value each row was paired on, so two units differing "
+            f"only in storage engine are two rows here rather than one._\n"
+            + dropped_axis_note + quantization_note
+        )
+    else:
+        parts.append(
+            "_No point was measured by both paths in this run._ That is a "
+            "statement about the configuration, not a missing measurement — "
+            "the table below says which case each engine and dataset is in.\n"
+        )
+
+    if coverage:
+        parts.append("\n#### Which configurations could be cross-checked\n\n")
+        parts.append(_md_table(
+            ["Engine", "Dataset", "M measured by the recall sweep",
+             "M measured by calibration", "M in both", "Matches", "Status"],
+            [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+              ", ".join(str(m) for m in c["ann_m"]) or "—",
+              ", ".join(str(m) for m in c["ops_m"]) or "—",
+              ", ".join(str(m) for m in c["overlap_m"]) or "—",
+              str(c["matches"]), c["status"]]
+             for c in coverage],
+        ))
+        from report.generate import (COVERAGE_NO_M_OVERLAP,
+                                     COVERAGE_NOTHING_MATCHED)
+        if any(c["status"] == COVERAGE_NO_M_OVERLAP for c in coverage):
+            parts.append(
+                "\n_Rows reading **“no M is measured by both paths (by "
+                "configuration)”** are a profile choice and not a fault: the "
+                "recall sweep varies M because it is the only build knob "
+                "MHNSW and VIDX expose, while the ops phase pins one M "
+                "because every extra value reloads the whole corpus. To make "
+                "this check non-empty, add one of the ops M values to "
+                "`ann.m_values` for a single dataset, or run calibration at "
+                "the ann M values in a cross-check profile._\n"
+            )
+        if any(c["status"] == COVERAGE_NOTHING_MATCHED for c in coverage):
+            parts.append(
+                "\n_Rows reading **“M overlaps but no point matched”** are a "
+                "**fault**, not a configuration: both paths measured a shared "
+                "M and no pair formed anyway, which means one of the other "
+                "matched axes — resource pass, `ef_search`, quantization, "
+                "build mode — disagrees between the two paths for a reason "
+                "the records do not explain._\n"
+            )
+
+    if inversions:
+        parts.append("\n#### Throughput order that differs between the two "
+                     "paths\n\n")
+        parts.append(_md_table(
+            ["Dataset", "M", "ef_search", "Engines", "Faster in-process",
+             "Faster over TCP", "QPS (ann)", "QPS (ops)"],
+            [[row.get("dataset", "?"),
+              str(row.get("m") if row.get("m") is not None else "—"),
+              str(row.get("ef_search")
+                  if row.get("ef_search") is not None else "—"),
+              " vs ".join(_label(e) for e in row["engines"]),
+              _label(row["faster_in_ann"]), _label(row["faster_in_ops"]),
+              " / ".join(_fmt(q, 0) for q in row["qps_ann"]),
+              " / ".join(_fmt(q, 0) for q in row["qps_ops"])]
+             for row in inversions],
+        ))
+        parts.append(
+            "\n_**Not a failure.** §5.2 item 5 flags these rather than "
+            "failing on them: the recall path queries the engine in-process "
+            "and the ops path goes over TCP with one client, so a fixed "
+            "per-query overhead is added to every ops measurement. Two "
+            "engines close together in-process can therefore swap places once "
+            "that overhead is paid, and that is a real difference an operator "
+            "experiences. It is listed because the alternative reading — that "
+            "one of the two measurements is wrong — is also possible and "
+            "nothing else in this report would surface it._\n"
+        )
+    elif matches:
+        parts.append(
+            "\n_No engine pair changed places between the two paths._\n")
+
+    return "".join(parts)
+
+
 def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
                     records: List[Dict[str, Any]],
                     chart_paths: Dict[str, Dict[str, str]], title: str) -> str:
@@ -1671,11 +2202,16 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
 
     parts += [
         "\n---\n\n## 5. Index build cost\n\n",
-        "ann-benchmarks does not measure this. Note the **Separable build** column: "
-        "pgvector builds its graph as one bulk operation after the load, while MHNSW "
-        "and VIDX maintain theirs on every INSERT and have no separable build step. "
-        "Where a run includes pgvector in `incremental` mode, that row is the "
-        "like-for-like comparison.\n\n",
+        "ann-benchmarks does not measure this. **`Index build` says which "
+        "operation the build time describes**, and the two are not the same "
+        "quantity: pgvector builds its graph as one bulk operation after a "
+        "plain load, while MHNSW and VIDX maintain theirs on every INSERT and "
+        "have no separable build step at all \u2014 so for them the build cost "
+        "IS the load cost. `Time to queryable index` is the column that "
+        "compares across that difference: ingest plus build for a bulk engine, "
+        "the single figure for an incremental one. Read the two together, and "
+        "see the chart's first two panels for the same split drawn against "
+        "M.\n\n",
         _build_table(summary),
     ]
     for stem, paths in sorted(chart_paths.items()):
@@ -1764,7 +2300,31 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
 
     parts += [
-        "\n---\n\n## 10. Reproducing this run\n\n",
+        # PR 5 §5.2 item 3. Its own numbered section rather than a note under
+        # §2 Validity, because it is not a list of faults: it reports every
+        # point the two measurement paths both measured, passing ones
+        # included, and an empty list with the reason it is empty. A reader
+        # who finds only the failures here would read the absence of failures
+        # as the absence of the check.
+        #
+        # After §9 and before the reproduction instructions, so the two
+        # sections it compares -- §4's recall frontier and §6's operating
+        # point -- have both been read by the time it arrives. §6's own prose
+        # already asks the reader to do this comparison by hand off Appendix
+        # A's curves; this is that comparison done by the generator.
+        "\n---\n\n## 10. Consistency checks\n\n",
+        "The recall/throughput sweep in §4 and the calibration sweep in §6 "
+        "measure the same index with different code: ann-benchmarks in-process "
+        "against the whole test set, and the ops harness over TCP against the "
+        "first 1,000 queries. Where a configuration was measured by both, the "
+        "two recalls should agree to within the ops measurement's own "
+        "uncertainty. Where they do not, the disagreement is a fact about this "
+        "framework and belongs in the report.\n\n",
+        _consistency_section(summary),
+    ]
+
+    parts += [
+        "\n---\n\n## 11. Reproducing this run\n\n",
         "```bash\n"
         f"./run-benchmark.sh build --march {(config.get('resolved_resources') or {}).get('march', 'x86-64-v3')}\n"
         f"./run-benchmark.sh fetch --datasets {','.join(summary.get('datasets', []) or ['glove-100-angular'])}\n"
@@ -2119,6 +2679,14 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
                             else _not_measured("churn", profile))
          + _pass_note(summary),
          figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
+        # PR 5 §5.2 item 3, in the renderer a reader actually opens. The
+        # comment above this list is about exactly this failure: the HTML is
+        # built from its own section list, so a section added to the markdown
+        # alone is a section the page does not have. No figure -- the check is
+        # a table of two recalls per row, and a chart of 1,000 matched pairs
+        # would say less than the pass/fail column does.
+        ("10. Consistency checks",
+         _md_tables_to_html(_consistency_section(summary)), ""),
     ]
     body = "".join(
         f"<h2>{_html.escape(name)}</h2>{content}{figs}"
@@ -2161,7 +2729,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
 <div class="meta">{cards_html}</div>
 {warn_html}
 {body}
-<h2>10. Reproducing this run</h2>
+<h2>11. Reproducing this run</h2>
 <pre><code>./run-benchmark.sh build
 ./run-benchmark.sh fetch --datasets {_html.escape(','.join(summary.get('datasets', []) or ['glove-100-angular']))}
 ./run-benchmark.sh run --profile {_html.escape(str(profile.get('name', 'quick')))} --resource-pass {_html.escape(str(config.get('resource_pass', 'normalized')))}</code></pre>

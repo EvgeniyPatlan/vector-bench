@@ -668,11 +668,17 @@ class TestTheOperatingPointTableComesBeforeConcurrency:
 
         A duplicated "## 6." or a jump from 6 to 8 is the visible half of
         having edited one renderer and not the other.
+
+        Eleven since PR 5 §5.2 inserted "## 10. Consistency checks" between
+        §9 and the reproduction instructions. The range is spelled from the
+        count of numbered headings the renderer emits, so this test keeps
+        catching a renumbering that was applied to one place and not the
+        other -- which is what it caught when that section was added.
         """
         report = _render(self._records())
         numbers = [int(line.split(".")[0][3:]) for line in report.splitlines()
                    if line.startswith("## ") and line[3].isdigit()]
-        assert numbers == list(range(1, 11))
+        assert numbers == list(range(1, 12))
 
 
 class TestTheOperatingPointTableCells:
@@ -1707,8 +1713,11 @@ class TestTheAppendixSectionIsOnlyThereWhenTheChartIs:
         report = _render(self._records(), chart_paths=paths)
         assert "## Appendix A. Calibration curves" in report
         assert "calibration-glove-100-angular.svg" in report
-        # Last on the page, after the reproduction instructions.
-        assert report.index("## 10. Reproducing this run") < report.index(
+        # Last on the page, after the reproduction instructions. The
+        # section number moved from 10 to 11 when PR 5 §5.2 inserted
+        # "Consistency checks" between §9 and it; the property under test is
+        # the ORDER, so the literal is updated rather than the assertion.
+        assert report.index("## 11. Reproducing this run") < report.index(
             "## Appendix A. Calibration curves")
 
     def test_there_is_no_appendix_without_a_chart(self):
@@ -1743,7 +1752,7 @@ class TestTheAppendixSectionIsOnlyThereWhenTheChartIs:
             MANIFEST, summary, self._records(),
             {"calibration-g": {"svg": str(svg), "png": "/x.png"}}, "T2b")
         assert "Appendix A. Calibration curves" in page
-        assert page.index("10. Reproducing this run") < page.index(
+        assert page.index("11. Reproducing this run") < page.index(
             "Appendix A. Calibration curves")
 
 

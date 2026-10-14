@@ -51,7 +51,60 @@ ann:
   # M=32 is where the high-recall end of the frontier lives and it is also
   # ~65% of the grid's load cost. Keep it; drop the middle instead if you need
   # to cut further.
-  m_values: [8, 32]
+  #
+  # **M=16 is here for PR 5 §5.2, not for the frontier**, and it is the one
+  # value in this grid whose job is a cross-check rather than a measurement.
+  # `ops.m_values` below is [16], and §5.2 matches an ops calibration point to
+  # an ann recall point at the same M -- so without a 16 here the two paths
+  # never meet on this profile and the report's "Consistency checks" section
+  # is empty by construction. Surveyed across every shipped profile at the
+  # time: `main` was the ONLY one whose grids did not meet. `full` and `quick`
+  # sweep [8, 16, 32] against ops [16]; `smoke`, `tuned-complete`,
+  # `mariadb-blog` and `mariadb-blog-repro` pin [16] on both sides; `dev` runs
+  # no ann phase and `m-sweep` no ops phase.
+  #
+  # **So the choice was not about feasibility -- it was about which run the
+  # check lands on.** §5.2 item 4's second option, calibration at the ann M
+  # values in a separate `--crosscheck` profile, costs nothing and needs no
+  # code at all: `ops.m_values` is a plain per-profile list
+  # (`cli.py`: `m_values = list(ops_cfg.get("m_values", [16]))`), with no
+  # dataset axis anywhere near it, so that option is one new YAML file. What
+  # it buys is a consistency check on a profile nobody publishes from. `main`
+  # is the profile the report comes from, and a cross-check that never runs
+  # beside the numbers it is checking is not a cross-check. That is what the
+  # extra reload is being spent on.
+  #
+  # The per-dataset obstacle belongs to item 4's FIRST option, not the
+  # second: restricting M=16 to sift-128 alone would halve the cost and needs
+  # an `m_values_by_dataset` axis that does not exist --
+  # `ann_pass.render_config` takes no `dataset` argument at all, and
+  # `estimate.estimate_load_hours` reads one global `len(ann.m_values)` for
+  # every dataset, so the printed figure would be wrong too.
+  #
+  # It costs a full reload of both corpora per engine: +17.04 h of ingest for
+  # the three headline engines and +23.29 h for all six, by
+  # `orchestrator/estimate.py`. Restricting it to sift-128 alone would have
+  # saved about half of that (+8.12 h / +11.07 h).
+  #
+  # **The "~65%" above is the share over THIS grid, and that is worth saying
+  # now that the grid has three values again.** docs/07's "The cost rises
+  # steeply with M" measures MariaDB on glove-100 at ~320 rows/s for M=8,
+  # ~200 for M=16 and ~70 for M=32 -- 1.03 h, 1.64 h and 4.70 h -- so M=32 is
+  # 64% of the [8, 16, 32] grid. Over the [8, 32] grid this profile ran until
+  # now it was 82%, and reading the sentence against that grid is what makes
+  # it look wrong. It is not.
+  #
+  # **The printed estimate is high on this change and low on the total**, and
+  # both directions come from one simplification: `estimate.py` charges every
+  # M value the same reload at one rate per engine, 147 rows/s for MariaDB on
+  # glove-100, which its own comment states is the observed *mid-grid*
+  # number. M=16 is the cheap middle of the grid, measured at ~200 rows/s, so
+  # the extra M really costs ~1.6 h there against the ~2.2 h charged -- the
+  # estimate is about a third high on the marginal M. The same flat rate sums
+  # to ~6.7 h for three loads where the measured per-M times sum to ~7.4 h,
+  # about 9% low on the total. Plan against the printed figure: for the
+  # decision this comment is about, it is the conservative one.
+  m_values: [8, 16, 32]
   ef_search: [10, 20, 40, 80, 160, 320]
   pgvector_ef_construction: 200
   pgvector_build_modes: [post, incremental]

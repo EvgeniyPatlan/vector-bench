@@ -153,22 +153,91 @@ def load(datasets_dir: str, name: str, max_test: Optional[int] = None) -> Datase
 # Recall
 # ---------------------------------------------------------------------------
 
+def recall_per_query(returned: Sequence[Sequence[int]],
+                     truth: numpy.ndarray, k: int) -> List[float]:
+    """PR 5 §5.1 item 2: the per-query recalls, not only their mean.
+
+    One entry per result set, so `len(...) == len(returned)` always and the
+    list can be bootstrapped directly: an interval over a vector shorter than
+    the queries it claims to describe is an interval over a different
+    measurement.
+
+    That invariant is why two entries here are `0.0` rather than absent, and
+    both come straight out of the mean this has to keep reproducing:
+
+    * a query whose ground truth is EMPTY. `recall_at_k` skipped its
+      numerator (`if not wanted: continue`) and still divided by every result
+      set, so the published mean already charges that query a zero. Measured
+      on a one-query fixture with a zero-width truth row: 0.0, not nan.
+    * a result set with NO ground truth row at all, which `zip` truncates
+      away while the denominator keeps counting it. Measured on two result
+      sets against one truth row, the first matching exactly: 0.5, not 1.0.
+
+    Neither is a recall of zero in any honest sense -- they are both "this
+    query was never scored" -- and an interval built from them is slightly
+    pessimistic. Changing that would move a figure the report has published
+    for its whole life, which §5.1 item 2 explicitly forbids ("the mean stays
+    the reported value"), so the shape is preserved and named instead of
+    quietly improved. A later task that wants to fix the mean has to fix it
+    here, in one place, and both the point and the interval move together.
+    """
+    out: List[float] = []
+    for index, got in enumerate(returned):
+        if index >= len(truth):
+            # `zip` in the original dropped these; the denominator did not.
+            out.append(0.0)
+            continue
+        wanted = set(int(x) for x in truth[index][:k])
+        if not wanted:
+            out.append(0.0)
+            continue
+        out.append(
+            len(wanted.intersection(int(x) for x in got[:k])) / len(wanted))
+    return out
+
+
 def recall_at_k(returned: Sequence[Sequence[int]],
                 truth: numpy.ndarray, k: int) -> float:
     """Mean fraction of the true top-k that each result set contains.
 
     Matches ann-benchmarks' definition so the two measurement paths produce
     directly comparable recall numbers.
+
+    Derived from `recall_per_query` rather than computed beside it. The two
+    were a loop each when §5.1 item 2 added the sibling, and "two paths that
+    agree today" is the shape this repository keeps paying for: the mean the
+    report publishes and the samples its error bar is drawn from have to be
+    the same arithmetic or the bar can sit beside a point it does not contain.
+
+    **The published figure moves in the last bits, and an earlier revision of
+    this docstring was wrong to claim otherwise.** It said `sum()` "adds left
+    to right exactly as the previous loop did". It does not: Python 3.12 gave
+    `sum()` Neumaier compensated summation, so `sum([1/3]*3 + [1/7]*7)` is
+    2.0 where the naive loop gives 1.9999999999999996. Against a verbatim
+    copy of the pre-PR-5 loop over 20,000 seeded fixtures, the raw mean
+    differs in 6,132 of them, by at most 6 ULP.
+
+    What does NOT move is the figure anything downstream reads. Every caller
+    stores `round(recall, 6)` (`calibrate.py`, `filtered.py`, `churn.py`),
+    and over those same 20,000 fixtures that six-decimal value differed in
+    **1**, on an exact rounding tie: the base loop produced
+    0.57031250000000011 and rounds to 0.570313, while this produces
+    0.5703125 -- the tie itself -- and rounds half-to-even to 0.570312. The
+    four decimals the report renders from the stored value differed in **0**
+    of 20,000, and §5.2's tolerance floor is 0.01, thirteen orders of
+    magnitude above the divergence.
+
+    So no ops measurement version bump: what an ops number MEANS is
+    unchanged, and the stored figure moves about once in twenty thousand
+    points by one unit in a decimal the report does not print. The compensated
+    sum is also the more accurate of the two, which is why the direction of
+    the change is not the question -- its size is.
+    `tests/test_t5b_stats.py` holds the base loop verbatim and asserts those
+    three counts, so this paragraph cannot drift from the arithmetic.
     """
     if len(returned) == 0:
         return float("nan")
-    total = 0.0
-    for got, want in zip(returned, truth):
-        wanted = set(int(x) for x in want[:k])
-        if not wanted:
-            continue
-        total += len(wanted.intersection(int(x) for x in got[:k])) / len(wanted)
-    return total / len(returned)
+    return sum(recall_per_query(returned, truth, k)) / len(returned)
 
 
 # ---------------------------------------------------------------------------

@@ -272,17 +272,25 @@ rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
 | --- | --- | ---: | --- |
 | `dev` | tiny synthetic | ~1 min | validating framework changes |
 | `smoke` | fashion-mnist | ~30 min | the gate before any long run |
-| `quick` | fashion-mnist + glove-100 | ~14 h | coarse but real numbers |
-| **`main`** | glove-100 + sift-128 | **~46 h** | **the report** |
+| `quick` | fashion-mnist + glove-100 | ~35 h | coarse but real numbers |
+| **`main`** | glove-100 + sift-128 | **~61 h** | **the report** |
 | `full` | all four, both passes | ~272 h | the complete space, rarely run whole |
-| `mariadb-blog` | dbpedia-openai-1000k, 1536 dims | ~72 h | reproducing MariaDB's published big-vector benchmark |
+| `mariadb-blog` | dbpedia-openai-1000k, 1536 dims | ~21 h | reproducing MariaDB's published big-vector benchmark |
 
 Times are measured ingest only, the original three engines, before any query
-runs. `full`
+runs, and they are what the whole run loads: every `M` value reloads the
+corpus on both paths, so a profile with three `M` values pays for the corpus
+four times. `smoke` is lower than its dataset suggests because
+`ops.subset_rows` caps its ops phase at 20,000 of fashion-mnist's 60,000.
+`mariadb-blog` is the one row not derived from the per-engine rates above:
+dbpedia-openai-1000k is 1,536 dims and loads far slower than they imply, so
+its figure comes from the estimator the run prints. `full`
 describes the measurement space rather than recommending it. Narrow with
 `--datasets` and `--resource-pass`; see
 [docs/07-planning-a-run.md](docs/07-planning-a-run.md) for what each cut costs
-you scientifically.
+you scientifically — and note that every figure here is pinned against the
+estimator by `tests/test_estimate.py`, so a profile change moves them or fails
+the suite.
 
 Profiles are plain YAML — copy and edit:
 

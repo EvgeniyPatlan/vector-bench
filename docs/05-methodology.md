@@ -60,6 +60,33 @@ These are not directly comparable to the byte, because each engine stores graph
 nodes differently. They are comparable in *order of magnitude* and in how they
 scale with `M`, which is the useful signal.
 
+**`build_wall_s` is two different quantities and must never be compared across
+engines on its own.** For an engine that bulk-builds — pgvector, Valkey — it is
+the `CREATE INDEX` call alone, after a plain load. For MariaDB MHNSW and AliSQL
+VIDX there is no separable build step at all: the graph is maintained on every
+INSERT, so the honest build cost *is* the load cost and that is what the field
+holds. `extra.separable_build` says which, and the report's `Index build`
+column renders it.
+
+So the figure that compares like with like is **time to a queryable index**:
+ingest + build for a bulk engine, the single figure for an incremental one.
+Adding ingest to an incremental record would double-count the load, which at
+1M rows is hours rather than a rounding error. The build table and the build
+chart both carry that column, and the chart keeps the raw bulk build step on
+an axis of its own where no number includes a corpus load. That preserves both
+of the claims the two fields exist to support — "this engine's bulk build is
+N× cheaper than its own incremental build", and "this engine's incremental
+build costs X against that engine's Y" — instead of collapsing them into one
+misleading one.
+
+A record written before `extra.separable_build` existed appears on **neither**
+of those axes, and the chart says how many it left off. Absence has no honest
+reading here: archived runs contain both kinds of engine, so filing an unmarked
+record as either would be inventing the fact the field exists to record. (There
+is a diagnostic — an incremental record's `build_wall_s` equals its
+`ingest_wall_s` exactly, because both are the load time — but that is evidence,
+not a record, and the report does not reclassify on it.)
+
 ### 2.3 Concurrency scaling (ops harness)
 
 QPS and latency percentiles (p50/p95/p99) at 1, 2, 4, 8, 16, 32 concurrent
@@ -469,6 +496,119 @@ rate measured *with* those readers running, and `extra.readers` beside it says
 how many. `ops.churn_readers: 0` measures the write-only rate, which is the
 quantity this report showed before PR 4 and is not the same quantity;
 `config/profiles/dev.yml` runs that pass.
+
+### 2.6 Uncertainty intervals, and when two engines are not ordered
+
+Every figure here is one sample of a noisy process. Without an interval beside
+it a 3% gap between two engines reads as a result, and the report has no way to
+say "these two measurements cannot be told apart".
+
+**Single-client recall and QPS carry a 95% bootstrap interval.** Calibration,
+filtered and churn records each carry `extra.recall_ci95` and
+`extra.qps_ci95`, as `{low, high, n}`. The method is a percentile bootstrap:
+1,000 resamples of the per-query measurements with replacement, the statistic
+taken on each, and the 2.5th and 97.5th percentiles of those reported. No
+closed form, because almost nothing measured here is normally distributed —
+latencies are right-skewed with a long tail and per-query recall is a bounded
+fraction that piles up at 1.0. The resampling seed is fixed, so a report
+regenerated from the same records is byte-identical.
+
+- **Recall** is resampled from the per-query recalls, not from repeated runs.
+  So the interval says how well *this measurement* pins the engine's recall
+  over its query set; it does **not** describe run-to-run variation.
+- **QPS** at one client is `queries / sum(latency)`, which is `1 / mean
+  latency`. The mean latency is what gets resampled and the bounds are
+  inverted, which also swaps them: the slow end of the latency interval is the
+  low end of the throughput interval.
+- **`n` travels with the bounds**, and it is not decoration. A zero-width
+  interval has two causes that the bounds alone cannot separate: 500 queries
+  that all found the whole top-k, which is a real measurement of no spread,
+  and a single query, which is the absence of one. Only the first supports a
+  claim.
+
+**Concurrency deliberately has no bootstrap interval.** Its spread comes from
+repeating each point — `ops.concurrency_repeats`, reported as
+`extra.qps_samples` and `extra.qps_spread_pct`. Samples inside one concurrency
+window are not independent: sixteen clients queuing on one server produce
+latencies that rise and fall together, so resampling them would estimate the
+spread of a quantity nobody measured and report it narrower than the
+window-to-window spread already recorded. The harness refuses to compute one
+rather than relying on this paragraph.
+
+**Where two engines' intervals overlap, the tables say "tied with" instead of
+letting the numbers imply an order.** The churn and filtered tables carry a
+`Tied with` column and the corresponding charts draw the interval as a
+whisker. The comparison is closed-interval overlap — two engines whose
+intervals merely touch are reported as tied, which is the conservative
+direction — and it is made only within a group that holds the dataset, the
+resource pass, `M`, the build mode, `ef_search` and the point being measured
+constant. Storage engine is **not** held constant, because engines
+legitimately differ on it; it is named inside the cell instead.
+
+Three answers, not two. `distinct` means the intervals do not overlap and the
+ordering the numbers suggest is supported. `no interval` means at least one row
+at that point has no usable interval — an archived record, or too few queries
+for a spread to mean anything — so the comparison is **not available** rather
+than negative. A dash means no other engine was measured at that exact point.
+The distinction matters: a two-valued version of this column reports
+"distinguishable" for a measurement that never happened, because a comparison
+against a `nan` interval is false whichever way it is written.
+
+### 2.7 Cross-checking the two measurement paths
+
+The recall/throughput sweep and the ops calibration sweep measure **the same
+index** with different code: ann-benchmarks in-process against the whole test
+set, and the ops harness over TCP against the first 1,000 queries. Where a
+configuration was measured by both, the two recalls should agree. Section 10 of
+the report lists every such pair with both values and a pass/fail mark, and an
+empty list is reported rather than hidden.
+
+**The tolerance is `max(0.01, 2 × the ops 95% CI half-width)`.** One recall
+point is allowed unconditionally, because the two paths score different query
+subsets; a noisier ops measurement is allowed proportionally more. A record
+with no usable interval gets exactly the floor, which is the stricter of the
+two branches — a missing interval cannot widen the tolerance.
+
+**What the pair is matched on, and the two fields it cannot be matched on.**
+Engine, dataset, resource pass, `M`, `ef_search`, quantization and build mode.
+Two fields are special, and both for the same measurable reason: the ops
+harness stamps a default on every record that the ann path either names
+differently or does not name at all.
+
+- **Storage engine** is not in the key. `--storage-engine` defaults to
+  `InnoDB` for every engine, so pgvector's ops records say `InnoDB` while its
+  ann module reports `heap`; Valkey's says `memory` and Percona Search's
+  `wiredTiger`. Requiring equality would empty the check for three of six
+  engines on a naming difference. It is used to pair rows *inside* a key,
+  under the same normalisation the rest of the report uses, and is shown on
+  every row.
+- **Build mode** is in the key, but only for the engines that have one. The
+  MariaDB, MariaDB 12.3 and AliSQL ann modules write no `build_mode` at all,
+  while the ops harness stamps `post` on every record regardless of what the
+  engine did — for MHNSW and VIDX the graph is maintained on every INSERT
+  whatever that field says. So the axis is dropped wherever the recall sweep
+  is silent about it and kept wherever it is not, and a row whose build mode
+  was not matched on is marked.
+
+**An empty list has two causes and the report distinguishes them.** "No `M` is
+measured by both paths" is a profile choice: the recall sweep varies `M`
+because it is the only build knob MHNSW and VIDX expose, while the ops phase
+pins one `M` because every extra value reloads the whole corpus. In `main`
+these grids do not intersect — `ann.m_values: [8, 32]` against
+`ops.m_values: [16]` — so the check is empty by design there. "`M` overlaps but
+no point matched" is a **fault**: both paths measured a shared `M` and no pair
+formed anyway. The coverage table under section 10 says which case each engine
+and dataset is in.
+
+**Throughput order is flagged, never failed.** At matched recall the engine
+order should agree between the two paths; where it does not, the report lists
+the pair. The ops path pays a TCP round trip per query that the in-process
+path does not, so two engines close together in-process can legitimately swap
+places once that overhead is paid. "At matched recall" is enforced with a band
+rather than assumed from a shared `ef_search`: a fixed `ef_search` is not one
+quantity across these engines and buys recalls up to 0.18 apart, and a
+throughput order between two engines doing different amounts of work is not a
+measurement of speed.
 
 ## 3. Fairness
 

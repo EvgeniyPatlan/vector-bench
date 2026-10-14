@@ -186,6 +186,116 @@ def ops_unit(record: Dict[str, Any]) -> tuple:
     return tuple(record.get(field) for field in OPS_UNIT_FIELDS)
 
 
+#: What `extra.separable_build` means when it is absent, in the voice
+#: `FILTER_COLUMN_WHEN_ABSENT` above uses and for the opposite reason.
+#:
+#: There, absence had ONE cause and so one honest reading. Here it has two at
+#: once: every record written before the key existed is implicit ops
+#: measurement version 1, and those runs contain pgvector (which bulk-builds)
+#: AND MHNSW and VIDX (which do not). So there is no fact to read absence as,
+#: and inventing one is the defect: `build_wall_s` is the `CREATE INDEX` call
+#: for a separable build and the ENTIRE million-row load for an incremental
+#: one, so filing an unmarked record under either kind puts two different
+#: quantities on one axis under a lower-is-better arrow.
+#:
+#: `render._index_build_kind` read a falsy `separable_build` as
+#: "incremental", which silently files every archived pgvector build -- a
+#: bulk one -- as incremental. Hence a third value rather than a default.
+#:
+#: There IS a diagnostic, and it is deliberately not acted on here:
+#: `build.py` writes `effective_build = load.wall_seconds` for an incremental
+#: build and `ingest_wall_s = load.wall_seconds` beside it, both rounded to
+#: three places, so `build_wall_s == ingest_wall_s` exactly on an incremental
+#: record and essentially never on a bulk one. That is evidence, not a
+#: record, and a chart that reclassified on it would be publishing an
+#: inference as a measurement -- which is the thing this constant exists to
+#: stop. It is written down so the next reader knows the signal is there.
+BUILD_KIND_BULK = "bulk"
+BUILD_KIND_INCREMENTAL = "incremental"
+BUILD_KIND_UNRECORDED = "unrecorded"
+
+
+def build_kind(record: Dict[str, Any]) -> str:
+    """Which of the three kinds of build cost `build_wall_s` holds.
+
+    One classifier for the chart and the table both, so the figure and the
+    column beside it cannot disagree about what a row measured.
+    """
+    extra = record.get("extra") or {}
+    if "separable_build" not in extra:
+        return BUILD_KIND_UNRECORDED
+    return (BUILD_KIND_BULK if extra.get("separable_build")
+            else BUILD_KIND_INCREMENTAL)
+
+
+def time_to_queryable_index_s(record: Dict[str, Any]) -> Optional[float]:
+    """The one quantity every engine's build cost can be compared on.
+
+    Wall clock from an empty table to an index that answers queries:
+
+    * a BULK build paid for a plain load and then a `CREATE INDEX`, so it is
+      `ingest_wall_s + build_wall_s`;
+    * an INCREMENTAL build did the graph work inside the INSERTs, so it is
+      `build_wall_s` alone -- which `build.py` set to `load.wall_seconds`,
+      making it equal to `ingest_wall_s`. Adding them would double count the
+      load, and that is not a rounding error: it would double the figure.
+    * an UNRECORDED record cannot be placed, because the two formulas differ
+      by a whole corpus load and nothing in the record says which applies.
+      None, and the chart says how many it dropped and why.
+
+    This is what makes both of `build.py`'s promised claims answerable from
+    one axis: "pgvector's bulk build is N x cheaper than its own incremental
+    build" is its two build modes on this axis, and "pgvector's incremental
+    build costs X versus MHNSW's Y" is two engines on it. The bulk engine's
+    `CREATE INDEX` time on its own stays available -- it is `build_wall_s` on
+    a bulk record -- and is drawn in its own panel where only bulk records
+    appear, so it is never beside a number that includes a load.
+    """
+    kind = build_kind(record)
+    build = record.get("build_wall_s")
+    if build is None:
+        return None
+    if kind == BUILD_KIND_INCREMENTAL:
+        return float(build)
+    if kind == BUILD_KIND_BULK:
+        ingest = record.get("ingest_wall_s")
+        if ingest is None:
+            # A bulk record with no load time recorded is the one case where
+            # the sum cannot be formed. Dropped rather than reported as the
+            # build step alone, which is precisely the comparison this
+            # function exists to prevent.
+            return None
+        return float(ingest) + float(build)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PR 5 §5.2 lives in `report/crosscheck.py`.
+#
+# Re-exported here rather than left to callers to import, because the §5.2
+# names were part of this module's surface for a round and `report/render.py`,
+# `summarize` below and `tests/test_t5b_stats.py` all reach them through it.
+# The implementations moved; where they are imported from did not.
+#
+# A module-scope import is safe in this direction: `crosscheck` imports
+# nothing at module scope but `typing`, so this cannot pull `harness` into
+# `report/`'s import graph -- which is the property `test_t5b_stats.py`
+# asserts by walking both files' ASTs.
+# ---------------------------------------------------------------------------
+from report.crosscheck import (COVERAGE_MATCHED,  # noqa: E402,F401
+                               COVERAGE_NO_ANN, COVERAGE_NO_M_OVERLAP,
+                               COVERAGE_NO_OPS, COVERAGE_NOTHING_MATCHED,
+                               CROSSCHECK_BASIS_SLACK,
+                               CROSSCHECK_KEY_FIELDS,
+                               CROSSCHECK_MIN_TOLERANCE,
+                               CROSSCHECK_RECALL_BAND,
+                               _append_crosscheck_row,
+                               _crosscheck_qps_inversions,
+                               _crosscheck_quantization, _crosscheck_sort_key,
+                               _normalised_storage, build_mode_axis_engines,
+                               consistency_checks, crosscheck_key)
+
+
 def _filter_columns_present(records: List[Dict[str, Any]],
                             dataset: str) -> List[str]:
     """The filter columns this dataset has filtered records for, in order.
@@ -584,6 +694,17 @@ def summarize(records: List[Dict[str, Any]],
     from report.loaders import calibration_targets, operating_points
     summary["operating_points"] = operating_points(records)
     summary["calibration_targets"] = calibration_targets(records)
+
+    # PR 5 §5.2. Built here for the reason `filter_strategies` and
+    # `churn_during_writes` are: the matching rule is the correctness
+    # property and it belongs in one place a test can mutate, not spread
+    # between the table that prints it and the chart beside it.
+    #
+    # Always set, never conditional on there being matches. §5.2 item 3 says
+    # "An empty match list is itself reported, not hidden", and a key that is
+    # absent when empty makes the renderer's "no matches" branch
+    # indistinguishable from an older summary that never had the key.
+    summary["consistency"] = consistency_checks(records)
 
     # An engine whose ann phase ran and wrote nothing.
     #
