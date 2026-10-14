@@ -37,8 +37,9 @@ repository holds at test time:
 * the item docs/10 §3 says is NOT satisfiable still says so, with its
   mechanical reason, and the condition that removed the row beside it still
   holds -- `report/crosscheck.py` exists and the report renders section 10;
-* the two statements docs/10 §4 item 5 calls stale are still stale, so the
-  document stops flagging them the moment they are corrected;
+* the two statements docs/10 §4 item 5 used to call stale now say that
+  `main`'s grids DO meet, pinned by polarity so a differently wrong rewrite
+  fails too, and neither still carries the `[8, 32]` claim in any spelling;
 * the D1 cost table in §5 item 3 is recomputed from the estimator for both M
   grids and both engine sets, and agrees with the comment that states it.
 
@@ -46,6 +47,12 @@ This file was written one pull request earlier, when `report/crosscheck.py` did
 not exist and `main`'s two M grids did not meet. Both guards fired on #16, which
 is what they were for; what they assert now is the other side of the same
 condition, so neither claim can drift back silently.
+
+The staleness guard did the same thing one round later: it was written to fail
+when the two sentences were FIXED, and it did, which is how docs/10 came to
+stop flagging them. What stands in its place asserts the correction, in the
+direction that cannot be satisfied by a sentence that is wrong a different
+way.
 
 The prose claims are pinned as PATTERNS and not as sentences -- see `CLAIMS`
 below, which carries for each claim the rewordings it must accept and the
@@ -290,18 +297,6 @@ CLAIMS = {
             "The consistency section is not reviewable until T5b lands.",
             "This section no longer exists.",
         ]),
-    "the two stale places are not this document's to edit": dict(
-        section='### 5. "Consistency checks pass, or each failure is explained"',
-        pattern=r"(neither|not|none of them)\b[^.]{0,60}?"
-                r"this document'?s to edit",
-        accepts=[
-            "Neither file is this document's to edit; read the profile",
-            "Not this document's to edit, so read the profile instead",
-            "None of them is this documents to edit",
-        ],
-        rejects=[
-            "Both are this document's to edit, so they are corrected above.",
-        ]),
     "item 5 left the unsatisfiable table": dict(
         section='## 3. One checklist item is not satisfiable as written',
         pattern=r"item 5\b.{0,80}?(was in this table and has left|"
@@ -314,19 +309,24 @@ CLAIMS = {
         rejects=[
             "Item 5 is in this table because the section does not exist.",
         ]),
-    "two places still say the cross-check is empty on main": dict(
+    "an empty section on main is a fault": dict(
         section='### 5. "Consistency checks pass, or each failure is explained"',
-        pattern=r"(two places|both)\b.{0,70}?"
-                r"(still say|say)\b.{0,90}?"
-                r"(empty by design|nothing can match|do not (meet|intersect))",
+        # Replaces "two places still say the cross-check is empty on main",
+        # which this document made until the two sentences were corrected.
+        # Tempered on polarity rather than spelled: the window between `main`
+        # and `fault` must not contain a word that flips it, so wording is
+        # free and the claim is not.
+        pattern=r"`?main`?\b(?:(?!\bby design\b|\bnot a fault\b|"
+                r"\bno fault\b|\bexpected\b)[\s\S]){0,160}?\bfault\b",
         accepts=[
-            "Two places still say this check is empty by design on `main`",
-            "Two places say that nothing can match on main, and both are now "
-            "wrong",
-            "Both still say main's grids do not meet.",
+            "**On `main` an empty section is a fault, not a design.**",
+            "On main, an empty consistency section is a fault to investigate.",
+            "main's grids meet, so an empty section is a fault.",
         ],
         rejects=[
-            "Nothing in the tree still claims the check is empty on main.",
+            "On `main` an empty section is empty by design.",
+            "On `main` an empty section is expected, not a fault.",
+            "On `main` an empty section is no fault at all.",
         ]),
     "the README figure and the estimator are different bases": dict(
         section='### 3. The cost envelope, and what D1 cost',
@@ -487,10 +487,10 @@ CITED_IN_REPO = {
         ("config/profiles/main.yml", "churn_readers: 4"),
     "config/profiles/dev.yml:72":
         ("config/profiles/dev.yml", "churn_readers: 0"),
-    "docs/05-methodology.md:192-199":
+    "docs/05-methodology.md:233-240":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:661-662":
+    "docs/05-methodology.md:728-729":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
     "config/profiles/main.yml:107":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
@@ -501,14 +501,18 @@ CITED_IN_REPO = {
         ("report/crosscheck.py", "def consistency_checks"),
     "report/crosscheck.py:103":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
-    "report/render.py:2315":
+    "report/render.py:2328":
         ("report/render.py", "## 10. Consistency checks"),
-    "report/render.py:1948":
+    # These two cited the stale sentences until they were corrected; they now
+    # cite the corrected ones. The anchor is the same phrase in both files,
+    # which is deliberate: it is the polarity-bearing clause, so a row that
+    # still matched after a wrong rewrite would be a row worth nothing.
+    "report/render.py:1953":
         ("report/render.py",
-         "`ann.m_values: [8, 32]` against `ops.m_values: [16]`"),
-    "docs/05-methodology.md:596-598":
+         "the grids meet, so an empty section there is the fault case"),
+    "docs/05-methodology.md:660":
         ("docs/05-methodology.md",
-         "these grids do not intersect"),
+         "the grids meet, so an empty section there is the fault case"),
     "docs/09-adding-percona-server.md:676":
         ("docs/09-adding-percona-server.md",
          "is not a cache, and that is a fairness problem"),
@@ -1077,46 +1081,167 @@ class TestItemFiveLeftTheTableForAReasonThatStillHolds:
         assert "report/crosscheck.py" in section
 
 
-class TestTheStatementsTheDocumentCallsStaleAreStillStale:
-    """§4 item 5 flags two places that say `main`'s M grids do not intersect.
+class TestTheStatementsTheDocumentFlaggedAreCorrected:
+    """§4 item 5 flagged two places that said `main`'s M grids do not meet.
 
-    Both are in files this document does not own, and both were falsified by
-    the same change that wrote them -- `config/profiles/main.yml` moved to
-    `[8, 16, 32]` in the pull request that added the section those sentences
-    describe. The document therefore tells the reader to trust the profile.
+    Both were falsified by the pull request that wrote them --
+    `config/profiles/main.yml` moved to `[8, 16, 32]` in the same change that
+    added the section those sentences describe -- so an operator reading
+    either one after an empty section on a `main` run would have filed a real
+    fault as expected behaviour.
 
-    This guard fails when they are FIXED, which is the intent: at that point
-    docs/10 must stop flagging them, and a runbook still warning about a
-    corrected sentence is its own kind of stale.
+    The previous revision of this class asserted they were STILL stale, and
+    failed when they were fixed, which is how docs/10 came to stop flagging
+    them. This asserts the other side, and it is deliberately not a literal:
+    pinning the corrected sentence by its exact text would accept any other
+    wrong sentence and reject a harmless reflow. So the claim is pinned by
+    POLARITY -- `main` and `meet` with nothing between them that flips it --
+    and the stale spellings are asserted absent after whitespace
+    normalisation, because one of these sentences spans a line break and a
+    prose guard a reflow defeats is not a guard.
     """
 
-    STALE = {
-        "report/render.py":
-            "`ann.m_values: [8, 32]` against `ops.m_values: [16]`",
-        "docs/05-methodology.md": "these grids do not intersect",
-    }
+    FILES = ("report/render.py", "docs/05-methodology.md")
 
-    @pytest.mark.parametrize("path", sorted(STALE))
-    def test_the_statement_is_still_there(self, path):
+    #: The claim each file must make: `main`'s grids meet.
+    #:
+    #: Word order is free and polarity is not, which is the shape `CLAIMS`
+    #: above uses. A regex pinning "main ... grids ... meet" in that order
+    #: rejects "the grids overlap on main", which says the same thing -- and
+    #: a guard that fires on correct prose teaches the next author to delete
+    #: it. So this looks for the three ideas inside one window and refuses
+    #: the window if anything in it flips the sense.
+    MEET_VERB = r"\b(?:meet|intersect|overlap)\b"
+    NEGATION = r"\b(?:not|never|cannot|no longer)\b|\bby design\b"
+    #: Characters either side of `grids`. Wide enough for a sentence, narrow
+    #: enough not to reach the paragraph above -- which in `render.py` is the
+    #: general two-causes explanation and legitimately contains "do not
+    #: overlap". Measured against both files.
+    WINDOW = 110
+
+    def _says_grids_meet(self, text):
+        """Whether `text` states somewhere that main's grids meet."""
+        for match in re.finditer(r"\bgrids\b", text, re.I):
+            window = text[max(0, match.start() - self.WINDOW):
+                          match.end() + self.WINDOW]
+            if not re.search(r"`?main`?\b", window, re.I):
+                continue
+            if not re.search(self.MEET_VERB, window, re.I):
+                continue
+            if re.search(self.NEGATION, window, re.I):
+                continue
+            return window
+        return None
+
+    #: Spellings of the stale claim. Patterns, not one sentence: the figure
+    #: that rotted can come back worded differently, and a guard keyed to the
+    #: exact old text would miss that.
+    STALE = (
+        r"ann\.m_values:\s*`?\s*\[8,\s*32\]`?\s*against",
+        r"grids\s+do\s+not\s+(meet|intersect)",
+        r"nothing\s+can\s+match",
+    )
+
+    #: Where a labelled history clause starts. Both corrected passages record
+    #: what they used to say, and one of them quotes "empty by design" while
+    #: doing it -- so the absence check skips the clause that declares itself
+    #: history, exactly as `tests/test_t4b_readers.py` does for the line
+    #: counts it stopped restating. Keying the exemption to the LABEL rather
+    #: than to the wording is the only way to keep an honest record legal
+    #: while still catching the same words used as a current claim.
+    HISTORY = "An earlier revision"
+    HISTORY_WINDOW = 600
+
+    def _live_prose(self, path):
+        """The file's prose with labelled history removed, whitespace flat."""
         text = open(os.path.join(VB_ROOT, path)).read()
-        needle = self.STALE[path]
-        assert needle in text, (
-            f"{path} no longer says {needle!r} -- it has been corrected, so "
-            f"docs/10 §4 item 5 must stop flagging it")
+        flat = re.sub(r"\s+", " ", re.sub(r"\s*#\s*", " ", text))
+        while self.HISTORY in flat:
+            at = flat.index(self.HISTORY)
+            flat = flat[:at] + flat[at + self.HISTORY_WINDOW:]
+        return flat
 
-    def test_the_profile_is_what_makes_them_stale(self):
-        """The other half: they are only wrong because the profile moved."""
+    @pytest.mark.parametrize("path", FILES)
+    def test_the_file_says_the_grids_meet(self, path):
+        flat = self._live_prose(path)
+        assert self._says_grids_meet(flat), (
+            f"{path} no longer states that `main`'s M grids meet. The "
+            f"profile is `[8, 16, 32]` against `[16]`, so an empty "
+            f"consistency section on `main` is a fault; a file that does not "
+            f"say so inverts the diagnostic the coverage table is for.")
+
+    @pytest.mark.parametrize("path", FILES)
+    def test_the_stale_claim_is_gone_in_every_spelling(self, path):
+        flat = self._live_prose(path)
+        for pattern in self.STALE:
+            hit = re.search(pattern, flat, re.I)
+            assert hit is None, (
+                f"{path} states the stale claim again ({hit.group(0)!r}). "
+                f"`main` runs `[8, 16, 32]` against `[16]`. If this is a "
+                f"record of what the file used to say, introduce it with "
+                f"{self.HISTORY!r} as both corrected passages do.")
+
+    def test_the_patterns_are_neither_brittle_nor_vacuous(self):
+        """The needles are findable and the polarity is load-bearing.
+
+        Without this the two tests above would pass against an empty string
+        and against any sentence containing the right nouns, which is how a
+        negative assertion goes quietly vacuous.
+        """
+        accepts = [
+            "On `main` the grids meet, so an empty section is the fault case.",
+            "main sweeps [8, 16, 32] against [16]; the grids intersect.",
+            "The grids overlap on main.",
+        ]
+        rejects = [
+            "In `main` these grids do not intersect",
+            "On `main` the grids never meet",
+            "`main` configures [8, 32] against [16], so the check is empty "
+            "by design",
+            "",
+        ]
+        for text in accepts:
+            assert self._says_grids_meet(text), text
+        for text in rejects:
+            assert not self._says_grids_meet(text), text
+        # And each stale pattern matches the thing it bans.
+        stale_text = ("`main` configures `ann.m_values: [8, 32]` against "
+                      "`ops.m_values: [16]`, so these grids do not intersect "
+                      "and nothing can match there")
+        for pattern in self.STALE:
+            assert re.search(pattern, stale_text, re.I), pattern
+
+    def test_the_history_exemption_is_scoped_and_not_a_hole(self):
+        """The exemption keeps an honest record legal without blanket amnesty.
+
+        Honest: both corrected files pass, and each does mention the old
+            `[8, 32]` grid inside a clause introduced by the label.
+        Mutant (the same clause with the label removed): the stale pattern
+            fires, so the exemption cannot be had by accident.
+        """
+        for path in self.FILES:
+            raw = open(os.path.join(VB_ROOT, path)).read()
+            assert self.HISTORY in raw, (
+                f"{path} does not record what it used to say")
+            assert "[8, 32]" in raw, (
+                f"{path} dropped the record of the old grid entirely; the "
+                f"exemption below is then describing nothing")
+        unlabelled = ("the two grids do not intersect on main, so the check "
+                      "is empty by design")
+        assert re.search(self.STALE[1], unlabelled, re.I)
+
+    def test_the_profile_is_what_makes_the_correction_true(self):
+        """The claim is only right because the profile says so."""
         main = _profile("main.yml")
-        assert set(main["ann"]["m_values"]) & set(main["ops"]["m_values"]), (
-            main["ann"]["m_values"], main["ops"]["m_values"])
-        _claim("two places still say the cross-check is empty on main")
+        ann, ops = set(main["ann"]["m_values"]), set(main["ops"]["m_values"])
+        assert ops and ops <= ann, (sorted(ann), sorted(ops))
+        _claim("an empty section on main is a fault")
 
     def test_the_document_names_both_places(self):
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
-        assert "report/render.py:1948" in section
-        assert "docs/05-methodology.md:596-598" in section
-        _claim("the two stale places are not this document's to edit")
+        assert "report/render.py:1953" in section
+        assert "docs/05-methodology.md:660" in section
 
 
 # ---------------------------------------------------------------------------
@@ -1335,11 +1460,15 @@ class TestTheMethodologyGapsAreDerived:
     well covered" -- is half of what makes the gap meaningful.
     """
 
+    #: PR 2's four names, which are the whole of what docs/05 still does not
+    #: describe. `client_bound`, `client_cpu_util` and `during_writes` were
+    #: here until they landed in §2.3 and §2.5; they moved to PRESENT below
+    #: rather than being deleted, so the list cannot shrink by forgetting.
     ABSENT = ("ef_calibration", "floor_above_target", "target_unreached",
-              "operating-point", "client_bound", "client_cpu_util",
-              "during_writes")
+              "operating-point")
     PRESENT = ("maintenance_state", "churn_readers", "ctag",
-               "ops_measurement_version", "index_sync_s")
+               "ops_measurement_version", "index_sync_s",
+               "client_bound", "client_cpu_util", "during_writes")
 
     @pytest.fixture(scope="class")
     def methodology(self):
@@ -1721,48 +1850,86 @@ class TestThePullRequestMappingMatchesTheHistory:
                                                                     merges):
         """§1 says #4 is absent from the history. Derived, not asserted: the
         reader is being told the two numbering schemes do not line up, and a
-        gap the document invented would undercut exactly that."""
+        gap the document invented would undercut exactly that.
+
+        **The highest merged number is deliberately no longer pinned, and
+        that is the fix rather than an omission.** This test used to assert
+        `highest == 16` and that §1 said "up to #16". Both went stale the
+        next time anything merged -- which was this document's own pull
+        request, within the hour -- and the gate failed on
+        `AssertionError: 17` for a figure no reader acts on. It is the same
+        class as the spliced line counts `tests/test_t4b_readers.py` stopped
+        restating: a monotonically increasing fact cannot be written down and
+        stay true.
+
+        What is pinned instead is the claim the test is named for. The gap at
+        #4 is a fact about history, and history does not acquire new gaps, so
+        it holds indefinitely. Each individual row is checked by
+        `test_the_row_names_a_merge_that_happened` above, which is where a
+        wrong number belongs.
+        """
         highest = max(merges)
         gaps = sorted(set(range(1, highest + 1)) - set(merges))
         assert gaps == [4], gaps
-        # 15 while #16 was open, 16 once it merged. Asserted rather than
-        # derived-and-forgotten because the sentence in §1 names the number.
-        assert highest == 16, highest
-        assert re.search(r"up to #%d\b" % highest, _doc()), (
-            f"the highest merged pull request is #{highest}; docs/10 §1 does "
-            f"not say so")
+        # A FLOOR, not a value. The quantity only increases, so a lower bound
+        # never goes stale, and it is here only to keep the gap computation
+        # above from being satisfied by a mis-parsed handful of merges.
+        # `test_the_history_was_read` is the other half of that.
+        assert highest >= 16, highest
         assert re.search(r"#%d does not appear" % gaps[0], _doc()), (
             f"the only gap in the merge numbering is #{gaps[0]}; docs/10 §1 "
             f"names a different one")
+        # And §1 must not reintroduce the figure that rotted. Checked as a
+        # pattern rather than against today's number, because the defect is
+        # any such claim and not one particular spelling of it.
+        stale = re.search(r"(up to|as high as|through)\s+#\d+", _plain(_doc()))
+        assert stale is None, (
+            f"docs/10 §1 names the highest merged pull request again "
+            f"({stale.group(0)!r}). That figure goes stale on the next "
+            f"merge; the mapping table carries the numbers instead.")
 
     def test_what_the_document_says_about_16_matches_the_tree(self):
-        """§1 says #16 is open and not in `origin/master`.
+        """Whether §1 calls #16 open has to match whether #16 is merged.
 
         Two-way, so it never fires spuriously: whichever side the tree is on,
-        the document has to be on the same one. The previous revision of this
-        file learned the cost of a one-way claim about a pull request -- it
-        said T5b was unmerged and was overtaken within the day.
+        the document has to be on the same one.
+
+        **It asks about #16's own merge commit now, and it used to ask about
+        HEAD.** `HEAD in origin/master` is only a proxy for "#16 is merged"
+        while HEAD is #16's branch. It stopped being one as soon as this
+        document was written on a later branch: #16 was already merged, HEAD
+        was not, so the test demanded §1 call #16 open and failed at its own
+        base. It then self-resolved when this document merged, which is worse
+        than failing -- a guard that goes green because an unrelated branch
+        landed was never measuring its subject.
+
+        Searching `origin/master`'s own merge subjects answers the question
+        directly and does not depend on where HEAD sits.
         """
         try:
             out = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", "HEAD",
-                 "origin/master"],
+                ["git", "log", "--merges", "--format=%s", "origin/master"],
                 cwd=VB_ROOT, capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as exc:
             pytest.skip(f"git unavailable: {exc}")
-        if out.returncode not in (0, 1):
+        if out.returncode != 0 or not out.stdout.strip():
             pytest.skip("origin/master not available in this checkout")
-        merged = out.returncode == 0
+        subjects = out.stdout.splitlines()
+        # Non-vacuity: a parse that found no merges at all would make the
+        # `merged = False` branch below assert the opposite of the truth.
+        assert any(re.match(r"Merge pull request #\d+ ", s) for s in subjects), (
+            "no merge subjects parsed from origin/master")
+        merged = any(re.match(r"Merge pull request #16 ", s) for s in subjects)
         plain = _plain(_doc())
         says_open = bool(re.search(r"#16 is (the )?open", plain))
         if merged:
             assert not says_open, (
-                "this commit is in origin/master, so docs/10 §1 must stop "
-                "calling #16 open and §2 must stop waiting on it")
+                "#16 is merged into origin/master, so docs/10 §1 must stop "
+                "calling it open and §2 must stop waiting on it")
         else:
             assert says_open, (
-                "this commit is not in origin/master; docs/10 §1 should say "
-                "#16 is still open, because §2's order waits on the merge")
+                "#16 is not in origin/master; docs/10 §1 should say it is "
+                "still open, because §2's order waits on the merge")
 
     def test_t5a_landed_and_t5c_did_not(self):
         """The distinction §1 draws inside PR 5, which is what unblocks the
