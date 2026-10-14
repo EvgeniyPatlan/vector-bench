@@ -308,7 +308,7 @@ and is what the run settles.
 
 Note what changed underneath this item: the selectivity label used to be the
 share *requested*, and is now the share *delivered*
-(`docs/05-methodology.md:233-240`). If you compare against an older chart, the
+(`docs/05-methodology.md:470-477`). If you compare against an older chart, the
 axis means a different thing.
 
 **The overshoot is not a single number**, and the draft of this page quoted one
@@ -372,7 +372,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:1953` and `docs/05-methodology.md:660` both say
+matched rows. `report/render.py:1953` and `docs/05-methodology.md:897` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -385,15 +385,17 @@ the guard that held the flag now asserts the correction instead.
 
 ### 6. "`05-methodology.md` updated for all five PRs"
 
-**Not satisfied at this commit, and the gap is bigger than it looks.** Scanning
+**Satisfied at this commit**, and it was the item that took longest to get
+there — it started as four gaps and closed one PR at a time. Scanning
 `docs/05-methodology.md` for the names the new work introduced:
 
-* **PR 2 is absent entirely.** Neither `ef_calibration`, nor
-  `floor_above_target`, nor `target_unreached`, nor the phrase
-  "operating-point" appears anywhere in the document. The calibration workload
-  is referred to once, in passing, as "the calibrated `ef_search`" inside the
-  churn section. A reader asked by item 2 to review an operating-point table
-  has nothing in the methodology describing it.
+* **PR 2 is now covered**, in a §2.0 placed before §2.1: the sweep and the
+  `ef_calibration` records it writes, the selection rule, `floor_above_target`
+  and `target_unreached` with the direction each one qualifies the sections
+  below in, what the operating-point table's marks mean, and which later
+  sections inherit the choice. The figures it quotes about real engine
+  behaviour are marked supplied, because no run this repository holds contains
+  an `ef_calibration` record.
 * **PR 1's client-bound flag is now covered**, at the end of §2.3: the three
   numbers the judgement rests on, the 0.80 threshold and what it is and is not,
   and the blindness §4 item 1 above turns on — including the signature of the
@@ -407,21 +409,28 @@ the guard that held the flag now asserts the correction instead.
   held when it was written; that is corrected, and §4 item 5 above records what
   it said.
 
-So the item has gone from four gaps to one, and the one left is the oldest and
-the largest: a reader sent by item 2 to review an operating-point table still
-has nothing in the methodology describing one. That is a section rather than a
-paragraph — calibration is not a seventh measurement dimension but the premise
-of three of them, which is why the report puts the operating-point table before
-concurrency, filtered search and churn rather than among them — so it is left
-for a task of its own rather than bolted onto §2.1. The guards derive this list
-from the document at test time rather than restating it, so the item closes
-itself as the gap is filled.
+So the item has gone from four gaps to none. The last one to close was the
+oldest and the largest, and it closed as a section rather than a paragraph for
+the reason this entry gave while it was still open: calibration is not a
+seventh measurement dimension but the premise of three of them, which is why
+the report puts the operating-point table before concurrency, filtered search
+and churn rather than among them. §2.0 is numbered 2.0 rather than inserted as
+a new 2.1 so that nothing below it was renumbered, because the §-references in
+this document and in `tests/test_e3_rollout_doc.py` point into that numbering.
+
+The guards for this item are a restated list and not a derivation of the
+sentences above, whatever an earlier revision of this paragraph claimed: the
+names live in `TestTheMethodologyGapsAreDerived.ABSENT` and `PRESENT`, and a
+gap closes when a name moves from the first tuple to the second. `ABSENT` is
+now empty, which that class asserts is the terminal state rather than a
+disabled guard — so this entry cannot quietly go back to calling a covered
+name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 ### 7. "Run manifest records `ops_measurement_version`, seeds and the resolved profile"
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:728-729` documents it.
+prints it above the numbers, and `docs/05-methodology.md:965-966` documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 

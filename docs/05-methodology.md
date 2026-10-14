@@ -24,6 +24,243 @@ but the question here is "MariaDB vs AliSQL vs PostgreSQL".
 
 ## 2. Measurement dimensions
 
+### 2.0 The operating point: the one `ef_search` three sections share
+
+§2.3, §2.4 and §2.5 are each measured at **one** `ef_search` per engine, and by
+default that value is chosen by a measurement rather than declared in a
+profile. So this section is the premise of those three rather than a note about
+them, which is why it comes before §2.1 — and why the report puts the same
+table before the same three sections instead of after them
+(`report/render.py:_operating_point_table`). A reader who meets those
+throughput numbers first has already read them as equal-effort comparisons by
+the time any caveat arrives.
+
+#### A fixed `ef_search` is not one quantity across these engines
+
+It is a different knob in each of them, and this repository names every one:
+
+| Engine | What the harness sets | Where |
+| --- | --- | --- |
+| MariaDB 11.8 and 12.3 | `SET mhnsw_ef_search` | `harness/drivers/mysql_family.py:MARIADB_DIALECT` |
+| AliSQL | `SET vidx_hnsw_ef_search` | `harness/drivers/mysql_family.py:ALISQL_DIALECT` |
+| pgvector | `SET hnsw.ef_search` | `harness/drivers/postgres.py:set_ef_search` |
+| Valkey | `EF_RUNTIME`, a modifier inside the query string | `harness/drivers/valkey.py:set_ef_search` |
+| Percona Search | `numCandidates`, a per-query argument | `harness/drivers/mongo.py:set_ef_search` |
+
+Two of those five do not search the number they are handed. Valkey sends
+`EF_RUNTIME max(ef, k)` and Percona Search sends `max(numCandidates, k)`,
+because neither can return `k` rows out of fewer than `k` candidates. At any
+`k` above the grid's floor the low end of a shared grid therefore collapses: at
+`k = 100` the six points 10, 16, 24, 32, 48 and 64 are one search measured six
+times (`harness/drivers/mongo.py:effective_ef`). That much is read out of the
+drivers and needs no server to check, and on its own it settles the weaker half
+of the claim — a shared literal is demonstrably not a shared amount of work.
+The harness asks each driver what it will really search and records the answer
+as `extra.effective_ef`, so a reader comparing two engines at "ef 10" can see
+which of them looked at ten candidates. Only Percona Search overrides the
+default (`harness/drivers/base.py:effective_ef`), so **Valkey's clamp is
+applied to its queries and is not reflected in its `effective_ef`** — that is a
+known gap in the record rather than a claim about Valkey.
+
+The stronger half of the claim — *how far apart* the recalls at one `ef_search`
+actually are — is **supplied**, and nothing here measures it. The figure quoted
+throughout the code and the report is two engines at recall 0.98 and 0.80 at
+`ef_search = 100`, up to 0.18 of recall apart
+(`harness/workloads/calibrate.py`, module docstring). It comes from the
+tuned-profile notes the project specification cites. **No run this repository
+holds contains an `ef_calibration` record at all** — the phase is newer than
+every archive (`tests/test_c2_webui_phases.py`) — so nothing here can confirm
+or refute that spread, and no test tries to.
+
+#### What the sweep does
+
+`harness/workloads/calibrate.py` runs once per measurement unit, on the index
+the build phase has just finished, before any of the three workloads below.
+
+- The grid is twelve requested `ef_search` values — `10, 16, 24, 32, 48, 64,
+  100, 160, 256, 400, 640, 1000`, declared as
+  `harness/workloads/calibrate.py:DEFAULT_EF_GRID` — walked ascending and
+  de-duplicated. A descending grid swept in the order given would stop at its
+  two largest values and calibrate every engine to the top of it, which is the
+  opposite of what the sweep is for. The profile key that replaces the grid is
+  `ops.ef_calibration` (`orchestrator/ops_pass.py:DEFAULT_EF_CALIBRATION`); the
+  report's own footnote calls it `ops.ef_grid`, which is not a key the
+  orchestrator reads.
+- At each point: set the knob, ask the driver what it will really search, check
+  once that the vector index is in the query plan, discard 20 warm-up queries,
+  then time and score `ops.max_queries` queries — 1,000 by default — at a
+  single client. The plan check is per point and after the knob is set, because
+  a full-table scan returns recall 1.0 at the smallest `ef_search` and is
+  otherwise indistinguishable from an engine whose floor is above the target.
+- Each point becomes one record of its own, `phase: ef_calibration`
+  (`harness/metrics/records.py:PHASE_CALIBRATION`), carrying
+  `extra.effective_ef`, `extra.target_recall`, `extra.reached_target`,
+  `extra.grid_position` and `extra.grid_size` — so a sweep that stopped after
+  three of twelve points says so in the records and not only in the log. Each
+  also carries the bootstrap intervals of §2.6.
+- Ground truth is recomputed over the row count the engine was actually given,
+  because a profile may have loaded a subset of the training set.
+- The sweep stops as soon as two consecutive points reach the target. Every
+  larger `ef_search` costs query time and changes nothing about the choice.
+
+The query set is deliberately the one the later workloads use. This sweep's
+output is an `ef_search` and a recall rather than a speed, so a warm cache here
+is not a contaminated measurement there — and sharing the queries means the
+recall the choice was made on is the recall those workloads will report.
+
+#### The selection rule
+
+The target is `recall@k >= 0.95` by default
+(`harness/workloads/calibrate.py:DEFAULT_TARGET_RECALL`), settable per profile
+as `ops.target_recall`. **No profile shipped in this repository sets
+`ops.ef_mode`, `ops.target_recall` or `ops.ef_calibration`**, so every profile
+here runs the default grid against the default target in `calibrated` mode.
+
+Given the measured curve, `harness/workloads/calibrate.py:_choose` returns the
+first case that applies:
+
+1. The smallest grid point's recall is more than 0.02 above the target
+   (`FLOOR_MARGIN`) — the smallest `ef_search` is used and the status is
+   `floor_above_target`. The margin is not zero on purpose: an engine whose
+   first point reads 0.951 against a 0.95 target is calibrated, not
+   uncalibratable.
+2. The smallest `ef_search` that reaches the target **and whose successor also
+   reaches it** — status `ok`. The successor clause is the whole guard. Recall
+   over a finite query set is a mean of Bernoulli draws, so a single point can
+   clear the target by sampling noise, and without the clause that point
+   becomes the `ef_search` every later workload is measured at.
+3. The target is first met at the last grid point, where nothing can confirm it
+   — status `ok`, with the result's `confirmed` flag false. **`confirmed` is
+   not a fourth status.** The clause could not be applied because the grid ran
+   out, not because the check failed, and the run log prints `unconfirmed`
+   beside the status rather than qualifying the comparison.
+4. Nothing reached the target — the largest grid point is used and the status
+   is `target_unreached`.
+
+"Reaches" is `recall_at_k >= target`, inclusive; the floor test in case 1 is a
+strict `>` against `target + 0.02`.
+
+The chosen value then replaces `ef_search` for everything below, and `ef_mode`,
+`target_recall` and `calibration_status` are stamped on every record written
+afterwards (`harness/workloads/calibrate.py:status_extra`). That stamp is what
+the report joins on: the chosen `ef_search` and the status are read back off the
+records of the workloads that *used* them and never re-derived by applying the
+selection rule a second time (`report/loaders.py:operating_points`). A second
+copy of the rule could drift from the first, and the symptom would be a report
+whose "chosen ef" column names an `ef_search` no workload ran at.
+
+#### The two statuses that qualify everything below them
+
+`ok` is the only status under which an engine was held to the target. The other
+two say it was not, in opposite directions, and each has its own footnote mark.
+
+**`floor_above_target` — the engine cannot be slowed down to the target.** Its
+recall at minimum search effort is already more than 0.02 above it, so no grid
+point brings it down, and its numbers in §2.3, §2.4 and §2.5 were bought at a
+**higher** recall than the engines marked `ok`. That direction understates its
+throughput against theirs rather than flattering it. What an operator should
+conclude depends on the engine. For one with an `ef_construction` knob it means
+`ops.ef_calibration` does not start low enough to reach the target from below,
+and the grid is the thing to change. For MHNSW and VIDX at `M = 16` the
+expectation is that this is a property of the implementation: `M` is the only
+build knob either exposes (§4), so there is nothing left to turn down. **That
+expectation is supplied, not established here.** It reaches this repository as
+a line of the project specification's rollout step 2, quoted in
+`docs/10-rollout.md` §2 — the operating-point table "should show
+`floor_above_target` or a low chosen `ef`" for those two. The status names in
+that sentence are real and checked against the code; which engines land on them
+is what the sweep measures, and anything else is a finding rather than a
+configuration slip.
+
+**`target_unreached` — the engine reached the target at no grid point.** It is
+reported at the best recall it achieved, at the largest `ef_search` in the
+grid, which the sweep is guaranteed to have measured because early stop needs
+two consecutive points at the target and this curve had none. Its numbers below
+were bought at a **lower** recall than the `ok` engines', so they will tend to
+look better than they are. The remedy is to extend `ops.ef_calibration`
+upwards and re-run, at the cost of query time.
+
+A third mark exists and is not a sweep outcome: an engine with concurrency,
+filtered or churn records and **no** `calibration_status` was never calibrated
+at all. Runs are checkpointed per `(pass, engine, dataset, phase)`, so flipping
+`ops.ef_mode` to `calibrated` and resuming keeps the fixed-`ef` records of every
+engine already measured, and nothing refuses the mixture because the ops
+measurement version (§5) did not change. Such engines have throughput in the
+sections below, no row in the operating-point table, and no recall at which
+they are comparable with anything.
+
+#### What a dagger means
+
+In the operating-point table's Status column and in the concurrency chart's
+legend:
+
+| Mark | Status | How to read the throughput below |
+| --- | --- | --- |
+| `†` | `floor_above_target` | measured at a **higher** recall than the `ok` engines |
+| `‡` | `target_unreached` | measured at a **lower** recall than the `ok` engines |
+| `*` | no status at all | never held to any target; no recall at which it is comparable |
+
+One glyph for one meaning. The chart imports all three marks from the renderer
+rather than spelling them again (`report/charts.py:FLOOR_MARK`), so a mark on a
+chart cannot be explained by a footnote under a different glyph in a table.
+Each footnote is printed only when the run earned it, and each names the
+engines, the `M`, the resource pass, the recall and the `ef_search` concerned.
+Further notes cover rows that carry no status at all: two different chosen
+`ef_search` values or two different statuses under one measurement unit, which
+only a hand-merged records file can produce; a unit whose downstream workloads
+never ran, so the sweep's cost was paid and no comparison came of it; and a
+unit whose sweep records are absent, so the ef and the status are trustworthy
+and the evidence for the choice cannot be shown.
+
+**The same dagger appears in §2.1's headline table for a different object.**
+There it marks a QPS-at-a-recall-floor cell for which every swept configuration
+returned recall above that floor, so the figure is the engine's throughput at
+the higher recall printed beside it. The two uses are the same kind of caveat —
+a figure taken above the recall it is being compared at — about two different
+sweeps, and neither footnote covers the other's table.
+
+#### What §2.3, §2.4 and §2.5 inherit from this
+
+All three are measured at the single `ef_search` chosen here
+(`harness/workloads/calibrate.py:CALIBRATED_WORKLOADS`), so **every number in
+them is conditional on this section's Status column.**
+
+- **§2.3 Concurrency.** Its QPS curves and latency percentiles are at this
+  `ef_search` at every client count. Its `recall_at_k` is **not** the recall in
+  the operating-point table: that one is the sweep's, single-client against warm
+  caches over `ops.max_queries` queries, and §2.3 defines the other. They are
+  not expected to be equal and neither is a check on the other. §2.3 also
+  describes what the concurrency figures can and cannot be read as on their
+  own, including the one limit `extra.client_bound` does not catch; that is a
+  separate question from this one and is not restated here.
+- **§2.4 Filtered search.** Measured at the *unfiltered* calibrated
+  `ef_search`, not at one re-calibrated per selectivity. Re-calibrating per
+  point would hide exactly what that section exists to show — that a scalar
+  predicate costs recall or speed — because the `ef_search` would be raised
+  until it did not.
+- **§2.5 Churn.** Baseline and post-churn recall and QPS are both at this
+  `ef_search`, which is what makes the degradation a property of the churned
+  graph rather than of two different search efforts.
+
+With `ops.ef_mode: fixed` none of this happens: the profile's literal
+`ef_search` is used, no record carries a status, and in place of the table the
+report says that the engines below are compared at equal *search effort* rather
+than at equal *answer quality*. Nothing is wrong with such a run — it answers a
+different question, and the report declines to imply otherwise.
+
+#### What this section does not establish
+
+No claim here is a measurement of an engine. No server can be started from this
+checkout, no run the repository holds contains an `ef_calibration` record, and
+every statement above about the shape of a real curve — the 0.98/0.80 spread,
+the 0.18, MHNSW's and VIDX's floors at `M = 16` — is supplied by the project
+specification and the tuned-profile notes it cites. What *is* established from
+this repository is the mechanism: five distinct knobs, two clamps of which one
+is recorded, the grid, the selection rule, the three statuses and the marks the
+report renders them with. The first run of this sweep against live servers is
+what would turn the supplied half into a measurement; until then the Status
+column is the only honest way into §2.3, §2.4 and §2.5.
+
 ### 2.1 Recall vs QPS (ann-benchmarks)
 
 The standard approximate-nearest-neighbour quality/speed tradeoff.
