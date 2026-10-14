@@ -1666,7 +1666,7 @@ CITED_IN_REPO = {
         ("orchestrator/ops_pass.py", "VB_ENGINE_TAG"),
     "orchestrator/engines.py:63-65":
         ("orchestrator/engines.py", "def _source_tag"),
-    "docs/07-planning-a-run.md:506":
+    "docs/07-planning-a-run.md:505":
         ("docs/07-planning-a-run.md", "60,000-row smoke"),
     # Found only once `_CITE_RE` learned to see extensionless filenames --
     # see the note on that pattern. It is the citation that sat at `:113`,

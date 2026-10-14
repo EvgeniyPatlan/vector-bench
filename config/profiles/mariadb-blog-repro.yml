@@ -121,6 +121,11 @@ ops:
   max_queries: 500
   # Unused with workloads: [build], kept so the profile degrades sensibly if
   # someone enables the other workloads.
+  # Keeps the 2-client point that the measurement profiles dropped on
+  # 2026-10-14: here it is a QPS figure compared against a published
+  # curve, not a concurrency verdict. The verdict at n=2 is undecidable
+  # either way -- see config/profiles/main.yml -- so read this point's
+  # throughput and percentiles and ignore its scaling_status.
   client_counts: [1, 2, 4, 8, 16, 32]
   concurrency_duration_s: 60
   selectivities: [0.10]

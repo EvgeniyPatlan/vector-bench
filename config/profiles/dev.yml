@@ -32,7 +32,10 @@ ops:
   subset_rows: null
   load_threads: 1
   max_queries: 100
-  client_counts: [1, 2]
+  # [1, 2] until 2026-10-14. Two clients cannot decide a concurrency
+  # verdict (see main.yml), and [1] alone would leave the fast loop
+  # exercising no client pool at all, so this is [1, 4].
+  client_counts: [1, 4]
   concurrency_duration_s: 4
   selectivities: [0.10, 0.50]
   # Sixty seconds a point, not the 300 s default, and the reason is this
