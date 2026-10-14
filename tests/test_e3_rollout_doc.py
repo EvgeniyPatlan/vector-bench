@@ -487,10 +487,10 @@ CITED_IN_REPO = {
         ("config/profiles/main.yml", "churn_readers: 4"),
     "config/profiles/dev.yml:72":
         ("config/profiles/dev.yml", "churn_readers: 0"),
-    "docs/05-methodology.md:233-240":
+    "docs/05-methodology.md:470-477":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:728-729":
+    "docs/05-methodology.md:965-966":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
     "config/profiles/main.yml:107":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
@@ -510,7 +510,7 @@ CITED_IN_REPO = {
     "report/render.py:1953":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:660":
+    "docs/05-methodology.md:897":
         ("docs/05-methodology.md",
          "the grids meet, so an empty section there is the fault case"),
     "docs/09-adding-percona-server.md:676":
@@ -1241,7 +1241,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
         assert "report/render.py:1953" in section
-        assert "docs/05-methodology.md:660" in section
+        assert "docs/05-methodology.md:897" in section
 
 
 # ---------------------------------------------------------------------------
@@ -1464,11 +1464,17 @@ class TestTheMethodologyGapsAreDerived:
     #: describe. `client_bound`, `client_cpu_util` and `during_writes` were
     #: here until they landed in §2.3 and §2.5; they moved to PRESENT below
     #: rather than being deleted, so the list cannot shrink by forgetting.
-    ABSENT = ("ef_calibration", "floor_above_target", "target_unreached",
-              "operating-point")
+    #: Empty, and that is the item's TERMINAL state rather than a disabled
+    #: guard: PR 2's four names moved to `PRESENT` when docs/05 §2.0 landed,
+    #: as PR 1's and PR 4's did before them. `test_an_empty_absent_list_is_the
+    #: _closed_state` asserts the emptiness is deliberate, because a loop over
+    #: an empty tuple passes for the same reason a dead probe does.
+    ABSENT = ()
     PRESENT = ("maintenance_state", "churn_readers", "ctag",
                "ops_measurement_version", "index_sync_s",
-               "client_bound", "client_cpu_util", "during_writes")
+               "client_bound", "client_cpu_util", "during_writes",
+               "ef_calibration", "floor_above_target", "target_unreached",
+               "operating-point")
 
     @pytest.fixture(scope="class")
     def methodology(self):
@@ -1487,13 +1493,40 @@ class TestTheMethodologyGapsAreDerived:
         missing = [name for name in self.PRESENT if name not in methodology]
         assert not missing, missing
 
+    @staticmethod
+    def _item6() -> str:
+        return _doc().split("### 6. \"", 1)[1].split("\n### ", 1)[0]
+
     def test_the_document_names_every_absence_it_claims(self):
         """The list in §4 item 6 and the list here must be the same list."""
-        section = _doc().split("### 6. \"", 1)[1].split("\n### ", 1)[0]
+        section = self._item6()
         for name in self.ABSENT:
             assert name in section, (
                 f"docs/10 §4 item 6 no longer names {name}, which this guard "
                 f"still asserts is missing from docs/05")
+
+    def test_an_empty_absent_list_is_the_closed_state(self):
+        """`ABSENT` is empty, so the loop above passes over nothing.
+
+        That is the state the item was designed to reach, but an empty loop
+        and a deleted guard are indistinguishable from the outside, so the
+        emptiness is asserted here together with the sentence docs/10 has to
+        be making once it holds. A name returned to `ABSENT` fails the first
+        assertion; a document still calling a gap open while `ABSENT` is empty
+        fails the second.
+        """
+        assert self.ABSENT == (), self.ABSENT
+        plain = _plain(self._item6())
+        for still_open in ("is absent entirely", "has nothing in the "
+                           "methodology describing", "one gap", "one left",
+                           "Not satisfied at this commit"):
+            assert still_open not in plain, (
+                f"docs/10 §4 item 6 still says {still_open!r} while this "
+                f"guard holds that every name it listed is now in docs/05")
+        # The paired positive: the item has to say the thing it now means,
+        # or the negatives above would pass against an item that had simply
+        # lost its text.
+        assert "now covered" in plain, plain[:200]
 
     def test_the_selectivity_range_is_the_one_the_source_measured(self):
         """§4 item 3 quotes three figures out of `harness/datasets.py`.
