@@ -339,6 +339,39 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # ended -- no progress at all for the hours this takes. `=line` keeps progress
 # live but still splits a multi-line diagnostic from its own target.
 #
+# `|| make -j1` is the other half, and it is about where the error lands
+# rather than whether it is adjacent to its file. `--output-sync` puts
+# the compiler diagnostic next to the `[ 26%] Building CXX object ...` line
+# that names the file; it does NOT move either of them to the end of the log.
+# When a target fails at -j80 make stops launching new work but lets the ~79
+# already-running targets finish, and their blocks print AFTER the failing
+# one -- so the last twenty lines of the log are the stragglers draining out,
+# and three builds of this image were reported from that tail with the error
+# never read. The serial retry resumes from wherever the parallel build got
+# to, recompiles only what is missing, stops at the first error and prints it
+# as the last thing in the log. It costs minutes rather than hours because
+# everything before the failure is already built.
+#
+# Two consequences to know rather than discover:
+#
+#   * a failure that was a parallel-build RACE will not recur serially, so
+#     the retry succeeds and the image builds. That is a better outcome than
+#     failing, and it produces the same binary -- but it means a green build
+#     here does not prove the parallel build is sound.
+#   * `set -e` does not fire between the two, because `||` suppresses errexit
+#     for its left side. If the serial retry also fails the chain still exits
+#     non-zero, which is what fails the Docker build.
+#
+# The retry is spelled `--jobs=1` and not `-j1`, which is not a style choice.
+# `make -j` is the region anchor two other suites split this file on, and it
+# has to stay UNIQUE: with a second `make -j` token in the same command, the
+# guard in tests/test_e5_percona_make_output_sync.py stops failing loudly
+# when the flag is misplaced and starts silently falling through to the
+# retry, widening the region past the invocation it is meant to bound.
+# Measured: with `-j1` the "wrong side of the anchor" probe went from
+# reporting an empty region to reporting a populated one, which is the
+# failure the probe exists to detect. `--jobs=1` is identical to make.
+#
 # The flag goes AFTER -j"$JOBS" deliberately. `make -j` is the literal string
 # tests/test_e1_percona_design.py and tests/test_e4_percona_build_flags.py
 # split this file on to bound the cmake flag region, and they do not survive
@@ -377,7 +410,7 @@ RUN set -eux; \
       -DWITH_ZLIB=bundled \
       -DWITH_ZSTD=bundled \
       ${CMAKE_FLAGS} ; \
-    make -j"$JOBS" --output-sync=target; \
+    make -j"$JOBS" --output-sync=target || make --jobs=1; \
     make install; \
     echo "${MARCH}" > /opt/percona/.march
 

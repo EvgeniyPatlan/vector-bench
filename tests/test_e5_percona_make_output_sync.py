@@ -196,6 +196,67 @@ class TestTheBuildIsOutputSynchronised:
             f"{command!r}")
 
 
+class TestTheSerialRetryIsThereAndIsSerial:
+    """`|| make --jobs=1`, the half that decides WHERE the error lands.
+
+    `--output-sync=target` makes the diagnostic adjacent to the line naming
+    the file. It does not move either of them to the end of the log: when a
+    target fails at -j80, make stops launching new work but lets the ~79
+    running targets finish, and their blocks print after the failing one. So
+    the tail of the log is stragglers draining out, and three builds of this
+    image were reported from that tail with the error never read.
+
+    The retry resumes from wherever the parallel build stopped, recompiles
+    only what is missing, stops at the first error and prints it last.
+
+    Guarded because the flag above it is: without these tests, deleting the
+    retry left all seventeen of this file's other assertions green, which is
+    measured in TestTheProbesDiscriminate below.
+    """
+
+    def test_the_build_command_has_a_fallback(self, dockerfile_text):
+        command = build_command(dockerfile_text)
+        assert "||" in command, (
+            "the compiling make has no fallback, so a failure still prints "
+            f"its error above the stragglers rather than last: {command!r}")
+
+    def test_the_fallback_is_a_make(self, dockerfile_text):
+        fallback = build_command(dockerfile_text).split("||", 1)[1].strip()
+        assert fallback.startswith("make "), (
+            f"the fallback is not a make invocation: {fallback!r}")
+
+    def test_the_fallback_is_serial(self, dockerfile_text):
+        """One job, not merely fewer. The point is that make runs one recipe
+        at a time so nothing can print between a diagnostic and its target;
+        -j2 reintroduces interleaving at half the width."""
+        fallback = build_command(dockerfile_text).split("||", 1)[1].strip()
+        jobs = re.search(r"--jobs=(\d+)|(?<!\S)-j\s*(\d+)", fallback)
+        assert jobs is not None, (
+            f"the fallback names no job count, so it inherits MAKEFLAGS and "
+            f"may not be serial at all: {fallback!r}")
+        count = jobs.group(1) or jobs.group(2)
+        assert count == "1", (
+            f"the fallback runs {count} jobs. Only one job guarantees that "
+            f"nothing prints between a diagnostic and the target that "
+            f"produced it: {fallback!r}")
+
+    def test_the_fallback_does_not_spell_a_second_region_anchor(
+            self, dockerfile_text):
+        """`--jobs=1` and not `-j1`, and this is not a style rule.
+
+        `make -j` is the anchor two other suites bound the cmake region on,
+        and it has to stay unique. With a second `make -j` token in the same
+        command, a misplaced --output-sync stops emptying the region and
+        starts falling through to the retry, widening it past the invocation
+        it bounds -- so the guard goes quiet exactly when it is needed.
+        """
+        assert dockerfile_text.count(REGION_END_ANCHOR) >= 1
+        in_command = build_command(dockerfile_text).count(REGION_END_ANCHOR)
+        assert in_command == 1, (
+            f"{REGION_END_ANCHOR!r} appears {in_command} times in the build "
+            f"command. It is the region bound and must appear once.")
+
+
 class TestTheRegionAnchorSurvived:
     """The hazard specific to this edit, not to the flag.
 
@@ -321,6 +382,35 @@ class TestTheProbesDiscriminate:
         # And it now reaches text that is not the cmake invocation at all.
         assert "ARG PERCONA_TAG" not in honest
         assert "ARG PERCONA_TAG" in widened
+
+    def test_deleting_the_serial_retry_is_seen(self, dockerfile_text):
+        """Measured before these tests existed: removing the retry left all
+        seventeen other assertions in this file green. That is what an
+        unguarded addition looks like."""
+        mutant = dockerfile_text.replace(" || make --jobs=1", "")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        honest, mutated = build_command(dockerfile_text), build_command(mutant)
+        assert honest != mutated, (honest, mutated)
+        assert "||" in honest
+        assert "||" not in mutated
+
+    def test_a_retry_that_is_not_serial_is_seen(self, dockerfile_text):
+        mutant = dockerfile_text.replace("make --jobs=1", "make --jobs=2")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        def jobs_of(text):
+            fallback = build_command(text).split("||", 1)[1]
+            return re.search(r"--jobs=(\d+)", fallback).group(1)
+        assert jobs_of(dockerfile_text) == "1"
+        assert jobs_of(mutant) == "2"
+
+    def test_respelling_the_retry_as_dash_j_one_is_seen(self,
+                                                       dockerfile_text):
+        """The subtle one: `-j1` builds identically and quietly turns the
+        region anchor from unique into a fall-through."""
+        mutant = dockerfile_text.replace("make --jobs=1", "make -j1")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        assert build_command(dockerfile_text).count(REGION_END_ANCHOR) == 1
+        assert build_command(mutant).count(REGION_END_ANCHOR) == 2
 
     def test_a_region_with_no_anchor_reads_as_empty_not_as_everything(
             self, dockerfile_text):
