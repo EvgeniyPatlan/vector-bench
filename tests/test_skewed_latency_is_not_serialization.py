@@ -133,14 +133,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.drivers.base import IndexSpec                            # noqa: E402
 from harness.metrics import latency as latency_mod                    # noqa: E402
-from harness.metrics.latency import (CREDIBLE_BASELINE_MEDIAN_RATIO,     # noqa: E402
-                                     LatencyCollector,
+from harness.metrics import scaling as scaling_mod                    # noqa: E402
+from harness.metrics.latency import (LatencyCollector,                # noqa: E402
+                                     merge_collectors, window_concurrency)
+# The scaling POLICY is `scaling.py`'s, not `latency.py`'s. Imported from its
+# own module rather than through `latency`'s re-export so that the mutation
+# probes below name the module whose globals the rule actually reads -- the
+# asymmetry `tests/test_g1_client_concurrency.py` pins.
+from harness.metrics.scaling import (CREDIBLE_BASELINE_MEDIAN_RATIO,  # noqa: E402
                                      SCALING_CONCURRENCY_NOT_ACHIEVED,
                                      SCALING_OK, SERVED_CONCURRENCY_FLOOR,
                                      achieved_fraction, baseline_is_credible,
-                                     merge_collectors, scaling_status,
-                                     served_fraction, throughput_fraction,
-                                     window_concurrency)
+                                     scaling_status, served_fraction,
+                                     throughput_fraction)
 from harness.workloads import clients as cl                           # noqa: E402
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
@@ -542,7 +547,7 @@ def pre_change_scaling_status(served: Optional[float],
     fraction = served_fraction(served, clients)
     if fraction is None:
         return None
-    if fraction < latency_mod.SERVED_CONCURRENCY_FLOOR:
+    if fraction < scaling_mod.SERVED_CONCURRENCY_FLOOR:
         return SCALING_CONCURRENCY_NOT_ACHIEVED
     return SCALING_OK
 
@@ -735,17 +740,17 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
         (`achieved_fraction` rebound to the `min` form):
         `concurrency_not_achieved` for both.
         """
-        original = latency_mod.achieved_fraction
+        original = scaling_mod.achieved_fraction
         try:
-            latency_mod.achieved_fraction = (
+            scaling_mod.achieved_fraction = (
                 lambda served, clients, efficiency=None: min(
                     served_fraction(served, clients), efficiency))
-            assert latency_mod.achieved_fraction is not original
+            assert scaling_mod.achieved_fraction is not original
             mutant_skewed = scaling_status(0.8, 4, 0.9)
             mutant_queued = scaling_status(3.6, 4, 0.3)
         finally:
-            latency_mod.achieved_fraction = original
-        assert latency_mod.achieved_fraction is original
+            scaling_mod.achieved_fraction = original
+        assert scaling_mod.achieved_fraction is original
         assert scaling_status(0.8, 4, 0.9) == SCALING_OK
         assert scaling_status(3.6, 4, 0.3) == SCALING_OK
         assert mutant_skewed == SCALING_CONCURRENCY_NOT_ACHIEVED
@@ -756,20 +761,20 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
 
         Honest (floor 0.5): a window at `served / clients` 0.2 and efficiency
         0.45 is refused. Mutant (floor rebound to 0.4 **on
-        `harness.metrics.latency`**): the same window reads `ok`. The rule
+        `harness.metrics.scaling`**): the same window reads `ok`. The rule
         looks the floor up in its own module globals on every call, so the
         rebinding lands; a floor captured in a default argument would make
         this probe dead.
         """
-        original = latency_mod.SERVED_CONCURRENCY_FLOOR
+        original = scaling_mod.SERVED_CONCURRENCY_FLOOR
         honest = scaling_status(0.8, 4, 0.45)
         try:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = 0.4
-            assert latency_mod.SERVED_CONCURRENCY_FLOOR != original
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = 0.4
+            assert scaling_mod.SERVED_CONCURRENCY_FLOOR != original
             mutant = scaling_status(0.8, 4, 0.45)
         finally:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = original
-        assert latency_mod.SERVED_CONCURRENCY_FLOOR == original
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = original
+        assert scaling_mod.SERVED_CONCURRENCY_FLOOR == original
         assert honest == SCALING_CONCURRENCY_NOT_ACHIEVED
         assert mutant == SCALING_OK
         assert honest != mutant
@@ -786,21 +791,21 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
         distinction to avoid.
         """
         honest = scaling_status(None, 4, 1.0)
-        original = latency_mod.achieved_fraction
+        original = scaling_mod.achieved_fraction
         try:
-            latency_mod.achieved_fraction = (
+            scaling_mod.achieved_fraction = (
                 lambda served, clients, efficiency=None: (
                     served_fraction(served, clients)
                     if served is not None else efficiency))
-            assert latency_mod.achieved_fraction is not original
+            assert scaling_mod.achieved_fraction is not original
             mutant = scaling_status(None, 4, 1.0)
         finally:
-            latency_mod.achieved_fraction = original
+            scaling_mod.achieved_fraction = original
         # Restoration, asserted and not left to the `finally`. The two calls
         # below reach the module-level import binding rather than this
         # module's global, so they would pass with the mutant still in place
         # and cannot stand in for this line.
-        assert latency_mod.achieved_fraction is original
+        assert scaling_mod.achieved_fraction is original
         assert honest is None
         assert mutant == SCALING_OK
         assert honest != mutant
@@ -874,22 +879,22 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
 
         Honest (floor 0.5): the term is withheld at two clients and admitted
         at three. Mutant (floor rebound to 0.3 on
-        `harness.metrics.latency`): withheld at three and admitted at four,
+        `harness.metrics.scaling`): withheld at three and admitted at four,
         because `1/3` is 0.333 which is no longer below it. A `clients > 2`
         spelling would read 0.9 at three clients under both floors, which is
         the dead-probe signature this names.
         """
-        original = latency_mod.SERVED_CONCURRENCY_FLOOR
+        original = scaling_mod.SERVED_CONCURRENCY_FLOOR
         honest = (throughput_fraction(0.9, 2), throughput_fraction(0.9, 3),
                   throughput_fraction(0.9, 4))
         try:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = 0.3
-            assert latency_mod.SERVED_CONCURRENCY_FLOOR != original
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = 0.3
+            assert scaling_mod.SERVED_CONCURRENCY_FLOOR != original
             mutant = (throughput_fraction(0.9, 2), throughput_fraction(0.9, 3),
                       throughput_fraction(0.9, 4))
         finally:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = original
-        assert latency_mod.SERVED_CONCURRENCY_FLOOR == original
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = original
+        assert scaling_mod.SERVED_CONCURRENCY_FLOOR == original
         assert honest == (None, 0.9, 0.9)
         assert mutant == (None, None, 0.9)
         assert honest != mutant
@@ -908,17 +913,17 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
         `min(efficiency, 1.0)` would turn both of these into a confident 1.0,
         the most permissive value the rule has.
         """
-        original = latency_mod.CREDIBLE_EFFICIENCY_CEILING
+        original = scaling_mod.CREDIBLE_EFFICIENCY_CEILING
         honest = (scaling_status(0.8, 4, 1e308),
                   scaling_status(0.8, 4, float("inf")))
         try:
-            latency_mod.CREDIBLE_EFFICIENCY_CEILING = float("inf")
-            assert latency_mod.CREDIBLE_EFFICIENCY_CEILING != original
+            scaling_mod.CREDIBLE_EFFICIENCY_CEILING = float("inf")
+            assert scaling_mod.CREDIBLE_EFFICIENCY_CEILING != original
             mutant = (scaling_status(0.8, 4, 1e308),
                       scaling_status(0.8, 4, float("inf")))
         finally:
-            latency_mod.CREDIBLE_EFFICIENCY_CEILING = original
-        assert latency_mod.CREDIBLE_EFFICIENCY_CEILING == original
+            scaling_mod.CREDIBLE_EFFICIENCY_CEILING = original
+        assert scaling_mod.CREDIBLE_EFFICIENCY_CEILING == original
         assert honest == (SCALING_CONCURRENCY_NOT_ACHIEVED,) * 2
         assert mutant == (SCALING_OK,) * 2
         assert honest != mutant
@@ -949,17 +954,17 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
         """
         nan = float("nan")
         honest = scaling_status(0.8, 4, nan)
-        original = latency_mod.achieved_fraction
+        original = scaling_mod.achieved_fraction
         try:
-            latency_mod.achieved_fraction = (
+            scaling_mod.achieved_fraction = (
                 lambda served, clients, efficiency=None: max(
                     throughput_fraction(efficiency, clients),
                     served_fraction(served, clients)))
-            assert latency_mod.achieved_fraction is not original
+            assert scaling_mod.achieved_fraction is not original
             mutant = scaling_status(0.8, 4, nan)
         finally:
-            latency_mod.achieved_fraction = original
-        assert latency_mod.achieved_fraction is original
+            scaling_mod.achieved_fraction = original
+        assert scaling_mod.achieved_fraction is original
         assert honest == SCALING_CONCURRENCY_NOT_ACHIEVED
         assert mutant == SCALING_OK
         assert honest != mutant
@@ -1603,21 +1608,21 @@ class TestAnUnderWarmedBaselineIsTheRepairsOwnExposure:
         0.97-1.02 over every regime and client count the fixture rebuilds,
         and the lowest corrupt reading measured was 1.889. Honest (1.4): 1.02
         is credible and 1.889 is not. Mutant (the constant rebound to 2.0 on
-        `harness.metrics.latency`): 1.889 reads credible too -- and 1.889 is
+        `harness.metrics.scaling`): 1.889 reads credible too -- and 1.889 is
         the row whose efficiency came within 6% of publishing a serialized
         pool, so that is the miss that matters.
         """
-        original = latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO
+        original = scaling_mod.CREDIBLE_BASELINE_MEDIAN_RATIO
         honest = (baseline_is_credible(1.02, 1.0),
                   baseline_is_credible(1.889, 1.0))
         try:
-            latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = 2.0
-            assert latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO != original
+            scaling_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = 2.0
+            assert scaling_mod.CREDIBLE_BASELINE_MEDIAN_RATIO != original
             mutant = (baseline_is_credible(1.02, 1.0),
                       baseline_is_credible(1.889, 1.0))
         finally:
-            latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = original
-        assert latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO == original
+            scaling_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = original
+        assert scaling_mod.CREDIBLE_BASELINE_MEDIAN_RATIO == original
         assert honest == (True, False)
         assert mutant == (True, True)
         assert honest != mutant
@@ -1800,17 +1805,17 @@ class TestTheResidueHoldsBothCausesAndCannotSeparateThem:
             f"no verdict moved at all, so this probe compared nothing"
             f"\n{report(table)}")
 
-        original = latency_mod.achieved_fraction
+        original = scaling_mod.achieved_fraction
         try:
-            latency_mod.achieved_fraction = (
+            scaling_mod.achieved_fraction = (
                 lambda served, clients, efficiency=None: min(
                     served_fraction(served, clients), efficiency)
                 if served is not None else None)
-            assert latency_mod.achieved_fraction is not original
+            assert scaling_mod.achieved_fraction is not original
             mutant = verdicts(scaling_status)
         finally:
-            latency_mod.achieved_fraction = original
-        assert latency_mod.achieved_fraction is original
+            scaling_mod.achieved_fraction = original
+        assert scaling_mod.achieved_fraction is original
         mutant_tightened = [key for key, (new, old) in mutant.items()
                             if new == SCALING_CONCURRENCY_NOT_ACHIEVED
                             and old == SCALING_OK]
