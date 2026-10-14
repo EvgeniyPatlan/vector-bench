@@ -429,9 +429,16 @@ def _claim(name: str):
 # the sentence it is quoted for breaking across the two lines.
 CITED_IN_REPO = {
     # doc spelling                            -> (real path, anchor)
-    "harness/metrics/records.py:261":
-        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 5"),
-    "harness/metrics/records.py:268":
+    # Was `:261`, anchored on `OPS_MEASUREMENT_VERSION = 5`. G3 made the
+    # concurrency clients OS processes, which changes what every multi-client
+    # figure measures, and the constant moved to 6 in the same commit --
+    # atomically, because a version 5 record from the process pool would mean
+    # something different from a version 5 record in the 2026-10-14 run.
+    # There was no edit that bumped the constant and left this row green, and
+    # that is the row doing its job rather than a row in the way.
+    "harness/metrics/records.py:318":
+        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 6"),
+    "harness/metrics/records.py:325":
         ("harness/metrics/records.py", "IMPLICIT_OPS_MEASUREMENT_VERSION = 1"),
     "harness/metrics/records.py:240-246":
         ("harness/metrics/records.py",
@@ -440,7 +447,7 @@ CITED_IN_REPO = {
         ("harness/metrics/records.py", "CHANGES WHAT IT MEASURES"),
     "harness/metrics/records.py:253-260":
         ("harness/metrics/records.py", "is a diagnostic, not a guard"),
-    "harness/metrics/records.py:299-302":
+    "harness/metrics/records.py:356":
         ("harness/metrics/records.py",
          "OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({"),
     "harness/metrics/stats.py:49":
@@ -459,10 +466,19 @@ CITED_IN_REPO = {
     "orchestrator/manifest.py:80":
         ("orchestrator/manifest.py",
          '"ops_measurement_version": OPS_MEASUREMENT_VERSION'),
-    "harness/workloads/clients.py:166":
-        ("harness/workloads/clients.py", "CLIENT_BOUND_UTIL = 0.80"),
-    "harness/workloads/clients.py:326-328":
-        ("harness/workloads/clients.py",
+    # These two changed FILE, not just line. G3 split `clients.py`, which
+    # stood at 791 lines of the repo's 800-line ceiling, and
+    # `CLIENT_BOUND_UTIL` went to `pool_window.py` beside
+    # `PoolWindow.client_bound` -- its only reader, which is the placement
+    # `metrics/latency.py` argues for `SERVED_CONCURRENCY_FLOOR`. `clients.py`
+    # re-exports it, and `tests/test_g3_process_clients.py` pins that the
+    # re-export does NOT share the name, so a mutation aimed at
+    # `clients.CLIENT_BOUND_UTIL` is recorded as dead rather than reported as
+    # a guard that held.
+    "harness/workloads/pool_window.py:58":
+        ("harness/workloads/pool_window.py", "CLIENT_BOUND_UTIL = 0.80"),
+    "harness/workloads/pool_window.py:184":
+        ("harness/workloads/pool_window.py",
          "return self.client_cpu_util > CLIENT_BOUND_UTIL"),
     "harness/workloads/clients.py:34-45":
         ("harness/workloads/clients.py", "flattens at 2.06 cores"),

@@ -100,10 +100,10 @@ being wrong.
 There is no previous smoke run to compare against **through the report**, and
 the obstacle is a deliberate one.
 
-`OPS_MEASUREMENT_VERSION` is 5 (`harness/metrics/records.py:261`). Records
+`OPS_MEASUREMENT_VERSION` is 6 (`harness/metrics/records.py:318`). Records
 written before the constant existed carry no version key at all and are
 version 1 by definition, not "unknown"
-(`harness/metrics/records.py:268`). The archived corpus is entirely version 1:
+(`harness/metrics/records.py:325`). The archived corpus is entirely version 1:
 `harness/metrics/records.py:240-246` records a count of it, and that count was
 re-taken independently for this document — 239 ops record files, 2,134 ops
 records, `extra.ops_measurement_version` absent from every one, every record in
@@ -119,7 +119,7 @@ versions are present, so a version 1 record and a version 5 record in one
 report raise `MixedMeasurementVersions`, and so do a version 1 and a version 2
 — which `report/measurement_versions.py:187-191` says **denote the same
 measurement**. The equivalence set
-(`harness/metrics/records.py:299-302`) changes the *wording* of the refusal,
+(`harness/metrics/records.py:356`) changes the *wording* of the refusal,
 dropping the advice to re-measure; it does not change the decision. And the
 refusal is not a caveat on a chart: `report/generate.py:858-859` prints the
 message and returns 2, so there is no report.
@@ -270,8 +270,8 @@ The recall half is straightforward and enforced. **The `client_bound` half
 cannot be satisfied by reading that flag**, and this is the flag's own code
 rather than an opinion about where a threshold sits.
 
-`harness/workloads/clients.py:166` sets `CLIENT_BOUND_UTIL = 0.80`, and
-`harness/workloads/clients.py:326-328` is the whole decision:
+`harness/workloads/pool_window.py:58` sets `CLIENT_BOUND_UTIL = 0.80`, and
+`harness/workloads/pool_window.py:184` is the whole decision:
 `self.client_cpu_util > CLIENT_BOUND_UTIL`. So a client that is not burning CPU
 is not flagged, whatever else is limiting it. The module states why moving the
 threshold does not help: *"a CPU-utilisation threshold cannot see a GIL

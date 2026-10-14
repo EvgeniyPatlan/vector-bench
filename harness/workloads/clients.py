@@ -1,5 +1,6 @@
 """One client pool, shared by the concurrency and churn workloads.
 
+
 PR 4 §4.3 item 3 asks for this module by name, and the reason is that churn now
 needs readers running while the writer works. Every piece of machinery that
 takes is already in `concurrency.py` and was argued for there over three
@@ -102,103 +103,24 @@ Connector/C), which `docker/_shared/requirements-mysql.txt` says is used for
 BOTH MariaDB and AliSQL on purpose. The question is per-library, not
 per-engine, and nothing in this repository settles it.
 
-**THE CLIENTS ARE PROCESSES, AND THE RUN THAT SETTLED IT.** The paragraph
-this one replaces said running the clients as processes was "the fix for the
-underlying limit" and "deliberately NOT attempted", and named the next real
-run as the thing that would settle whether the limit was the client library.
-That run finished on 2026-10-14 -- a six-engine `smoke` pass on a Xeon Gold
-6230, `SMOKE/results/smoke-20261014-075119/` -- and it settled it in the
-direction the paragraph feared. `served = qps x p50` (Little's law, the
-quantity `served_concurrency` computes) per client, at 1 client -> 4 clients:
+**THE CLIENTS ARE PROCESSES, AND `client_process.py` HAS THE MECHANISM.**
+The paragraph that used to end this docstring said running them as processes
+was "the fix for the underlying limit" and "deliberately NOT attempted", and
+named the next real run as the thing that would settle whether the limit was
+the client library. That run finished on 2026-10-14 and settled it in the
+direction the paragraph feared -- three of seven engines pinned near one
+query in service at four clients, exactly the three sharing MariaDB
+Connector/Python. `harness/workloads/client_process.py` carries that run's
+table, the fork-versus-spawn decision, and §7's cost list measured item by
+item; `docs/05-methodology.md` §7 carries the same figures for a reader who
+is not in the code. What stays here is the pool: the barrier, the window, the
+two concurrency figures, the client-CPU accounting and the sharding.
 
-    mariadb      0.95 -> 0.238      pgvector   0.98 -> 0.974
-    mariadb123   0.95 -> 0.237      valkey     0.97 -> 0.969
-    alisql       0.97 -> 0.242      mongodb    0.99 -> 0.984
-
-Exactly the three engines that share MariaDB Connector/Python are pinned near
-one query in service however many clients ask; the three that do not are at
-the client count. That is the per-library split the paragraph predicted,
-measured on live engines, and it is not a property of this pool: the same
-pool put pgvector at 2,466.9 -> 8,754.7 q/s over the same four-fold rise. The
-same run's churn writer managed **11.991 rows/s** against four readers --
-`extra.reinsert_rows_per_s`, 2,000 rows in 166.794 s -- where the SAME run's
-single-threaded load of the SAME corpus recorded `ingest_rows_per_s` 769.9 at
-`ingest_threads` 1. A factor of 64, inside one run, with nothing changed but
-whether four readers were querying. That comparison is stronger than §7's
-against a modelled ~150 rows/s, which is a 1.18M-row glove figure from
-`orchestrator/estimate.py` and not this corpus.
-
-So the clients are now OS PROCESSES and there is no shared interpreter lock in
-the measurement path. What that costs, and what it did not cost, each measured
-rather than accepted (the §7 list this answers is in `docs/05-methodology.md`):
-
-* **fork, not spawn, and it is not a preference.** `driver_factory` is a
-  callable the caller supplies, and every real one is unpicklable:
-  `harness/main.py:270` is a `def` nested inside `main()`, whose
-  `__qualname__` is `main.<locals>.driver_factory`, and pickle resolves a
-  function by qualified name -- measured, `AttributeError: Can't pickle local
-  object`. The test suite's factories are a `lambda` and a bound
-  `FakeDriver.clone`, which fail the same way. Under spawn the pool would
-  therefore have to be handed something picklable, which is a change to every
-  caller's contract; under fork nothing is pickled at all, because the child
-  IS the parent's address space. `CLIENT_START_METHOD` pins it rather than
-  inheriting the interpreter default, which is `fork` on Linux today and
-  becomes `forkserver` in 3.14.
-* **Memory: the cost §7 states is NOT REAL, and that is a measurement.** §7
-  says "each client becomes an OS process with its own copy of the query set,
-  so the harness container's memory grows with the client count". Under fork
-  it does not: the query set is read-only in a client, `shard_queries` hands
-  it out as a strided VIEW rather than a copy, and copy-on-write never
-  copies a page nobody writes. Measured, eight children over a 104.9 MB
-  float32 array: summed `Private_Dirty` 13.8 MB, 0.13x the array, against
-  838.9 MB if each had copied it. The control arm is what makes that a
-  measurement and not a blind probe -- eight children that WRITE the array
-  measure 851.7 MB, 8.12x, so the probe can see a copy when there is one.
-  What a client does cost is its own interpreter's private pages, ~1.7 MB.
-* **The clock the processes agree on is still `time.perf_counter()`, and this
-  was verified rather than assumed.** It is `clock_gettime(CLOCK_MONOTONIC)`
-  on this platform, which is system-wide rather than per-process, so the
-  reference point is shared across a fork -- unlike `time.process_time`.
-  Measured over 200 forks: the child's `perf_counter - CLOCK_MONOTONIC`
-  offset matches the parent's to within **4.2 us**, which is the cost of
-  reading two clocks back to back rather than an offset, and the child's
-  reading fell inside the parent's bracketing pair **200 times out of 200**.
-  `tests/test_g3_process_clients.py` asserts both, so a platform where
-  `perf_counter` is process-local fails loudly instead of producing spans
-  that cannot be compared with the window they are inside.
-* **Client CPU accounting keeps working, for a structural reason.** `fork`
-  never changes cgroup membership -- only an explicit write to
-  `cgroup.procs` does -- so every client process is in the harness
-  container's cgroup and `read_own_cpu_usec` still counts all of them.
-  Verified by reading `/proc/self/cgroup` in parent and children and
-  comparing the strings, which is exact; the MAGNITUDE cannot be checked on
-  a developer box for the reason §2.3 gives, that outside a container the
-  same file is the root cgroup and reads the whole machine.
-* **`/dev/shm` needs no raising, measured.** `multiprocessing` semaphores
-  are POSIX semaphores, one page each, and are unlinked immediately after
-  `sem_open`, so they never appear in a directory listing -- measure the
-  tmpfs, not the listing. One pool's whole footprint is **40,960 bytes** and
-  is independent of the client count, because the go and halt flags are two
-  Events for the pool rather than two per client (that design measured
-  1,310,720 bytes at 32 clients). Pipes cost zero. The harness container is
-  started with `shm_size` from the resource pass -- 2g normalized, 8g tuned,
-  `orchestrator/ops_pass.py:138` -- so 40 KiB is five orders of magnitude
-  inside it and nothing outside this module has to change.
-
-**What did NOT survive, and a reader has to be told.** The clients no longer
-share an interpreter, so a SYNTHETIC driver that models the defect by holding
-the GIL -- `tests/test_g1_client_concurrency.py`'s `holding` family, a
-pure-Python spin -- no longer serializes this pool and no longer produces
-`concurrency_not_achieved`. The instrument is unchanged and still fires on a
-pool that really serves one query at a time; what changed is that Python's own
-lock can no longer put it there. The quantity is kept and the guard is kept,
-because the SERVER serializing is the other cause `scaling_status` names and
-this change does nothing about that one.
-
-This also changes what every published multi-client number means, so it
-invalidates comparison with every run measured before it, including the
-2026-10-14 smoke run above -- `OPS_MEASUREMENT_VERSION` 6, bumped in the same
-commit by the rule version 3's query-pool change earned one.
+The split is this repository's 800-line ceiling, which this file stood at 791
+lines against before G3. **A re-export does not SHARE a name**, so the split
+had to be checked against every test that patches one of these: see
+`client_process.py`'s docstring, which lists them and says which single
+target moved.
 
 `_one_window` deliberately stays in `concurrency.py`: it owns the fixed
 duration, the recall scoring and the repeats, none of which churn wants.
@@ -206,14 +128,28 @@ duration, the recall scoring and the repeats, none of which churn wants.
 
 from __future__ import annotations
 
-import multiprocessing
 import threading
 import time
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple)
 
 import numpy
 
-from ..drivers.base import EngineDriver, IndexSpec
+from ..drivers.base import IndexSpec
+# The client itself is an OS process and lives next door; see that module for
+# why the split is where it is and for what a re-export does not share.
+# Re-exported here under the names `concurrency.py`, `churn.py`,
+# `churn_readers.py` and four test files already import.
+from .client_process import (CLIENT_START_METHOD,  # noqa: F401
+                             Answer, Client, ClientDied, ClientFailed,
+                             DriverFactory, PoolError, Timeouts, _MP,
+                             _exit_description)
+# The window's value types and the refusal that guards a ratio across two
+# of them. Re-exported because `report/`, `churn.py` and four test files
+# import them from here; `CLIENT_BOUND_UTIL` comes with them because
+# `PoolWindow.client_bound` is its only reader, and that module's
+# docstring records that rebinding it HERE therefore reaches nothing.
+from .pool_window import (CLIENT_BOUND_UTIL,  # noqa: F401
+                          PoolSpec, PoolWindow, window_ratio)
 # The scaling-status policy lives in `metrics/latency.py`, beside the
 # quantity it judges and because this module was 846 lines against the repo's
 # 800-line ceiling with it inlined -- the reason `churn_readers.py` exists.
@@ -232,34 +168,6 @@ from ..metrics.latency import (INFLIGHT_DISCARDED,  # noqa: F401
                                span_disposition, window_concurrency)
 from ..metrics.resources import own_cpu_count, read_own_cpu_usec
 from ..progress import Heartbeat
-
-DriverFactory = Callable[[], EngineDriver]
-
-#: Share of the client container's CPUs above which a point is reported as
-#: client-bound. Not a measured constant and not claimed to be one: it is the
-#: level at which this harness stops being able to say whose ceiling a figure
-#: shows. Python threads serializing vectors do not scale smoothly to the last
-#: percent of a cpuset, so a point at 0.8 is already one where the clients may
-#: be contributing, and the honest report is "this number is not evidence about
-#: the engine" rather than a correction factor nobody can justify.
-#:
-#: SUFFICIENT, NOT NECESSARY. See this module's docstring for the measurement:
-#: raising or lowering 0.80 does not help, because the quantity itself is blind
-#: to a GIL ceiling -- and for the regime that measurement was taken in, which
-#: is the numpy-bound one and not the socket-bound one a real driver runs in.
-#:
-#: THAT BLINDNESS IS NOW A MEASUREMENT AND NOT AN ARGUMENT. Four GIL-holding
-#: clients at 0.325 ms per query delivered a quarter of this pool's throughput
-#: -- `scaling_efficiency` 0.26 against 1.02 for the same cost released --
-#: while `client_cpu_util` read **0.177** against this 0.80 and the flag
-#: stayed `False`. The 0.177 is SUPPLIED: that counter is a cgroup's and reads
-#: the whole machine outside a container.
-#: `metrics/latency.SERVED_CONCURRENCY_FLOOR` is the quantity that sees it.
-#:
-#: Kept unchanged by the move to client PROCESSES. A client container that
-#: genuinely runs out of CPU is still a real case and is the case this flag
-#: catches; what the move removed is the OTHER case, the one it never saw.
-CLIENT_BOUND_UTIL = 0.80
 
 #: Seconds the PARENT waits at the barrier, and it does **not** bind. Kept at
 #: the value it had before the lift so nothing about the window moved, and
@@ -307,184 +215,6 @@ JOIN_TIMEOUT_S = 120.0
 #: The `multiprocessing` start method the pool forks its clients with, pinned
 #: rather than inherited. See this module's docstring: spawn and forkserver
 #: both pickle the target and its arguments, and every `driver_factory` a real
-#: caller passes is a closure or a bound method that cannot be pickled, so
-#: choosing them would be choosing to change every caller's contract. Pinned
-#: and not left as the default because the Linux default is `fork` today and
-#: becomes `forkserver` in CPython 3.14 -- a release upgrade would otherwise
-#: turn a working pool into `AttributeError: Can't pickle local object` at the
-#: start of a measured window.
-CLIENT_START_METHOD = "fork"
-
-#: The context the clients, the pipes and the two window flags come from.
-#: One context object for the module, so nothing can half-fork: mixing
-#: primitives from two contexts raises at use rather than at construction.
-_MP = multiprocessing.get_context(CLIENT_START_METHOD)
-
-
-class Answer(NamedTuple):
-    """One query's returned ids, with the span that produced them.
-
-    The ids and the span travel together because the window is trimmed to the
-    queries that finished inside it and recall must be scored over exactly the
-    queries that were counted. Keeping the span beside the ids means the same
-    `span_disposition` call decides both, rather than the latency being
-    trimmed by one rule and the result set by another.
-    """
-
-    ids: List[int]
-    started: float
-    finished: float
-
-
-class PoolSpec(NamedTuple):
-    """What identifies one client pool, for comparing two of its windows.
-
-    This exists because of the shape of PR 4 §4.3 item 5's headline number:
-    `p99 under writes / baseline p99`, a ratio of two separately measured
-    percentiles. This repository has published two wrong ratios of exactly
-    that shape -- the filter-strategy ratio divided a narrow point from one
-    ops unit by a wide point from another, and `charts.churn_retention` pairs
-    records from two different maintenance states -- and both read as findings
-    rather than as bugs. So a ratio across two windows is computed only when
-    the two windows agree on every axis that could make them measurements of
-    different things, and this tuple is that list.
-
-    `unit` carries the ops unit: (M, build mode, storage engine, resource
-    pass). It is `()` for the concurrency workload, which takes no such ratio.
-    It is deliberately a tuple the CALLER builds rather than a field list this
-    module knows, because `harness/` must not import `report/` -- see
-    `churn.OPS_UNIT_KEYS`, which names the axes and is pinned against
-    `report.generate.OPS_UNIT_FIELDS` by a test.
-    """
-
-    clients: int
-    #: How many distinct queries the clients drew from. Two windows over pools
-    #: of 10,000 and of 15 queries are measurements of two different things:
-    #: every graph cache in this comparison is sensitive to the size of the
-    #: hot set, which is the whole reason `ops.concurrency_queries` exists.
-    queries: int
-    k: int
-    ef_search: int
-    unit: Tuple[Any, ...] = ()
-
-
-class PoolWindow(NamedTuple):
-    """One measured window of one pool.
-
-    `merged` holds nothing but `Record` columns, so `Record(**merged)` stays
-    valid; the discard counts and the throughput are carried separately for
-    that reason rather than left inside it.
-    """
-
-    qps: float
-    merged: Dict[str, float]
-    inflight_discarded: int
-    prewindow_discarded: int
-    #: The client container's own CPU over this window, the size of the cpuset
-    #: it was measured against, and their ratio. All three, never the ratio
-    #: alone: the ratio is a cgroup counter divided by a wall clock and a CPU
-    #: count, each of which can be wrong while the quotient stays plausibly
-    #: between 0 and 1.
-    client_cpu_seconds: Optional[float]
-    client_cpus: int
-    client_cpu_util: Optional[float]
-    #: The wall the throughput above is over, kept because a reader cannot
-    #: otherwise tell a busy window from a short one.
-    wall_s: float
-    #: Which pool measured this. Two windows with different specs are not two
-    #: samples of one quantity -- see `PoolSpec`.
-    spec: PoolSpec
-    #: Query position -> that query's answer, trimmed to this window. Empty
-    #: when the pool was built with `collect_results=False`, which is what the
-    #: churn readers do: §4.3 item 6 says they compute no recall, because the
-    #: corpus is mid-change and no ground truth describes it.
-    results: Dict[int, Answer]
-    #: The two concurrency figures, over exactly the spans the QPS above
-    #: counts: the exact time-average number of queries the clients had
-    #: OUTSTANDING, and the median-span estimate of how many were in SERVICE.
-    #: `metrics/latency.WindowConcurrency` has the measurement that says why
-    #: both are kept and why only the second can carry a guard.
-    #:
-    #: Defaulted rather than required, and the default is the honest absence:
-    #: `tests/test_t4b_readers.py` hand-builds a `PoolWindow` to exercise
-    #: `window_ratio`'s refusals, which are a property of `PoolSpec` alone.
-    #: A None there says nobody measured it. `stop` passes both explicitly.
-    outstanding_concurrency: Optional[float] = None
-    served_concurrency: Optional[float] = None
-
-    @property
-    def p99_ms(self) -> Optional[float]:
-        return self.merged.get("latency_p99_ms")
-
-    @property
-    def queries_executed(self) -> int:
-        return int(self.merged.get("queries_executed") or 0)
-
-    @property
-    def client_bound(self) -> Optional[bool]:
-        """Whether the clients may have been part of the ceiling.
-
-        `None` -- not False -- when there was no counter to read, because "the
-        clients were not the limit" and "nobody looked" are different
-        statements and only one of them is a measurement.
-
-        **WHAT THIS CANNOT SEE, as a measurement rather than an argument.**
-        Four clients were run through this pool on a driver costing 0.325 ms
-        per query and holding the interpreter lock for it, against the same
-        driver releasing the lock -- the pair that
-        `tests/test_g1_client_concurrency.py` rebuilds. The releasing one
-        scaled -- `scaling_efficiency` 1.02 at four clients -- and the
-        holding one delivered 0.26. On that 0.26 point `client_cpu_util` read
-        **0.177** (SUPPLIED: that counter is a cgroup's and reads the whole
-        machine outside a container, so only a containerised run makes it)
-        against `CLIENT_BOUND_UTIL` of **0.80**, and this property returned
-        `False` -- three of four clients' throughput went missing and the flag
-        said the clients were fine. Not a threshold merely set too high: a
-        lock ceiling PREVENTS the CPU consumption the quotient looks for,
-        since a thread waiting its turn is not running and costs the counter
-        nothing, and moving 0.80 into (0, 0.177] would fire on every point of
-        every run. Read `scaling_status` instead, computed from the spans.
-        This flag is kept because it catches a different and real case -- a
-        client container that genuinely runs out of CPU at 16-32 clients with
-        a driver that does release the lock, which `scaling_status` cannot.
-
-        The clients are processes now, so the case above can no longer be
-        reached through Python's own lock -- but the paragraph stays, because
-        the figures in it are what a reader needs to understand why this flag
-        is not the instrument, and because a client LIBRARY that serializes
-        inside one process is not the only way a pool fails to achieve its
-        concurrency. This flag's own case is unaffected by the move: the
-        cgroup counter it divides still covers every client, since fork does
-        not change cgroup membership.
-        """
-        if self.client_cpu_util is None:
-            return None
-        return self.client_cpu_util > CLIENT_BOUND_UTIL
-
-    @property
-    def served_fraction(self) -> Optional[float]:
-        """`served_concurrency` as a share of this pool's client count.
-
-        NOT recursive, though it reads like it: a class body is not an
-        enclosing scope for the functions defined in it, so the call below
-        resolves to `metrics/latency.served_fraction` through this module's
-        globals and never to this property. Said out loud because the obvious
-        "fix" -- renaming one of them -- would be undoing a deliberate choice
-        to keep the window's view of the quantity under the quantity's own
-        name. `scaling_status` below is the same shape.
-        """
-        return served_fraction(self.served_concurrency, self.spec.clients)
-
-    @property
-    def scaling_status(self) -> Optional[str]:
-        """Whether a scaling efficiency over this window is reportable.
-
-        `metrics/latency.scaling_status` holds the rule, the floor and the
-        two statuses, and carries the measurement that chose the floor. This
-        property is the window's view of it and nothing else, so there is one
-        definition a test can move.
-        """
-        return scaling_status(self.served_concurrency, self.spec.clients)
 
 
 class Instruments(NamedTuple):
@@ -558,474 +288,6 @@ class Instruments(NamedTuple):
 DEFAULT_INSTRUMENTS = Instruments()
 
 
-class PoolError(RuntimeError):
-    """A client failed. Raised rather than returned, and never swallowed.
-
-    PR 4 §4.4 asks that a reader exception fail the record instead of hanging,
-    and the hang is the specific hazard: a client that dies before the barrier
-    leaves every other party waiting on it. `Client.attend` releases the
-    barrier in a `finally` for that reason, `ClientPool.start` aborts the
-    barrier on `BrokenBarrierError`, and `ClientPool.stop` joins with a
-    timeout and then raises this. A pool that measured nothing raises too: a
-    QPS of 0 from a pool whose clients all died reads as "the engine was
-    slow", which is the one thing it is not evidence of.
-
-    **AGAINST PROCESS DEATH RATHER THAN THREAD EXCEPTIONS, which is a wider
-    set of failures and needed re-establishing.** A thread could only stop by
-    raising, and the raise was an object in the same memory as the pool. A
-    client process can also be killed outright -- `SIGKILL` from the OOM
-    killer is the realistic one in a container with a memory limit, and it
-    runs no handler, unwinds nothing and writes no error anywhere. The three
-    ways that is caught, each with its own test in
-    `tests/test_g3_process_clients.py`:
-
-    * **Before the barrier.** The client's end of its pipe closes when it
-      dies, so the parent's `recv` raises `EOFError` instead of blocking
-      forever. `Client.attend` turns that into a `ClientDied` and ABORTS the
-      barrier rather than joining it, so `start` raises at once instead of
-      after the caller's whole window length. A thread could not reach this
-      state at all.
-    * **Mid-window.** The same `EOFError`, on the payload `stop` waits for,
-      becomes the client's `error` and the existing failure path raises.
-    * **After reporting.** A client that sent its spans and was then killed
-      leaves `error` None and a window that looks complete, so `stop` checks
-      `exitcode` as well: anything that is neither 0 nor None is a failure,
-      and a negative one is the signal that killed it. Without this check a
-      pool whose clients were OOM-killed at the end of a window would publish
-      the partial window as a measurement.
-
-    None of these is `qps == 0`. A window in which nothing finished is a
-    legitimate measurement of a configuration whose queries outlast
-    `ops.concurrency_duration_s`, and `concurrency._warn_nothing_finished`
-    reports it on stderr; it must not be confused with a pool that died, and
-    the two are distinguished by whether any client failed rather than by the
-    throughput.
-    """
-
-
-class ClientFailed(PoolError):
-    """One client's exception, carried back across the process boundary.
-
-    TEXT and not the exception object, and the reason is not convenience: a
-    driver's exception can hold a socket, a connection or a C extension's
-    state, and pickling it either fails or reconstructs something that is not
-    the same object. `str(ClientFailed(text)) == text`, so the message
-    `ClientPool.stop` builds reads exactly as it did when the client was a
-    thread and `extra.readers_failed` still carries the driver's own wording.
-
-    A subclass of `PoolError` so a caller that already catches `PoolError` --
-    `churn_readers` does, around both halves of its ratio -- catches this
-    without being changed.
-    """
-
-
-class ClientDied(PoolError):
-    """A client process ended without reporting anything.
-
-    The state a thread could not reach. Named separately from `ClientFailed`
-    because the two say different things to whoever reads the run's stderr: a
-    `ClientFailed` is the driver's own error and the message is actionable,
-    while a `ClientDied` means something outside the harness ended the
-    process and the exit status is the only evidence there is.
-    """
-
-
-def _exit_description(exitcode: Optional[int]) -> str:
-    """How a client process ended, in the words a reader needs.
-
-    A negative `exitcode` is `-signum`, and the signal is the whole finding:
-    `-9` is the OOM killer in a container with a memory limit and `-11` is a
-    segfault in a driver's C extension. Spelling it out rather than printing
-    the raw negative number, because "-9" in a run log is the kind of thing
-    that gets read as an error code.
-    """
-    if exitcode is None:
-        return "it is still running"
-    if exitcode < 0:
-        import signal
-        try:
-            name = signal.Signals(-exitcode).name
-        except ValueError:  # pragma: no cover - unknown signal number
-            name = f"signal {-exitcode}"
-        return f"it was killed by {name}"
-    return f"it exited with status {exitcode}"
-
-
-class Client(_MP.Process):
-    """One benchmark client: own connection, own query slice, own latencies.
-
-    A process and no longer a thread, which is the whole of G3: MariaDB
-    Connector/Python holds the interpreter lock across its socket wait, so
-    three of this study's seven engines measured one query in service however
-    many clients asked (the module docstring has the run). An OS process has
-    its own interpreter and there is no shared lock left in the measurement
-    path.
-
-    **THE HAZARD FORK CREATES, AND IT IS THE ONLY ONE THAT MATTERS HERE.**
-    `_MP.Process` with the fork start method copies the parent's address
-    space, so `self` exists on both sides and `self.error`, `self.collector`
-    and `self.results` are TWO objects after `start()`. Everything `run`
-    assigns is in the child and the parent will never see it; everything the
-    parent reads has to have crossed the pipe. That is a silent fault rather
-    than a crash -- a pool whose clients all failed would report a clean
-    window of zero queries -- so the two sides are separated by name here:
-    `run` and the `_child_*` helpers execute in the CHILD and may only write
-    down the pipe, while `attend`, `absorb` and the attributes the pool reads
-    belong to the PARENT and are filled from what arrives on it.
-
-    Deliberately NOT subclassing `multiprocessing.Process`: that is the
-    default context's class, and the default start method on Linux becomes
-    `forkserver` in CPython 3.14, which pickles. `_MP` pins fork. See
-    `CLIENT_START_METHOD`.
-    """
-
-    def __init__(self, driver_factory: DriverFactory, queries: numpy.ndarray,
-                 query_offsets: numpy.ndarray,
-                 k: int, ef_search: int, index: IndexSpec, warmup: int,
-                 ready: threading.Barrier, stop: threading.Event,
-                 collect_results: bool = True,
-                 go: Optional[Any] = None, halt: Optional[Any] = None,
-                 instruments: Instruments = DEFAULT_INSTRUMENTS):
-        super().__init__(daemon=True)
-        self._factory = driver_factory
-        self._queries = queries
-        # Where this client's queries sit in the full query array. Needed
-        # because recall scores a result against the ground truth of the query
-        # that produced it, and a shard is a strided view: `shards[1]` under
-        # four clients is queries 1, 5, 9, ... and its results belong against
-        # those rows of the truth, not against rows 0, 1, 2, ...
-        self._offsets = query_offsets
-        self._k = k
-        self._ef_search = ef_search
-        self._index = index
-        self._warmup = warmup
-        self._ready = ready
-        # Kept under its old name although the CHILD no longer watches it: it
-        # is the parent-side flag `ClientPool.stop` sets first, and one
-        # concurrency test replaces it with an `Event` whose `set()` is slow
-        # in order to prove the window's end is read before the flag goes up.
-        # The child watches `_halt`, which is set immediately after it.
-        self._stop_event = stop
-        self._go = go if go is not None else _MP.Event()
-        self._halt = halt if halt is not None else _MP.Event()
-        self._broken_barrier = instruments.threading.BrokenBarrierError
-        # One pipe per client, child -> parent, and one message per phase. A
-        # Queue would do the same job with a feeder THREAD inside the child,
-        # which is a thread in the measurement path for no gain.
-        #
-        # Opened by `launch` rather than here, and the ordering is what makes
-        # a dead client detectable at all. See `launch`.
-        self._from_client: Any = None
-        self._to_parent: Any = None
-        # False for the churn readers. §4.3 item 6: they compute no recall,
-        # because the corpus is mid-change and no ground truth describes it,
-        # so retaining a result list per query would allocate inside the
-        # window for nothing a reader can use.
-        self._collect_results = collect_results
-        self.collector = LatencyCollector(warmup=0)
-        #: Query position -> that query's answer and span, first pass only.
-        self.results: Dict[int, Answer] = {}
-        self.error: Optional[BaseException] = None
-        #: Whether this client's window payload has been read off the pipe.
-        #: Parent-side; `absorb` is idempotent so a second `stop` cannot hang.
-        self._absorbed = False
-
-    # -- starting it -------------------------------------------------------
-
-    def launch(self) -> None:
-        """Open this client's pipe, fork it, and close the parent's write end.
-
-        **ALL THREE, IN THIS ORDER, AND THE ORDER IS A CORRECTNESS
-        PROPERTY.** `Connection.recv` raises `EOFError` only when EVERY copy
-        of the pipe's write end is closed, and that is the whole mechanism by
-        which the parent discovers a client that died without reporting --
-        `PoolError`'s discipline rests on it. Two ways to keep a stray copy
-        open, both of which turn a dead client into a pool that hangs until a
-        timeout instead of failing at once:
-
-        * the PARENT's own copy of the write end. Closed on the line below,
-          immediately after the fork.
-        * a SIBLING CHILD's copy. A fork duplicates every open descriptor, so
-          a client forked while another client's pipe already existed would
-          hold that pipe's write end for its whole life. This is why the pipe
-          is opened here, one client at a time, instead of for all of them in
-          `__init__`: by the time client *i* is forked, every earlier
-          client's write end has already been closed in the parent, so there
-          is nothing left for *i* to inherit.
-
-        `tests/test_g3_process_clients.py` kills one client of several and
-        reads back how long the pool took to fail, which is the measurement
-        that distinguishes this from the version that hangs.
-        """
-        self._from_client, self._to_parent = _MP.Pipe(duplex=False)
-        self.start()
-        try:
-            self._to_parent.close()
-        except OSError:  # pragma: no cover
-            pass
-
-    # -- the child ---------------------------------------------------------
-
-    def run(self) -> None:
-        """The client, IN THE CHILD PROCESS. Writes only down the pipe.
-
-        Nothing this method assigns to `self` reaches the pool. The structure
-        is the thread version's, in two phases with a report after each, so
-        the parent can tell "failed to warm up" from "failed in the window"
-        from "never spoke again".
-        """
-        self._from_client.close()  # the child never reads its own pipe
-        driver = None
-        error: Optional[BaseException] = None
-        try:
-            driver = self._factory()
-            driver.connect()
-            # The driver needs the metric to build its SELECT; supplying the
-            # spec directly avoids a catalog round-trip per client.
-            driver._index = self._index
-            driver.set_ef_search(self._ef_search)
-
-            # Warm up before the barrier: cold-cache cost belongs to neither the
-            # measured window nor to one unlucky client, and every client must
-            # enter the measured window equally warm.
-            for i in range(min(self._warmup, len(self._queries))):
-                driver.query(self._queries[i], self._k)
-        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
-            error = exc
-
-        # Report before the barrier, always -- the parent's `attend` is
-        # blocked on this and a client that dies instead of sending it is why
-        # `attend` has to treat `EOFError` as a death rather than waiting.
-        self._tell("warmup", error, None, None)
-        if error is not None or driver is None:
-            return
-
-        try:
-            # The window opens in the parent, in the barrier's action, before
-            # any client is released. This wait is what "released" means now,
-            # and it is why `extra.prewindow_discarded` is still zero by
-            # construction: the flag cannot be set until the opening instant
-            # has been read.
-            if not self._go.wait(timeout=BARRIER_TIMEOUT_S):
-                self._tell("window", ClientDied(
-                    "the window never opened for this client"), None, None)
-                return
-            self.collector.start()
-            i = 0
-            n = len(self._queries)
-            while not self._halt.is_set():
-                q = self._queries[i % n]
-                started = time.perf_counter()
-                ids = driver.query(q, self._k)
-                # Both instants, not the duration: whether this query counts
-                # depends on when it ran. The window ends by setting a flag,
-                # and this client is holding a query when that happens -- a
-                # query that finishes after the wall clock in the denominator
-                # stopped. `merge_collectors` drops it on the strength of
-                # `finished`, so the instant has to survive to the merge --
-                # and now also across the pipe, which is why the spans are
-                # shipped as instants rather than as durations.
-                finished = time.perf_counter()
-                self.collector.add_span(started, finished)
-                # Only the first pass over the shard. The window is a fixed
-                # duration, so a fast engine makes thousands of passes and
-                # keeping every result would grow without bound and charge the
-                # measurement for the allocation; every pass answers the same
-                # query, so later ones add no recall information. This bounds
-                # the memory to one result list per query however long the
-                # window runs.
-                #
-                # After `collector.add_span`, deliberately: the timer brackets
-                # the query alone, so recording the result cannot be charged
-                # to the latency the record reports.
-                #
-                # The span is stored with the ids, not just in the collector.
-                # Whether this query's latency counts is decided after the
-                # window closes, and its result has to be decided the same way
-                # -- recall over a query whose timing was discarded would
-                # describe a different set of queries from the QPS beside it.
-                if self._collect_results and i < n:
-                    self.results[int(self._offsets[i])] = Answer(
-                        list(ids), started, finished)
-                i += 1
-            self.collector.stop()
-        except BaseException as exc:  # noqa: BLE001
-            error = exc
-        finally:
-            try:
-                driver.close()
-            except Exception:
-                pass
-
-        self._tell("window", error, self.collector, self.results)
-
-    def _tell(self, phase: str, error: Optional[BaseException],
-              collector: Optional[LatencyCollector],
-              results: Optional[Dict[int, Answer]]) -> None:
-        """Send one phase's outcome to the parent. CHILD side.
-
-        The spans go as a flat list of `(started, finished)` floats rather
-        than as `Sample` objects or as a `LatencyCollector`: the parent
-        rebuilds them through `add_span`, which is the same call the child
-        made, so `Sample.seconds` is derived once on each side by the same
-        expression and the two cannot disagree. Shipping the collector itself
-        would pickle its private state and make the transport sensitive to a
-        field being added to it.
-
-        The error is `repr`-free text. See `ClientFailed`.
-        """
-        spans = ([(s.started, s.finished) for s in collector._samples]
-                 if collector is not None else [])
-        try:
-            self._to_parent.send(
-                (phase, None if error is None else f"{error}", spans,
-                 results or {}))
-        except (BrokenPipeError, OSError):  # pragma: no cover - parent gone
-            pass
-
-    # -- the parent --------------------------------------------------------
-
-    def attend(self) -> None:
-        """Stand in for this client at the barrier. PARENT side, own thread.
-
-        The barrier is a THREAD barrier in the parent, because its action is
-        what reads the window's opening instant and that reading has to land
-        in the parent's memory -- a `multiprocessing.Barrier`'s action runs in
-        whichever process arrives last, so the instant would be written into
-        a forked copy of `ClientPool._opened` and lost. See `Instruments` for
-        the second reason, which is that the barrier class is an injected
-        instrument and the injected value is the `threading` module.
-
-        So one parent thread per client waits for that client to say it is
-        warm and then takes its place at the barrier. This thread does nothing
-        during the measured window: it is gone before the window opens, and
-        the GIL it holds while it waits is not in any client's query path.
-
-        The `finally` is the thread version's, for the same reason: a client
-        that failed still has to release the barrier, or every sibling waits
-        out `CLIENT_BARRIER_TIMEOUT_S` on a client that is never coming.
-        """
-        try:
-            self.error = self._await_warmup()
-        finally:
-            if isinstance(self.error, ClientDied):
-                # A client that DIED cannot be waited for and must not be
-                # waited for. Aborting breaks the barrier from this client's
-                # side, which makes the parent's `wait` raise at once --
-                # `start` then fails the record instead of the caller sleeping
-                # out a whole window over a pool that is one client short.
-                # A client that merely RAISED still joins the barrier, which
-                # is what the thread version did: `start` returns, `stop`
-                # collects the error and raises there.
-                self._ready.abort()
-            else:
-                try:
-                    self._ready.wait(timeout=CLIENT_BARRIER_TIMEOUT_S)
-                except self._broken_barrier:
-                    pass
-
-    def _await_warmup(self) -> Optional[BaseException]:
-        """Wait for this client to report that it is warm. PARENT side.
-
-        Three outcomes, and the pool behaves differently for each:
-        the client reported (its error or None), the client died without
-        reporting (`EOFError` on a closed pipe -- `ClientDied`), or the client
-        is alive and still has not reported inside
-        `CLIENT_BARRIER_TIMEOUT_S`, which is the stuck-driver case the
-        constant is named for.
-        """
-        try:
-            if not self._from_client.poll(CLIENT_BARRIER_TIMEOUT_S):
-                return ClientDied(
-                    f"client {self.name} did not finish its warm-up within "
-                    f"{CLIENT_BARRIER_TIMEOUT_S:.0f}s")
-            phase, text, _spans, _results = self._from_client.recv()
-        except (EOFError, OSError):
-            return ClientDied(
-                f"client {self.name} died during warm-up: "
-                f"{_exit_description(self.exitcode)}")
-        if phase != "warmup":  # pragma: no cover - protocol desync
-            return ClientDied(
-                f"client {self.name} sent a {phase!r} payload before the "
-                f"window opened")
-        return None if text is None else ClientFailed(text)
-
-    def absorb(self, deadline: float) -> None:
-        """Take this client's window payload off the pipe. PARENT side.
-
-        Called before any client is joined, because a client blocks writing a
-        payload larger than the pipe's 64 KiB buffer until somebody reads it
-        -- a 30 s window of a fast engine is tens of megabytes of spans -- so
-        joining first would deadlock the pool at exactly the configurations
-        that matter most.
-
-        `deadline` is a `time.monotonic` instant and is shared across the
-        whole pool, so a slow first client cannot buy the last one a fresh
-        `JOIN_TIMEOUT_S`.
-        """
-        if self._absorbed:
-            return
-        self._absorbed = True
-        if self.error is not None:
-            # It never ran a window, so there is no payload coming and
-            # waiting for one would spend the whole deadline. The error is
-            # already the finding.
-            return
-        try:
-            left = max(0.0, deadline - time.monotonic())
-            if not self._from_client.poll(left):
-                self.error = ClientDied(
-                    f"client {self.name} did not return its spans within "
-                    f"{JOIN_TIMEOUT_S:.0f}s of the window closing")
-                return
-            phase, text, spans, results = self._from_client.recv()
-        except (EOFError, OSError):
-            self.error = ClientDied(
-                f"client {self.name} died during the measured window: "
-                f"{_exit_description(self.exitcode)}")
-            return
-        if phase != "window":  # pragma: no cover - protocol desync
-            self.error = ClientDied(
-                f"client {self.name} sent a {phase!r} payload after the "
-                f"window closed")
-            return
-        if text is not None:
-            self.error = ClientFailed(text)
-        # Rebuilt through `add_span` -- the call the child made -- so the
-        # duration is derived by one expression on both sides. A collector
-        # assembled by assigning to `_samples` would be a second definition
-        # of `Sample.seconds`.
-        for started, finished in spans:
-            self.collector.add_span(started, finished)
-        self.results = {int(offset): Answer(list(ids), began, ended)
-                        for offset, (ids, began, ended) in results.items()}
-
-    def reap(self) -> None:
-        """End this client and close the parent's end of its pipe.
-
-        `terminate` then `kill`, because a client blocked in a driver's C
-        extension can ignore `SIGTERM` and a leaked client process would go on
-        querying the server that the next configuration is about to measure.
-        That is worse than a leaked thread: a thread dies with the
-        interpreter, a process does not.
-        """
-        try:
-            if self.is_alive():
-                self.terminate()
-                self.join(timeout=5.0)
-            if self.is_alive():  # pragma: no cover - ignores SIGTERM
-                self.kill()
-                self.join(timeout=5.0)
-        except (OSError, ValueError, AssertionError):  # pragma: no cover
-            pass
-        for end in (self._from_client, self._to_parent):
-            if end is None:
-                continue
-            try:
-                end.close()
-            except OSError:  # pragma: no cover
-                pass
-
 
 def shard_queries(queries: numpy.ndarray,
                   clients: int) -> List[Tuple[numpy.ndarray, numpy.ndarray]]:
@@ -1096,6 +358,7 @@ def client_cpu(cpu_start: Optional[int], cpu_end: Optional[int],
     # meaningless either way.
     seconds = max(0.0, (cpu_end - cpu_start) / 1e6)
     return seconds, seconds / (wall_s * cpus)
+
 
 
 class ClientPool:
@@ -1176,13 +439,40 @@ class ClientPool:
             Client(driver_factory, shard, offsets, k, ef_search, index,
                    warmup, self._ready, self._stop,
                    collect_results=collect_results,
-                   go=self._go, halt=self._halt, instruments=instruments)
+                   go=self._go, halt=self._halt,
+                   broken_barrier=instruments.threading.BrokenBarrierError,
+                   timeouts=self._timeouts())
             for shard, offsets in shard_queries(queries, clients)
         ]
         #: The parent threads that stand in for the clients at the barrier.
         #: Empty until `start`; they are finished before the window opens.
         self._attendants: List[threading.Thread] = []
         self._started = False
+
+    @staticmethod
+    def _timeouts() -> Timeouts:
+        """The three waits, read out of THIS module's globals at construction.
+
+        **Read here and not imported by `client_process.py`, and that is the
+        one thing the split had to get right.** A module that re-exports a
+        name does not share it, so a `Client` that did `from .clients import
+        CLIENT_BARRIER_TIMEOUT_S` would freeze the value at import and a
+        `monkeypatch.setattr(cl, "CLIENT_BARRIER_TIMEOUT_S", 0.3)` would reach
+        nothing -- which is exactly how three mutants got a fully green suite
+        in an earlier task here. `tests/test_t4b_readers.py` sets both barrier
+        numbers on this module and then measures when the barrier broke, so a
+        frozen copy would have turned that measurement into a reading of the
+        shipped 120 s against itself.
+
+        A STATICMETHOD reading globals rather than a module-level constant
+        bundle, for the reason `concurrency._instruments()` is a function: a
+        bundle built at import would hold the originals. The values are
+        captured once per pool, at construction, which every patch site in the
+        tree already precedes.
+        """
+        return Timeouts(barrier_s=BARRIER_TIMEOUT_S,
+                        client_barrier_s=CLIENT_BARRIER_TIMEOUT_S,
+                        join_s=JOIN_TIMEOUT_S)
 
     def _open_window(self) -> None:
         self._opened.append(
@@ -1203,20 +493,31 @@ class ClientPool:
         to unlock it. Forking before this method starts a thread of its own
         keeps the window of exposure to threads the CALLER already had.
 
-        **THE CALLER'S OWN THREADS ARE NOT THIS METHOD'S TO REMOVE, AND
-        CPYTHON NOW SAYS SO OUT LOUD.** Since 3.12 `os.fork()` raises
+        **CPYTHON SAYS SO OUT LOUD, AND THE FIRST THING IT CAUGHT WAS THIS
+        POOL'S OWN THREADS.** Since 3.12 `os.fork()` raises
         `DeprecationWarning: This process is multi-threaded, use of fork()
         may lead to deadlocks in the child` whenever the forking process has
-        more than one thread. A real run reaches here from
-        `harness/main.py` with no thread of its own, so the warning does not
-        fire; the test suite reaches here from fixtures that hold a
-        `threading.Lock` to count queries, and 53 of those warnings are in
-        the suite's output. They are not noise to filter: each one names a
-        fork that COULD have copied a held lock, and the reason none of them
-        deadlocks is that the locks in question are released between queries.
-        Nothing here suppresses the warning, because a measurement framework
-        that silenced a deadlock warning would be choosing a quiet log over a
-        run that finishes.
+        more than one thread. A full suite run reported **54** of them, and
+        the first reading of that was wrong: it blamed the test fixtures that
+        hold a `threading.Lock` to count queries. The real cause was here --
+        a sweep builds one pool per window and `stop` did not join its
+        attendants, so the next pool forked while the previous pool's were
+        still being collected. `stop` joins them now and the count is **0**.
+        `tests/test_g3_process_clients.py` carries the honest/mutant pair.
+
+        What remains is genuinely not this method's to remove: a CALLER that
+        already has threads of its own. A real run reaches here from
+        `harness/main.py` with none. The suite's remaining 53 are all one
+        caller and were bisected rather than guessed:
+        `tests/test_webui_control.py` leaves a `webui/jobs.py` worker thread
+        alive when it finishes, so every pool a later test builds forks beside
+        it -- measured, that file paired with `tests/test_workloads.py`
+        reproduces the warning and the other three `test_webui_*` files paired
+        the same way produce none. The fix belongs in that test (join the job
+        before the test returns), not here and not in a warning filter: a
+        measurement framework that silenced a deadlock warning would be
+        choosing a quiet log over a run that finishes, and this warning is how
+        the pool's own un-joined attendants were found.
         """
         for worker in self._workers:
             worker.launch()
@@ -1354,6 +655,18 @@ class ClientPool:
 
         for worker in self._workers:
             worker.reap()
+        # The attendants, joined before this pool is finished with. They have
+        # been idle since the barrier released, so this costs nothing -- and
+        # NOT joining them cost something real: a sweep builds one pool per
+        # window, so the next pool's `launch` forked while the previous
+        # pool's attendants were still being collected, which is a fork from
+        # a multi-threaded parent. CPython 3.12 warns about exactly that, and
+        # the warning is right to: a child forked beside a live thread can
+        # inherit a lock that thread was holding, with nothing left to unlock
+        # it. Measured, a full suite run: 54 of those warnings before this
+        # join and 0 after. `start`'s docstring has the rest of the argument.
+        for attendant in self._attendants:
+            attendant.join(timeout=JOIN_TIMEOUT_S)
 
         return PoolWindow(
             qps=merged.pop("qps"),
@@ -1400,40 +713,6 @@ class ClientPool:
         return None
 
 
-def window_ratio(numerator: PoolWindow, denominator: PoolWindow,
-                 field: str) -> Optional[float]:
-    """One field's ratio across two windows of the SAME pool.
-
-    The whole value of this function is the refusal. PR 4 §4.3 item 5's
-    headline number is `p99 under writes / baseline p99`, and a ratio of two
-    separately measured quantities is the shape that has produced two
-    published-wrong results in this repository: the filter-strategy ratio
-    divided a narrow point from one ops unit by a wide point from another, and
-    `charts.churn_retention` pairs records from two different maintenance
-    states. Both looked like findings. So the two windows must agree on every
-    axis in `PoolSpec` -- client count, query pool, k, ef_search and the ops
-    unit -- and a caller that crosses any one of them gets a `PoolError`
-    naming the field rather than a plausible number.
-
-    `None` when either window has no value for `field`, which is what a window
-    that completed no query records. A ratio over a missing percentile would
-    be a `TypeError` at best and a 0.0 published as "no slowdown" at worst.
-    """
-    if numerator.spec != denominator.spec:
-        differing = [name for name, a, b
-                     in zip(PoolSpec._fields, numerator.spec, denominator.spec)
-                     if a != b]
-        raise PoolError(
-            f"refusing to divide two windows measured by different pools: "
-            f"they differ on {', '.join(differing)} "
-            f"({numerator.spec} vs {denominator.spec}). A ratio across two "
-            f"pools is not a measurement of either.")
-    top = numerator.merged.get(field)
-    bottom = denominator.merged.get(field)
-    if not top or not bottom:
-        return None
-    return top / bottom
-
 
 __all__ = [
     "Answer", "BARRIER_TIMEOUT_S", "CLIENT_BARRIER_TIMEOUT_S",
@@ -1441,5 +720,6 @@ __all__ = [
     "ClientFailed", "ClientPool", "DEFAULT_INSTRUMENTS", "DriverFactory",
     "Instruments", "JOIN_TIMEOUT_S", "PoolError", "PoolSpec", "PoolWindow",
     "SCALING_CONCURRENCY_NOT_ACHIEVED", "SCALING_OK", "SCALING_STATUSES",
-    "SERVED_CONCURRENCY_FLOOR", "client_cpu", "shard_queries", "window_ratio",
+    "SERVED_CONCURRENCY_FLOOR", "Timeouts", "client_cpu", "shard_queries",
+    "window_ratio",
 ]

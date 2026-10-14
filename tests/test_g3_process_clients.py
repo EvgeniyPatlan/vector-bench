@@ -115,9 +115,12 @@ from harness.metrics import records                                   # noqa: E4
 from harness.metrics.latency import (LatencyCollector,                # noqa: E402
                                      merge_collectors, span_disposition,
                                      window_concurrency)
+from harness.workloads import client_process as cp                    # noqa: E402
 from harness.workloads import clients as cl                           # noqa: E402
+from harness.workloads import pool_window as pw                       # noqa: E402
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
+from tests.retired_thread_pool import thread_window                   # noqa: E402
 
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -355,93 +358,17 @@ def spec_for(queries) -> IndexSpec:
 # The thread arm: a verbatim-shaped copy of the pre-change client loop
 # ---------------------------------------------------------------------------
 
-class _ThreadClient(threading.Thread):
-    """The pre-change client, copied so the two arms can be compared.
+def _thread_arm(factory, queries, clients: int,
+                window_s: float = WINDOW_S) -> Dict[str, float]:
+    """The retired thread pool's window, through the shared helper.
 
-    This is `clients.Client` as it stood at 9fbf2cb: a `threading.Thread`
-    whose `run` connects, warms up, releases the barrier in a `finally`, and
-    then loops on `driver.query` recording both instants until a
-    `threading.Event` is set. It is here and not reconstructed by patching the
-    real pool because R2 asks that a repair be shown against the form it
-    replaced, run over the same input -- and because the comparison is the
-    deliverable, so the old arm has to be reproducible from this tree after
-    the new one has replaced it.
+    `tests/retired_thread_pool.py` holds the implementation because
+    `tests/test_g1_client_concurrency.py` needs the same one: it is the only
+    thing in the tree that can still produce the defect G3 removed, and two
+    copies of it would start out agreeing and then drift -- the argument
+    `clients.py` itself was written out of.
     """
-
-    def __init__(self, factory, queries, k, ready, stop):
-        super().__init__(daemon=True)
-        self._factory = factory
-        self._queries = queries
-        self._k = k
-        self._ready = ready
-        self._stop_event = stop
-        self.collector = LatencyCollector(warmup=0)
-        self.error: Optional[BaseException] = None
-
-    def run(self) -> None:
-        driver = None
-        try:
-            driver = self._factory()
-            driver.connect()
-            for i in range(min(2, len(self._queries))):
-                driver.query(self._queries[i], self._k)
-        except BaseException as exc:  # noqa: BLE001
-            self.error = exc
-        finally:
-            try:
-                self._ready.wait(timeout=cl.CLIENT_BARRIER_TIMEOUT_S)
-            except threading.BrokenBarrierError:
-                pass
-        if self.error is not None or driver is None:
-            return
-        try:
-            self.collector.start()
-            i = 0
-            n = len(self._queries)
-            while not self._stop_event.is_set():
-                q = self._queries[i % n]
-                started = time.perf_counter()
-                driver.query(q, self._k)
-                self.collector.add_span(started, time.perf_counter())
-                i += 1
-            self.collector.stop()
-        except BaseException as exc:  # noqa: BLE001
-            self.error = exc
-
-
-def _thread_window(factory, queries, clients: int,
-                   window_s: float = WINDOW_S) -> Dict[str, float]:
-    """One measured window of the THREAD pool. The arm being compared against.
-
-    Reuses the real `merge_collectors` and `window_concurrency`, so the only
-    difference from the process arm is where the queries ran. Returns the
-    three figures the table reports.
-    """
-    opened: List[float] = []
-    stop = threading.Event()
-    def open_window():
-        opened.append(time.perf_counter())
-
-    ready = threading.Barrier(clients + 1, action=open_window)
-    shards = cl.shard_queries(queries, clients)
-    workers = [_ThreadClient(factory, shard, K, ready, stop)
-               for shard, _offsets in shards]
-    for worker in workers:
-        worker.start()
-    ready.wait(timeout=cl.BARRIER_TIMEOUT_S)
-    time.sleep(window_s)
-    stop_at = time.perf_counter()
-    stop.set()
-    wall = stop_at - opened[0]
-    for worker in workers:
-        worker.join(timeout=30.0)
-    collectors = [w.collector for w in workers]
-    merged = merge_collectors(collectors, wall, cutoff=stop_at,
-                              window_start=opened[0])
-    outstanding, served = window_concurrency(collectors, wall, cutoff=stop_at,
-                                             window_start=opened[0])
-    return {"qps": merged["qps"], "served": served,
-            "outstanding": outstanding, "clients": clients}
+    return thread_window(factory, queries, clients, K, window_s)
 
 
 def _process_window(factory, queries, clients: int,
@@ -477,7 +404,7 @@ def table(base, queries) -> Dict[str, Dict[str, Dict[str, float]]]:
         spend = build()
         factory = factory_for(base, spend)
         row: Dict[str, Dict[str, float]] = {}
-        for arm_name, arm in (("threads", _thread_window),
+        for arm_name, arm in (("threads", _thread_arm),
                               ("processes", _process_window)):
             one = _best(arm, factory, queries, 1)
             four = _best(arm, factory, queries, 4)
@@ -693,8 +620,8 @@ class TestTheHeldWaitReallyHoldsTheLock:
             f"the held wait burns {cores:.3f} cores, so it is a CPU-bound "
             f"regime after all and its process arm needs free cores like "
             f"`spin` does")
-        # The control: a spin of the same nominal cost burns about one core,
-        # so the probe can tell the two regimes apart.
+        # The control: a spin of the same nominal cost is CPU-bound, so the
+        # probe can tell the two regimes apart.
         before = resource.getrusage(resource.RUSAGE_SELF)
         opened = time.perf_counter()
         _spin(0.1)
@@ -702,7 +629,15 @@ class TestTheHeldWaitReallyHoldsTheLock:
         after = resource.getrusage(resource.RUSAGE_SELF)
         spin_cpu = ((after.ru_utime - before.ru_utime)
                     + (after.ru_stime - before.ru_stime))
-        assert spin_cpu / spin_wall > 0.8, spin_cpu / spin_wall
+        spin_cores = spin_cpu / spin_wall
+        # A RATIO against the held wait and not an absolute, because a spin
+        # only gets a whole core if the box has one to give: measured at
+        # 0.507 cores on a loaded box, which failed an `> 0.8` assertion for
+        # a reason that was not the regime. The quantity this test is about is
+        # the DIFFERENCE between the two regimes' CPU cost, and that survives
+        # oversubscription -- a spin that is descheduled half the time still
+        # burns an order of magnitude more than a wait that burns nothing.
+        assert spin_cores > 5.0 * max(cores, 1e-4), (spin_cores, cores)
 
 
 class TestASaturatedServerIsStillNotFlagged:
@@ -1121,6 +1056,8 @@ class TestAClientThatDiesFailsTheRecordAndNeverHangsThePool:
             elapsed = time.perf_counter() - started
             for worker in pool._workers:
                 worker.reap()
+            for attendant in pool._attendants:
+                attendant.join(timeout=5.0)
             return elapsed
 
         honest_launch = cl.Client.launch
@@ -1183,6 +1120,19 @@ class TestAClientThatDiesFailsTheRecordAndNeverHangsThePool:
             elapsed = time.perf_counter() - started
             for worker in pool._workers:
                 worker.reap()
+            # The attendants are joined before the NEXT pool forks, and that
+            # is not tidiness. CPython 3.12 warns on `os.fork()` from a
+            # multi-threaded process, and an attendant whose client never
+            # reported is still blocked on that client's pipe -- so leaving
+            # one alive would make the second arm of this very test fork from
+            # a threaded parent and emit the warning `start()`'s docstring
+            # argues must not be suppressed. Reaping the clients closes the
+            # pipes, which is what lets the attendants return.
+            for attendant in pool._attendants:
+                attendant.join(timeout=5.0)
+            assert not [a for a in pool._attendants if a.is_alive()], (
+                "an attendant outlived its reaped client, so the next fork "
+                "in this test happens from a multi-threaded parent")
             return elapsed
 
         honest = timed()
@@ -1977,6 +1927,197 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
 # The public surface the callers depend on
 # ---------------------------------------------------------------------------
 
+class TestThePoolLeavesNoThreadBehindEither:
+    """The attendants are the pool's threads and `stop` joins them.
+
+    **This is a repair, and the defect it fixes was found by the gate rather
+    than predicted.** A sweep builds one pool per window, so the next pool's
+    `launch` forked while the previous pool's attendants were still being
+    collected -- a fork from a multi-threaded parent, which CPython 3.12
+    warns about because a child can inherit a lock a live thread was holding
+    with nothing left to unlock it. Measured over a full suite run: **54** of
+    those warnings before the join and **0** after.
+
+    Nothing suppresses the warning, and that is deliberate: a measurement
+    framework that filtered a deadlock warning would be choosing a quiet log
+    over a run that finishes.
+    """
+
+    def test_stop_waits_for_the_attendants(self, base, queries,
+                                           monkeypatch):
+        """Honest and mutant, with the live-thread count read back.
+
+        The attendants are idle from the barrier onward, so the race is
+        normally too narrow to see. One is made slow on purpose -- 0.3 s after
+        it leaves the barrier -- which makes the ordering observable the way
+        `tests/test_workloads.py` amplifies the stop flag's `set()`.
+
+        Honest: `stop()` returns with **0** attendants alive. Mutant (the
+        pool's attendant list emptied just before `stop`, which is the
+        pre-repair form -- it had nothing to join): **1** still alive, and
+        that is the thread a following pool would have forked beside.
+        """
+        real_attend = cl.Client.attend
+
+        def slow_attend(self) -> None:
+            real_attend(self)
+            time.sleep(0.3)
+
+        monkeypatch.setattr(cl.Client, "attend", slow_attend)
+
+        def alive_after(skip_the_join: bool) -> int:
+            pool = cl.ClientPool(
+                factory_for(base, lambda: time.sleep(QUERY_S)), queries, 2, K,
+                32, spec_for(queries), warmup=2)
+            pool.start("g3 attendant probe", prefix="g3")
+            attendants = list(pool._attendants)
+            if skip_the_join:
+                pool._attendants = []
+            pool.stop()
+            count = len([a for a in attendants if a.is_alive()])
+            for attendant in attendants:
+                attendant.join(timeout=5.0)
+            return count
+
+        honest = alive_after(skip_the_join=False)
+        mutant = alive_after(skip_the_join=True)
+        assert honest == 0, (
+            f"{honest} attendants outlived `stop`, so a following pool would "
+            f"fork beside them")
+        assert mutant > 0, (
+            "emptying the attendant list changed nothing, so this probe "
+            "cannot see the join and the repair is unproven")
+        assert honest != mutant
+
+
+class TestTheSplitDidNotMovePatchTargets:
+    """`clients.py` was 791 lines of an 800-line ceiling, so G3 had to split
+    it. **A module that re-exports a name does not SHARE it**, and this
+    repository has been caught by that twice -- three mutants once got a fully
+    green suite because a patch reached a rebound facade. So every name a test
+    patches on `clients` is checked here against the thing that reads it.
+    """
+
+    def test_the_three_modules_are_each_inside_the_line_ceiling(self):
+        """The split's own reason, measured rather than asserted.
+
+        If any one of them is over again, the split has stopped doing its job
+        and whoever notices should be this test rather than a reviewer -- the
+        argument `tests/test_t4b_readers.py` makes for the churn split.
+        """
+        sizes = {}
+        for mod in (cl, cp, pw):
+            lines = len(open(mod.__file__).read().splitlines())
+            sizes[mod.__name__.rsplit(".", 1)[1]] = lines
+        assert all(n <= 800 for n in sizes.values()), sizes
+        # Non-vacuity: splicing them back together is over the ceiling, so the
+        # split is justified by the reason all three files give for it.
+        assert sum(sizes.values()) > 800, sizes
+
+    def test_patching_a_timeout_on_clients_still_reaches_the_client(self):
+        """Honest and mutant, with the two values read back off a client.
+
+        `Client` does not import the three timeouts: `ClientPool._timeouts()`
+        reads them out of `clients`' globals at construction and hands over a
+        `Timeouts` bundle. Honest: the shipped 120.0 reaches the client.
+        Mutant (`clients.CLIENT_BARRIER_TIMEOUT_S` rebound to 0.25 before the
+        pool is built): **0.25** reaches it. An `import` in
+        `client_process.py` would have frozen the value and both readings
+        would be 120.0 -- which is the dead probe this test exists to rule
+        out, and `tests/test_t4b_readers.py`'s barrier-timeout measurement
+        depends on it entirely.
+        """
+        def built():
+            pool = cl.ClientPool(lambda: None, numpy.zeros((4, 2)), 2, K, 64,
+                                 None, 0)
+            return pool._workers[0]._timeouts
+
+        honest = built()
+        original = cl.CLIENT_BARRIER_TIMEOUT_S
+        try:
+            cl.CLIENT_BARRIER_TIMEOUT_S = 0.25
+            mutant = built()
+        finally:
+            cl.CLIENT_BARRIER_TIMEOUT_S = original
+        assert honest.client_barrier_s == 120.0
+        assert mutant.client_barrier_s == 0.25
+        assert honest.client_barrier_s != mutant.client_barrier_s
+        # And the other two came through the same bundle, so none of the three
+        # is quietly a literal in the client.
+        assert honest.barrier_s == cl.BARRIER_TIMEOUT_S
+        assert honest.join_s == cl.JOIN_TIMEOUT_S
+        assert cl.CLIENT_BARRIER_TIMEOUT_S == original
+
+    def test_a_client_refuses_to_be_built_without_the_pools_timeouts(self):
+        """The other half of not defaulting them.
+
+        A fallback inside `Client` would be a second copy of three numbers
+        whose whole point is that `clients.py` owns them, and the copy would
+        be the one that silently won on any path that forgot to pass them. So
+        it raises. Read back: the message names where to look.
+        """
+        with pytest.raises(ValueError) as raised:
+            cp.Client(lambda: None, numpy.zeros((2, 2)),
+                      numpy.arange(2), K, 64, None, 0,
+                      threading.Barrier(2), threading.Event())
+        assert "Timeouts" in str(raised.value), str(raised.value)
+
+    def test_patching_window_concurrency_on_clients_still_reaches_stop(self):
+        """`ClientPool.stop` stayed in `clients.py`, so this target did not
+        move. Asserted by identity rather than behaviourally, because
+        `tests/test_g1_client_concurrency.py`'s median-versus-mean mutation
+        rebinds exactly this name and would report a clean result if the split
+        had taken `stop` with it."""
+        assert "window_concurrency" in cl.ClientPool.stop.__code__.co_names
+        assert cl.window_concurrency is not None
+
+    def test_rebinding_client_bound_util_on_clients_reaches_nothing(self):
+        """**The one patch target the split DID move, recorded as dead.**
+
+        `CLIENT_BOUND_UTIL` went to `pool_window.py`, beside
+        `PoolWindow.client_bound`, which is its only reader -- the placement
+        `metrics/latency.py` argues for `SERVED_CONCURRENCY_FLOOR`. Nothing in
+        the tree patches it, but a future mutation aimed at
+        `clients.CLIENT_BOUND_UTIL` would measure nothing, so that is asserted
+        here instead of being discovered by somebody reporting a clean mutant.
+
+        Honest and dead are the SAME value, which is the signature of a
+        mutation that reached nothing; the live target is shown working in the
+        same test so the pair is not simply a broken probe.
+        """
+        window = _client_bound_window(0.9)
+        honest = window.client_bound
+        original = cl.CLIENT_BOUND_UTIL
+        try:
+            cl.CLIENT_BOUND_UTIL = 0.95
+            dead = window.client_bound
+        finally:
+            cl.CLIENT_BOUND_UTIL = original
+        assert honest is True
+        assert dead is True, "the re-export has become a second constant"
+        assert honest == dead
+        # The live target, so this file records which one works.
+        try:
+            pw.CLIENT_BOUND_UTIL = 0.95
+            live = window.client_bound
+        finally:
+            pw.CLIENT_BOUND_UTIL = original
+        assert live is False
+        assert live != honest
+        assert cl.CLIENT_BOUND_UTIL == pw.CLIENT_BOUND_UTIL == original
+
+
+def _client_bound_window(util: float) -> Any:
+    """A `PoolWindow` carrying nothing but the client-CPU utilisation."""
+    kwargs = {field: None for field in cl.PoolWindow._fields}
+    kwargs.update(qps=1.0, wall_s=1.0, inflight_discarded=0,
+                  prewindow_discarded=0, client_cpus=4,
+                  client_cpu_seconds=util * 4.0, client_cpu_util=util,
+                  results={}, merged={},
+                  spec=cl.PoolSpec(clients=4, queries=10, k=K, ef_search=32))
+    return cl.PoolWindow(**kwargs)
+
+
 class TestThePublicSurfaceIsUnchanged:
     """The hard constraint on this change: `concurrency.py`, `churn.py` and
     `churn_readers.py` are not touched, so everything they reach has to keep
@@ -2043,9 +2184,22 @@ class TestThePublicSurfaceIsUnchanged:
         assert cl.BARRIER_TIMEOUT_S == 300.0
         assert cl.JOIN_TIMEOUT_S == 120.0
         assert cl.CLIENT_BARRIER_TIMEOUT_S < cl.BARRIER_TIMEOUT_S
-        source = open(cl.__file__).read()
-        assert "self._ready.wait(timeout=CLIENT_BARRIER_TIMEOUT_S)" in source
-        assert "timeout=120)" not in source
+        # Named rather than a bare literal, which is the discipline
+        # `tests/test_t4b_readers.py` pinned on the pre-split file. The split
+        # moved the two halves apart, so both are checked: `clients.py` names
+        # the constants when it builds the bundle, and `client_process.py`
+        # reads the bundle instead of a number of its own.
+        pool_src = open(cl.__file__).read()
+        client_src = open(cp.__file__).read()
+        bundle = pool_src.split("def _timeouts()")[1].split("def _open_window")[0]
+        for name in ("BARRIER_TIMEOUT_S", "CLIENT_BARRIER_TIMEOUT_S",
+                     "JOIN_TIMEOUT_S"):
+            assert name in bundle, name
+        assert "self._ready.wait(timeout=self._timeouts.client_barrier_s)" \
+            in client_src
+        for stale in ("timeout=120)", "timeout=300)", "Timeouts(300"):
+            assert stale not in pool_src, stale
+            assert stale not in client_src, stale
 
     def test_the_pool_leaves_no_client_process_behind(self, base, queries):
         """A leaked THREAD died with the interpreter; a leaked PROCESS goes on
