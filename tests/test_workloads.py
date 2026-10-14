@@ -20,6 +20,7 @@ anything — is calibrated in tests/test_fake_driver.py.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
 import sys
@@ -947,14 +948,23 @@ class TestConcurrencyRecordsRecall:
                               ef_search=EF_SEARCH_98)
         # The healthy window's recall, measured independently of the workload.
         healthy = measure_recall(driver, wide, K)
-        handed_out = []
+        # Counted in a `multiprocessing.Value`, not a list, because G3 made
+        # the clients OS processes and this factory is called IN THE CHILD.
+        # With a list the child saw only the metadata driver's entry, the
+        # second window was never degraded, and `extra.recall_spread` came
+        # back **0.0** against the 0.005 limit this test exists to trip -- a
+        # fixture that staged nothing and an assertion that could not fail
+        # for the right reason.
+        handed_out = MP_FORK.Value("i", 0)
 
         def degrading_factory():
             clone = driver.clone()
-            handed_out.append(clone)
+            with handed_out.get_lock():
+                handed_out.value += 1
+                mine = handed_out.value
             # One for the metadata driver, one for the first window's client;
             # everything after that is the second window.
-            if len(handed_out) > 2:
+            if mine > 2:
                 clone.ef_half = 400.0
             return clone
 
@@ -969,6 +979,12 @@ class TestConcurrencyRecordsRecall:
         assert row["extra"]["repeats"] == 2
         spread = row["extra"]["recall_spread"]
         assert spread > concurrency_workload.RECALL_SPREAD_LIMIT, spread
+        # The degradation crossed the fork: three drivers were handed out as
+        # the PARENT counts them, so the second window really got the bad one.
+        assert handed_out.value >= 3, (
+            f"only {handed_out.value} drivers were counted in the parent, so "
+            f"the second window was never degraded and the spread above is "
+            f"not this fixture's doing")
 
         # One window's recall, not an average of the two. The two windows
         # measure `healthy` (about 0.98) and `healthy - spread` (about 0.21),
@@ -1361,6 +1377,17 @@ class TestWorkloadsShareOneSchema:
 #: fraction of the window: at `wide_dataset`'s 1,000 queries each of two
 #: clients gets a 500-query shard, so 300 warm-up queries each is 600 queries
 #: of CPU spent before the window opens, against roughly a thousand inside it.
+#: The fork context every cross-client counter below is built from. G3 made
+#: the concurrency clients OS PROCESSES, and that broke a technique three
+#: fixtures in this file were built on: put a dict or a `threading.Event` in
+#: the test, have the client's `query` touch it, read it back in the test.
+#: Under fork the client gets a SNAPSHOT -- its writes never come back and the
+#: test's later writes never reach it -- so the plain-object form does not
+#: fail loudly, it silently measures nothing. Each converted fixture carries
+#: the honest and the plain-object reading in its docstring, and asserts the
+#: shared value moved, so the conversion cannot rot back.
+MP_FORK = multiprocessing.get_context("fork")
+
 BRACKET_WARMUP = 300
 BRACKET_CLIENTS = 2
 BRACKET_WINDOW_S = 0.15
@@ -1466,13 +1493,24 @@ class TestTheClientsOwnCpuIsRecorded:
         assert extra["client_bound"] is False
         assert "CLIENT CPU-BOUND" not in capsys.readouterr().err
 
-    def _counting(self, base, state, lock):
+    def _counting(self, base, counter):
         """A driver factory that charges one virtual query per query answered.
 
-        The virtual counter below returns `state["queries"] * USEC_PER_QUERY`,
+        The virtual counter below returns `counter.value * USEC_PER_QUERY`,
         so the CPU delta the workload computes has a unit the record also
         reports independently -- queries -- and the assertion can be against
         `queries_executed` rather than against a tolerance of its own.
+
+        **`counter` is a `multiprocessing.Value` and was a dict behind a
+        `threading.Lock`.** G3 made the clients OS processes, so the increment
+        now happens in a child: a dict would have stayed at 0 in the parent
+        and the "virtual CPU counter" would have returned 0 for every reading,
+        making the whole calibration vacuous rather than failing. Measured
+        with the plain dict, two clients at 300 warm-up queries each:
+        `state["queries"]` read back **0** against the 3,922 the clients
+        answered. The `Value`'s own lock replaces the `threading.Lock`,
+        because an increment that crosses processes needs a lock that does
+        too.
         """
         def clone():
             client = base.clone()
@@ -1480,8 +1518,8 @@ class TestTheClientsOwnCpuIsRecorded:
 
             def query(vector, k):
                 result = answer(vector, k)
-                with lock:
-                    state["queries"] += 1
+                with counter.get_lock():
+                    counter.value += 1
                 return result
 
             client.query = query
@@ -1502,14 +1540,16 @@ class TestTheClientsOwnCpuIsRecorded:
         and the utilisation would be high for a reason the record could not
         show.
         """
-        lock = threading.Lock()
-        state = {"queries": 0}
+        counter = MP_FORK.Value("q", 0)
         base = loaded_driver(wide, ef_half=64.0, ef_search=32)
+        # Read in the PARENT, in the barrier action and at the stop instant,
+        # against a counter the CHILDREN advance -- which is the whole point
+        # of the shared `Value`. See `_counting`.
         monkeypatch.setattr(concurrency_workload, "read_own_cpu_usec",
-                            lambda: state["queries"] * USEC_PER_QUERY)
+                            lambda: counter.value * USEC_PER_QUERY)
 
         concurrency_workload.run(
-            ctx, self._counting(base, state, lock), wide, index_spec(wide),
+            ctx, self._counting(base, counter), wide, index_spec(wide),
             ef_search=32, client_counts=(BRACKET_CLIENTS,),
             duration_s=BRACKET_WINDOW_S, warmup=BRACKET_WARMUP,
             max_queries=concurrency_workload.WHOLE_TEST_SET)
@@ -1519,8 +1559,14 @@ class TestTheClientsOwnCpuIsRecorded:
                         * 1e6 / USEC_PER_QUERY)
         executed = row["queries_executed"]
         warmed = BRACKET_CLIENTS * BRACKET_WARMUP
-        # The warm-up really happened, so there was something to exclude.
-        assert state["queries"] >= executed + warmed
+        # The warm-up really happened, so there was something to exclude --
+        # and the counter crossed the fork at all, which is what a plain dict
+        # would have failed to do while reading a silent 0.
+        assert counter.value >= executed + warmed, (
+            f"the shared counter read {counter.value} against "
+            f"{executed} + {warmed}; a value of 0 means the clients' "
+            f"increments never reached the parent and this calibration is "
+            f"measuring nothing")
         # And the charge is the window's own queries, within the handful each
         # client can complete between the stop instant and the second reading.
         assert executed <= charged <= executed + BRACKET_CLIENTS + 2, (
@@ -1544,15 +1590,25 @@ class TestTheClientsOwnCpuIsRecorded:
         latencies = (0.0005, 0.001, 0.002)
         charges = (1.0, 100.0, 10_000.0)
         base = loaded_driver(dataset, ef_half=64.0, ef_search=32)
-        made = {"n": -1}
+        # A `multiprocessing.Value` and not a dict, because G3 made the
+        # clients OS processes and this factory is now called IN THE CHILD.
+        # With a dict the parent's counter never advanced past call 0 and
+        # every window's client ran at the same latency: measured, `made["n"]`
+        # read back **0** after a three-window run and `qps_samples` came out
+        # [1348.7, 1388.1, 1401.3] -- a 1.04x spread against the 1.5x this
+        # test needs, so the median had no middle to pick and the fixture was
+        # silently staging nothing.
+        made = MP_FORK.Value("i", -1)
 
         def clone():
-            made["n"] += 1
+            with made.get_lock():
+                made.value += 1
+                mine = made.value
             sibling = base.clone()
             # Call 0 is `run`'s metadata driver, which issues no queries;
             # calls 1..3 are the single client of each successive window.
-            if 1 <= made["n"] <= len(latencies):
-                sibling.latency_s = latencies[made["n"] - 1]
+            if 1 <= mine <= len(latencies):
+                sibling.latency_s = latencies[mine - 1]
             return sibling
 
         reads = {"n": -1}
@@ -1579,6 +1635,12 @@ class TestTheClientsOwnCpuIsRecorded:
         # pass for any selection rule.
         samples = sorted(row["extra"]["qps_samples"])
         assert samples[-1] > samples[0] * 1.5, samples
+        # And the staging crossed the fork: four calls, so each window's
+        # client really was handed its own latency. A plain dict reads 0 here.
+        assert made.value == len(latencies), (
+            f"the factory was called {made.value + 1} times as the PARENT "
+            f"counts them; the three windows were therefore not staged and "
+            f"the spread above is this box's noise")
         assert row["extra"]["client_cpu_seconds"] == pytest.approx(100.0), (
             f"the reported CPU figure is "
             f"{row['extra']['client_cpu_seconds']}, which is the "

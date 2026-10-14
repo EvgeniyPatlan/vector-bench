@@ -1111,32 +1111,57 @@ and the percentiles stay: the pool did answer that many queries at those
 latencies, and it is the division by the client count that has no basis.
 
 The threshold is half the client count, and it sits in the middle of a measured
-gap. Five synthetic drivers of identical 0.325 ms per-query cost, differing only
-in what they do with the interpreter lock, were run through the real client pool
-at one and four clients — three two-second windows per point, median window,
-CPython 3.12.3. The drivers are a throwaway harness rather than part of this
-repository; what is reproducible from the tree is
-`tests/test_g1_client_concurrency.py`, which builds the same four regimes and
-asserts the verdicts:
+gap. Five synthetic drivers of identical per-query cost, differing only in what
+they do with the interpreter lock, were run through the real client pool at one
+and four clients — CPython 3.12.3. **Both arms are measured, and the second is
+the point of this section**: the left column is the retired thread pool and the
+right is the process pool the harness runs today. One driver built once per
+row, both arms in one fixture, so a row is one experiment rather than two runs.
+All of it is reproducible from the tree —
+`tests/test_g3_process_clients.py` builds the regimes and reports the table,
+and `tests/retired_thread_pool.py` is the thread arm, kept for the reason given
+below.
 
-| Driver | Efficiency at 4 | `served / clients` | `outstanding / clients` |
+| Driver | Efficiency at 4 (threads / processes) | `served / clients` | `outstanding / clients` |
 | --- | --- | --- | --- |
-| releases the lock (`time.sleep`) | 1.00 | 0.96 | 0.99 |
-| **saturated server** (latency rises with the client count) | 0.28 | **0.98** | 1.00 |
-| atomic C call holding the lock | 0.27 | 0.22 | 0.99 |
-| Python spin holding the lock | 0.25 | 0.25 | 0.98 |
-| half released, half held | 0.52 | 0.96 | 1.00 |
+| releases the lock (`time.sleep`) | 1.006 / 1.009 | 0.975 / 0.983 | 0.994 / 0.980 |
+| **saturated server** (latency rises with the client count) | 0.276 / 0.272 | **0.977 / 1.004** | 0.994 / 0.991 |
+| C call holding the lock (`ctypes.PyDLL` `usleep`) | 0.249 / **0.995** | 0.243 / **0.982** | 0.944 / 0.979 |
+| Python spin holding the lock | 0.265 / **0.999** | 0.264 / **0.995** | 0.835 / 0.995 |
+| half released, half held | 0.518 / 0.980 | 0.979 / 0.980 | 0.997 / 0.991 |
 
-Two things to read off it. **A genuinely saturated server is not flagged**,
-which is the case the threshold exists to protect: a real queue raises the whole
-latency distribution, median included, so that row's `served` stays at the
-client count while its efficiency falls to 0.28. And **the exact figure is the
-blind one** — `outstanding` is 0.98–1.00 of the client count on all five rows,
-across efficiencies from 0.25 to 1.00, because a query waiting for the lock is
-still inside the client's timed region and the stretched spans tile the window.
-It is recorded anyway, because the pair is the diagnostic: outstanding at the
-client count while in service sits near one is the signature of time spent
-waiting for a lock rather than for the engine.
+Four things to read off it. **Only the two lock-holding rows moved**, which is
+the whole claim of the change below: the clients no longer share an
+interpreter, so a driver that holds the lock no longer makes them take turns.
+**A genuinely saturated server is not flagged in either arm**, which is the
+case the threshold exists to protect: a real queue raises the whole latency
+distribution, median included, so that row's `served` stays at the client count
+while its efficiency falls to 0.27. A change that had started refusing real
+engine ceilings would be worse than the defect it fixes. **The lock-releasing
+row did not move either**, so the pipes, the barrier and the span transport
+cost the pool nothing. And **the exact figure is the blind one** — `outstanding`
+is 0.84–1.00 of the client count on all ten readings, across efficiencies from
+0.249 to 1.009, because a query waiting for the lock is still inside the
+client's timed region and the stretched spans tile the window. It is recorded
+anyway, because the pair is the diagnostic: outstanding at the client count
+while in service sits near one is the signature of time spent waiting for a
+lock rather than for the engine.
+
+**The lock-holding row is a C call that WAITS with the lock held, and the
+earlier version of this table burned CPU with it held instead.** That matters
+for two reasons. A real client library blocked on a socket with the lock held
+burns nothing, so a CPU-burning driver was never a faithful model of it. And
+four CPU-bound client *processes* deliver four queries at once only if the box
+has four cores spare, so an assertion on that row would have been a joint
+measurement of the lock and of the machine — measured, it failed at 8–18 busy
+cores of 20, correctly and for a reason that was not the lock.
+`ctypes.PyDLL` does not release the interpreter lock around a call and
+`ctypes.CDLL` does, so the same libc `usleep` gives both halves of a controlled
+pair: four threads × 200 waits of 500 µs took **0.466 s** held against a
+fully-serial 0.400 s, and **0.116 s** released against a fully-parallel
+0.100 s, and the held form costs a measured **0.034 cores**. §7's Python-spin
+row is kept because it is the regime this document published, and only the part
+of it that is about the lock is asserted.
 
 **`client_bound` is kept, and §2.3 says why it cannot see this.** Nothing here
 replaces it: a client container that genuinely runs out of CPU is a real case
@@ -1167,34 +1192,149 @@ reader pool's status therefore travels onto the step record that publishes the
 rate, as `extra.reader_scaling_status`, and the during-writes table marks the
 writer cell as well as the latency ratio.
 
-**What is read rather than measured.** Whether a particular client library
-releases the interpreter lock around its socket wait is a property of that
-library's C extension, and no measurement here settles it: these tests start no
-server. The engines do not share a library — pgvector goes through **psycopg3**
-and both MySQL-family engines through **MariaDB Connector/Python** over
-Connector/C, which `docker/_shared/requirements-mysql.txt` explains is
-deliberate so the two are not compared through different clients. The next real
-run settles it for free: if pgvector's efficiency sits near 1.0 at four clients
-while MariaDB's sits near 0.25, the difference is in the client library and not
-in the engines.
+**What was read rather than measured, and the run that measured it.** Whether a
+particular client library releases the interpreter lock around its socket wait
+is a property of that library's C extension, and no measurement in this
+repository settles it: these tests start no server. The engines do not share a
+library — pgvector goes through **psycopg3** and both MySQL-family engines
+through **MariaDB Connector/Python** over Connector/C, which
+`docker/_shared/requirements-mysql.txt` explains is deliberate so the two are
+not compared through different clients. This section used to say the next real
+run would settle it for free, and name the shape: pgvector near 1.0 at four
+clients while MariaDB sits near 0.25.
 
-**Running the clients as processes is the fix for the limit, and it has not
-been done.** It is the only way to remove a shared interpreter lock from the
-measurement path, and it is an architectural change rather than a correction.
-The cost, so the decision can be taken rather than discovered: each client
-becomes an OS process with its own copy of the query set, so the harness
-container's memory grows with the client count (at 32 clients and a 1M×784
-float32 corpus the query set alone is the dominant term, and it is currently
-shared); the barrier that opens the window, the stop event, the per-client
-latency collectors and the merge over one shared wall all become
-inter-process — a `multiprocessing.Barrier`, a shared `Event` and a queue or
-shared-memory path for the spans — and the wall-clock instants on both sides of
-the window have to come from a clock the processes agree on; `PoolError`'s
-discipline that a client failure fails the record rather than hanging has to be
-re-established against process death rather than thread exceptions; and the
-client-CPU accounting, which today reads one cgroup counter for the whole
-harness container, keeps working only if every client process stays inside that
-cgroup. It would also change what every published multi-client number means, so
-it invalidates comparison with every run measured before it — an
-`OPS_MEASUREMENT_VERSION` bump by the same rule version 3's query-pool change
-earned one. None of that is attempted here.
+**That run happened on 2026-10-14 and the shape was exactly that** (SUPPLIED —
+a six-engine `smoke` pass on fashion-mnist-784 at M=16, a Xeon Gold 6230,
+`SMOKE/results/smoke-20261014-075119/`, 158 ops records; not reproduced by any
+test here). `served = qps × p50` per client, at one client and at four:
+
+| Engine | Client library | `served / clients` at 1 → 4 |
+| --- | --- | --- |
+| `mariadb` | MariaDB Connector/Python | 0.95 → **0.238** |
+| `mariadb123` | MariaDB Connector/Python | 0.95 → **0.237** |
+| `alisql` | MariaDB Connector/Python | 0.97 → **0.242** |
+| `pgvector` | psycopg3 | 0.98 → 0.974 |
+| `valkey` | valkey-py | 0.97 → 0.969 |
+| `mongodb` | pymongo | 0.99 → 0.984 |
+
+Exactly the three engines sharing one library are pinned near one query in
+service however many clients ask, and the three that do not are at their client
+count. It is not the pool: the same pool took pgvector from 2,466.9 to
+8,754.7 q/s over the same four-fold rise. The same run's churn writer managed
+**11.991 rows/s** against four readers where the same run's single-threaded
+load of the same corpus recorded `ingest_rows_per_s` **769.9** at
+`ingest_threads` 1 — a factor of 64 inside one run, with nothing changed but
+whether four readers were querying.
+
+**The clients are processes, and this is what it cost.** Running them that way
+is the only way to remove a shared interpreter lock from the measurement path,
+and it is an architectural change rather than a correction. It was taken before
+the `main` run because taking it afterwards would mean re-running the
+measurement. Each client is now an OS process with its own connection and its
+own interpreter; `harness/workloads/client_process.py` is the client and
+`harness/workloads/clients.py` is the pool. What crosses the fork is three
+things and no more: the barrier stays a *thread* barrier in the parent, with
+one attendant thread standing in for each client, because its action reads the
+window's opening instant into parent memory; two `multiprocessing.Event`s carry
+the barrier's decision and the stop flag's to the children; and each client's
+spans come back over its own pipe and are rebuilt into the same
+`LatencyCollector` objects the merge has always been handed, so
+`merge_collectors` still works over one shared wall under one
+`span_disposition` rule, and `extra.prewindow_discarded` is still zero by
+construction.
+
+The cost list this section used to publish as a reason to decide carefully, now
+measured item by item rather than estimated:
+
+- **fork and not spawn, and it is forced rather than preferred** (MEASURED).
+  `driver_factory` is a callable the caller supplies, and every real one is
+  unpicklable: `harness/main.py` defines it as a `def` nested inside `main()`,
+  whose `__qualname__` is `main.<locals>.driver_factory`, and pickle resolves a
+  function by qualified name — `AttributeError: Can't pickle local object`. The
+  test suite's are a `lambda` and a bound method. Under spawn or forkserver the
+  pool would have to be handed something picklable, which is a change to every
+  caller's contract. **The start method is pinned and not inherited**, because
+  CPython's default on Linux is `fork` today and becomes `forkserver` in 3.14:
+  an inherited default would turn a working pool into `Can't pickle local
+  object` at the start of a measured window on a release upgrade.
+- **The memory cost this section used to state was wrong** (MEASURED). It said
+  each client gets its own copy of the query set, so the harness container's
+  memory grows with the client count. It does not. `shard_queries` hands out
+  strided *views* of one array, a client never writes to one, and fork's
+  copy-on-write never copies a page nobody writes: eight children over a
+  104.9 MB float32 array dirtied **13.8 MB — 0.13×** the array, against 838.9 MB
+  if each had copied it. The control arm is what makes that a measurement
+  rather than a blind probe: eight children that *write* the array measure
+  **851.7 MB, 8.12×**. What a client does cost is its own interpreter's private
+  pages, about 1.7 MB.
+- **The clock needed no replacing** (MEASURED). `time.perf_counter()` is
+  `clock_gettime(CLOCK_MONOTONIC)`, which is the machine's clock rather than
+  the process's — unlike `time.process_time`, which is the control. Over 200
+  forks the child's offset from `CLOCK_MONOTONIC` matched the parent's to
+  within **4.2 µs**, which is the cost of reading two clocks back to back
+  rather than an offset, and the child's reading fell inside the parent's
+  bracketing pair **200 times out of 200**. A platform where that is false
+  fails loudly rather than producing spans that cannot be compared with the
+  window they are inside.
+- **Client CPU accounting still covers the clients** (VERIFIED STRUCTURALLY).
+  `fork` never changes cgroup membership — only an explicit write to
+  `cgroup.procs` does — so every client is in the harness container's cgroup
+  and the one counter `read_own_cpu_usec` reads covers all of them. Checked by
+  comparing `/proc/self/cgroup` between parent and children, which is exact.
+  The *magnitude* cannot be checked outside a container, for the reason §2.3
+  gives: there the same file is the root cgroup and reads the whole machine.
+- **`/dev/shm` needs no raising** (MEASURED). `multiprocessing` semaphores are
+  POSIX semaphores, and it calls `sem_unlink` immediately after `sem_open` —
+  so they never appear in a `/dev/shm` directory listing while their pages stay
+  charged to the tmpfs. A probe that counts files reports zero for the wrong
+  reason; the filesystem's used bytes are what to measure. One pool costs
+  **40,960 bytes** and the figure is *independent of the client count*, because
+  the go and halt flags belong to the pool rather than to each client — the
+  rejected per-client design measured 1,310,720 bytes at 32 clients. Pipes cost
+  zero. The harness container is started with `shm_size` from the resource pass
+  (2 GB normalized, 8 GB tuned), so the pool's footprint is five orders of
+  magnitude inside it.
+- **`PoolError`'s discipline is re-established against exit codes and
+  `SIGKILL`** rather than thread exceptions, which is a wider set of failures.
+  A client that dies *before* the barrier closes its pipe, so the parent's
+  `recv` raises `EOFError` and the attendant aborts the barrier — measured, the
+  pool fails in 0.01 s against a 2 s timeout instead of waiting it out. One
+  that dies *mid-window* is caught the same way. One that is killed *after*
+  reporting leaves no error and a window that looks complete, so `stop` checks
+  `exitcode` as well: a client reaped by a container's memory limit at the end
+  of a long window would otherwise have its partial window published as a
+  measurement. A window in which nothing finished is still a legitimate
+  measurement and still does not raise.
+- **The cost this section never listed, and in practice the largest one**: the
+  process boundary cuts the *test suite's* instrumentation channel. Five
+  existing tests injected a plain Python object into a driver factory — a dict,
+  a counter, a `threading.Event` — had the client touch it, and read it back in
+  the parent. Under fork the child gets a snapshot: its writes never come back
+  and the parent's later writes never reach it, so the technique fails
+  *silently* rather than loudly. Measured before conversion: a query counter
+  read 0 against 3,922 queries answered; a three-window latency staging left
+  every window at one speed and a 1.04× throughput spread where the test needed
+  1.5×; a reader-failure `Event` set by the writer never reached the readers.
+  All five now use `multiprocessing` shared state and each says why. Anything
+  new that needs to observe or steer a client has to do the same.
+
+**One consequence for this whole section, and it changes how
+`concurrency_not_achieved` should be read.** With the clients in one
+interpreter, that status was an expected finding — the live `smoke` run
+produced it on three engines. With the clients in separate processes it is
+close to unreachable: a serializing *server* raises the median along with
+everything else, so `served` stays near the client count, and it was the
+client-side lock that produced the low reading. The guard has therefore become
+a **tripwire** rather than a finding — for a revert to threads, for a driver
+that serializes inside one process at the C level, for a future pool bug. A
+tripwire nothing can trip cannot be told apart from a broken one, which is why
+`tests/retired_thread_pool.py` keeps the retired pool alive as a test helper:
+it is the only thing in the tree that can still produce the shape, and the
+refusal, the operator warning and the report's withheld cell are all still
+exercised end to end against a window it measured.
+
+It also changes what every published multi-client number means, so it
+invalidates comparison with every run measured before it — including the
+2026-10-14 run above, which is the first that ever stamped a version 5. That
+is an `OPS_MEASUREMENT_VERSION` bump by the same rule version 3's query-pool
+change earned one, and it is version **6**.

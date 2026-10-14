@@ -46,6 +46,7 @@ form publishes. A repair whose old form also passes is not a repair.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
 import sys
@@ -202,19 +203,43 @@ def reader_driver(dataset, cls=SlowWriter, latency_s=READER_LATENCY_S,
     return driver
 
 
+#: The fork context every cross-process fixture below is built from. G3 made
+#: the churn readers OS processes, which retired a technique two fixtures here
+#: were built on: put a dict or a `threading.Event` in the test, have the
+#: reader touch it, read it back. Under fork a child gets a SNAPSHOT, so the
+#: plain-object form fails silently rather than loudly. Each converted fixture
+#: records what it measured before the conversion.
+MP_FORK = multiprocessing.get_context("fork")
+
+
 def _no_constants(name):
     raise AssertionError(f"record contains the non-JSON constant {name!r}")
 
 
-def pool_threads() -> List[threading.Thread]:
-    """Every live thread belonging to a client pool.
+def pool_clients() -> List[Any]:
+    """Every live client PROCESS belonging to a pool.
 
-    Identified by class rather than by name, because `clients.Client` does not
-    name its threads and a count of `threading.active_count()` would also
-    catch pytest's own.
+    **This was `pool_clients()` and it had become a dead probe**, which is
+    worse than no probe because it reads as coverage. G3 made `clients.Client`
+    an OS process rather than a `threading.Thread`, so
+    `[t for t in threading.enumerate() if isinstance(t, cl.Client)]` -- the
+    old body, verbatim -- can only ever be empty, and the four
+    `pool_clients() == []` assertions below held for a reason that had nothing
+    to do with leaks. `tests/test_g3_process_clients.py` pins that fact so it
+    stays visible.
+
+    A leaked process matters MORE than a leaked thread did: a thread died with
+    the interpreter, while a leaked client goes on querying the server that
+    the next configuration is about to measure -- which would put one engine's
+    concurrency figure on top of the previous one's leftovers.
+
+    `multiprocessing.active_children()` rather than a class check, because it
+    reaps finished children as a side effect and is the list the runtime
+    itself keeps. Filtered to this repo's clients by class, so pytest's own
+    helpers (and any `multiprocessing` a plugin runs) are not counted.
     """
-    return [t for t in threading.enumerate()
-            if isinstance(t, cl.Client) and t.is_alive()]
+    return [p for p in multiprocessing.active_children()
+            if isinstance(p, cl.Client) and p.is_alive()]
 
 
 # ---------------------------------------------------------------------------
@@ -350,9 +375,30 @@ class TestTheLiftIsOneImplementation:
             "the comment on BARRIER_TIMEOUT_S is no longer true")
         # Named, not a bare literal: a future edit cannot reintroduce a
         # number that disagrees with the comment without failing here.
-        source = open(cl.__file__).read()
-        assert "self._ready.wait(timeout=CLIENT_BARRIER_TIMEOUT_S)" in source
-        assert "timeout=120)" not in source
+        #
+        # **Both halves, since G3 split the file.** `clients.py` names the
+        # three constants where it builds the `Timeouts` bundle and
+        # `client_process.py` reads the bundle rather than a number of its
+        # own -- and the bundle is read from `clients`' globals at pool
+        # construction precisely so the `monkeypatch` below still reaches the
+        # client that waits. An `import` in `client_process.py` would have
+        # frozen all three and turned the measurement underneath this test
+        # into a reading of the shipped 120 s against itself;
+        # `tests/test_g3_process_clients.py` carries the honest/mutant pair
+        # for that.
+        from harness.workloads import client_process as cp
+        pool_src = open(cl.__file__).read()
+        client_src = open(cp.__file__).read()
+        bundle = pool_src.split("def _timeouts()")[1].split(
+            "def _open_window")[0]
+        for name in ("BARRIER_TIMEOUT_S", "CLIENT_BARRIER_TIMEOUT_S",
+                     "JOIN_TIMEOUT_S"):
+            assert name in bundle, name
+        assert "self._ready.wait(timeout=self._timeouts.client_barrier_s)" \
+            in client_src
+        for stale in ("timeout=120)", "timeout=300)", "Timeouts(300"):
+            assert stale not in pool_src, stale
+            assert stale not in client_src, stale
 
         base = reader_driver(dataset, cls=FakeDriver, latency_s=0.0)
 
@@ -554,9 +600,19 @@ class TestTheReaderPoolRunsAroundTheWrite:
         minimum becomes 2,000 as well, so the two windows measure the same
         corpus and the ratio stops being about writes at all.
         """
-        seen: Dict[str, List[int]] = {}
-        lock = threading.Lock()
-        phase = {"name": "baseline"}
+        # A manager dict and a shared string, not a plain dict and a plain
+        # dict, because G3 made the readers OS PROCESSES. The reader's `query`
+        # runs in a child, so its appends never reached the parent -- measured,
+        # `seen` came back `{}` and this test failed with `KeyError:
+        # 'baseline'` rather than with a wrong number. And `phase` is written
+        # by the WRITER in the parent and read by the readers in children, so
+        # it has to cross the fork in the other direction too: a plain dict
+        # left every reader on a pre-fork snapshot saying "baseline" for the
+        # whole run.
+        manager = MP_FORK.Manager()
+        seen = manager.dict()
+        lock = manager.Lock()
+        phase = manager.dict(name="baseline")
 
         class _WatchingReader(FakeDriver):
             """A READER that records how many rows it could see.
@@ -572,7 +628,12 @@ class TestTheReaderPoolRunsAroundTheWrite:
             def query(self, vector, k):
                 live = int((~self._store.rows.tombstoned).sum())
                 with lock:
-                    seen.setdefault(phase["name"], []).append(live)
+                    # `manager.dict` does not mutate a nested list in place:
+                    # the proxy ships a copy, so the append has to be written
+                    # back through the proxy or it is lost in the child. That
+                    # is the same class of silence as the plain dict was.
+                    where = phase["name"]
+                    seen[where] = list(seen.get(where, [])) + [live]
                 return super().query(vector, k)
 
         writer = reader_driver(dataset)
@@ -955,14 +1016,14 @@ class TestReadersStopWithoutHanging:
         write that never finished. The stall record states `readers: 4`, so
         the JSONL still says what the stalled write was contending with.
         """
-        before = pool_threads()
+        before = pool_clients()
         assert before == [], f"a pool leaked from an earlier test: {before}"
         driver = reader_driver(dataset, load_latency_s=0.05)
         started = time.perf_counter()
         run_churn(ctx, dataset, driver, budget_s=0.01)
         elapsed = time.perf_counter() - started
 
-        assert pool_threads() == [], "a reader thread outlived the call"
+        assert pool_clients() == [], "a reader process outlived the call"
         # Comfortably inside `clients.BARRIER_TIMEOUT_S` (300 s) and
         # `JOIN_TIMEOUT_S` (120 s): a hang would have to blow one of those,
         # and this bound distinguishes "returned" from "eventually returned".
@@ -996,7 +1057,13 @@ class TestReadersStopWithoutHanging:
         run_churn(ctx, dataset, driver)
         assert len(during_writes(ctx)) == 1
 
-        writing = threading.Event()
+        # A `multiprocessing.Event` and not a `threading.Event`, because the
+        # WRITER sets it in the parent and the READERS test it in child
+        # processes. With a thread Event the readers held a pre-fork copy that
+        # was never set: measured, zero readers failed, one during-writes
+        # record was written where this test requires none, and the mutant arm
+        # asserted nothing at all.
+        writing = MP_FORK.Event()
 
         class _FailingReader(FakeDriver):
             def query(self, vector, k):
@@ -1041,7 +1108,7 @@ class TestReadersStopWithoutHanging:
         elapsed = time.perf_counter() - started
 
         assert elapsed < 30.0, f"the failing pool hung for {elapsed:.1f}s"
-        assert pool_threads() == [], "a failed reader thread outlived the call"
+        assert pool_clients() == [], "a failed reader process outlived the call"
         assert [r for r in rows
                 if (r.get("extra") or {}).get("during_writes")] == []
         err = capsys.readouterr().err
@@ -1086,7 +1153,7 @@ class TestReadersStopWithoutHanging:
         elapsed = time.perf_counter() - started
 
         assert elapsed < 30.0, f"the failing baseline hung for {elapsed:.1f}s"
-        assert pool_threads() == []
+        assert pool_clients() == []
         assert during_writes(ctx) == []
         err = capsys.readouterr().err
         assert "READER POOL FAILED" in err
@@ -1688,7 +1755,7 @@ class TestTheProseSaysWhatTheCodeDoes:
         assert "during_writes" in block
         assert "reinsert_rows_per_s" in block
         assert "2,134 ops records" in block
-        assert records.OPS_MEASUREMENT_VERSION == 5
+        assert records.OPS_MEASUREMENT_VERSION == 6
 
     def test_a_version_5_figure_is_still_refused_against_an_older_one(self):
         """The guard the "no archived record carries a 5" argument rests on.
@@ -1710,7 +1777,7 @@ class TestTheProseSaysWhatTheCodeDoes:
         start loading beside reader-contended version 5 ones and the argument
         in the block would be wrong rather than merely unverified here.
         """
-        assert records.OPS_MEASUREMENT_VERSION == 5
+        assert records.OPS_MEASUREMENT_VERSION == 6
         assert 5 not in records.OPS_MEASUREMENT_EQUIVALENT_VERSIONS
         assert not records.ops_versions_measure_the_same_thing([1, 5])
         # And the pair the archive actually contains stays comparable.

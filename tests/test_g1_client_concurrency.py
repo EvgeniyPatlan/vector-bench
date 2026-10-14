@@ -51,10 +51,12 @@ also passes is not a repair.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import re
 import statistics
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List
 
@@ -76,6 +78,9 @@ from harness.workloads.context import RunContext                      # noqa: E4
 from report import render as render_mod                               # noqa: E402
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
+# The pool G3 retired, kept because it is the only thing in the tree that can
+# still produce the shape `scaling_status` refuses -- see that module.
+from tests.retired_thread_pool import thread_window                   # noqa: E402
 
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -197,20 +202,30 @@ def saturated(_clients: int) -> Callable[[], None]:
     flat throughput and an efficiency of about 1/n. That is exactly the shape
     the live run showed -- but every client really is waiting on the engine,
     and **this is the case the guard must not fire on**.
+
+    **THE QUEUE IS A `multiprocessing.Value` AND WAS A `threading.Lock`, AND
+    THAT CHANGE IS THE MOST DANGEROUS LINE IN G3's FOLLOW-UP.** G3 made the
+    clients OS processes. A `threading.Lock` and a `[0]` are per-process
+    objects, so under fork every client would have seen its own queue at
+    depth one, every query would have cost the base latency, the pool would
+    have scaled -- and the row would have passed while asserting nothing
+    about the case the whole threshold exists to protect. Measured after the
+    change: efficiency 0.272 at four clients with `served / clients` 1.004,
+    which is a server that IS the bottleneck and is correctly not flagged.
+    The counter is created BEFORE any fork, so every client process shares
+    the one queue and the regime still models one server.
     """
-    import threading
-    lock = threading.Lock()
-    depth = [0]
+    depth = multiprocessing.get_context("fork").Value("i", 0)
 
     def spend():
-        with lock:
-            depth[0] += 1
-            here = depth[0]
+        with depth.get_lock():
+            depth.value += 1
+            here = depth.value
         try:
             time.sleep(QUERY_S * here)
         finally:
-            with lock:
-                depth[0] -= 1
+            with depth.get_lock():
+                depth.value -= 1
     return spend
 
 
@@ -231,10 +246,27 @@ def half_and_half(_clients: int) -> Callable[[], None]:
 DRIVERS = {"releasing": releasing, "holding": holding,
            "saturated": saturated, "half": half_and_half}
 
-#: Which families the pool must be able to run at the client count, and which
-#: it must refuse. Named here so a family added above has to be classified.
-SCALES = ("releasing", "saturated", "half")
-SERIALIZES = ("holding",)
+#: Which families the LIVE pool must be able to run at the client count.
+#: Named here so a family added above has to be classified.
+#:
+#: **ALL FOUR, SINCE G3, AND THAT IS THE CHANGE RATHER THAN A LOOSENING.**
+#: `holding` was in `SERIALIZES` until the clients became OS processes: it
+#: models the defect by holding the interpreter lock, and separate
+#: interpreters do not share one. The regime still serializes a THREAD pool
+#: and `tests/retired_thread_pool.py` keeps that demonstrable -- see
+#: `SERIALIZES_UNDER_THREADS` below and the class that uses it. Deleting the
+#: row instead would have thrown away the only thing in the tree that can
+#: still produce the shape the guard exists for.
+SCALES = ("releasing", "saturated", "half", "holding")
+
+#: The families that serialize the RETIRED thread pool, which is where the
+#: refusal is still demonstrated end to end. Empty for the live pool by
+#: construction: `concurrency_not_achieved` is now close to unreachable
+#: through Python's own lock, which is why the guard has become a tripwire
+#: rather than an expected finding -- `tests/retired_thread_pool.py`'s
+#: docstring has the argument.
+SERIALIZES_UNDER_THREADS = ("holding",)
+SERIALIZES = ()
 
 
 #: What every synthetic query returns. Fixed ids rather than the fake's real
@@ -581,26 +613,65 @@ class TestTheExactFigureIsBlindAndTheRobustOneIsNot:
 
     def test_the_serializing_pool_is_outstanding_at_its_client_count(
             self, dataset, queries):
-        """The blindness, in the one case that matters.
+        """The blindness, in the one case that matters -- on the RETIRED arm.
 
         Four lock-holding clients: `served_concurrency` lands near one and the
-        status refuses, while `outstanding_concurrency` sits near four. Both are
-        asserted off the same window, so this cannot be two different runs.
+        status refuses, while `outstanding_concurrency` sits near four. Both
+        are read off the same window, so this cannot be two different runs.
+
+        **Measured through `tests/retired_thread_pool.py` and no longer
+        through the live pool, and that is G3 rather than a weakening.** The
+        live clients are OS processes, so a driver that models the defect by
+        holding the interpreter lock no longer serializes them -- measured,
+        `served / clients` 0.243 under threads against 0.982 under processes
+        for the identical regime. The shape this test is about has become
+        unreachable through Python's own lock, which is precisely why the
+        retired pool is kept: a tripwire nothing can trip cannot be
+        distinguished from a broken one. `tests/test_g3_process_clients.py`
+        reports both arms side by side.
         """
-        window = self._window(dataset, "holding", 4, queries)
-        assert (window.scaling_status
+        window = thread_window(factory_for(loaded(dataset),
+                                           DRIVERS["holding"](4)),
+                               queries, 4, K, WINDOW_S)
+        served, outstanding = window["served"], window["outstanding"]
+        assert (latency_mod.scaling_status(served, 4)
                 == cl.SCALING_CONCURRENCY_NOT_ACHIEVED), window
         # The margin measured on this box was a factor of four. Half of the
         # client count is the floor, so 2.0 is the line; the exact figure sat
-        # at 0.97-1.00 of the client count on every run.
-        assert window.served_concurrency < 2.0, window.served_concurrency
-        assert window.outstanding_concurrency > 2.0, window.outstanding_concurrency
+        # at 0.84-1.00 of the client count on every run.
+        assert served < 2.0, served
+        assert outstanding > 2.0, outstanding
         # The pair, as a relation rather than as two absolutes: the exact
         # figure is at least twice the robust one, which is the signature of
         # time spent waiting for a lock rather than for the engine. Measured
-        # at about four times.
-        assert (window.outstanding_concurrency
-                > 2.0 * window.served_concurrency), window
+        # at about three to four times.
+        assert outstanding > 2.0 * served, window
+
+    def test_the_live_pool_no_longer_reaches_that_state(self, dataset,
+                                                        queries):
+        """The other half of the row above, so the move is a measurement.
+
+        The SAME regime through the live pool: `served_concurrency` comes back
+        at its client count and the status is `ok`. Honest (processes) and
+        mutant (threads) are the two arms, over one driver built once, so the
+        pair cannot be two runs that differed for another reason.
+
+        This is also the assertion that would catch a revert to threads, which
+        is the first thing the tripwire is for.
+        """
+        driver = factory_for(loaded(dataset), DRIVERS["holding"](4))
+        live = cl.ClientPool(driver, queries, 4, K, 32,
+                             IndexSpec(dim=queries.shape[1], m=16,
+                                       metric="euclidean"), warmup=2)
+        live.start("g1 holding, live pool", prefix="g1")
+        time.sleep(WINDOW_S)
+        window = live.stop()
+        retired = thread_window(driver, queries, 4, K, WINDOW_S)
+        assert window.scaling_status == cl.SCALING_OK, window
+        assert window.served_concurrency > 2.0, window.served_concurrency
+        # Not an identical pair, which is the signature of a dead probe.
+        assert window.served_concurrency > 2.0 * retired["served"], (
+            window.served_concurrency, retired["served"])
 
     @pytest.mark.parametrize("family", ["releasing", "saturated", "holding"])
     def test_the_exact_figure_does_not_separate_the_regimes(
@@ -633,12 +704,41 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
         assert len(matching) == 1, [r["clients"] for r in rows]
         return matching[0]
 
-    @pytest.mark.parametrize("family", SERIALIZES)
-    def test_a_serializing_pool_is_refused(self, ctx, dataset, family):
+    @pytest.mark.parametrize("family", SERIALIZES_UNDER_THREADS)
+    def test_a_serializing_pool_is_refused(self, ctx, dataset, family,
+                                           monkeypatch):
         """Honest: the record carries `concurrency_not_achieved` and the
         report publishes no efficiency. The `scaling_efficiency` the record
         still holds was 0.21-0.30 across runs, which is why nothing here pins
-        it: the refusal is the assertion, not the decimal."""
+        it: the refusal is the assertion, not the decimal.
+
+        **The serialization is supplied by the RETIRED pool rather than by the
+        live one, because the live one cannot produce it any more.** The
+        workload's own window is replaced for the duration with a reading
+        taken from `tests/retired_thread_pool.py` over the same driver family
+        -- so what travels into the record and out to the report is a real
+        measurement of a real serializing pool, and only the question of which
+        pool produced it has changed. Patched on
+        `harness.workloads.clients`, which is where `ClientPool.stop` reads
+        the name; patching `harness.metrics.latency` would reach nothing, and
+        `TestTheMedianIsWhatMakesTheGuardWork` asserts that asymmetry.
+        """
+        retired = thread_window(factory_for(loaded(dataset),
+                                            DRIVERS[family](4)),
+                                tiny_dataset().test[:N_QUERIES], 4, K,
+                                WINDOW_S)
+        assert retired["served"] < 2.0, retired
+        real = cl.window_concurrency
+
+        def from_the_retired_pool(collectors, wall_seconds, cutoff=None,
+                                  window_start=None):
+            measured = real(collectors, wall_seconds, cutoff=cutoff,
+                            window_start=window_start)
+            if measured.served is None:
+                return measured
+            return measured._replace(served=retired["served"])
+
+        monkeypatch.setattr(cl, "window_concurrency", from_the_retired_pool)
         rows = run_sweep(ctx, dataset, loaded(dataset), family)
         four = self._point(rows, 4)["extra"]
         assert four["scaling_status"] == cl.SCALING_CONCURRENCY_NOT_ACHIEVED
@@ -646,7 +746,6 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
         # The efficiency is still IN the record. Deleting it would lose the
         # evidence for the refusal; the report is what declines to print it.
         assert four["scaling_efficiency"] is not None
-        assert four["scaling_efficiency"] < 0.5, four
 
     @pytest.mark.parametrize("family", SCALES)
     def test_a_pool_that_achieves_its_concurrency_is_not_refused(
@@ -723,7 +822,7 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
                 extra["served_concurrency"], 3)
 
     def test_the_operator_is_told_while_the_run_is_happening(
-            self, ctx, dataset, capsys):
+            self, ctx, dataset, capsys, monkeypatch):
         """On stderr, named, and with the efficiency printed as `refused`.
 
         The remedy is a different client library or a different measurement
@@ -731,7 +830,28 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
         The live log that exposed this printed `efficiency=0.25` on a line
         whose every other figure said the pool had one client's worth of work
         in it, so the stdout line is asserted too.
+
+        The serializing reading is SUPPLIED by `retired_thread_pool`, for the
+        reason `test_a_serializing_pool_is_refused` gives: the live pool
+        cannot produce it any more. The operator message is the tripwire's
+        output, so it has to stay exercised by a real serializing window
+        rather than by a hand-written float.
         """
+        retired = thread_window(
+            factory_for(loaded(dataset), DRIVERS["holding"](4)),
+            tiny_dataset().test[:N_QUERIES], 4, K, WINDOW_S)
+        assert retired["served"] < 2.0, retired
+        real = cl.window_concurrency
+
+        def from_the_retired_pool(collectors, wall_seconds, cutoff=None,
+                                  window_start=None):
+            measured = real(collectors, wall_seconds, cutoff=cutoff,
+                            window_start=window_start)
+            if measured.served is None:
+                return measured
+            return measured._replace(served=retired["served"])
+
+        monkeypatch.setattr(cl, "window_concurrency", from_the_retired_pool)
         run_sweep(ctx, dataset, loaded(dataset), "holding")
         captured = capsys.readouterr()
         assert "CONCURRENCY NOT ACHIEVED" in captured.err, captured.err
@@ -1192,8 +1312,13 @@ class TestTheClientBoundFlagIsKeptAndDocumentsItsBlindness:
     def test_the_threshold_comment_points_at_the_quantity_that_sees_it(self):
         """A reader who concludes "raise the threshold" has read it wrong, so
         the constant's own comment has to name the alternative."""
+        # In `pool_window.py` since G3 split `clients.py`: the constant went
+        # beside `PoolWindow.client_bound`, its only reader, which is the
+        # placement `metrics/latency.py` argues for `SERVED_CONCURRENCY_FLOOR`.
+        # `clients.py` re-exports it and that re-export does NOT share the
+        # name -- `tests/test_g3_process_clients.py` pins the asymmetry.
         source = open(os.path.join(
-            VB_ROOT, "harness", "workloads", "clients.py")).read()
+            VB_ROOT, "harness", "workloads", "pool_window.py")).read()
         block = source.split("CLIENT_BOUND_UTIL = 0.80")[0]
         tail = _plain(block[-2200:])
         assert "0.177" in tail
@@ -1474,21 +1599,44 @@ class TestTheFootnoteKeepsSayingIt:
         assert notes == re.sub(r"\s+", " ", notes)
 
     def test_the_methodology_document_carries_the_mechanism(self):
-        """§5. Measured, read and not-done, each marked as such.
+        """§5. Measured, read and supplied, each marked as such.
 
-        `docs/05-methodology.md` is where a reader goes for what is measured,
-        and the one claim that must be marked as READ is whether a client
-        library releases the lock: no test here starts a server, so nothing
-        here can measure it.
+        `docs/05-methodology.md` is where a reader goes for what is measured.
+        The claim that must stay marked as READ is whether a client library
+        releases the lock: no test here starts a server, so nothing here can
+        measure it, and the 2026-10-14 run that settled it is SUPPLIED rather
+        than reproduced.
+
+        **Re-pointed by G3.** This used to assert that the document said
+        running the clients as processes "has not been done". It has been
+        done, so that pair of assertions would now pin prose that is false --
+        which is the failure mode this class exists to catch, arriving from
+        the code side instead of the prose side. What replaces them is the
+        other half of the same discipline: the document must say the change
+        was made, must still mark the per-library question as read rather than
+        measured, and must carry the cost list as measurements.
         """
         doc = _plain(open(os.path.join(
             VB_ROOT, "docs", "05-methodology.md")).read())
-        assert "What is read rather than measured" in doc
+        assert "What was read rather than measured" in doc
         assert "psycopg3" in doc and "MariaDB Connector/Python" in doc
-        assert "no measurement here settles it" in doc
-        # And the thing that was deliberately not built.
-        assert "Running the clients as processes" in doc
-        assert "has not" in doc
+        assert "no measurement in this repository settles it" in doc
+        # The change itself, and that it is stated as done rather than
+        # proposed.
+        assert "The clients are processes, and this is what it cost" in doc
+        assert "None of that is attempted here" not in doc, (
+            "docs/05 still says the change was not attempted, which is now "
+            "false prose about shipped code")
+        # And the three cost claims a reader is most likely to act on, each
+        # labelled with how it is known.
+        assert "fork and not spawn, and it is forced rather than preferred" \
+            in doc
+        assert "The memory cost this section used to state was wrong" in doc
+        assert "becomes `forkserver` in 3.14" in doc
+        # The consequence for how the status should be read, because a
+        # tripwire that is documented as a finding will be misread.
+        assert "has therefore become a **tripwire**" in doc or \
+            "has therefore become a tripwire" in doc
 
 
 # ---------------------------------------------------------------------------
@@ -1528,45 +1676,56 @@ class TestTheMedianIsWhatMakesTheGuardWork:
         return WindowConcurrency(outstanding=exact, served=exact)
 
     def test_a_mean_based_instrument_stops_seeing_the_defect(self, dataset):
-        """Honest and mutant values, read off two real windows.
+        """Honest and mutant values, read off ONE window by two instruments.
 
-        Honest: a four-client lock-holding pool reports
-        `concurrency_not_achieved`, and the report's efficiency cell reads
-        "⊘ not measurable". Mutant (`window_concurrency` rebound on
-        `harness.workloads.clients` to the mean-based form above): the SAME
-        driver, the SAME pool and the same window length report `ok`, and the
-        cell reads the number. Both statuses are read out of
-        `PoolWindow.scaling_status` and both cells out of
-        `render._efficiency_cell`.
+        Honest (`window_concurrency`, the median form): a four-client
+        lock-holding window reports `concurrency_not_achieved`, and the
+        report's efficiency cell reads "⊘ not measurable". Mutant (the
+        mean-based form above, which is what a reader would write from
+        "Little's law over the spans we already have"): the SAME SPANS report
+        `ok` and the cell reads the number.
+
+        **One window read twice rather than two windows, which is stronger
+        than the version this replaces.** That version ran the live pool
+        twice with `clients.window_concurrency` rebound in between; since G3
+        the live clients are processes and a lock-holding driver no longer
+        serializes them, so there is no live window with the shape to read.
+        `tests/retired_thread_pool.py` produces it and hands back its
+        collectors, its wall and its two window instants -- so the two
+        instruments are compared over identical input and any difference is
+        the arithmetic rather than two runs of a loaded box.
+
+        `test_patching_the_defining_module_would_not_have_reached_it` below
+        still pins the binding asymmetry that made the old spelling
+        necessary, and `test_a_serializing_pool_is_refused` still rebinds
+        `clients.window_concurrency` for real.
         """
-        queries = tiny_dataset().test[:N_QUERIES]
-        honest = pool_window(loaded(dataset), "holding", 4, queries).stop()
-        original = cl.window_concurrency
-        try:
-            cl.window_concurrency = self._mean_based
-            mutant = pool_window(loaded(dataset), "holding", 4,
-                                 queries).stop()
-        finally:
-            cl.window_concurrency = original
-        assert honest.scaling_status == cl.SCALING_CONCURRENCY_NOT_ACHIEVED
-        assert mutant.scaling_status == cl.SCALING_OK
+        retired = thread_window(
+            factory_for(loaded(dataset), DRIVERS["holding"](4)),
+            tiny_dataset().test[:N_QUERIES], 4, K, WINDOW_S)
+        args = (retired["collectors"], retired["wall"])
+        kwargs = {"cutoff": retired["cutoff"],
+                  "window_start": retired["window_start"]}
+        honest = cl.window_concurrency(*args, **kwargs)
+        mutant = self._mean_based(*args, **kwargs)
+        honest_status = latency_mod.scaling_status(honest.served, 4)
+        mutant_status = latency_mod.scaling_status(mutant.served, 4)
+        assert honest_status == cl.SCALING_CONCURRENCY_NOT_ACHIEVED, honest
+        assert mutant_status == cl.SCALING_OK, mutant
         # Not an identical pair, which is the signature of a dead probe.
-        assert honest.scaling_status != mutant.scaling_status
+        assert honest_status != mutant_status
         # And the mutant's `served` is its own `outstanding`, which is the
         # mechanism rather than a coincidence of this window.
-        assert mutant.served_concurrency == pytest.approx(
-            mutant.outstanding_concurrency)
-        assert honest.served_concurrency != pytest.approx(
-            honest.outstanding_concurrency)
+        assert mutant.served == pytest.approx(mutant.outstanding)
+        assert honest.served != pytest.approx(honest.outstanding)
         # Carried through to what a reader sees.
         assert render_mod._efficiency_cell(
             {"scaling_efficiency": 0.25,
-             "scaling_status": honest.scaling_status}
+             "scaling_status": honest_status}
         ) == render_mod.SCALING_REFUSED_CELL
         assert render_mod._efficiency_cell(
             {"scaling_efficiency": 0.25,
-             "scaling_status": mutant.scaling_status}) == "0.25"
-        assert cl.window_concurrency is original
+             "scaling_status": mutant_status}) == "0.25"
 
     def test_patching_the_defining_module_would_not_have_reached_it(self):
         """The dead-probe trap, asserted rather than remembered.
