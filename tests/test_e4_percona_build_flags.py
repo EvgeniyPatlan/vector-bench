@@ -120,10 +120,11 @@ each is asserted rather than assumed:
    records that it was checked rather than believed. The shape is real; that
    instance of it is not.)
 3. **A text search that finds the flag in the prose documenting it.** The
-   Dockerfile header quotes the cmake errors verbatim, so
-   `-DWITH_AUTHENTICATION_LDAP=ON` and `-DWITH_CURL=0` -- both wrong values,
-   one of them for a flag that IS passed -- are in the file, and so is the
-   correct `-DWITH_CURL=bundled`. A whole-file grep therefore proves
+   Dockerfile header quotes all five cmake errors verbatim, so
+   `-DWITH_AUTHENTICATION_LDAP=ON`, `-DWITH_CURL=0` and `-DWITH_CURL=system`
+   -- every wrong value, two of them for the flag that IS passed -- are in the
+   file, and so is the correct `-DWITH_CURL=bundled`. A whole-file grep
+   therefore proves
    nothing about what is passed and can prove the opposite of the truth; it is
    also why the removed-flag assertion works on parsed tokens, since
    `assert "-DWITH_AUTHENTICATION_LDAP" not in dockerfile_text` would fail
@@ -266,6 +267,7 @@ VENDOR_VIRTUAL_PAM_NAME = "libpam-dev"
 WRONG_VALUES_QUOTED_IN_PROSE = (
     "-DWITH_AUTHENTICATION_LDAP=ON",
     "-DWITH_CURL=0",
+    "-DWITH_CURL=system",
 )
 
 # The CORRECT value is quoted in the header too (the apt note explains the
@@ -495,10 +497,11 @@ class TestTheFlagsTheConfigureFailuresRequired:
         that the ambiguity is real, so the exactness elsewhere is visibly
         load-bearing rather than stylistic.
         """
-        assert "-DWITH_CURL=0" in dockerfile_text, (
-            "the header no longer quotes the -DWITH_CURL=0 that caused the "
-            "keyring_vault:33 failure, so this test has stopped "
-            "discriminating")
+        for wrong in ("-DWITH_CURL=0", "-DWITH_CURL=system"):
+            assert wrong in dockerfile_text, (
+                f"the header no longer quotes {wrong!r}, one of the two "
+                f"values of this flag that failed a real configure, so this "
+                f"test has stopped discriminating")
         # The right value is in the prose as well, so even a count of the
         # correct string over the whole file proves nothing about arguments.
         assert dockerfile_text.count(RIGHT_VALUE_ALSO_QUOTED_IN_PROSE) >= 2, (

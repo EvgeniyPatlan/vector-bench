@@ -115,17 +115,31 @@ ARG JOBS=0
 #
 # AliSQL builds from the same MySQL lineage with none of them, so this is not
 # a MySQL-family cost -- it is what Percona Server 9.0 plus its own components
-# need. Four separate configure failures asked for four of these:
+# need. Five configure failures, in the order they happened:
 #
 #   CMakeLists.txt:2075   -DWITH_AUTHENTICATION_LDAP=ON, but missing system
 #                         libraries  (fed by the LDAP, SASL and KERBEROS
 #                         warnings together -- any one of the three trips it)
+#   CMakeLists.txt:2127   -DWITH_CURL=system, but missing system libraries,
+#                         preceded by an ALIAS failure for `ext::curl` at
+#                         cmake/curl.cmake:246. WITH_CURL defaults to "system"
+#                         on every UNIX (CMakeLists.txt:998-1002).
 #   cmake/rpc.cmake:108   Could not find rpc/rpc.h in /usr/include or
 #                         /usr/include/tirpc            -> libtirpc-dev
 #   plugin/auth_ldap/CMakeLists.txt:21
-#                         Required LDAP dev library not found -- a PERCONA
-#                         plugin with its own unconditional check, which no
-#                         upstream -DWITH_AUTHENTICATION_* flag governs
+#                         Required LDAP dev library not found. A PERCONA
+#                         plugin, and the half of that which matters is that
+#                         no upstream -DWITH_AUTHENTICATION_* flag governs it.
+#                         The check is NOT unconditional, as an earlier
+#                         revision of this note claimed: it sits inside
+#                         `IF(WITH_PERCONA_AUTHENTICATION_LDAP)` at
+#                         plugin/auth_ldap/CMakeLists.txt:16, declared at
+#                         CMakeLists.txt:2004-2011 with the default ON
+#                         everywhere but APPLE. So the governing flag exists;
+#                         it is simply a different, Percona-specific one from
+#                         the family we were setting, and
+#                         -DWITH_PERCONA_AUTHENTICATION_LDAP=OFF would have
+#                         disabled it.
 #   components/keyrings/keyring_vault/CMakeLists.txt:33
 #                         could not find CURL library, after -DWITH_CURL=0
 #                         had been set to clear an earlier failure
@@ -147,20 +161,81 @@ ARG JOBS=0
 #                         noble, after a --no-cache rebuild proved the dev
 #                         package was installed and the check failed anyway.
 #
-# Only rpc.cmake offers no way out but the package; the others each tempted a
-# flag first, and each flag moved the failure rather than removing it. Hence
-# the rule recorded beside cmake_flags in config/engines/percona.yml: on this
-# tree, switching a dependency off breaks a component that wanted the target.
+# EVERY ONE OF THESE HAS AN OFF SWITCH SOMEWHERE. An earlier revision of this
+# note said only rpc.cmake did not, and that was wrong three times over. The
+# switches are recorded so the strategy below reads as a choice rather than as
+# the absence of one:
 #
-# The list is the subset of this tree's own build-ps/percona-server-9.0_builder.sh
-# `install_deps()` that gates configure, filtered to packages noble actually
-# has -- the vendor list also names gcc-8 through gcc-15, valgrind, doxygen,
-# python-mysqldb, dh-systemd, libzstd1-dev and libncurses5-dev, several of
-# which have no candidate here. Note libpam0g-dev and not the vendor's
-# `libpam-dev`, which resolves to nothing on noble. It is a SUPERSET rather
-# than a minimal set: with -DWITH_CURL=bundled and the vendor's bundled
-# libevent/zstd, several of these are probably unnecessary, and nothing here
-# can run a build to find out which, so none were pruned.
+#   :2075              -DWITH_AUTHENTICATION_LDAP=OFF, and it was tried
+#   :2127              -DWITH_CURL=0, and it was tried -- see keyring_vault
+#   auth_ldap:21       -DWITH_PERCONA_AUTHENTICATION_LDAP=OFF, per above
+#   keyring_vault:33   components/keyrings/keyring_vault/CMakeLists.txt:25 is
+#                      `option(WITH_COMPONENT_KEYRING_VAULT ... ON)` with an
+#                      early `return()` at :26-29, so =OFF closes it
+#   rpc.cmake:108      -DWITH_TIRPC=bundled takes the branch at
+#                      cmake/rpc.cmake:51-59, which sets TIRPC_FOUND itself
+#                      and calls ADD_SUBDIRECTORY(extra/tirpc) -- and
+#                      extra/tirpc IS in the tarball, since .gitmodules at
+#                      this pin lists only the four submodules note 2 names
+#
+# UNPROVEN, AND DELIBERATELY LEFT THAT WAY: the vendor's own
+# build-ps/percona-server-9.0_builder.sh:603-609 carries a comment asserting
+# there is "no bundled-tirpc fallback despite extra/tirpc/ existing in the
+# tree". That contradicts the branch cited on the last row above. Nothing here
+# can settle it -- no build of this image has ever succeeded, so neither
+# reading has been executed -- and it must not be resolved by argument.
+#
+# The strategy does not depend on which of those is right. Every flag that was
+# tried moved the failure instead of removing it, and -DWITH_CURL=0 is the
+# clearest case because it CAUSED keyring_vault:33; each further switch costs
+# a multi-hour build to evaluate. Hence the rule recorded beside cmake_flags
+# in config/engines/percona.yml: on this tree, switching a dependency off
+# breaks a Percona component that wanted the target, while installing the
+# dependency does not.
+#
+# WHY NO CONSUMER-SIDE FLAG COULD EVER HAVE SAVED THE CURL ONE, which is the
+# sharpest thing here and the easiest to get backwards: the curl check at
+# CMakeLists.txt:2121-2131 sits at TOP LEVEL, inside no IF() at all. It runs
+# whether or not anything in the build wants curl, and :2127 is fatal on the
+# library being absent rather than on anything needing it. OpenID Connect
+# genuinely is a curl consumer -- plugin/auth_openid_connect/CMakeLists.txt:32-34
+# links `curl`, inside `IF(WITH_AUTH_OPENID_CONNECT)` at :16 -- so the
+# -DWITH_AUTH_OPENID_CONNECT=OFF in the cmake list below really does remove
+# one, and it still does not help.
+#
+# The list is this tree's own build-ps/percona-server-9.0_builder.sh
+# `install_deps()`, filtered to the development packages and plugins among its
+# entries and to what noble actually has -- the vendor list also names gcc-8
+# through gcc-15, valgrind, doxygen, python-mysqldb, dh-systemd, libzstd1-dev
+# and libncurses5-dev, several of which have no candidate here. It is NOT "the
+# subset that gates configure", which an earlier revision of this note claimed
+# while also calling it a superset: it is a SUPERSET and it was not pruned.
+# Only three entries are tied to a failure recorded above -- libldap2-dev,
+# libtirpc-dev and libsasl2-modules. With -DWITH_CURL=bundled and the vendor's
+# bundled libevent and zstd (build-binary.sh:309-310), libcurl4-openssl-dev,
+# liblz4-dev, libzstd-dev, libevent-dev and libre2-dev are probably
+# unnecessary; nothing here can run a build to find out which, so none were
+# removed. Prune it against a build that succeeded, not against reasoning.
+#
+# libpam0g-dev AND NOT THE VENDOR'S `libpam-dev`, for a reason an earlier
+# revision of this note also got wrong: `libpam-dev` does not resolve to
+# nothing on noble -- it is a VIRTUAL package whose only provider is
+# libpam0g-dev, and packages.ubuntu.com files it under "virtual". Naming the
+# real package is still the right call, because a purely virtual name is one
+# more thing for apt to be clever about, but no failure above asked for it:
+# CMakeLists.txt:165 is `OPTION(WITH_PAM "Build with Percona PAM plugin" OFF)`,
+# DEFAULT OFF, and only build-binary.sh:298 turns it on. libpam0g-dev is
+# precautionary, like most of this list.
+#
+# TELEMETRY, recorded for whoever next compares this against build-binary.sh:
+# that script passes -DWITH_PERCONA_TELEMETRY=ON at :311 and this build passes
+# nothing at all. CMakeLists.txt:2392 is
+# `option(WITH_PERCONA_TELEMETRY "Build Percona Telemetry component" OFF)` --
+# already OFF -- so no telemetry component is built and no flag is needed to
+# achieve that. Leave it alone rather than "fixing" the difference: a
+# component doing periodic background work inside a server whose CPU and wall
+# time this benchmark attributes to query execution is a confound, and ON is a
+# choice Percona's PACKAGING makes, not the source default.
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake bison pkg-config \
