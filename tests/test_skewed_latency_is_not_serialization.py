@@ -60,20 +60,27 @@ bound and the SAME floor of 0.5 judges it. Measured, the efficiency column is
 again the midpoint of a measured gap -- a factor of 1.9 below the lowest
 scaling row and 1.7 above the highest non-scaling one.
 
-**THE REPAIR REACHES `clients >= 3` AND NOT BELOW, which is the review's
-finding and not a design choice.** A completely serialized pool's efficiency
-is exactly `1 / clients`, so at one and two clients the throughput estimator
-sits ON the floor and cannot discriminate; admitting it there dropped a true
-positive the old rule caught. `throughput_fraction` therefore withholds the
-term wherever `1 / clients` is not itself below the floor, and that withholds
-the FIX at one and two clients as well.
-`TestTwoClientsIsAKnifeEdgeForBothEstimators` measures both halves of that.
-Two consequences a reader of the follow-up needs: a skewed point at ONE client
-is still refused, and the harness still says "the clients serialized" about a
-single client (measured `served / clients` 0.1428, 0.1764 and 0.2050 for the
-30%-at-20x regime at one client); and `config/profiles/main.yml` sweeps two
-clients today, so the two-client point keeps the old rule's false positive
-until a profile stops asking for it.
+**THE EFFICIENCY TERM REACHES `clients >= 3` AND NOT BELOW, which is the
+review's finding and not a design choice.** A completely serialized pool's
+efficiency is exactly `1 / clients`, so at one and two clients it sits ON the
+floor and cannot discriminate; admitting it there dropped a true positive the
+old rule caught. `throughput_fraction` therefore withholds the term wherever
+`1 / clients` is not itself below the floor -- and that withholds the FIX
+there too, so the two-client point keeps the old rule's false positive until a
+profile stops asking for it. `config/profiles/main.yml` sweeps two clients
+today. `TestTwoClientsIsAKnifeEdgeForBothEstimators` measures both halves.
+
+**ONE CLIENT IS HANDLED SEPARATELY AND IS NOW `ok` BY DEFINITION**, because
+it is a different statement: a one-client pool has no concurrency to fail to
+achieve. One client cannot take turns with itself, and "the engine answers one
+query at a time" is not a defect at n=1 but the definition of n=1. That was a
+live defect -- `clients == 1` is in every profile, and the 30%-at-20x regime
+at a single client measured `served / clients` 0.1428, 0.1716, 0.1764, 0.1850
+and 0.2050 over five builds, every one refused, so every run of a skewed
+workload printed "the clients serialized" about one client while withholding
+an efficiency that is 1.0 by definition.
+`TestOneClientHasNoConcurrencyToFailToAchieve` asserts that it is the branch
+and NOT the tautological efficiency that publishes those points.
 
 **WHAT THIS DOES NOT FIX, asserted rather than admitted in prose.**
 `TestTheResidueHoldsBothCausesAndCannotSeparateThem` measures a saturated
@@ -126,12 +133,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.drivers.base import IndexSpec                            # noqa: E402
 from harness.metrics import latency as latency_mod                    # noqa: E402
-from harness.metrics.latency import (LatencyCollector,                # noqa: E402
+from harness.metrics.latency import (CREDIBLE_BASELINE_MEDIAN_RATIO,     # noqa: E402
+                                     LatencyCollector,
                                      SCALING_CONCURRENCY_NOT_ACHIEVED,
                                      SCALING_OK, SERVED_CONCURRENCY_FLOOR,
-                                     achieved_fraction, merge_collectors,
-                                     scaling_status, served_fraction,
-                                     throughput_fraction, window_concurrency)
+                                     achieved_fraction, baseline_is_credible,
+                                     merge_collectors, scaling_status,
+                                     served_fraction, throughput_fraction,
+                                     window_concurrency)
 from harness.workloads import clients as cl                           # noqa: E402
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
@@ -1216,8 +1225,8 @@ class TestClientsTakingTurnsAreStillRefused:
 # ---------------------------------------------------------------------------
 
 class TestTwoClientsIsAKnifeEdgeForBothEstimators:
-    """At one and two clients the throughput estimator is withheld, so the
-    median-span rule decides there alone.
+    """At one and two clients the throughput estimator is withheld; at two
+    that leaves the median-span rule deciding alone.
 
     **THE FIRST VERSION OF THIS FILE CALLED THIS "a property of the floor as
     it already stood, surfaced by this work rather than created by it", AND
@@ -1235,26 +1244,41 @@ class TestTwoClientsIsAKnifeEdgeForBothEstimators:
     measured 0.5008 and published a pool whose clients were taking turns.
 
     So `throughput_fraction` withholds the term wherever `1 / clients` is not
-    itself below the floor. That is symmetric and it CUTS BOTH WAYS: the skew
-    false positive this file exists to fix is also not fixed at one or two
-    clients, because the term that fixes it is not admitted there. The repair
-    reaches `clients >= 3`. That is measured below rather than asserted in
-    prose, and it is the main thing a reader of the follow-up needs.
+    itself below the floor. That is symmetric and it CUTS BOTH WAYS: at TWO
+    clients the skew false positive this file exists to fix is also not fixed,
+    because the term that fixes it is not admitted there. The term reaches
+    `clients >= 3`.
+
+    **One client is not in that trade**, and the asymmetry is the point:
+    there the withholding costs nothing, because a separate branch in
+    `scaling_status` returns `ok` for a reason that has nothing to do with
+    either estimator -- a one-client pool has no concurrency to fail to
+    achieve. See `TestOneClientHasNoConcurrencyToFailToAchieve`. So the
+    verdicts run ok / refused / ok / ok at n=1,2,3,4, which is measured below
+    rather than asserted in prose.
     """
 
-    def test_the_repair_does_not_reach_one_or_two_clients(self):
-        """The reach of the fix, stated as the verdicts at each client count.
+    def test_the_verdict_at_every_client_count_the_withholding_touches(self):
+        """The reach of the fix, as the verdicts themselves.
 
-        A skewed-but-SCALING pool -- `served / clients` 0.17, efficiency
-        0.98, which is the 30%-at-20x regime's measured shape -- is published
-        from three clients up and REFUSED at one and two, because the
-        efficiency is withheld there. Honest: the four verdicts below. Mutant
-        (`CLIENT_COUNTS`-independent admission, i.e. the pre-review form that
-        returned the efficiency at every count): `ok` at all four, including
-        the two where a serialized pool is indistinguishable from this one.
+        A skewed-but-SCALING pool -- `served / clients` 0.17, efficiency 0.98,
+        the 30%-at-20x regime's measured shape -- reads:
 
-        Both are read back, and they differ at exactly the two counts the
-        withholding covers.
+            n=1   ok        by DEFINITION: no concurrency to fail to achieve
+            n=2   refused   the term is withheld, the old rule decides
+            n=3   ok        the term is admitted and the repair applies
+            n=4   ok
+
+        **The asymmetry between n=1 and n=2 is the whole content of this
+        probe, and the two `ok`s have different causes.** At one client the
+        efficiency is withheld as well -- `1/1` is not below the floor -- so
+        the `ok` comes from the one-client branch and not from the term; at
+        two the withholding leaves the old rule in charge and it refuses.
+
+        Honest: the four verdicts above. Mutant (the pre-review form, which
+        admitted the efficiency at every client count): `ok` at all four,
+        including at two, where a serialized pool is indistinguishable from
+        this one. The pair differs at exactly n=2.
         """
         skewed = {}
         unguarded = {}
@@ -1264,16 +1288,18 @@ class TestTwoClientsIsAKnifeEdgeForBothEstimators:
             unguarded[clients] = (
                 SCALING_OK if max(0.17, 0.98) >= SERVED_CONCURRENCY_FLOOR
                 else SCALING_CONCURRENCY_NOT_ACHIEVED)
-        assert skewed == {1: SCALING_CONCURRENCY_NOT_ACHIEVED,
+        assert skewed == {1: SCALING_OK,
                           2: SCALING_CONCURRENCY_NOT_ACHIEVED,
                           3: SCALING_OK, 4: SCALING_OK}, skewed
         assert unguarded == {c: SCALING_OK for c in (1, 2, 3, 4)}, unguarded
         assert skewed != unguarded
-        # And the cost is paid in the direction of the OLD rule, never past
-        # it: where the term is withheld the verdict is exactly the old one.
-        for clients in (1, 2):
-            assert (skewed[clients]
-                    == pre_change_scaling_status(0.17 * clients, clients))
+        # Where the term is withheld AND there is a concurrency question to
+        # ask -- which is n=2 and not n=1 -- the verdict is exactly the old
+        # rule's, so the withholding costs nothing beyond the status quo.
+        assert (skewed[2] == pre_change_scaling_status(0.34, 2)
+                == SCALING_CONCURRENCY_NOT_ACHIEVED)
+        # And at one client the two rules DISAGREE, which is the next class.
+        assert skewed[1] != pre_change_scaling_status(0.17, 1)
 
     def test_a_serialized_two_client_pool_is_still_refused(self, table):
         """The true positive the review found dropped, read off the fixture.
@@ -1371,6 +1397,97 @@ class TestTwoClientsIsAKnifeEdgeForBothEstimators:
                 == SCALING_CONCURRENCY_NOT_ACHIEVED)
 
 
+class TestOneClientHasNoConcurrencyToFailToAchieve:
+    """`clients == 1` is `SCALING_OK` whenever the window measured anything.
+
+    **Not a special case bolted on, and not the efficiency's accident.** There
+    is no true positive at one client: one client cannot take turns with
+    itself, so "the clients serialized on the interpreter lock" is impossible,
+    and "the engine answers one query at a time" is not a defect at n=1 -- it
+    is the definition of n=1. Whatever `served / clients` comes out as at one
+    client is a statement about the latency distribution and nothing else.
+
+    It is reached as that statement rather than through the efficiency, which
+    is 1.0 by construction at one client: `throughput_fraction` withholds any
+    reading that `1 / clients` does not put below the floor, and `1 / 1` does
+    not, so the term is withheld here too. A right answer from a constructed
+    value would not be evidence.
+
+    **This was a live defect, not a hypothetical.** `clients == 1` is in every
+    profile -- `smoke`, `percona` and `dev` among them -- so every run of a
+    skewed workload printed "the clients serialized" about a single client and
+    withheld a scaling efficiency that is 1.0 by definition.
+    """
+
+    def test_a_skewed_one_client_window_is_published(self, table):
+        """Honest against mutant on the measured one-client window.
+
+        Honest (the new rule): `ok`. Mutant (the pre-change body, same
+        window): `concurrency_not_achieved`. Measured `served / clients` at
+        one client for the 30%-at-20x regime: 0.1428, 0.1716, 0.1764, 0.1850
+        and 0.2050 over five builds, every one of them a refusal before.
+
+        The efficiency is passed as None as well as as 1.0, because the two
+        callers in `harness/workloads/` pass nothing and this branch has to
+        fire for them too -- it is the one part of this change that is NOT
+        waiting on plumbing.
+        """
+        point = table["skew30x20"][1]
+        share = fractions(point)
+        assert share["served"] < SERVED_CONCURRENCY_FLOOR, (
+            f"the one-client skewed window is no longer under the floor, so "
+            f"this probe is not measuring the defect\n{report(table)}")
+        honest_with = scaling_status(point["served"], 1, 1.0)
+        honest_without = scaling_status(point["served"], 1)
+        mutant = pre_change_scaling_status(point["served"], 1)
+        assert honest_with == honest_without == SCALING_OK, report(table)
+        assert mutant == SCALING_CONCURRENCY_NOT_ACHIEVED, report(table)
+        assert honest_with != mutant
+
+    def test_it_is_the_branch_and_not_the_efficiency_that_publishes_it(self):
+        """The term is withheld at one client, so the `ok` is the branch's.
+
+        Honest: `throughput_fraction(1.0, 1)` is None -- the efficiency plays
+        no part -- and `scaling_status(0.17, 1, 1.0)` is still `ok`. Mutant
+        (the one-client branch removed, which is the pre-change shape of the
+        rule): the same call reads `concurrency_not_achieved`, because the
+        withheld term leaves `served_fraction` of 0.17 against the floor.
+
+        So the two readings differ, and the difference is attributable to the
+        branch rather than to the efficiency -- which is the distinction the
+        whole class exists to make.
+        """
+        assert throughput_fraction(1.0, 1) is None
+        honest = scaling_status(0.17, 1, 1.0)
+        # The rule without the branch, run over the same input.
+        fraction = achieved_fraction(0.17, 1, 1.0)
+        mutant = (SCALING_CONCURRENCY_NOT_ACHIEVED
+                  if fraction < SERVED_CONCURRENCY_FLOOR else SCALING_OK)
+        assert fraction == pytest.approx(0.17)
+        assert honest == SCALING_OK
+        assert mutant == SCALING_CONCURRENCY_NOT_ACHIEVED
+        assert honest != mutant
+
+    def test_a_one_client_window_that_measured_nothing_is_still_none(self):
+        """`None` wins over the branch, and that ordering is asserted.
+
+        "Nobody could look" is not "the pool was fine", and a one-client
+        window that counted no query is the first of those. Honest: None.
+        Mutant (the branch moved ABOVE the None check, which is the obvious
+        way to write it): `ok` -- a window nobody measured published as a
+        pass, which is the fault `PoolWindow.client_bound` draws the same
+        distinction to avoid.
+        """
+        honest = scaling_status(None, 1, 1.0)
+        mutant = SCALING_OK          # the branch, taken before the None check
+        assert honest is None
+        assert honest != mutant
+        assert scaling_status(None, 1) is None
+        # And a one-client window that DID measure something is not None, so
+        # the probe is not passing because everything at n=1 is None.
+        assert scaling_status(0.17, 1) == SCALING_OK
+
+
 class TestAnUnderWarmedBaselineIsTheRepairsOwnExposure:
     """What a depressed `qps_1` does to the term, and the signal that sees it.
 
@@ -1449,9 +1566,6 @@ class TestAnUnderWarmedBaselineIsTheRepairsOwnExposure:
         measured 0.996 -- because a stalled client leaves the median alone.
         Mutant (the 2x cold baseline): 1.889. A median that got faster as
         clients were added, which no engine can do.
-
-        Asserted as a factor rather than a threshold, because the threshold is
-        the follow-up's to choose once the quantity is an input.
         """
         four = table["held"][4]
         honest = table["held"][1]["p50"] / four["p50"]
@@ -1459,6 +1573,77 @@ class TestAnUnderWarmedBaselineIsTheRepairsOwnExposure:
         assert honest < 1.3, (honest, report(table))
         assert mutant > 1.5, (mutant, report(table))
         assert mutant > 1.3 * honest, (honest, mutant, report(table))
+
+    def test_baseline_is_credible_reads_the_two_windows_that_way(
+            self, table, cold_baseline):
+        """`baseline_is_credible`, over the very windows above.
+
+        Honest (the fixture's own baseline against the four-client window):
+        True. Mutant (the 2x cold baseline against the same four-client
+        window): False. Both read back off measured medians rather than off
+        hand-picked numbers, so the function is exercised on the shape it
+        exists for.
+
+        **Nothing in `harness/` calls this yet.** It is a handover: the
+        caller is `concurrency.py`, which holds both medians already as
+        `latency_p50_ms`. This probe is what makes it a tested handover
+        rather than a paragraph.
+        """
+        four = table["held"][4]
+        honest = baseline_is_credible(table["held"][1]["p50"], four["p50"])
+        mutant = baseline_is_credible(cold_baseline["p50"], four["p50"])
+        assert honest is True, report(table)
+        assert mutant is False, report(table)
+        assert honest != mutant
+
+    def test_the_ratio_threshold_sits_in_the_gap_it_was_measured_from(self):
+        """Either side of 1.4, with no measurement in it.
+
+        The gap it is the midpoint of: legitimate readings of this ratio ran
+        0.97-1.02 over every regime and client count the fixture rebuilds,
+        and the lowest corrupt reading measured was 1.889. Honest (1.4): 1.02
+        is credible and 1.889 is not. Mutant (the constant rebound to 2.0 on
+        `harness.metrics.latency`): 1.889 reads credible too -- and 1.889 is
+        the row whose efficiency came within 6% of publishing a serialized
+        pool, so that is the miss that matters.
+        """
+        original = latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO
+        honest = (baseline_is_credible(1.02, 1.0),
+                  baseline_is_credible(1.889, 1.0))
+        try:
+            latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = 2.0
+            assert latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO != original
+            mutant = (baseline_is_credible(1.02, 1.0),
+                      baseline_is_credible(1.889, 1.0))
+        finally:
+            latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO = original
+        assert latency_mod.CREDIBLE_BASELINE_MEDIAN_RATIO == original
+        assert honest == (True, False)
+        assert mutant == (True, True)
+        assert honest != mutant
+        # The constant is read out of module globals on every call, so the
+        # rebinding above reached the function rather than a captured copy.
+        assert CREDIBLE_BASELINE_MEDIAN_RATIO == original
+        # Measured rows, read through the function rather than described.
+        assert baseline_is_credible(0.996, 1.0) is True
+        assert [baseline_is_credible(r, 1.0)
+                for r in (1.889, 2.338, 2.782)] == [False, False, False]
+
+    def test_a_missing_median_is_none_and_never_false(self):
+        """None is "nobody could look"; False would say "it was corrupt".
+
+        Honest: None for a missing or non-positive median either side.
+        Mutant (the obvious `bool(...)` spelling, which turns every absence
+        into a verdict): False, which a consumer would render as a warning
+        about a baseline nobody measured.
+        """
+        for pair in ((None, 1.0), (1.0, None), (None, None),
+                     (0.0, 1.0), (1.0, 0.0), (-1.0, 1.0)):
+            honest = baseline_is_credible(*pair)
+            assert honest is None, pair
+            assert honest is not False, pair
+        # Non-vacuity: a measured pair does return a bool.
+        assert baseline_is_credible(1.0, 1.0) is True
 
 
 class TestTheResidueHoldsBothCausesAndCannotSeparateThem:
