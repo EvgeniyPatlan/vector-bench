@@ -8,8 +8,31 @@
 # Measured on a Xeon Gold 6230: ~30 min for one resource pass, ~57 min for
 # both. AliSQL dominates it at ~55 rows/s ingest. An earlier version of this
 # file claimed 15 minutes, which was wrong.
+#
+# THOSE TIMINGS PREDATE PERCONA AND DO NOT INCLUDE IT. Nothing has measured
+# Percona's ingest rate -- `orchestrator/estimate.py` names it in
+# `engines_without_ingest_rate` rather than modelling it -- so "AliSQL
+# dominates it" is a claim about the six engines that were measured, and this
+# profile is the run that will settle whether it is still true. Percona builds
+# its HNSW graph inside every INSERT by default, which is AliSQL's shape
+# rather than pgvector's.
+#
+# Two things this gate deliberately does NOT cover, both recorded in
+# docs/09-adding-percona-server.md:
+#
+#  * `innodb_hnsw_max_memory`. Percona's is a hard allocation ceiling and not
+#    a cache, so exceeding it fails the statement. This profile's worst case
+#    is 0.19 GiB of graph against a 1 GiB compiled-in default, so the gate
+#    cannot surface the limit at all and passing it is not evidence that the
+#    default would have held on `main`. The engine config sets the knob to 0
+#    (unlimited) for exactly that reason; provoking the limit deliberately on
+#    a throwaway run is docs/09 §5 item 2.
+#  * The ann build-mode comparison. The ops harness measures both of Percona's
+#    build modes; the ann overlay module has no `build_mode`, so
+#    `ann.percona_build_modes` is refused at render time rather than producing
+#    two identical curves. See orchestrator/ann_pass.py's percona branch.
 name: smoke
-description: End-to-end pipeline validation, all six engines, all charts (~45 min/pass)
+description: End-to-end pipeline validation, all seven engines, all charts (~45 min/pass)
 
 datasets:
   - fashion-mnist-784-euclidean

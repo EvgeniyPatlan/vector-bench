@@ -72,6 +72,43 @@ numpy-bound regime is the pessimistic one for scaling and the optimistic one
 for this flag, which is the direction that matters: a flag calibrated there
 under-reports what a real client costs.
 
+**THE MECHANISM, AND WHICH PARTS OF IT ARE MEASURED.** A live `smoke` run
+exposed this rather than a reading of the code, so the claims are separated by
+how each one is known.
+
+*Observed (SUPPLIED -- a `smoke` run of MariaDB on fashion-mnist-784 at
+M=16, not reproduced here).* Throughput flat across a four-fold rise in
+clients -- 2,920.7 q/s at one and 2,927.5 at four -- with every percentile
+unchanged: p50 0.325 ms, p95 0.442/0.439, p99 0.552/0.544. `qps x p50` is
+0.95, so about one query was in service. The same run's churn writer managed
+12.0 rows/s against four readers at 2,819 q/s, against a modelled ~150.
+
+*Measured here.* A saturated server and a serializing client ARE
+distinguishable from the client's own spans, and `served_concurrency` is the
+quantity that does it -- see `SERVED_CONCURRENCY_FLOOR` for the five-driver
+calibration and `metrics/latency.WindowConcurrency` for why the exact
+span-sum does not. The pool itself is not the fault: driven by a
+lock-releasing driver it scales 1.02 at four clients. `client_cpu_util` on
+the serializing point reads 0.177 against a 0.80 threshold.
+
+*Read, not measured, and it CANNOT be measured here -- this host starts no
+server.* Whether a client library releases the interpreter lock around its
+socket wait is a property of that library's C extension, and the engines do
+not share one: `drivers/postgres.py` imports **psycopg** (psycopg3) while
+`drivers/mysql_family.py` imports **mariadb** (MariaDB Connector/Python over
+Connector/C), which `docker/_shared/requirements-mysql.txt` says is used for
+BOTH MariaDB and AliSQL on purpose. The question is per-library, not
+per-engine, and nothing in this repository settles it.
+
+*What settles it for free.* The next real run, because those two libraries
+meet the same pool and the same workload: pgvector near 1.0 at four clients
+while MariaDB sits near 0.25 is a client-library difference, and both
+collapsing is the pool or the box -- the reading already excluded on
+synthetic drivers. Running the clients as PROCESSES is the fix for the
+underlying limit and is deliberately NOT attempted: an architectural change
+nobody has signed off, which would change what every published multi-client
+number means. `docs/05-methodology.md` §7 sets out that cost.
+
 `_one_window` deliberately stays in `concurrency.py`: it owns the fixed
 duration, the recall scoring and the repeats, none of which churn wants.
 """
@@ -85,9 +122,22 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple)
 import numpy
 
 from ..drivers.base import EngineDriver, IndexSpec
-from ..metrics.latency import (INFLIGHT_DISCARDED, PREWINDOW_DISCARDED,
+# The scaling-status policy lives in `metrics/latency.py`, beside the
+# quantity it judges and because this module was 846 lines against the repo's
+# 800-line ceiling with it inlined -- the reason `churn_readers.py` exists.
+# Re-exported under the names it was written with, because that is how
+# `concurrency.py`, `churn_readers.py` and the tests reach them. **A
+# re-export does not SHARE the name**: rebinding `clients.SERVED_CONCURRENCY_FLOOR`
+# does not reach `scaling_status`, which reads it out of `latency`'s globals,
+# and `tests/test_g1_client_concurrency.py` asserts that asymmetry so a
+# mutation aimed here is not taken for a clean result.
+from ..metrics.latency import (INFLIGHT_DISCARDED,  # noqa: F401
+                               PREWINDOW_DISCARDED,
+                               SCALING_CONCURRENCY_NOT_ACHIEVED, SCALING_OK,
+                               SCALING_STATUSES, SERVED_CONCURRENCY_FLOOR,
                                LatencyCollector, merge_collectors,
-                               span_disposition)
+                               scaling_status, served_fraction,
+                               span_disposition, window_concurrency)
 from ..metrics.resources import own_cpu_count, read_own_cpu_usec
 from ..progress import Heartbeat
 
@@ -105,6 +155,14 @@ DriverFactory = Callable[[], EngineDriver]
 #: raising or lowering 0.80 does not help, because the quantity itself is blind
 #: to a GIL ceiling -- and for the regime that measurement was taken in, which
 #: is the numpy-bound one and not the socket-bound one a real driver runs in.
+#:
+#: THAT BLINDNESS IS NOW A MEASUREMENT AND NOT AN ARGUMENT. Four GIL-holding
+#: clients at 0.325 ms per query delivered a quarter of this pool's throughput
+#: -- `scaling_efficiency` 0.26 against 1.02 for the same cost released --
+#: while `client_cpu_util` read **0.177** against this 0.80 and the flag
+#: stayed `False`. The 0.177 is SUPPLIED: that counter is a cgroup's and reads
+#: the whole machine outside a container.
+#: `metrics/latency.SERVED_CONCURRENCY_FLOOR` is the quantity that sees it.
 CLIENT_BOUND_UTIL = 0.80
 
 #: Seconds the PARENT waits at the barrier, and it does **not** bind. Kept at
@@ -216,6 +274,18 @@ class PoolWindow(NamedTuple):
     #: churn readers do: §4.3 item 6 says they compute no recall, because the
     #: corpus is mid-change and no ground truth describes it.
     results: Dict[int, Answer]
+    #: The two concurrency figures, over exactly the spans the QPS above
+    #: counts: the exact time-average number of queries the clients had
+    #: OUTSTANDING, and the median-span estimate of how many were in SERVICE.
+    #: `metrics/latency.WindowConcurrency` has the measurement that says why
+    #: both are kept and why only the second can carry a guard.
+    #:
+    #: Defaulted rather than required, and the default is the honest absence:
+    #: `tests/test_t4b_readers.py` hand-builds a `PoolWindow` to exercise
+    #: `window_ratio`'s refusals, which are a property of `PoolSpec` alone.
+    #: A None there says nobody measured it. `stop` passes both explicitly.
+    outstanding_concurrency: Optional[float] = None
+    served_concurrency: Optional[float] = None
 
     @property
     def p99_ms(self) -> Optional[float]:
@@ -232,10 +302,55 @@ class PoolWindow(NamedTuple):
         `None` -- not False -- when there was no counter to read, because "the
         clients were not the limit" and "nobody looked" are different
         statements and only one of them is a measurement.
+
+        **WHAT THIS CANNOT SEE, as a measurement rather than an argument.**
+        Four clients were run through this pool on a driver costing 0.325 ms
+        per query and holding the interpreter lock for it, against the same
+        driver releasing the lock -- the pair that
+        `tests/test_g1_client_concurrency.py` rebuilds. The releasing one
+        scaled -- `scaling_efficiency` 1.02 at four clients -- and the
+        holding one delivered 0.26. On that 0.26 point `client_cpu_util` read
+        **0.177** (SUPPLIED: that counter is a cgroup's and reads the whole
+        machine outside a container, so only a containerised run makes it)
+        against `CLIENT_BOUND_UTIL` of **0.80**, and this property returned
+        `False` -- three of four clients' throughput went missing and the flag
+        said the clients were fine. Not a threshold merely set too high: a
+        lock ceiling PREVENTS the CPU consumption the quotient looks for,
+        since a thread waiting its turn is not running and costs the counter
+        nothing, and moving 0.80 into (0, 0.177] would fire on every point of
+        every run. Read `scaling_status` instead, computed from the spans.
+        This flag is kept because it catches a different and real case -- a
+        client container that genuinely runs out of CPU at 16-32 clients with
+        a driver that does release the lock, which `scaling_status` cannot.
         """
         if self.client_cpu_util is None:
             return None
         return self.client_cpu_util > CLIENT_BOUND_UTIL
+
+    @property
+    def served_fraction(self) -> Optional[float]:
+        """`served_concurrency` as a share of this pool's client count.
+
+        NOT recursive, though it reads like it: a class body is not an
+        enclosing scope for the functions defined in it, so the call below
+        resolves to `metrics/latency.served_fraction` through this module's
+        globals and never to this property. Said out loud because the obvious
+        "fix" -- renaming one of them -- would be undoing a deliberate choice
+        to keep the window's view of the quantity under the quantity's own
+        name. `scaling_status` below is the same shape.
+        """
+        return served_fraction(self.served_concurrency, self.spec.clients)
+
+    @property
+    def scaling_status(self) -> Optional[str]:
+        """Whether a scaling efficiency over this window is reportable.
+
+        `metrics/latency.scaling_status` holds the rule, the floor and the
+        two statuses, and carries the measurement that chose the floor. This
+        property is the window's view of it and nothing else, so there is one
+        definition a test can move.
+        """
+        return scaling_status(self.served_concurrency, self.spec.clients)
 
 
 class Instruments(NamedTuple):
@@ -582,6 +697,16 @@ class ClientPool:
             [w.collector for w in self._workers], wall,
             cutoff=stop_at, window_start=wall_start)
 
+        # The concurrency this pool actually achieved, over the same spans
+        # and by the same `span_disposition` rule the merge above used. NOT
+        # routed through `Instruments.merge`: that bundle exists so a test can
+        # replace the merge to show what an untrimmed one counted, and a guard
+        # computed by the replaced instrument would be calibrated against the
+        # test's fixture rather than against the window.
+        outstanding, served = window_concurrency(
+            [w.collector for w in self._workers], wall,
+            cutoff=stop_at, window_start=wall_start)
+
         # One dict across every client. The shards are disjoint and the
         # offsets are absolute positions, so no two clients can write the same
         # key and the merge cannot lose a result.
@@ -610,6 +735,8 @@ class ClientPool:
             wall_s=wall,
             spec=self.spec,
             results=results,
+            outstanding_concurrency=outstanding,
+            served_concurrency=served,
         )
 
     def _first_error(self) -> Optional[BaseException]:
@@ -658,5 +785,7 @@ __all__ = [
     "Answer", "BARRIER_TIMEOUT_S", "CLIENT_BARRIER_TIMEOUT_S",
     "CLIENT_BOUND_UTIL", "Client", "ClientPool", "DEFAULT_INSTRUMENTS",
     "DriverFactory", "Instruments", "JOIN_TIMEOUT_S", "PoolError", "PoolSpec",
-    "PoolWindow", "client_cpu", "shard_queries", "window_ratio",
+    "PoolWindow", "SCALING_CONCURRENCY_NOT_ACHIEVED", "SCALING_OK",
+    "SCALING_STATUSES", "SERVED_CONCURRENCY_FLOOR", "client_cpu",
+    "shard_queries", "window_ratio",
 ]

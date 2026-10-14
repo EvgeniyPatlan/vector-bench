@@ -2,11 +2,11 @@
 
 The sweep exists so the ops workloads compare engines at the same *answer
 quality* rather than at the same knob setting. `ef_search` is not one quantity
-across these six engines -- it is `mhnsw_ef_search`, VIDX's equivalent,
-`hnsw.ef_search`, MongoDB's `numCandidates` and Valkey's `EF_RUNTIME` -- so a
-shared literal 100 buys six different amounts of search effort, and a
-concurrency chart drawn from it compares engines doing materially different
-work per query.
+across these seven engines -- it is `mhnsw_ef_search` (both MariaDB versions),
+VIDX's equivalent, `hnsw.ef_search`, MongoDB's `numCandidates`, Valkey's
+`EF_RUNTIME` and Percona's `innodb_hnsw_ef_search` -- so a shared literal 100
+buys six different amounts of search effort, and a concurrency chart drawn
+from it compares engines doing materially different work per query.
 
 Four things are pinned here, in this order of importance:
 
@@ -756,17 +756,26 @@ class TestEffectiveEf:
         for engine, cls in table.items():
             assert callable(getattr(cls, "effective_ef", None)), engine
 
-    def test_mongo_is_the_only_driver_that_overrides_it(self):
-        """`base.py` says the answer is `ef` for every engine here except one,
-        and that sentence is the reason the method is concrete rather than
-        abstract. Measured, because a second driver quietly acquiring a clamp
-        would make the base class's claim false with the suite green."""
+    def test_exactly_the_two_clamping_drivers_override_it(self):
+        """`base.py` names the drivers that clamp, and this is that sentence.
+
+        Measured, because a driver quietly acquiring or losing a clamp would
+        make the base class's claim false with the suite green -- which is
+        what it caught: this used to read `== ["MongoDriver"]` and fired the
+        moment `PerconaDriver` landed, with `base.py` still saying "every
+        engine here except one". Both were corrected together.
+
+        A value assertion and not a membership one, deliberately. The whole
+        point is to notice a THIRD.
+        """
         from harness.drivers.base import EngineDriver
         from harness.drivers.postgres import _driver_table
         overriding = sorted(
             {cls.__name__ for cls in _driver_table().values()
              if cls.effective_ef is not EngineDriver.effective_ef})
-        assert overriding == ["MongoDriver"]
+        assert overriding == ["MongoDriver", "PerconaDriver"]
+        # What each clamp actually does is exercised where it belongs:
+        # MongoDB's below, Percona's in tests/test_e2_percona_wiring.py.
 
     def test_the_clamp_bites_exactly_the_grid_points_below_k(self, monkeypatch):
         """The arithmetic `mongo.py`'s docstring states, counted against the

@@ -207,8 +207,27 @@ def _strings(csv: str) -> List[str]:
 
 
 def _detect_march() -> str:
+    """Which -march the server image was compiled with.
+
+    One of two independent readers, in two different containers. This one runs
+    in the HARNESS container, which mounts `harness/` and not `overlay/`, so no
+    override in an ann-benchmarks module can reach it -- and
+    `orchestrator/ops_pass.py` passes no `--march`, so `args.march` is empty
+    and this is what runs for every ops record.
+
+    A missing path here does not crash: it records `march: "unknown"` in a
+    field a reader takes for a measurement. That matters more than it looks,
+    because "never mix -march between engines" is a stated invariant -- the
+    five engines built from source compile SIMD distance kernels, and the
+    other two are installed from packages -- and `march` is the field that
+    would catch a mixed build. An engine added to the image set and not to
+    this tuple loses exactly the check that would have caught it:
+    `/opt/percona/.march` was absent from both readers when Percona's image
+    was written, and nothing anywhere would have said so.
+    """
     for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
-                 "/opt/pgvector-artifacts/.march"):
+                 "/opt/pgvector-artifacts/.march",
+                 "/opt/percona/.march"):
         try:
             with open(path) as fh:
                 return fh.read().strip()

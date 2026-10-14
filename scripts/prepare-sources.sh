@@ -13,9 +13,14 @@
 #     clone into sources/ using the local repo as an object `--reference`
 #     (fast, almost no network for the main history) and then initialise only
 #     the submodules the build actually requires.
+#   * Percona Server HAS four submodules and still takes the AliSQL path, not
+#     the MariaDB one, because all four are switched off by cmake flags in the
+#     build rather than populated. It is also the one engine pinned to a SHA on
+#     a branch rather than to a tag -- see prepare_percona.
 #
 # Usage:
-#   scripts/prepare-sources.sh [--engine mariadb|alisql|pgvector|all] [--force]
+#   scripts/prepare-sources.sh [--engine mariadb|alisql|pgvector|percona|all]
+#                              [--force]
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -28,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     --engine) ENGINE="$2"; shift 2 ;;
     --engine=*) ENGINE="${1#*=}"; shift ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -100,6 +105,72 @@ prepare_alisql() {
   mv "$tar.tmp" "$tar"
   record_meta alisql "$tag" "$sha" "$origin"
   stage_context alisql "$tar"
+}
+
+# ---------------------------------------------------------------------------
+# Percona Server — pinned to a SHA, and deliberately WITHOUT its submodules
+# ---------------------------------------------------------------------------
+#
+# Same shape as prepare_alisql: a pure offline `git archive`, no network when
+# the commit is already in the local checkout. Two things differ and both are
+# deliberate.
+#
+# 1. THE PIN IS A COMMIT, NOT A TAG. `source.tag` holds a SHA because the
+#    engine lives on branch `vector-mvp` and has no release to name. `git
+#    archive` takes a commit-ish wherever it takes a tag, so the mechanism is
+#    unchanged -- but `refs/tags/$tag` is not how this one is resolved, which
+#    is why the verify below is `rev-parse "$sha^{commit}"` against the bare
+#    object rather than against a tag ref. Compare SHAs and never dates: the
+#    branch was rebased, so its author and committer dates disagree.
+#
+# 2. NO SUBMODULES, AND THAT IS NOT AN OMISSION. The pin has four of them --
+#    percona-xtradb-cluster-galera, storage/rocksdb/rocksdb, extra/coredumper
+#    and extra/jwt-cpp -- and MariaDB's branch above exists precisely because
+#    `git archive` cannot carry a submodule. Percona does not need the clone
+#    treatment because all four are switched OFF in the build instead, which
+#    takes four cmake flags (docker/percona/Dockerfile note 2). Cloning to
+#    populate submodules we then disable would fetch from three more hosts for
+#    code that is never compiled.
+prepare_percona() {
+  local cfg="$VB_CONFIG/engines/percona.yml"
+  local sha; sha="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$sha" ]] || die "percona: config/engines/percona.yml has no source.tag"
+  local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/percona/percona-server.git)"
+  local tar="$VB_SOURCES/percona-${sha}.tar"
+  local repo="$VB_REPO_PERCONA" origin=local
+
+  if [[ ! -d "$repo/.git" ]] \
+     || ! git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    warn "percona commit ${sha:0:12} not available locally; cloning from $upstream"
+    repo="$VB_SOURCES/percona-git"
+    origin=upstream
+    if [[ ! -d "$repo/.git" ]]; then
+      # No --depth: a shallow clone of a default branch would not contain a
+      # commit on `vector-mvp`, and the failure would arrive as "fatal: not a
+      # tree object" after the download rather than before it.
+      git clone --quiet "$upstream" "$repo"
+    fi
+    git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+      || git -C "$repo" fetch --quiet origin "$sha" 2>/dev/null || true
+  fi
+
+  # Resolve and re-verify: this is the line that makes the SHA an identity
+  # check and not just a string that got passed along.
+  local resolved; resolved="$(git -C "$repo" rev-parse "${sha}^{commit}")" \
+    || die "percona: commit $sha is not in $repo"
+  [[ "$resolved" == "$sha" ]] \
+    || die "percona: source.tag $sha resolved to $resolved -- not the pinned commit"
+
+  if tarball_current percona "$resolved" "$tar"; then
+    ok "percona: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+    stage_context percona "$tar"; return
+  fi
+
+  info "percona: exporting ${sha:0:12} from $repo (read-only git archive)"
+  git -C "$repo" archive --format=tar --prefix=source/ "$resolved" > "$tar.tmp"
+  mv "$tar.tmp" "$tar"
+  record_meta percona "$sha" "$resolved" "$origin"
+  stage_context percona "$tar"
 }
 
 # ---------------------------------------------------------------------------
@@ -302,13 +373,14 @@ prepare_valkey() {
 
 case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
+  percona)    prepare_percona ;;
   mariadb)    prepare_mariadb mariadb ;;
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
   mongodb)    prepare_mongodb ;;
   valkey)     prepare_valkey ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|all)" ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|all)" ;;
 esac
 
 ok "sources prepared"

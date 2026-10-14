@@ -1239,7 +1239,18 @@ class TestMySQLFamilyStatements:
     def test_explain_sends_the_same_predicate_the_query_does(self):
         """Regression: the plan checked for one column and the measurement
         taken on the other -- the Validity section would then vouch for a
-        query nobody ran."""
+        query nobody ran.
+
+        The prefix is `EXPLAIN FORMAT=TRADITIONAL ` and not `EXPLAIN `, which
+        is what this assertion caught when it changed. `Dialect.plan_marker`
+        is a value in the `type` column and only the tabular format has one;
+        `explain_format` defaults to TRADITIONAL, so a bare EXPLAIN worked,
+        but the variable is settable and reachable through `VB_SERVER_ARGS`
+        and under TREE or JSON the marker vanishes -- recording a false
+        negative about a server that did use the index. The SELECT the two
+        paths share is still asserted to be byte-identical, which is what
+        this test is actually about.
+        """
         for column in COLUMNS:
             driver = mysql_driver()
             driver.query_filtered(vector(), K, CTAG_T, column=column)
@@ -1248,7 +1259,7 @@ class TestMySQLFamilyStatements:
                                              tag_threshold=CTAG_T,
                                              column=column)
             explained = driver._cur.sql[-1]
-            assert explained == "EXPLAIN " + queried
+            assert explained == "EXPLAIN FORMAT=TRADITIONAL " + queried
 
     def test_both_dialects_get_the_same_treatment(self):
         """MariaDB and AliSQL differ only in the Dialect values, and a

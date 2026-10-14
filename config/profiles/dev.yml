@@ -38,12 +38,14 @@ ops:
   # Sixty seconds a point, not the 300 s default, and the reason is this
   # profile's whole contract: "a full ops cycle runs in about a minute". Two
   # columns x two selectivities is four filtered points per engine, so the
-  # default budget would print a 2.0 h worst case for a run that takes about
-  # six minutes across six engines -- 20x the real cost, for the profile
+  # default budget would print a 2.3 h worst case for a run that takes about
+  # seven minutes across seven engines -- 20x the real cost, for the profile
   # people run most often, and over the 1 h threshold below which
   # `print_load_estimate` prints nothing at all. At 60 s the worst case is
-  # 0.41 h and `dev` stays silent, which is what it should be: an estimate
-  # for a framework exercise is noise.
+  # 0.48 h and `dev` stays silent, which is what it should be: an estimate
+  # for a framework exercise is noise. (0.41 h over the six engines that
+  # preceded Percona; `dev` names no engines, so it runs whatever the
+  # registry holds.)
   #
   # Note this is NOT the `long_run` warning, which is keyed on ingest above
   # 12 h and is False for `dev` either way. The 1 h threshold decides whether
@@ -66,7 +68,7 @@ ops:
   #
   # It also keeps dev what dev is for. The reader baseline is a fixed 30 s per
   # churn fraction and dev churns one fraction, so it is exactly 30 s per
-  # engine for all six -- half of a cycle CLAUDE.md documents as ~1 min per
+  # engine for all seven -- half of a cycle CLAUDE.md documents as ~1 min per
   # engine. `smoke` runs the pool on the default 4, so the path is exercised
   # by the profile that gates a long run.
   churn_readers: 0

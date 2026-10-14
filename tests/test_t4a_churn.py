@@ -359,12 +359,17 @@ class TestTheDeclaredRepairPathMatchesTheHook:
         assert pg_mod.PostgresDriver in DRIVER_CLASSES
 
     def test_exactly_the_drivers_that_override_maintain_declare_a_path(self):
-        """Honest: pgvector is the only `(overrides, declares)` pair; the other
-        four are `(inherits, "none")`.
+        """Honest: pgvector and Percona Server are the `(overrides, declares)`
+        pairs; the rest are `(inherits, "none")`.
         Mutant (`PostgresDriver.repair_path` left at the inherited "none"):
             pgvector reads (True, "none") and this fails -- which is the
             record that would have said "this engine has no repair path"
             beside a `VACUUM (ANALYZE)` it had just run.
+
+        Stated as a biconditional rather than as a list, which is why this one
+        did NOT have to change when Percona arrived: a driver that implements
+        `maintain()` and forgets `repair_path`, or declares a path it cannot
+        run, fails here whatever its name is.
         """
         for cls in DRIVER_CLASSES:
             overrides = cls.maintain is not EngineDriver.maintain
@@ -373,16 +378,34 @@ class TestTheDeclaredRepairPathMatchesTheHook:
                 f"{cls.__name__}: maintain overridden={overrides} but "
                 f"repair_path={cls.repair_path!r}")
 
-    def test_only_pgvector_has_one_and_it_is_named_not_substringed(self):
-        # `==`, not `in`: "none" is a substring of plenty, and this repo has
-        # already shipped seven assertions where a substring was satisfied by
-        # a longer string.
-        assert pg_mod.PostgresDriver.repair_path == "vacuum_analyze"
-        others = [cls for cls in DRIVER_CLASSES
-                  if cls is not pg_mod.PostgresDriver]
-        assert len(others) == len(DRIVER_CLASSES) - 1 >= 4, others
-        for cls in others:
-            assert cls.repair_path == "none", cls.__name__
+    def test_exactly_the_two_repairing_drivers_name_their_path(self):
+        """The drivers that have a repair path, and what each calls it.
+
+        **This used to read "only pgvector has one", and it fired when
+        `PerconaDriver` landed** -- which is the direction it should fire in.
+        Percona Server is the second engine here with a repair path and the
+        only one in the MySQL family: `ALTER TABLE t1 DROP KEY vi, ADD VECTOR
+        KEY vi (…)`, which rebuilds the graph from the live rows and so
+        collects the tombstones a DELETE leaves behind. Returning `None` from
+        `maintain()` would have made the churn workload write one record per
+        fraction instead of a before/after pair, losing the measurement this
+        engine is uniquely able to supply.
+
+        `==`, not `in`: "none" is a substring of plenty, and this repo has
+        already shipped seven assertions where a substring was satisfied by a
+        longer string. The expected map is exhaustive for the same reason --
+        a third repairing driver must fail here rather than pass.
+        """
+        expected = {"PostgresDriver": "vacuum_analyze",
+                    "PerconaDriver": "index-replace"}
+        assert len(DRIVER_CLASSES) >= 6, DRIVER_CLASSES
+        for cls in DRIVER_CLASSES:
+            want = expected.get(cls.__name__, "none")
+            assert cls.repair_path == want, (cls.__name__, cls.repair_path)
+        # Non-vacuity: both names really are present among the drivers, so
+        # the map above is not describing classes that are not there.
+        found = {cls.__name__ for cls in DRIVER_CLASSES}
+        assert set(expected) <= found, set(expected) - found
 
 
 # ---------------------------------------------------------------------------

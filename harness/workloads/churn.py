@@ -71,7 +71,7 @@ from .churn_readers import (DEFAULT_CHURN_READERS,  # noqa: F401
                             _during_writes_extra, _print_during_writes,
                             _reader_count, _reader_pool, _reader_shape,
                             _reader_window, _warn_reader_pool_failed,
-                            warn_empty_windows)
+                            reader_contention_shape, warn_empty_windows)
 from .context import RunContext
 
 # Wall clock allowed for one re-insertion. An engine that cannot write its rows
@@ -471,6 +471,14 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             "reinsert_rows_per_s": round(
                 len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
             **_reader_shape(driver_factory, readers, reader_count),
+            # And the status of that read load, because a reader count alone
+            # does not say the readers RAN concurrently. The readers are
+            # threads in this writer's own interpreter: if they serialized on
+            # the interpreter lock they starved the writer in the client, and
+            # the rate above stops being a measurement of the engine's ingest
+            # under reads. `{}` when there was no during-writes window, which
+            # keeps the key set of a readers-off record exactly what it was.
+            **reader_contention_shape(reader_during),
             "index_sync_s": round(synced_s, 3),
             "repair_path": driver.repair_path,
             **_write_shape(driver),
@@ -625,8 +633,8 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     Neither gap is an oversight. `repair_path` names the MECHANISM an engine
     has ("vacuum_analyze", "none") where the `Repair` column already names
     what actually ran on that row, so a column for it would repeat the row
-    beside it for five of six engines and disagree with it for none;
-    `index_sync_s` is 0.0 for the four engines that maintain their index on
+    beside it for five of seven engines and disagree with it for none;
+    `index_sync_s` is 0.0 for the five engines that maintain their index on
     the write path, and PR 4 §4.1's own acceptance for it is "non-zero or a
     reason documented" -- which `extra.index_sync_note` carries and which no
     shipped profile has yet produced a non-zero reading for. Both are

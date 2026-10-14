@@ -536,7 +536,26 @@ class VBMySQLBase(BaseANN):
 
     @staticmethod
     def _image_march() -> str:
-        for path in ("/opt/mariadb/.march", "/opt/alisql/.march"):
+        """Which -march the server binary in this image was compiled with.
+
+        Every MySQL-family image this base class serves is listed here, and a
+        new one belongs in this tuple rather than behind a per-engine
+        override. `percona/module.py` carried such an override for exactly one
+        release of this file and it is gone: there is a SECOND reader on the
+        ops path (`harness/main.py:_detect_march`) in a container that mounts
+        no overlay, so an override could only ever fix half of it and the half
+        it could not fix is the one a long run depends on. Two readers means
+        two chances to miss an engine, and the next engine added should find
+        both tuples rather than discover the second one from a blank field.
+
+        A missing path returns "unknown", which is worse than a crash: it
+        lands in a record field a reader takes for a measurement, and `march`
+        is the field that would catch the mixed build "never mix -march
+        between engines" exists to prevent. `/opt/percona/.march` is the one
+        that was missing, and the one whose absence nothing noticed.
+        """
+        for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
+                     "/opt/percona/.march"):
             try:
                 with open(path) as fh:
                     return fh.read().strip()

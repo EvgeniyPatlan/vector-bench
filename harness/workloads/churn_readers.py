@@ -37,6 +37,34 @@ flattens at 2.06 cores while its throughput peaks at two clients and halves by
 thirty-two, and the flag fired on none of those points. A reader pool's QPS is
 a measurement of this harness against this engine under writes, and it is not
 evidence about where either one saturates.
+
+**AND THE WRITE RATE DEPENDS ON THE READERS HAVING ACTUALLY RUN.**
+`extra.reinsert_rows_per_s` is a version-5 quantity precisely because it is
+now measured against `ops.churn_readers` concurrent reads, and those reads are
+THREADS IN THE WRITER'S OWN INTERPRETER. Readers that serialize on the
+interpreter lock therefore starve the writer in the CLIENT, and the rate stops
+being a measurement of the engine's ingest under read load at all. The live
+`smoke` run that exposed this recorded a writer at 12.0 rows/s -- 2,000 rows
+in 166.8 s -- with four readers at 2,819 q/s, against a modelled MariaDB
+ingest of about 150 rows/s.
+
+**Measured here, on `tests/fake_driver.py` with a 4 ms write slice and four
+readers whose query cost is IDENTICAL in both arms**, driving the real
+`churn.run`: readers that release the lock put the
+published `reinsert_rows_per_s` at 948.2, and readers that hold it put the
+same figure at 41.1 -- a factor of 23 in a number the report prints as a
+property of the engine, from nothing but what the reader's client library
+does with a lock. Their `served_concurrency` was 3.91 and 1.07 of four. The
+exact `outstanding_concurrency` was 3.96 and 3.95: blind to the whole
+difference, which is why the status is keyed to the other one.
+
+So every reader window here records `outstanding_concurrency`,
+`served_concurrency` and `scaling_status` (`clients.PoolWindow`), the
+during-writes record carries the during window's status unprefixed beside
+`client_bound`, and the step record that publishes `reinsert_rows_per_s`
+carries it as `extra.reader_scaling_status` -- see `reader_contention_shape`.
+That last one is the point of the exercise: the published write rate cannot be
+read without the status of the read load it was measured against.
 """
 
 from __future__ import annotations
@@ -48,8 +76,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy
 
 from ..drivers.base import IndexSpec
-from .clients import (CLIENT_BOUND_UTIL, ClientPool, DriverFactory, PoolWindow,
-                      window_ratio)
+from .clients import (CLIENT_BOUND_UTIL, SCALING_CONCURRENCY_NOT_ACHIEVED,
+                      SERVED_CONCURRENCY_FLOOR, ClientPool, DriverFactory,
+                      PoolWindow, window_ratio)
 
 #: Readers running while the writer re-inserts, per PR 4 §4.3 item 2.
 #: `ops.churn_readers: 0` disables them and restores exactly the write-only
@@ -165,6 +194,33 @@ def _reader_shape(driver_factory: Optional[DriverFactory], requested: int,
     return shape
 
 
+def reader_contention_shape(window: Optional[PoolWindow]) -> Dict[str, Any]:
+    """What read load the step record's `reinsert_rows_per_s` was measured
+    against, as a status rather than only as a reader count.
+
+    `{}` for a step with no during-writes window, and that follows
+    `_reader_shape`'s convention exactly: a caller with nothing to say carries
+    no key. A `reader_scaling_status: null` written onto a record from a run
+    that had no reader pool would be this change claiming to have looked at
+    something that never existed, and `tests/test_t4a_churn.py` pins the key
+    set those records have.
+
+    Public, unlike its neighbours, because `churn.py` is a different module
+    and this is the one key of the four that has to reach a record
+    `churn_readers.py` does not itself write. The write rate is published on
+    the step record; the status that decides whether it means anything is
+    measured on the reader pool.
+    """
+    if window is None:
+        return {}
+    return {
+        "reader_served_concurrency": (round(window.served_concurrency, 3)
+                                      if window.served_concurrency is not None
+                                      else None),
+        "reader_scaling_status": window.scaling_status,
+    }
+
+
 def _reader_pool(driver_factory: DriverFactory, queries: numpy.ndarray,
                  readers: int, k: int, ef_search: int, index: IndexSpec,
                  unit: Tuple[Any, ...]) -> ClientPool:
@@ -220,6 +276,20 @@ def _reader_extra(window: PoolWindow, prefix: str) -> Dict[str, Any]:
         f"{prefix}_window_s": round(window.wall_s, 3),
         f"{prefix}_inflight_discarded": window.inflight_discarded,
         f"{prefix}_prewindow_discarded": window.prewindow_discarded,
+        # How many reader queries this window actually had outstanding and in
+        # service. Under BOTH prefixes, because the ratio divides a window in
+        # which the readers may have served four queries by one in which they
+        # may have served one, and a reader of the JSONL cannot see that from
+        # the percentiles: a pool that serialized measures a p99 of a query
+        # that waited for a lock, not of a query the engine was slow to
+        # answer. See `clients.SERVED_CONCURRENCY_FLOOR`.
+        f"{prefix}_achieved_concurrency": (
+            round(window.outstanding_concurrency, 3)
+            if window.outstanding_concurrency is not None else None),
+        f"{prefix}_served_concurrency": (
+            round(window.served_concurrency, 3)
+            if window.served_concurrency is not None else None),
+        f"{prefix}_scaling_status": window.scaling_status,
     }
 
 
@@ -289,6 +359,29 @@ def _during_writes_extra(baseline: PoolWindow, during: PoolWindow,
         "client_cpu_util": (round(during.client_cpu_util, 4)
                             if during.client_cpu_util is not None else None),
         "client_bound": during.client_bound,
+        # Whether the readers ran the queries their count implies, over the
+        # DURING-WRITES window -- the one every published figure on this
+        # record is taken from. Unprefixed, beside `client_bound`, because
+        # this is the record's own status the way `client_bound` is; the two
+        # prefixed copies in `_reader_extra` are the per-window evidence.
+        #
+        # **This decides whether `writer_rows_per_s_with_readers` means
+        # anything**, and it is the version-5 quantity PR 4 §4.3 item 7
+        # introduced. The writer runs in the harness's MAIN thread while the
+        # readers run as threads in the SAME interpreter, so readers that
+        # serialize on the interpreter lock starve the writer inside the
+        # client -- and the rate becomes a measurement of Python rather than
+        # of the engine's ingest under read load. The live `smoke` run that
+        # exposed this recorded 12.0 rows/s (2,000 rows in 166.8 s) with four
+        # readers at 2,819 q/s, against a modelled MariaDB ingest of about
+        # 150 rows/s.
+        "outstanding_concurrency": (
+            round(during.outstanding_concurrency, 3)
+            if during.outstanding_concurrency is not None else None),
+        "served_concurrency": (round(during.served_concurrency, 3)
+                               if during.served_concurrency is not None
+                               else None),
+        "scaling_status": during.scaling_status,
     }
     extra.update(_reader_extra(baseline, "reader_baseline"))
     extra.update(_reader_extra(during, "reader_under_writes"))
@@ -341,6 +434,44 @@ def _print_during_writes(name: str, fraction: float,
             f"point is bounded by the readers as well as by the engine, so "
             f"it is not evidence about what the writes cost the engine.",
             file=sys.stderr, flush=True)
+    if extra.get("scaling_status") == SCALING_CONCURRENCY_NOT_ACHIEVED:
+        _warn_readers_serialized(name, fraction, extra)
+
+
+def _warn_readers_serialized(name: str, fraction: float,
+                             extra: Dict[str, Any]) -> None:
+    """Say so when the reader pool never ran the queries its count implies.
+
+    Separate from `_print_during_writes` because it is two paragraphs about
+    two different published figures and inlining it pushed that function past
+    what this repository asks of one.
+
+    The write rate is named as well as the read figures, and that is the point
+    of this warning rather than an extra. The readers are threads in the SAME
+    interpreter as the writer, so readers serializing on the interpreter lock
+    starve the writer in the client: the 12.0 rows/s the live `smoke` run
+    recorded against four readers, where the modelled ingest is about 150
+    rows/s, is the shape. `extra.reinsert_rows_per_s` on this fraction's step
+    record is the figure the report publishes, and it carries this status too
+    (`extra.reader_scaling_status`) so it cannot be read without it.
+    """
+    served = extra.get("served_concurrency")
+    served_text = f"{served:.2f}" if served is not None else "n/a"
+    readers = extra.get("readers") or 0
+    print(
+        f"[churn] {name}: READERS DID NOT ACHIEVE CONCURRENCY at "
+        f"{fraction:.0%} churn: {readers} reader(s) had {served_text} "
+        f"quer(ies) in service on average, below the "
+        f"{SERVED_CONCURRENCY_FLOOR:.0%} of {readers} these figures need. "
+        f"The p99 ratio and the reader throughput on this record are not "
+        f"evidence about what the writes cost the engine, because the reads "
+        f"were not running concurrently. The writer rate beside them "
+        f"({extra.get('writer_rows_per_s_with_readers') or 0:,.1f} rows/s) "
+        f"is affected in the same direction and for the same reason: the "
+        f"readers are threads in the writer's own interpreter, so reads that "
+        f"serialize on the interpreter lock starve the writer inside the "
+        f"client rather than inside the engine.",
+        file=sys.stderr, flush=True)
 
 
 def _reader_ms(value: Optional[float]) -> str:

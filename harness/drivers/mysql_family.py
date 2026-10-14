@@ -1,12 +1,24 @@
-"""Ops-harness drivers for MariaDB (MHNSW) and AliSQL (VIDX).
+"""Ops-harness drivers for MariaDB (MHNSW), AliSQL (VIDX) and Percona (InnoDB
+HNSW).
 
-Both are driven through MariaDB Connector/C via the `mariadb` Python package.
-Connector/C speaks the MySQL protocol, so one client library serves both
-servers — which is the point: if the two engines were driven through different
-clients, part of any measured difference would belong to the clients.
+All three are driven through MariaDB Connector/C via the `mariadb` Python
+package. Connector/C speaks the MySQL protocol, so one client library serves
+every server here — which is the point: if the engines were driven through
+different clients, part of any measured difference would belong to the clients.
 
-Behavioural differences between the two are confined to the `Dialect` values at
-the bottom of this file.
+**Differences live in the `Dialect` values at the bottom of this file wherever
+they can.** For MariaDB and AliSQL that is all of them, and Percona moved three
+more into values that `MySQLFamilyDriver` used to spell out — the primary-key
+type, the index clause and the distance expression — so the next engine finds
+them as fields rather than as methods to override.
+
+Four of Percona's differences are not values and could not be: `capabilities()`
+varies with `IndexSpec.build_mode` because it is the first engine here that can
+build its graph either way; `effective_ef` clamps; `maintain()` runs a real
+repair path and has to read the index's options back off the server to do it
+honestly; and `create_schema`/`create_index` split the index out of the table
+definition in bulk-build mode. Those four are `PerconaDriver`, and they are
+what makes it an architecture rather than a variant.
 """
 
 from __future__ import annotations
@@ -66,6 +78,69 @@ class MySQLDialect:
     # Statement that reports the size of the vector index from the catalog,
     # used when the data directory is not readable from this process.
     index_size_sql: Optional[str] = None
+
+    # --- the five fields Percona needed, each defaulted to what MariaDB and
+    # --- AliSQL already did, so neither of those engines changes behaviour.
+    #
+    # Before these, three of Percona's differences were not VALUES at all --
+    # `MySQLFamilyDriver` spelled the statements out, so a second spelling
+    # meant a second method rather than a second dialect. That is the
+    # arrangement where two methods drift.
+
+    #: Primary-key column type. Percona REQUIRES a `BIGINT UNSIGNED`
+    #: single-column primary key on any table carrying a vector index, and
+    #: refuses `BIGINT`, `INT UNSIGNED` and composite keys with one message:
+    #: "vector indexes on tables lacking a BIGINT UNSIGNED single column
+    #: primary key". So Percona rows are 4 bytes wider in the clustered index
+    #: and in the aux table's `base_pk` than MariaDB's and AliSQL's -- by the
+    #: server's requirement, not by our choice. About 4.7 MB at glove's
+    #: 1.18M rows: far below the resolution of any figure here, but
+    #: `index_bytes` and `table_bytes` are reported and someone will notice.
+    pk_type: str = "INT"
+
+    #: The index clause inside CREATE TABLE. `{name}`, `{m}`, `{metric}` and
+    #: `{ef_construction}` are interpolated. MariaDB and AliSQL take the
+    #: `M=n DISTANCE=m` spelling; Percona takes a parenthesised option list
+    #: after `TYPE hnsw`, where an option value is a bare identifier or an
+    #: integer and never a quoted string.
+    index_clause: str = "VECTOR INDEX {name} (v) M={m} DISTANCE={metric}"
+
+    #: The ORDER BY distance expression, with `%s` for the bound query vector.
+    #: `{metric}` is the dialect's lowercased metric name and `{metric_upper}`
+    #: its uppercase form. MariaDB and AliSQL have one function per metric;
+    #: Percona has one function with the metric as a mandatory third argument
+    #: (`sql/item_create.cc` registers DISTANCE with arity 3).
+    #:
+    #: The metric stays a LITERAL and does not become a bound parameter. The
+    #: parameter order is therefore the same for both spellings -- filtered
+    #: queries bind `(threshold, vector)` because the predicate precedes the
+    #: ORDER BY -- and making it a parameter would add a third placeholder and
+    #: reorder every call site for no gain.
+    distance_expr: str = "vec_distance_{metric}(v, %s)"
+
+    #: What an EXPLAIN must contain for the vector path to have been taken,
+    #: beyond the index name. `""` means "the index name is the whole test",
+    #: which is sound for MariaDB and AliSQL.
+    #:
+    #: IT IS NOT SOUND FOR PERCONA, and that is demonstrated rather than
+    #: argued. `…/percona_vector/r/optimizer.result:491-492` records a plan
+    #: with access type `ALL`, `key=NULL` and `Extra=Using filesort` -- a full
+    #: table scan -- on a table whose only index is a `VECTOR KEY`, with the
+    #: index name sitting in `possible_keys`. A substring test against the
+    #: joined EXPLAIN text therefore returns True for brute force published as
+    #: ANN search, which is the exact vacuity shape this repo keeps finding.
+    #: `:610` is the second shape -- the vector index offered and a different
+    #: one taken -- and a filtered query is exactly that shape.
+    #:
+    #: `vector_ann` is an access TYPE and appears only when the vector path
+    #: was activated.
+    plan_marker: str = ""
+
+    #: Build-time effort knob, for the one engine here that has one in the
+    #: MySQL family. `None` means the engine does not expose it and the
+    #: `{ef_construction}` slot is never reached. Percona's value comes from
+    #: `IndexSpec.ef_construction` per build, not from this default.
+    ef_construction: Optional[int] = None
 
 
 class MySQLFamilyDriver(EngineDriver):
@@ -132,28 +207,61 @@ class MySQLFamilyDriver(EngineDriver):
 
     def create_schema(self, index: IndexSpec) -> None:
         self._index = index
-        metric = self.dialect.metric_names[index.metric]
-        # `ctag` carries a plain KEY exactly as `tag` does, and that parity is
-        # the measurement rather than tidiness: the two columns exist to be
-        # compared, and an optimiser offered an index on one and not the other
-        # is choosing between different plans, not between different filter
-        # correlations. `tests/test_t3b_drivers.py` pins the index kinds on
-        # the two columns as equal sets rather than checking that a `ctag`
-        # index exists somewhere in the DDL.
-        ddl = (
-            f"CREATE TABLE {TABLE} (\n"
-            f"  id INT PRIMARY KEY,\n"
-            f"  tag INT NOT NULL,\n"
-            f"  ctag INT NOT NULL,\n"
-            f"  v VECTOR({index.dim}) NOT NULL,\n"
-            f"  KEY tag_idx (tag),\n"
-            f"  KEY ctag_idx (ctag),\n"
-            f"  VECTOR INDEX {self.dialect.index_name} (v) "
-            f"M={index.m} DISTANCE={metric}\n"
-            f") ENGINE={index.storage_engine}"
-        )
+        ddl = self._create_table_ddl(index, with_index=True)
         print(f"[{self.name}] {ddl}")
         self._cur.execute(ddl)
+
+    def _create_table_ddl(self, index: IndexSpec, *,
+                          with_index: bool) -> str:
+        """The CREATE TABLE, with or without the vector index inline.
+
+        One builder rather than one per driver, and `with_index` is the only
+        thing a caller may vary. `PerconaDriver` needs the index left out in
+        bulk-build mode and everything else identical; a second copy of this
+        string in that subclass would be a second place a column has to be
+        added, which is the arrangement `INSERT_SQL` above was consolidated
+        out of for the same reason.
+
+        `ctag` carries a plain KEY exactly as `tag` does, and that parity is
+        the measurement rather than tidiness: the two columns exist to be
+        compared, and an optimiser offered an index on one and not the other
+        is choosing between different plans, not between different filter
+        correlations. `tests/test_t3b_drivers.py` pins the index kinds on
+        the two columns as equal sets rather than checking that a `ctag`
+        index exists somewhere in the DDL.
+        """
+        columns = [
+            f"  id {self.dialect.pk_type} PRIMARY KEY",
+            "  tag INT NOT NULL",
+            "  ctag INT NOT NULL",
+            f"  v VECTOR({index.dim}) NOT NULL",
+            "  KEY tag_idx (tag)",
+            "  KEY ctag_idx (ctag)",
+        ]
+        if with_index:
+            metric = self.dialect.metric_names[index.metric]
+            columns.append(f"  {self._index_clause(index, metric)}")
+        body = ",\n".join(columns)
+        return (f"CREATE TABLE {TABLE} (\n{body}\n"
+                f") ENGINE={index.storage_engine}")
+
+    def _index_clause(self, index: IndexSpec, metric: str) -> str:
+        """The vector-index clause, in this dialect's spelling.
+
+        Its own method rather than an inline `.format()` because `maintain()`
+        has to rebuild the same index with the same options and must not
+        re-derive them from a second expression -- an index rebuilt at
+        different options is a different index, and the recall measured after
+        it would belong to that one.
+        """
+        return self.dialect.index_clause.format(
+            name=self.dialect.index_name,
+            m=int(index.m),
+            metric=metric,
+            ef_construction=(index.ef_construction
+                             if index.ef_construction is not None
+                             else self.dialect.ef_construction),
+        )
 
     def create_index(self, index: IndexSpec) -> None:
         # MHNSW and VIDX both build the graph incrementally as rows are inserted;
@@ -317,9 +425,12 @@ class MySQLFamilyDriver(EngineDriver):
                 f"_select's filtered argument is a flag, not a column; got "
                 f"{filtered!r}. Did you mean column={filtered!r}?")
         where = f"WHERE {checked_filter_column(column)} < %s " if filtered else ""
+        metric = self._metric_fn()
+        distance = self.dialect.distance_expr.format(
+            metric=metric, metric_upper=metric.upper())
         return (
             f"SELECT id FROM {TABLE} {where}"
-            f"ORDER BY vec_distance_{self._metric_fn()}(v, %s) LIMIT {int(k)}"
+            f"ORDER BY {distance} LIMIT {int(k)}"
         )
 
     def query(self, vector, k: int) -> List[int]:
@@ -333,6 +444,52 @@ class MySQLFamilyDriver(EngineDriver):
             (int(threshold), to_binary_f32(vector)),
         )
         return [row[0] for row in self._cur.fetchall()]
+
+    #: Zero-based position of the `type` column in `EXPLAIN
+    #: FORMAT=TRADITIONAL` output, whose twelve columns are id, select_type,
+    #: table, partitions, type, possible_keys, key, key_len, ref, rows,
+    #: filtered, Extra. Named rather than inlined because a bare `row[4]` in
+    #: the middle of a plan check is unreadable and un-greppable.
+    _EXPLAIN_TYPE_COLUMN = 4
+    _EXPLAIN_COLUMNS = 12
+
+    def _marker_in_access_type(self, rows: Sequence[Sequence[Any]]) -> bool:
+        """Is `plan_marker` the ACCESS TYPE of some row, not merely present?
+
+        The joined-text form of this test -- `plan_marker in plan` -- is the
+        shape this repo keeps being bitten by: a substring satisfied by
+        something other than the thing being asserted. It is not reachable for
+        the statements this driver sends (the table is `t1`, the columns are
+        fixed, and nothing else in the plan text spells `vector_ann`), so this
+        is closing a class rather than fixing a live defect. It is worth
+        closing because the whole argument for `plan_marker` existing is that
+        a substring check accepted a brute-force scan, and leaving the new
+        check as a substring would be making that argument and then not
+        applying it.
+
+        Falls back to the joined text when the row shape is not the twelve
+        tabular columns, which is the honest behaviour rather than a `False`:
+        a `False` here is published as "this engine did not use its index",
+        and an unexpected EXPLAIN shape is a statement about the format, not
+        about the engine. The fallback is no weaker than what this method did
+        before, so no plan that passed can start failing.
+
+        Compared case-insensitively on a stripped value. MySQL emits access
+        types lowercase, and a server that capitalised one would otherwise
+        turn a used index into a reported scan.
+        """
+        marker = self.dialect.plan_marker.strip().lower()
+        shaped = [r for r in rows if len(r) >= self._EXPLAIN_COLUMNS]
+        if not shaped:
+            plan = " | ".join(str(c) for row in rows for c in row)
+            print(f"[{self.name}] EXPLAIN returned "
+                  f"{len(rows)} row(s) with no {self._EXPLAIN_COLUMNS}-column "
+                  f"shape; falling back to a text match for "
+                  f"{self.dialect.plan_marker!r}")
+            return marker in plan.lower()
+        return any(
+            str(row[self._EXPLAIN_TYPE_COLUMN]).strip().lower() == marker
+            for row in shaped)
 
     def explain_uses_vector_index(self, vector, k: int,
                                   tag_threshold: Optional[int] = None,
@@ -352,23 +509,55 @@ class MySQLFamilyDriver(EngineDriver):
             else (to_binary_f32(vector),)
         )
         try:
+            # FORMAT=TRADITIONAL IS NOT DECORATION, and it is the one piece of
+            # hardening here that is free. `Dialect.plan_marker` is a value in
+            # the `type` column, which only the tabular format has.
+            # `explain_format` defaults to TRADITIONAL so a bare `EXPLAIN`
+            # worked -- but the variable is settable and reachable through
+            # `VB_SERVER_ARGS`, and under TREE or JSON the marker disappears
+            # and this method returns False about a server that DID use the
+            # index. That records a false negative in the report's Validity
+            # section and sends someone hunting an engine bug that is not
+            # there. Spelling the format out removes the whole failure mode.
             self._cur.execute(
-                "EXPLAIN " + self._select(k, filtered, column=column),
+                "EXPLAIN FORMAT=TRADITIONAL "
+                + self._select(k, filtered, column=column),
                 params)
-            plan = " | ".join(str(c) for row in self._cur.fetchall() for c in row)
+            rows = list(self._cur.fetchall())
+            plan = " | ".join(str(c) for row in rows for c in row)
         except Exception as exc:
             print(f"[{self.name}] EXPLAIN failed: {exc}")
             return False
+        # BOTH when a marker is declared, and the order of the two conjuncts
+        # is the order of their importance. The access type is the
+        # load-bearing half: the index name alone is satisfied by a name
+        # sitting in `possible_keys` on a plan that took a full table scan,
+        # which is recorded in Percona's own MTR output (see
+        # `MySQLDialect.plan_marker`). The name is kept beside it so that a
+        # second vector index on the table could not satisfy the check for
+        # the wrong one.
         used = self.dialect.index_name in plan
+        if self.dialect.plan_marker:
+            used = used and self._marker_in_access_type(rows)
         if not used:
             # The column is named, not just `filtered=True`: `tag` and `ctag`
             # carry the same kind of index and different value distributions,
             # and an optimiser that takes the vector index for one and a range
             # scan for the other is the single most likely way this check
             # fires in PR 3. "filtered" alone would not say which.
+            # The marker is named when there is one, because "not used" over
+            # two conjuncts does not say which failed, and the two mean
+            # different things: a missing index name is the optimiser taking
+            # another index, a missing access type with the name present is
+            # the brute-force scan this check exists to catch.
+            looked_for = (f"access type {self.dialect.plan_marker!r} and key "
+                          f"{self.dialect.index_name!r}"
+                          if self.dialect.plan_marker
+                          else f"key {self.dialect.index_name!r}")
             print(
                 f"[{self.name}] WARNING: vector index NOT used "
-                f"(k={k}, filtered={filtered}, column={column!r}). Plan: {plan}"
+                f"(k={k}, filtered={filtered}, column={column!r}); "
+                f"looked for {looked_for}. Plan: {plan}"
             )
         return used
 
@@ -482,3 +671,249 @@ class MariaDBDriver(MySQLFamilyDriver):
 class AliSQLDriver(MySQLFamilyDriver):
     dialect = ALISQL_DIALECT
     name = "alisql"
+
+
+PERCONA_DIALECT = MySQLDialect(
+    name="percona",
+    # Nothing to enable. Unlike AliSQL, whose VIDX ships disabled behind
+    # `vidx_disabled` and refuses every vector operation outside READ
+    # COMMITTED, Percona's HNSW index needs no global switch and no isolation
+    # level: no test in the pinned tree's percona_vector suite sets either to
+    # make vector DML work.
+    session_setup=("SET SESSION default_storage_engine = InnoDB",),
+    global_setup=(),
+    # SESSION and GLOBAL, default 40, range 1..100000, integers only, read per
+    # query inside the scan's open (`ha_innodb.cc` passes
+    # `THDVAR(m_user_thd, hnsw_ef_search)` to `vec_ann_open`). SESSION is
+    # spelled out: the variable has both scopes and the global one would
+    # outlive the calibration sweep that set it.
+    set_ef_search="SET SESSION innodb_hnsw_ef_search = {ef_search}",
+    index_name="vi",
+    # Percona keeps the graph in an InnoDB auxiliary table per vector index,
+    # named percona_vec_<type>_<table_id>_<index_id>. The ids are not knowable
+    # in advance, so match the prefix -- which is what the suite itself does
+    # when it checks the files are cleaned up.
+    index_file_globs=("percona_vec_*.ibd",),
+    # Left of the colon is the dataset's metric name; right is Percona's.
+    # Only these two exist as INDEX metrics: `euclidean_squared`, `dot` and
+    # `manhattan` are accepted by DISTANCE() but cannot be indexed at all
+    # ("HNSW indexes on anything but the EUCLIDEAN or COSINE metric"), so
+    # this benchmark can never show a Percona inner-product frontier.
+    # Lowercase because an index option value is a bare identifier and the
+    # data dictionary stores the canonical lowercase form.
+    metric_names={"angular": "cosine", "euclidean": "euclidean"},
+    # Required by the server on any table carrying a vector index. See
+    # `MySQLDialect.pk_type`.
+    pk_type="BIGINT UNSIGNED",
+    # `VECTOR KEY … TYPE hnsw (opts)`. An option value is a bare identifier or
+    # an integer and never a quoted string -- `metric = 'cosine'`, `M = 6.0`
+    # and `M = "6"` are all parse errors. Exactly one vector index per table
+    # is allowed, so there is nothing here to repeat.
+    index_clause=("VECTOR KEY {name} (v) TYPE hnsw "
+                  "(M = {m}, ef_construction = {ef_construction}, "
+                  "metric = {metric})"),
+    # Arity exactly 3; the metric argument is mandatory and matched
+    # case-insensitively. Uppercase here is for the reader, not the parser.
+    #
+    # A cosine index serves only 'COSINE' and an L2 index only 'EUCLIDEAN' --
+    # never the cross product, because the optimizer reads the metric back
+    # out of the stored index option. Querying with the other one gets a
+    # SILENT FULL SCAN rather than an error, which is why `metric_names` above
+    # is the single source for both the DDL and this expression.
+    distance_expr="DISTANCE(v, %s, '{metric_upper}')",
+    # The access type, and the reason this field exists at all. See
+    # `MySQLDialect.plan_marker`.
+    plan_marker="vector_ann",
+    # Not a default to build at: `IndexSpec.ef_construction` supplies the
+    # value per build and `_index_clause` prefers it. This is what a
+    # by-hand reproduction gets, and it is the server's own default.
+    ef_construction=200,
+)
+
+
+class PerconaDriver(MySQLFamilyDriver):
+    """Percona Server's InnoDB HNSW.
+
+    A class of its own rather than a third `MySQLDialect` constant, because
+    four things about this engine are behaviour and not values: `capabilities`
+    varies with the build mode, there is a real repair path, `effective_ef`
+    clamps, and `maintain()` has to read the index options back off the server.
+    `_driver_classes()` is "one entry per architecture, not per engine", and
+    those four are what make this one.
+    """
+
+    dialect = PERCONA_DIALECT
+    name = "percona"
+
+    #: Declared, not inferred: the churn workload stamps it onto the "before
+    #: maintenance" record BEFORE `maintain()` runs. Percona is the only
+    #: MySQL-family engine here that has a repair path at all.
+    repair_path = "index-replace"
+
+    def effective_ef(self, ef: int, k: int) -> int:
+        """`max(ef, k)` -- the clamp is the variable's own contract.
+
+        `innodb_hnsw_ef_search`'s help text states it ("the effective width is
+        max(ef, LIMIT)") and the call site passes `ef_search` beside
+        `std::max<size_t>(limit, 1)`, so the searched width is never below
+        `LIMIT k`.
+
+        At k=10 every grid value this repo sweeps is above 10, so this returns
+        the grid verbatim and today it changes nothing. It is implemented
+        rather than inherited because the inherited identity would be wrong at
+        the one grid point where it mattered and silently right everywhere
+        else -- and a calibration record that says "ef 5" when the engine
+        looked at 10 candidates is the kind of figure a reader compares across
+        engines. MongoDB clamps the same way and this hook exists for it.
+        """
+        return max(int(ef), int(k))
+
+    def capabilities(self) -> Dict[str, Any]:
+        """Percona is the first engine here whose build mode is a CHOICE.
+
+        It maintains the graph on every INSERT *and* has a real bulk path
+        (`ALTER TABLE … ADD VECTOR KEY` builds from one clustered scan), so
+        `incremental_index` is a property of the configuration rather than of
+        the engine, and it has to be reported that way.
+
+        **This is load-bearing, and `harness/workloads/build.py` is the
+        reason.** Its `incremental` flag is
+        `driver.capabilities().get("incremental_index", True)` with an
+        override that forces it True for `build_mode == "incremental"` -- and
+        there is NO counterpart forcing it False for `build_mode == "post"`.
+        That flag then decides whether `create_index` is called at all and
+        what `build_wall_s` means. A class-level `incremental_index = True`
+        here would make a `build_mode: post` Percona run load an
+        already-indexed table, never call `create_index`, and record the load
+        time as the build time -- a record reading "incremental" while the
+        profile asked for a bulk build, with nothing anywhere saying so.
+
+        Deriving it from the spec is the smaller of the two available fixes:
+        the other is a line in `build.py`, which governs every engine's build
+        accounting and is not this driver's to change.
+
+        Before `create_schema` has run there is no spec to read. The honest
+        answer then is the engine's unconfigured behaviour, which is
+        incremental -- the graph is maintained on the write path unless a
+        profile asks otherwise.
+        """
+        incremental = (self._index is None
+                       or self._index.build_mode == "incremental")
+        return {"incremental_index": incremental,
+                "ef_construction_tunable": True}
+
+    def create_schema(self, index: IndexSpec) -> None:
+        """CREATE TABLE, with the vector index inline only in incremental mode.
+
+        The split is what makes `build_mode` mean anything here. In `post`
+        mode the table is created without the index and `create_index` adds it
+        afterwards, so `build_wall_s` times a bulk build; in `incremental`
+        mode the index is declared inline and the graph is maintained inside
+        every INSERT, so the build cost IS the load cost. Creating the index
+        inline in both modes would make the two modes the same measurement
+        under two labels.
+
+        pgvector's driver splits the same way and for the same reason.
+        """
+        self._index = index
+        inline = index.build_mode == "incremental"
+        ddl = self._create_table_ddl(index, with_index=inline)
+        print(f"[{self.name}] {ddl}")
+        self._cur.execute(ddl)
+
+    def create_index(self, index: IndexSpec) -> None:
+        """The bulk build: one `ALTER TABLE … ADD VECTOR KEY`.
+
+        A no-op in incremental mode, where `create_schema` already declared
+        the index and `build.py` does not call this at all.
+
+        ALGORITHM=INPLACE is spelled out because the two algorithms build
+        different things: INPLACE builds the graph in memory and bulk-loads
+        the aux table, while a COPY-built aux is correct but slower to build
+        and larger. Leaving the choice to the server would let the measured
+        "bulk build" be either one.
+        """
+        self._index = index
+        if index.build_mode == "incremental":
+            return
+        metric = self.dialect.metric_names[index.metric]
+        sql = (f"ALTER TABLE {TABLE} ADD "
+               f"{self._index_clause(index, metric)}, ALGORITHM=INPLACE")
+        print(f"[{self.name}] {sql}")
+        self._cur.execute(sql)
+
+    def maintain(self) -> Optional[str]:
+        """Replace the vector index in one ALTER, which compacts tombstones.
+
+        A DELETEd row leaves a graph tombstone and there is no background
+        process that collects it -- Percona has no vacuum equivalent, which is
+        why `prepare_churn` and `wait_index_synced` are both inherited no-ops
+        here. The rebuild collects from the live rows only, so the tombstones
+        go.
+
+        `OPTIMIZE TABLE` would also compact, and is available. It is not what
+        this runs, because it rewrites the whole base table -- every row,
+        every secondary index -- so its cost is dominated by work that has
+        nothing to do with the vector index and the churn phase would be
+        timing a table rebuild. The index replace touches only the aux table
+        and reuses each row's existing label, which the suite proves by
+        asserting `TABLE_ID` is unchanged across it. That is the narrower
+        repair and the one whose cost means something.
+
+        **The option list is read back off the server rather than re-derived
+        from the profile, and that is the whole correctness argument.** The
+        DDL that rebuilds the index decides the new graph's `M`,
+        `ef_construction` and `metric`; omitting them rebuilds at the server's
+        defaults -- `M=25`, not the profile's -- and the post-maintenance
+        recall would then be a different index's recall, reported as the
+        repaired one's. `SHOW CREATE TABLE` returns the full canonical option
+        set because defaults are resolved at create time and stored, so the
+        server's own answer to "what was this graph built with" is available
+        and is better than trusting the DDL we sent.
+
+        Not timed here: `churn.py` times the call. It rebuilds the whole
+        graph, so on a 1M-row corpus this costs on the order of a bulk build,
+        and the ALTER takes a SHARED metadata lock -- readers continue, every
+        writer stops for the duration.
+        """
+        clause = self._index_clause_from_server()
+        sql = (f"ALTER TABLE {TABLE} DROP KEY {self.dialect.index_name}, "
+               f"ADD {clause}, ALGORITHM=INPLACE")
+        print(f"[{self.name}] {sql}")
+        self._cur.execute(sql)
+        self._cur.execute("COMMIT")
+        return "ALTER TABLE (index replace)"
+
+    def _index_clause_from_server(self) -> str:
+        """The live index definition, taken out of `SHOW CREATE TABLE`.
+
+        Returns a `VECTOR KEY …` clause ready to follow `ADD`. The server
+        emits the canonical form with backticks and `USING` rather than
+        `TYPE` -- both spellings are accepted on the way back in, so the
+        line is re-sent as the server wrote it rather than reformatted into
+        the spelling this module happens to use. Reformatting is where an
+        option would get dropped.
+
+        Falls back to rebuilding the clause from the `IndexSpec` only if the
+        server's definition cannot be found, and says so on the way past: a
+        silent fall-back here is exactly the "rebuilt at the defaults"
+        failure this method exists to avoid, except with our own numbers
+        instead of the server's.
+        """
+        try:
+            self._cur.execute(f"SHOW CREATE TABLE {TABLE}")
+            ddl = str(self._cur.fetchone()[1])
+            for line in ddl.splitlines():
+                stripped = line.strip().rstrip(",")
+                if stripped.upper().startswith("VECTOR KEY"):
+                    return stripped
+        except Exception as exc:
+            print(f"[{self.name}] SHOW CREATE TABLE failed: {exc}")
+        assert self._index is not None, "create_schema must run before maintain"
+        metric = self.dialect.metric_names[self._index.metric]
+        rebuilt = self._index_clause(self._index, metric)
+        print(f"[{self.name}] WARNING: could not read the vector index back "
+              f"out of SHOW CREATE TABLE; rebuilding from the profile as "
+              f"{rebuilt!r}. If the live index was built with other options, "
+              f"the post-maintenance recall is a different index's.")
+        return rebuilt

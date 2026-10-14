@@ -171,12 +171,12 @@ MariaDB alone first would buy nothing.
 
 **Step A — `dev`, all engines.** The cheapest end-to-end exercise: images build,
 every driver connects, every phase writes records. `dev` pins
-`ops.churn_readers: 0` (`config/profiles/dev.yml:72`), which is the write-only
+`ops.churn_readers: 0` (`config/profiles/dev.yml:74`), which is the write-only
 re-insert pass and is deliberate, not an omission.
 
 **What step A cannot confirm, and the draft of this page had it wrong.** With
 readers off there is no reader pool, so the `during_writes` churn record is
-never written: `harness/workloads/churn_readers.py:121-122` returns a count of
+never written: `harness/workloads/churn_readers.py:150-151` returns a count of
 zero for `readers <= 0`, and `harness/workloads/churn.py:279-280` says
 `reader_baseline` being None is *"the one state in which the whole
 during-writes record is absent"*. Step A therefore exercises two of the three
@@ -209,8 +209,8 @@ below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:2328`), computed by
-`report/crosscheck.py:308`'s `consistency_checks`. §4 item 5 says what to look
+report** (`report/render.py:2592`), computed by
+`report/crosscheck.py:327`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
 **Step F — only then `main`.** Spec step 6. On `main` the cross-check is no
@@ -219,8 +219,8 @@ that exercises it against published numbers.
 
 ### Do not pool one run's churn records with another's
 
-`main.yml` pins `ops.churn_readers: 4` (`config/profiles/main.yml:178`) and
-`dev.yml` pins `0` (`config/profiles/dev.yml:72`). Both stamp version 5, so the
+`main.yml` pins `ops.churn_readers: 4` (`config/profiles/main.yml:181`) and
+`dev.yml` pins `0` (`config/profiles/dev.yml:74`). Both stamp version 5, so the
 cross-version refusal in §1 will **not** catch a reader-contended re-insert rate
 pooled with a write-only one. The code names the gap itself:
 `harness/metrics/records.py:253-260` says *"`extra.readers` is a diagnostic,
@@ -270,8 +270,8 @@ The recall half is straightforward and enforced. **The `client_bound` half
 cannot be satisfied by reading that flag**, and this is the flag's own code
 rather than an opinion about where a threshold sits.
 
-`harness/workloads/clients.py:108` sets `CLIENT_BOUND_UTIL = 0.80`, and
-`harness/workloads/clients.py:228-238` is the whole decision:
+`harness/workloads/clients.py:166` sets `CLIENT_BOUND_UTIL = 0.80`, and
+`harness/workloads/clients.py:326-328` is the whole decision:
 `self.client_cpu_util > CLIENT_BOUND_UTIL`. So a client that is not burning CPU
 is not flagged, whatever else is limiting it. The module states why moving the
 threshold does not help: *"a CPU-utilisation threshold cannot see a GIL
@@ -298,6 +298,27 @@ client CPU does not move, treat the point as client-bound whatever the flag
 says. The flag's `None` is a third state and means nobody looked, not that the
 clients were fine.
 
+**That shape is now measured rather than left to the reader, and a live `smoke`
+run is why.** MariaDB on fashion-mnist-784 at M=16 measured 2,920.7 q/s at one
+client and 2,927.5 at four with every latency percentile unchanged — about one
+query in service, and a `scaling_efficiency` of 0.25 that describes the client.
+`harness/workloads/clients.py` now records, per window, how many queries the
+pool had outstanding and how many it had in service, and
+`extra.scaling_status` is `concurrency_not_achieved` where the second fell
+below half the client count; `report/render.py` then renders no efficiency
+figure for that point and names it in the Validity section.
+**It does not retire this item's row.** The quantity is computed from the
+spans, not from the CPU counter, so it is a different flag rather than a
+reading of this one — and on the four-client point that delivered 0.26 of
+linear, this one's utilisation read 0.177 against its own 0.80 limit and
+stayed false. (That 0.177 is a figure from a containerised run. The counter
+behind it is a cgroup's, and outside a container it reads the whole machine,
+so it is not reproducible on a developer box; §7 of the methodology says so
+beside it.) Both are kept, because each sees a case the other cannot:
+`client_bound` names a saturated cpuset, and the new status cannot. See
+`docs/05-methodology.md` §7 for the five-driver calibration and for why the
+exact span-sum is the blind one.
+
 ### 2. "Operating-point table reviewed; every non-`ok` status explained in the text"
 
 See step C. The three statuses are real and named in
@@ -308,7 +329,7 @@ and is what the run settles.
 
 Note what changed underneath this item: the selectivity label used to be the
 share *requested*, and is now the share *delivered*
-(`docs/05-methodology.md:470-477`). If you compare against an older chart, the
+(`docs/05-methodology.md:486-493`). If you compare against an older chart, the
 axis means a different thing.
 
 **The overshoot is not a single number**, and the draft of this page quoted one
@@ -323,13 +344,27 @@ corpus a run would use.
 
 ### 4. "Churn: before/after maintenance shown where a repair path exists; `repair_path: none` stated elsewhere"
 
-**Only pgvector has a repair path.** `harness/drivers/base.py:258` sets
-`repair_path: str = "none"` as the class default and
-`harness/drivers/base.py:254-257` names the inheritors; the only override in the
-tree is `harness/drivers/postgres.py:172`, `repair_path = "vacuum_analyze"`.
-MongoDB inherits `"none"`. The draft of this page said pgvector and MongoDB
-were both non-trivial here; they are not, and a before/after maintenance panel
-for MongoDB would be an empty comparison presented as a measurement.
+**Two engines have a repair path: pgvector and Percona Server.**
+`harness/drivers/base.py:258` sets `repair_path: str = "none"` as the class
+default and `harness/drivers/base.py:254-257` names the inheritors; the two
+overrides in the tree are `harness/drivers/postgres.py:172`,
+`repair_path = "vacuum_analyze"`, and
+`harness/drivers/mysql_family.py:751`, `repair_path = "index-replace"`.
+MongoDB inherits `"none"`. The draft of this
+page said pgvector and MongoDB were both non-trivial here; they are not, and a
+before/after maintenance panel for MongoDB would be an empty comparison
+presented as a measurement.
+
+**This page said "only pgvector" and that was true when it was written.**
+Percona Server's path is an `ALTER TABLE … DROP KEY vi, ADD VECTOR KEY vi (…)`
+which rebuilds the graph from the live rows, so the tombstones a DELETE leaves
+behind are collected — and it is the **expensive** one of the two: a whole
+graph rebuild per churn fraction, on the order of a bulk build at 1M rows,
+against pgvector's VACUUM. Neither has a measured rate at any corpus size, and
+`orchestrator/estimate.py` discloses both by name rather than charging for
+either. Budget for it before scheduling a churn phase on this engine; `docs/09
+-adding-percona-server.md` §2.7 has the mechanism and the lock level (SHARED —
+readers continue, every writer stops for the duration).
 
 What MongoDB has instead is the index-sync wait, a different hook:
 `harness/drivers/base.py:340-353` returns `0.0` by default and MongoDB and
@@ -346,9 +381,9 @@ is still true.
 
 ### 5. "Consistency checks pass, or each failure is explained"
 
-**This section now exists.** `report/crosscheck.py:308`'s `consistency_checks`
+**This section now exists.** `report/crosscheck.py:327`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:2328`). It is the check that cross-references
+as section 10 (`report/render.py:2592`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -363,7 +398,7 @@ What to read, in the order it matters:
   `max(0.01, 2 × the ops 95% CI half-width)` — one recall point is allowed
   unconditionally because the two paths score different query subsets, and a
   record with no usable interval gets exactly the floor
-  (`report/crosscheck.py:103`). A failure at a wide interval and a failure at
+  (`report/crosscheck.py:105`). A failure at a wide interval and a failure at
   the floor are different findings.
 * **The QPS inversions, which are flagged and never failed.** The ops path pays
   a TCP round trip per query that the in-process path does not, so two engines
@@ -372,7 +407,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:1953` and `docs/05-methodology.md:897` both say
+matched rows. `report/render.py:2217` and `docs/05-methodology.md:935` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -430,7 +465,7 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:965-966` documents it.
+prints it above the numbers, and `docs/05-methodology.md:1003-1004` documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 
@@ -440,7 +475,7 @@ everything above auditable a year from now.
 
 `innodb_hnsw_max_memory` is a hard bound and not a cache, which makes it a
 fairness problem rather than a tuning knob
-(`docs/09-adding-percona-server.md:676`). That document holds the floor
+(`docs/09-adding-percona-server.md:682`). That document holds the floor
 formula, the per-dataset table and the policy decision, and
 **the numbers are not repeated here on purpose** — `docs/09` carries its own
 guards, including a test that recomputes every row of that table from the
@@ -451,28 +486,58 @@ places and corrected in one.
 Where to look: `docs/09-adding-percona-server.md:736-775` for the table and its
 provenance — which says in its own words that the figures are projections and
 not measurements, because row counts, dimensionality and `M` are all supplied —
-and `docs/09-adding-percona-server.md:833-836` for the conclusion that matters
+and `docs/09-adding-percona-server.md:841-844` for the conclusion that matters
 to a rollout: the smoke profile fits under the shipped default, so **a green
 smoke run is not evidence the memory policy is sound**. The `main` profile does
 not fit. The policy chosen is unlimited, which removes the hazard; the point is
 that the gate would not have surfaced it either way.
 
-### 2. Percona's ingest rate, which the estimator guesses
+### 2. Percona's ingest rate, which the estimator now names instead of guessing
 
-`orchestrator/estimate.py:139` is `_INGEST_ROWS_PER_S.get(engine, 300)`. An
-engine with no entry in that table is modelled at 300 rows/s. The table's own
-measured MySQL-family rates are mariadb 150, mariadb123 110 and alisql 55
-(`orchestrator/estimate.py:50`), so the fallback is **5.45× optimistic against
-the slowest engine already measured**.
+**This was a live defect when this page was written and has since been fixed;
+the description is kept because the shape recurs and the fix is what you now
+have to read the printed estimate against.**
 
-That contradicts the rule the comment above the table sets for itself. It is
+`orchestrator/estimate.py` ended `_effective_rate` with
+`_INGEST_ROWS_PER_S.get(engine, 300)`, so an engine with no entry in that table
+was modelled at 300 rows/s. The table's own measured MySQL-family rates are
+mariadb 150, mariadb123 110 and alisql 55 (`orchestrator/estimate.py:50`), so
+the fallback was **5.45× optimistic against the slowest engine already
+measured** — for an engine that builds its HNSW graph inside every INSERT,
+which is the slowest shape in the study.
+
+That contradicted the rule the comment above the table sets for itself. It is
 headed "Measured ingest rates, rows/s, on a Xeon Gold 6230"
 (`orchestrator/estimate.py:43`) and explains that the first guesses were
 replaced because an estimate optimistic *by 3x* is worse than none
-(`orchestrator/estimate.py:43-51`). The fallback is a guess, is not measured,
-and is optimistic by more than the margin that argument rejects. Until it names
-the gap instead of guessing, do not trust a printed estimate that includes an
-engine absent from that table.
+(`orchestrator/estimate.py:43-51`). The fallback was a guess, was not measured,
+and was optimistic by more than the margin that argument rejects. Measured on
+`main` before the fix: 273.45 rows/s for an unmeasured engine on glove-100
+against MariaDB's measured 147, putting **9.10 h** of invented ingest into a
+published total (102.16 h against the honest 93.06 h) with nothing printed to
+say so.
+
+**What it does now.** `_effective_rate` returns `None` where nothing has been
+measured — `orchestrator/estimate.py:161` is `_INGEST_ROWS_PER_S.get(engine)`
+with no default — and `estimate_load_hours` reports
+`engines_without_ingest_rate` on the same terms the query half has always used
+for `engines_without_query_rate`: the engine is **named, contributes nothing to
+the total, and the printed block says which engines the total covers**:
+
+```
+  total ~93.1 h across 1 pass(es), 3 M value(s)
+  ! No measured ingest rate for percona, so the total above is
+    6 of 7 engine(s) and excludes it entirely rather than modelling
+    it at a guessed rate. A smoke run supplies the figure; until then the ingest
+    cost of this plan is higher than the number above, by an amount nothing here knows.
+```
+
+**So the rollout reading is the opposite of what it was.** A printed ingest
+figure is now trustworthy as far as it goes, and it tells you how far that is.
+What you must not do is read `~726 h` for `--profile full --resource-pass both`
+as the whole plan: it is six of the seven engines, and the smoke run is what
+supplies the seventh. Percona has no `_INGEST_ROWS_PER_S` entry and must not be
+given one until a run measures it.
 
 ### 3. The cost envelope, and what D1 cost
 
@@ -481,7 +546,7 @@ worst case on top of the current ~2 days, for six engines on two datasets, and
 requires the estimate to print the worst case (`SPEC.md:525`, supplied).
 
 **The spec's decision point D1 is decided, and `main` got more expensive.**
-`config/profiles/main.yml:107` is now `m_values: [8, 16, 32]` against an ops
+`config/profiles/main.yml:110` is now `m_values: [8, 16, 32]` against an ops
 `m_values` of `[16]`, so the two grids meet and §4 item 5's cross-check runs on
 the profile the report is published from. There is still no crosscheck profile
 in `config/profiles/`, and that is the point: the other option on the table
@@ -491,8 +556,15 @@ What it cost, from `orchestrator/estimate.py` and not from any prose:
 
 | Engines | `[8, 32]` | `[8, 16, 32]` | Added |
 |---|---:|---:|---:|
-| all six | 69.77 h | **93.06 h** | +23.29 h |
+| the six with a measured ingest rate | 69.77 h | **93.06 h** | +23.29 h |
 | the three headline engines | 51.07 h | **68.11 h** | +17.04 h |
+
+**That first row is computed over all SEVEN engines and is nevertheless a
+six-engine quantity, which is why it is labelled that way rather than "all".**
+Percona Server has no measured ingest rate, so `orchestrator/estimate.py`
+names it in `engines_without_ingest_rate` and it contributes nothing to either
+column — the figures are unchanged by its arrival and the label is what moved.
+A run of `main` loads seven engines; this table prices six of them.
 
 An earlier revision of this page carried the two "added" figures and removed
 them as unsourced, because at that commit nothing in the repo supported them.

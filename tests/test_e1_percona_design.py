@@ -533,13 +533,46 @@ class TestExplainFormatIsPinned:
         call = fn.split("self._cur.execute(", 1)[1]
         assert '"EXPLAIN FORMAT=TRADITIONAL ' in call
 
-    def test_the_shared_implementation_issues_a_bare_explain(self, overlay):
-        """Non-vacuity: proves the module differs rather than matching."""
+    def test_the_shared_implementation_checks_the_name_and_not_the_access_type(
+            self, overlay):
+        """Non-vacuity: proves the module differs rather than matching.
+
+        **Re-aimed from the EXPLAIN FORMAT at the access type, because the
+        format version was a landmine.** It asserted
+        `"FORMAT=TRADITIONAL" not in fn` for the SHARED reader, which pinned
+        the ann path to *not* being hardened the way its ops sibling was -- so
+        a later author hardening it would have read this failure as "you broke
+        something". That is the shape of guard this file exists to remove, not
+        to add.
+
+        The load-bearing difference is the access type, and it cannot be
+        acquired by accident: the shared reader asks only whether
+        `dialect.index_name` appears anywhere in the joined plan text, which
+        Percona's own recorded output satisfies for a full table scan.
+
+        **Pinning the format in the shared reader would be safe and is not
+        forbidden by anything here.** It is simply unnecessary: a name-only
+        check is format-insensitive -- the index name appears in TREE and JSON
+        output too -- so the keyword buys that reader nothing. It is pinned in
+        the ops driver (`harness/drivers/mysql_family.py`) because that one
+        tests `Dialect.plan_marker`, a value in the tabular `type` column that
+        no other format has, and in `percona/module.py` for the same reason.
+        All three servers the shared reader serves accept the keyword, so the
+        choice is about need rather than risk.
+        """
         shared = open(os.path.join(OVERLAY, "ann_benchmarks",
                                    "vb_mysql.py")).read()
         fn = shared.split("def _verify_plan", 1)[1].split("\n    def ", 1)[0]
-        assert '"EXPLAIN " +' in fn
-        assert "FORMAT=TRADITIONAL" not in fn
+        assert '"EXPLAIN ' in fn                      # needle findable
+        # The shared reader does NOT look for an access type. This is what
+        # makes the Percona override necessary rather than cosmetic.
+        assert "vector_ann" not in fn
+        assert "PLAN_ACCESS_TYPE" not in fn
+        # ...and the Percona module does, which is the other half of the pair.
+        percona = open(os.path.join(ALGORITHMS, "percona",
+                                    "module.py")).read()
+        own = percona.split("def _verify_plan", 1)[1].split("\n    def ", 1)[0]
+        assert "PLAN_ACCESS_TYPE in plan" in own
 
 
 class TestInitSqlDoesNotAskForARemovedPlugin:
@@ -895,27 +928,30 @@ class TestPlanCheckIsNotSatisfiedByTheIndexName:
 
 
 class TestMarchIsReportedAndNotLostToAnUnknown:
-    """docs/09 §4.8: the shared `_image_march` cannot see this image's path.
+    """docs/09 §4.8: BOTH `-march` readers know this image's path.
 
     "Never mix -march between engines" is a stated invariant, and `march` is the
-    field that would catch a mixed build. The shared implementation would report
-    `unknown` for every Percona record, which is the "hard-coded probe whose
-    figure reaches a published artefact looking measured" shape.
+    field that would catch a mixed build. A reader that does not know an
+    engine's path reports `unknown` for every one of that engine's records,
+    which is the "hard-coded probe whose figure reaches a published artefact
+    looking measured" shape.
+
+    **THIS CLASS WAS INVERTED BY THE CHANGE IT DESCRIBES, AND THAT IS WHY IT
+    READS THIS WAY NOW.** §4.8 prescribes two steps -- add
+    `/opt/percona/.march` to both tuples, and *then* drop the per-engine
+    override in `percona/module.py`, "since the next engine added will hit the
+    same thing twice". Until that was done these guards asserted the state the
+    DESIGN task left behind: the path absent from the shared tuple and present
+    in an override. Performing the prescribed change therefore failed four of
+    them. They assert the finished state instead, and they are strictly
+    stronger for it -- there are two readers, the old wording checked one, and
+    the one it could not check (`harness/main.py`, in the harness container) is
+    the one every ops record's `march` comes from.
     """
 
-    def test_the_shared_implementation_does_not_know_this_images_path(self,
-                                                                      overlay):
-        """Read as source, because the paths are inside the function body."""
-        vb, _ = overlay
-        source = open(os.path.join(OVERLAY, "ann_benchmarks",
-                                   "vb_mysql.py")).read()
-        shared = source.split("def _image_march", 1)[1].split("def ", 1)[0]
-        assert "/opt/mariadb/.march" in shared        # needle findable
-        assert "/opt/percona/.march" not in shared
-
     @staticmethod
-    def _march_paths() -> list:
-        """The string literals `_image_march` actually iterates.
+    def _march_paths(path_parts, name="_image_march") -> list:
+        """The string literals a march reader actually iterates.
 
         Parsed out of the AST rather than matched against the function's text.
         The text version of this test was vacuous: the method's own DOCSTRING
@@ -928,10 +964,9 @@ class TestMarchIsReportedAndNotLostToAnUnknown:
         `march` is the field that would catch a mixed-SIMD build.
         """
         import ast
-        tree = ast.parse(open(os.path.join(ALGORITHMS, "percona",
-                                           "module.py")).read())
+        tree = ast.parse(open(os.path.join(*path_parts)).read())
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_image_march":
+            if isinstance(node, ast.FunctionDef) and node.name == name:
                 # The docstring is an Expr statement, never a `for` iterable,
                 # so walking the loops cannot pick it up.
                 for inner in ast.walk(node):
@@ -940,32 +975,71 @@ class TestMarchIsReportedAndNotLostToAnUnknown:
                         return [e.value for e in inner.iter.elts
                                 if isinstance(e, ast.Constant)
                                 and isinstance(e.value, str)]
-        raise AssertionError("no _image_march loop over a literal sequence")
+        raise AssertionError(f"no {name} loop over a literal sequence")
 
-    def test_the_override_looks_where_this_image_writes(self):
-        paths = self._march_paths()
-        assert paths, "the tuple is empty"
+    #: The two readers, in the two containers. Named as data so every test
+    #: below covers both and one cannot be quietly dropped from a loop.
+    ANN_READER = (OVERLAY, "ann_benchmarks", "vb_mysql.py")
+    OPS_READER = (VB_ROOT, "harness", "main.py")
+    READERS = ((ANN_READER, "_image_march"), (OPS_READER, "_detect_march"))
+
+    @pytest.mark.parametrize("parts,name", READERS)
+    def test_every_march_reader_knows_this_images_path(self, parts, name):
+        """Both tuples, not one.
+
+        `vb_mysql.py` serves the ann pass; `harness/main.py` serves the ops
+        pass from a container that mounts no overlay, so no module override
+        could ever have reached it and `orchestrator/ops_pass.py` passes no
+        `--march` for its `or` to fall back from.
+        """
+        paths = self._march_paths(parts, name=name)
+        assert paths, f"{name}: the tuple is empty"
+        assert "/opt/mariadb/.march" in paths, paths   # needle findable
         assert "/opt/percona/.march" in paths, paths
 
-    def test_this_images_path_is_tried_first(self):
-        """A fallback order that put the other engines first would read a
-        /opt/mariadb/.march that a multi-engine image happened to carry."""
-        assert self._march_paths()[0] == "/opt/percona/.march"
+    def test_the_per_engine_override_is_gone(self):
+        """§4.8's second instruction, and the half that is easy to skip.
 
-    def test_the_docstring_alone_does_not_satisfy_the_guard(self):
+        Adding the path to the shared tuples while leaving the override in
+        place would work, and would leave the next engine two places to miss
+        instead of one. Asserted on the AST rather than on the text, because
+        the comment that REPLACED the override names the method it replaced
+        and a substring check would match that comment -- the same vacuity
+        shape the docstring hole had.
+        """
+        import ast
+        tree = ast.parse(open(os.path.join(ALGORITHMS, "percona",
+                                           "module.py")).read())
+        defined = [n.name for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)]
+        assert "_image_march" not in defined, (
+            "percona/module.py still overrides _image_march; §4.8 says the "
+            "path belongs in both shared tuples instead")
+        # Non-vacuity: the parser does find this file's other methods, so an
+        # empty list is not what made the line above pass.
+        assert "get_additional" in defined, defined
+        # And the removal is explained where the override was, rather than
+        # leaving a silent hole for the next reader to 'fix' by adding it back.
+        body = open(os.path.join(ALGORITHMS, "percona", "module.py")).read()
+        assert "_image_march" in body, "the reason it is absent is not recorded"
+
+    @pytest.mark.parametrize("parts,name", READERS)
+    def test_no_march_reader_can_be_satisfied_by_prose(self, parts, name):
         """Non-vacuity, stated as a test rather than as a comment.
 
-        Proves the two assertions above read the tuple and not the prose: the
-        path appears in the function's text in more places than the tuple, so
-        a text-matching guard cannot distinguish them.
+        Proves the assertions above read the tuples and not the surrounding
+        text: in both files the path appears in the function's text more often
+        than in its tuple, so a text-matching guard cannot tell the two apart.
         """
-        body = open(os.path.join(ALGORITHMS, "percona", "module.py")).read()
-        slice_ = body.split("def _image_march", 1)[1].split("\n    def ", 1)[0]
-        assert slice_.count("/opt/percona/.march") > len(
-            [p for p in self._march_paths() if p == "/opt/percona/.march"])
+        body = open(os.path.join(*parts)).read()
+        slice_ = body.split(f"def {name}", 1)[1]
+        slice_ = slice_.split("\n    def ", 1)[0].split("\ndef ", 1)[0]
+        in_tuple = len([p for p in self._march_paths(parts, name=name)
+                        if p == "/opt/percona/.march"])
+        assert slice_.count("/opt/percona/.march") > in_tuple, name
 
-    def test_the_dockerfile_writes_the_path_the_override_reads(self):
-        """The two halves of one measurement, in two files."""
+    def test_the_dockerfile_writes_the_path_both_readers_read(self):
+        """The two halves of one measurement, in three files."""
         dockerfile = open(os.path.join(DOCKER, "percona", "Dockerfile")).read()
         assert "/opt/percona/.march" in dockerfile
 
@@ -1479,13 +1553,19 @@ class TestTheDocument:
         assert "efConstruction" in body
         assert "efConstruction" not in mysql_branch
 
-    def test_the_ops_path_march_reader_really_lacks_this_image(self, doc):
-        """§4.8's second half. A different container from the overlay, so no
-        module override can reach it."""
+    def test_the_ops_path_march_reader_covers_this_image(self, doc):
+        """§4.8's second half, now done.
+
+        A different container from the overlay, so no module override can
+        reach it -- which is exactly why the path had to go in here and not
+        only in `percona/module.py`. This assertion used to be `not in`,
+        recording that the work was outstanding; it fired when the work was
+        done, which is the right direction for it to fire in.
+        """
         source = open(os.path.join(VB_ROOT, "harness", "main.py")).read()
         fn = source.split("def _detect_march", 1)[1].split("\ndef ", 1)[0]
         assert "/opt/mariadb/.march" in fn          # needle findable
-        assert "/opt/percona/.march" not in fn
+        assert "/opt/percona/.march" in fn
         assert "harness/main.py" in doc
         # And nothing passes --march in from the orchestrator, so the detector
         # is what runs.
@@ -1560,19 +1640,25 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", "def prepare_churn"),
     "harness/drivers/base.py:374":
         ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "churn.py:513-514":
+    "churn.py:522-523":
         ("harness/workloads/churn.py", "what = driver.maintain()"),
     "harness/workloads/build.py:12-16":
         ("harness/workloads/build.py", "ingest_wall_s"),
     "harness/datasets.py:492":
         ("harness/datasets.py", "1,183,514 training rows"),
-    "harness/main.py:209-211":
+    "harness/main.py:209-227":
         ("harness/main.py", "def _detect_march"),
-    "harness/drivers/mysql_family.py:46":
+    "harness/drivers/mysql_family.py:58":
         ("harness/drivers/mysql_family.py", "def to_binary_f32"),
-    "harness/drivers/mysql_family.py:145":
-        ("harness/drivers/mysql_family.py", "id INT PRIMARY KEY"),
-    "mysql_family.py:90-97":
+    # The anchor moved WITH the code, and that is the citation's job. §4.1
+    # replaced the hard-coded `id INT PRIMARY KEY` with `Dialect.pk_type`, so
+    # the literal the document used to point at no longer exists in this file
+    # -- it exists in the dialect default instead. Pointing the row at the
+    # interpolation keeps it checking the line §2.2 is talking about.
+    "harness/drivers/mysql_family.py:234":
+        ("harness/drivers/mysql_family.py",
+         "id {self.dialect.pk_type} PRIMARY KEY"),
+    "mysql_family.py:162-172":
         ("harness/drivers/mysql_family.py", "host=self.spec.host"),
     "postgres.py:689":
         ("harness/drivers/postgres.py", "def _driver_classes()"),
@@ -1582,6 +1668,11 @@ CITED_IN_REPO = {
         ("orchestrator/engines.py", "def _source_tag"),
     "docs/07-planning-a-run.md:506":
         ("docs/07-planning-a-run.md", "60,000-row smoke"),
+    # Found only once `_CITE_RE` learned to see extensionless filenames --
+    # see the note on that pattern. It is the citation that sat at `:113`,
+    # 51 lines wrong, for this document's whole life.
+    "docker/percona/Dockerfile:164":
+        ("docker/percona/Dockerfile", "ARG PERCONA_TAG=unknown"),
     "docker/alisql/entrypoint-alisql.sh:94":
         ("docker/alisql/entrypoint-alisql.sh", 'local u; u="$(user_args)"'),
     "docker/mariadb/entrypoint-mariadb.sh:95":
@@ -1603,7 +1694,7 @@ CITED_IN_REPO = {
     "overlay/.../vb_mysql.py:96":
         ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
          "id INT PRIMARY KEY"),
-    "overlay/.../vb_mysql.py:537-545":
+    "overlay/.../vb_mysql.py:538-564":
         ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
          "/opt/mariadb/.march"),
     "overlay/.../algorithms/alisql/module.py:22-24":
@@ -1623,11 +1714,15 @@ CITED_IN_REPO = {
 BARE_CONTINUATIONS = {
     ("harness/drivers/postgres.py", 698, 698):
         "from .mysql_family import",
-    ("harness/drivers/postgres.py", 701, 707):
-        '"PerconaDriver"' and "return {",
+    # NOTE the `and` in the old form of this value -- `'"PerconaDriver"' and
+    # "return {"` evaluates to its RIGHT operand, so the anchor was only ever
+    # `return {` and the PerconaDriver half was never checked. Both are
+    # asserted now, as a tuple the test iterates.
+    ("harness/drivers/postgres.py", 701, 713):
+        ("return {", '"PerconaDriver": PerconaDriver'),
     ("harness/drivers/postgres.py", 710, 730):
         "def _driver_table()",
-    ("harness/main.py", 264, 264):
+    ("harness/main.py", 283, 283):
         "args.march or _detect_march()",
 }
 
@@ -1656,11 +1751,30 @@ FOREIGN_MARKERS = (
     "percona-hnsw", "ha_innodb", "handler0alter", "field.cc", "field.h",
     "item_create", "sys_vars.cc", "vec0vec", "vector_constants",
     "CMakeLists", "keyring_kmip", "mysql-test", "MYSQL_VERSION",
+    # Cited in §4.1 for the three servers' EXPLAIN grammars. Invisible to
+    # `_CITE_RE` today because `.yy` is not in its extension list; listed
+    # anyway so that widening the parser classifies it instead of failing.
+    "sql_yacc",
     "ddl0loader",
 )
 
+#: Every `path:N[-M]` citation in backticks. The second alternative is for
+#: extensionless filenames, and `Dockerfile` is the one this document cites.
+#:
+#: **IT WAS ADDED BECAUSE THE OMISSION HID A LIVE ERROR.** The parser saw 60 of
+#: this document's 72 citations; eleven of the misses were foreign `.result` and
+#: `.test` paths that `_is_foreign` would have skipped anyway, and exactly one
+#: was in-repo: `docker/percona/Dockerfile:164`, which sat in §4.7 reading
+#: `:113` -- wrong by 51 lines, pointing at `ENV DEBIAN_FRONTEND`, with nothing
+#: in this file able to see it. A completeness guard that cannot see a whole
+#: CLASS of citation reports coverage it does not have, which is the same shape
+#: as the vacuity it exists to catch.
+#:
+#: Group numbering is unchanged: the inner alternation is non-capturing, so
+#: group 1 is still the path and 2/3 the line range.
 _CITE_RE = re.compile(
-    r"`([A-Za-z0-9_./-]+\.(?:py|sh|js|yml|md|cc|h|txt)):(\d+)(?:-(\d+))?`")
+    r"`((?:[A-Za-z0-9_./-]+\.(?:py|sh|js|yml|md|cc|h|txt)"
+    r"|[A-Za-z0-9_./-]*Dockerfile)):(\d+)(?:-(\d+))?`")
 
 
 def _doc_citations():
@@ -1733,15 +1847,25 @@ class TestEveryCitationIntoThisRepoIsChecked:
 
     @pytest.mark.parametrize("key", sorted(BARE_CONTINUATIONS))
     def test_the_bare_continuations_still_point_where_they_did(self, key):
-        """The `:N` citations the auto-parser cannot see."""
+        """The `:N` citations the auto-parser cannot see.
+
+        A value may be one anchor or a tuple of them. The tuple form exists
+        because the single-string form invited `'a' and 'b'`, which Python
+        evaluates to `'b'` -- so a row that read as two assertions made one,
+        and the half that was silently dropped was the half about the entry
+        the follow-on task had to add.
+        """
         path, lo, hi = key
-        anchor = BARE_CONTINUATIONS[key]
+        anchors = BARE_CONTINUATIONS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
         lines = open(os.path.join(VB_ROOT, path)).read().splitlines()
         assert hi <= len(lines), f"{path} has {len(lines)} lines"
         body = "\n".join(lines[lo - 1:hi])
-        assert anchor in body, (
-            f"{path}:{lo}-{hi} no longer contains {anchor!r}; it reads "
-            f"{body.strip()[:120]!r}")
+        for anchor in anchors:
+            assert anchor in body, (
+                f"{path}:{lo}-{hi} no longer contains {anchor!r}; it reads "
+                f"{body.strip()[:120]!r}")
 
     def test_foreign_citations_are_skipped_explicitly(self):
         """The Percona sources are pinned by SHA and are not in this checkout.

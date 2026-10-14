@@ -82,7 +82,9 @@ from typing import Any, Dict, List, Optional
 #:   (`algorithms/pgvector/module.py:324`), Valkey's reports "memory" and
 #:   mongodb's "wiredTiger". Put it in the key and pgvector, Valkey and
 #:   Percona Search never match at all -- the check would be empty for three
-#:   of six engines for a naming reason. It is instead used to PAIR inside a
+#:   of seven engines for a naming reason (Percona SERVER reports `InnoDB`
+#:   like the rest of the MySQL family, so it is not a fourth here). It is
+#:   instead used to PAIR inside a
 #:   key (see `_normalised_storage`) and is carried on every row, so two ops
 #:   units differing only in storage engine stay two visible rows instead of
 #:   one pooled one. That is H-1's lesson applied to the axis the key drops.
@@ -130,14 +132,31 @@ def build_mode_axis_engines(ann_records: List[Dict[str, Any]]) -> frozenset:
 
     **The second asymmetry between the two paths, measured, and the one §5.2
     item 1 does not anticipate.** The item asks for a match on build mode,
-    and three of six engines cannot supply one:
-    `overlay/.../algorithms/{mariadb,mariadb123,alisql}/module.py` write no
+    and four of seven engines cannot supply one:
+    `overlay/.../algorithms/{mariadb,mariadb123,alisql,percona}/module.py`
+    write no
     `build_mode` attribute at all, so `report/loaders.py`'s ann loader reads
     None for them -- while `harness/main.py` defaults `--build-mode` to "post"
     and
     `context.record_defaults` stamps it on EVERY ops record. Taken literally,
     the key is then `(..., None)` on one side and `(..., "post")` on the
-    other and the check is empty for MariaDB, MariaDB 12.3 and AliSQL.
+    other and the check is empty for MariaDB, MariaDB 12.3, AliSQL and
+    Percona Server.
+
+    **Percona Server is the fourth for a different reason from the other
+    three, and it is the one worth knowing about.** MHNSW and VIDX have no
+    separable bulk build, so a build mode would be meaningless for them.
+    Percona Server HAS one -- `PerconaDriver` splits `create_schema` and
+    `create_index` on `IndexSpec.build_mode`, and `config/profiles/
+    percona.yml` runs both modes through the ops path -- but its ann module
+    does not read `build_mode`, which is why `orchestrator/ann_pass.py`
+    refuses `ann.percona_build_modes` rather than emitting two identical
+    curves. So the axis is real for this engine on the OPS path and silent on
+    the recall path, and dropping it here is still the right call: the ann
+    records genuinely say nothing about it. Giving the overlay module a
+    `build_mode` the way pgvector's and valkey's have one would make this
+    engine supply the axis, and is the change that would close both gaps at
+    once.
 
     That ops value is not a measurement of how the index was built, and the
     mechanism runs the opposite way round from how an earlier revision of

@@ -190,6 +190,78 @@ def render_config(engine: str, profile: Dict[str, Any],
                 "query_args": query_args,
             }
 
+    elif engine == "percona":
+        # A branch of its own and NOT an addition to the MySQL-family
+        # condition above, because the thing this engine needs that branch
+        # cannot express is `efConstruction`. No MySQL-family branch emits it,
+        # because no other MySQL-family engine here exposes it: Percona has a
+        # build-time knob AND a query-time one (`innodb_hnsw_ef_search`),
+        # which makes it the only engine in this study with both.
+        #
+        # Pinned in the normalized pass for the same reason pgvector's and
+        # Valkey's are, and `percona/config.yml` says the same thing at
+        # length: MariaDB and AliSQL still lack the knob, and sweeping it
+        # where only one engine has it hands that engine a tuning axis the
+        # others cannot answer. Swept in the tuned pass, where following each
+        # vendor's own idioms is the point.
+        if resource_pass == "tuned" and extras.get("percona_ef_construction"):
+            ef_constructions = list(extras["percona_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("percona_ef_construction", 200))]
+
+        # `percona_build_modes` IS REFUSED RATHER THAN HONOURED, and this is
+        # the one place in the Percona addition where a documented intention
+        # could not be delivered.
+        #
+        # docs/09 §2.5 and §4.10 propose it: Percona maintains the graph on
+        # every INSERT *and* has a separable bulk path, so build mode is a
+        # within-engine comparison on a MySQL-family server -- which would
+        # separate "bulk is cheaper than incremental" from "Postgres differs
+        # from MySQL here", two claims that cannot be told apart while
+        # pgvector is the only engine with both modes and also the only
+        # Postgres. The ops harness can do it: `PerconaDriver.capabilities()`
+        # derives `incremental_index` from `IndexSpec.build_mode` and
+        # `create_schema`/`create_index` split accordingly.
+        #
+        # THE ANN PATH CANNOT, because the overlay module has no `build_mode`.
+        # `pgvector/module.py:76-78` and `valkey/module.py:110-112` each read
+        # it, validate it, branch on it in `fit` and report it back in
+        # `get_additional`; `percona/module.py` contains the string zero
+        # times, and so does the `VBMySQLBase` it inherits from. Emitting the
+        # key here anyway would produce two run groups, `post_build` and
+        # `incremental_build`, differing only in a `method_param` nothing
+        # reads -- two IDENTICAL curves under two labels, with no field in the
+        # record to say they were the same measurement. That is the shape this
+        # repo guards against everywhere else, and a loud refusal is the
+        # alternative it prefers.
+        modes = list(ann.get("percona_build_modes", ["post"]))
+        if modes != ["post"]:
+            raise ValueError(
+                "ann.percona_build_modes is not implemented: "
+                "overlay/.../algorithms/percona/module.py has no `build_mode`, "
+                "so every mode would build the index the same way and report "
+                f"identical curves under different labels. Got {modes!r}. The "
+                "ops harness does support it (PerconaDriver.capabilities), so "
+                "a build-mode comparison is available there today; the ann "
+                "half needs the overlay module to read `build_mode` the way "
+                "pgvector's and valkey's do.")
+
+        # One run group, matching `percona/config.yml`'s own `innodb` group
+        # and alisql's branch above rather than pgvector's: the vector index
+        # is InnoDB's, implemented in storage/innobase, so there is no second
+        # storage engine to curve against. `engine` is still passed rather
+        # than omitted, so a profile asking for something else gets a server
+        # error naming the engine instead of silently getting InnoDB.
+        run_groups["innodb"] = {
+            "arg_groups": [{
+                "M": m_values,
+                "efConstruction": ef_constructions,
+                "engine": "InnoDB",
+            }],
+            "args": {},
+            "query_args": query_args,
+        }
+
     elif engine == "mongodb":
         # Quantization is the one axis no other engine has, so it follows the
         # ef_construction precedent exactly: pinned in the normalized pass, set

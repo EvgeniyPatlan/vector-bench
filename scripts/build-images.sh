@@ -128,6 +128,12 @@ build_engine() {
   case "$base" in
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
+    # The value is a SHA rather than a tag name -- Percona is pinned to a
+    # commit on branch `vector-mvp`, not to a release -- but it travels by the
+    # same `source.tag` key and through the same build arg, because `git
+    # archive` and `docker build --build-arg` neither know nor care which it
+    # is. docker/percona/Dockerfile declares `ARG PERCONA_TAG` to receive it.
+    percona)  bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
     # Nothing compiled: the module is copied out of its own published image.
     mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
@@ -200,6 +206,11 @@ case "$ENGINE" in
   mongodb)    build_engine mongodb ;;
   # Installed from Percona's valkey repository; nothing is compiled.
   valkey)     build_engine valkey ;;
+  # Percona SERVER, compiled from source like mariadb and alisql and not from
+  # a package like the two above. Opt-in rather than part of `all` for the
+  # same reason mariadb123 is: it is another full MySQL build that nobody
+  # asked for by typing "all".
+  percona)    build_engine percona ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

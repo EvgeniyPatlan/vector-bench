@@ -1,14 +1,36 @@
 "use strict";
 
+// A SECOND COPY of config/engines/*.yml's `runtime.chart.color` and
+// `runtime.label`, kept in step with them by hand. The front end is static and
+// cannot read the engine registry, so these two maps are the one place in the
+// repo where the same facts live in two files -- an engine added to
+// config/engines/ and not to these renders in a fallback colour under its bare
+// key. Both values must match the YAML character for character.
 const ENGINE_COLOR = {
   mariadb: "#1f77b4", mariadb123: "#5fa8d3", alisql: "#d62728",
   pgvector: "#2ca02c", mongodb: "#9467bd", valkey: "#e377c2",
+  percona: "#ff7f0e",
 };
 const ENGINE_LABEL = {
   mariadb: "MariaDB 11.8 (MHNSW)", mariadb123: "MariaDB 12.3 (MHNSW)",
   alisql: "AliSQL (VIDX)", pgvector: "PostgreSQL (pgvector)",
   mongodb: "Percona Search (mongot)", valkey: "Valkey (valkey-search)",
+  // Percona SERVER (InnoDB HNSW), not Percona SEARCH (mongot) above. The two
+  // are different engines from the same vendor and swapping them would make
+  // one report the other's recall.
+  percona: "Percona Server (InnoDB HNSW)",
 };
+// Fallback colours for series that are NOT engines -- `app.js` reads
+// `ENGINE_COLOR[name] || PALETTE[index % PALETTE.length]`, so this is only
+// reached for a name absent from the map above.
+//
+// IT DELIBERATELY OVERLAPS `ENGINE_COLOR`, and always has: the first five
+// entries are mariadb's, alisql's, pgvector's, mongodb's and valkey's
+// colours, and `#ff7f0e` is now percona's too. That is not a collision to
+// fix -- it is one base palette used for two disjoint purposes, and an
+// engine series and a non-engine series never share a chart. A uniqueness
+// guard across the two would have to fail on five pre-existing entries to
+// catch nothing.
 const PALETTE = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#e377c2",
                  "#ff7f0e", "#8c564b", "#17becf"];
 
@@ -146,7 +168,7 @@ const VIEWS = [
     ys: ["build_wall_s", "index_bytes", "peak_rss_bytes"],
     logY: false,
     filters: ["dataset", "engine", "resource_pass", "build_mode", "storage_engine"],
-    hint: "What the index costs to make. pgvector bulk-builds; MHNSW and VIDX build on every INSERT.",
+    hint: "What the index costs to make. pgvector bulk-builds; MHNSW and VIDX build on every INSERT; Percona Server does either, so its two build modes are a comparison within one engine.",
     empty: "No index-build records in this run.",
   },
   {

@@ -194,10 +194,19 @@ class TestWrite:
 
 class TestListing:
     def test_lists_the_real_engines(self):
+        """In presentation order, which is `runtime.order` and not the
+        alphabetical order the directory scan returns.
+
+        A value assertion, so an engine config added to config/engines/
+        without this line being updated fails here rather than quietly
+        appearing in the web UI's Engines tab. `percona` is seventh by
+        `order: 70`; alphabetically it would sit between mongodb and
+        pgvector.
+        """
         listed = engines_mod.listing(os.path.join(VB_ROOT, "config"))
         names = [e["name"] for e in listed]
         assert names == ["mariadb", "alisql", "pgvector", "mariadb123",
-                         "mongodb", "valkey"]
+                         "mongodb", "valkey", "percona"]
 
     def test_carries_what_the_table_shows(self):
         listed = engines_mod.listing(os.path.join(VB_ROOT, "config"))

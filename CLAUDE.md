@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-`vector-bench` benchmarks **built-in vector search across six database engines**, all
+`vector-bench` benchmarks **built-in vector search across seven database engines**, all
 running HNSW, so the comparison isolates implementation quality rather than algorithm
 choice. It is a measurement instrument: the most damaging bugs here do not crash — they
 quietly hand one engine a different budget, grid or dataset and produce a credible-looking
@@ -20,6 +20,7 @@ The repo root is `vector-bench/` (git repo, branch `master`). All commands below
 | `pgvector` | PostgreSQL + pgvector | tag `v0.8.6` |
 | `mongodb` | Percona Search for MongoDB (mongot) | Percona package |
 | `valkey` | Valkey + valkey-search | Percona repo `valkey-91` |
+| `percona` | Percona Server, InnoDB HNSW | branch `vector-mvp`, commit `02a8b80c` |
 
 `KNOWN_ENGINES` is whatever `config/engines/*.yml` holds — there is no list in Python to keep
 in step with it. `orchestrator/engines.py` is the registry everything derives from.
@@ -143,7 +144,9 @@ reports the first's recall — this is why `mariadb123` exists) and a duplicate 
 
 These are the reasons the code looks over-defensive. Do not relax them.
 
-- **Never mix `-march` between engines.** All six compile SIMD distance kernels; a different
+- **Never mix `-march` between engines.** The five built from source compile SIMD distance
+  kernels — `mariadb`, `mariadb123`, `alisql`, `pgvector`, `percona`, all at `x86-64-v3`;
+  `mongodb` and `valkey` are installed from packages and declare `march: none`. A different
   flag on one turns the benchmark into a comparison of compiler flags.
 - **`harness/` and `report/` must not import `orchestrator`.** Each runs in a container that
   mounts only itself. Importing the orchestrator from `report/` once crashed generation at the
@@ -169,30 +172,47 @@ These are the reasons the code looks over-defensive. Do not relax them.
   memory or how many cores the engine had. `ann_fingerprint()` keys the tree by the resource
   pass's *declared* knobs so a 16 GB curve is never silently reused under a 64 GB manifest.
   The fingerprint is deliberately **engine-invariant**; making it engine-specific fragments the
-  tree and produces a six-engine recall chart containing one engine.
+  tree and produces a seven-engine recall chart containing one engine.
 - **Filtered ground truth is recomputed** (`harness/datasets.py`) — a `WHERE` predicate changes
   the correct answer set, and reusing unfiltered neighbours scores every engine against the
   wrong targets.
 - **Recall is ann-benchmarks' distance-threshold definition**, not an id intersection
   (`report/loaders.py:knn_recall`), so numbers stay comparable to published results.
-- **Both MySQL-family engines ship a 16 MiB graph cache by default** (`mhnsw_max_cache_size`,
+- **MariaDB and AliSQL ship a 16 MiB graph cache by default** (`mhnsw_max_cache_size`,
   `vidx_hnsw_cache_size`). The framework sets both from the resource pass; leaving the default
   judges a vendor on a value it plainly intended you to change.
+- **Percona's `innodb_hnsw_max_memory` is NOT a third member of that family** and must never be
+  fed from `graph_cache_bytes`. Those two are caches — a graph larger than the cache still
+  works and performance degrades. Percona's is a hard allocation ceiling with no per-node
+  eviction: exceeding it fails the statement with `ER_CAPACITY_EXCEEDED`, and not only during
+  ingest, because the limit is re-checked as a cold search faults the graph back in after a
+  restart. Equal byte counts would therefore compare a cache budget against a wall, and one
+  engine would be unable to finish the load where two merely slowed down. It is set to `0`
+  (unlimited) so the container's memory limit bounds it like every other engine, and
+  `Innodb_hnsw_memory_used` is recorded per phase — a figure that **omits the node map
+  (~30–50 B/node) and so is a floor on graph memory, not a measurement of it**. See
+  `docs/09-adding-percona-server.md` §3.
 - **A profile's `resources:` block deep-merges dict-into-dict.** To *clear* an inherited key
   write `null`, not `{}` — `{}` recurses into the inherited map and changes nothing. This
   silently halved the `m-sweep` profile once.
 - Structural asymmetries no config removes, and which the report always states:
-  `ef_construction` is exposed only by pgvector and Valkey; pgvector bulk-builds while MHNSW
-  and VIDX build incrementally on every INSERT (both `build_mode`s are measured); AliSQL VIDX
+  `ef_construction` is exposed by pgvector, Valkey and Percona Server, and by no other
+  MySQL-family engine here — Percona is the only engine in the study with both a build-time
+  and a query-time effort knob; pgvector bulk-builds while MHNSW and VIDX build incrementally
+  on every INSERT, and Percona Server does either, so its `build_mode` is a comparison within
+  one engine (ops path only — the ann overlay module has no `build_mode`, and
+  `render_config` refuses the key rather than emitting two identical curves); AliSQL VIDX
   is InnoDB-only and requires READ COMMITTED.
 
 ## Cost awareness
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~726 h of ingest before a single query runs, and ~1,006 h of run time
-in the worst case once querying is counted — all six engines, which is what that command
-measures when `--engines` is omitted. Before proposing a run,
+--resource-pass both` is ~726 h of ingest before a single query runs, and ~1,046 h of run time
+in the worst case once querying is counted — all seven engines, which is what that command
+measures when `--engines` is omitted. **The ingest figure covers six of those seven**: nothing
+has measured Percona's ingest rate, so the estimator names it in `engines_without_ingest_rate`
+rather than modelling it, and 726 h is a floor by an amount nothing here knows. Before proposing a run,
 check `docs/07-planning-a-run.md` and the estimate the run prints. Prefer `dev` → `smoke` when
 validating framework changes; long profiles are the user's call, not a default.
 

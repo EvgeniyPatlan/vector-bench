@@ -1,0 +1,227 @@
+# Percona Server engine definition.
+#
+# Vector support: InnoDB HNSW (storage/innobase, `VECTOR KEY … TYPE hnsw`),
+# on branch `vector-mvp` over MySQL 9.7.1 LTS. Everything here is pinned to one
+# commit and the whole design is written up in docs/09-adding-percona-server.md,
+# which cites the server's own sources and recorded MTR output for every claim.
+#
+# NOTHING IN THIS FILE HAS EVER BEEN RUN. The image has never been built and no
+# server has been started from it. The first thing that will exercise it is the
+# smoke run, and docs/09 §5 lists what that run has to survive.
+name: percona
+display_name: Percona Server
+family: mysql
+
+source:
+  # The key is `tag` even though the value is a SHA, and that is not a cosmetic
+  # choice. `orchestrator/engines.py:63-65` is
+  # `return str(source.get("tag") or source.get("version") or "")` -- there is
+  # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
+  # the empty string and `scripts/prepare-sources.sh` fall back to its
+  # hard-coded default for this engine. `orchestrator/ops_pass.py` reads the
+  # same key into `VB_ENGINE_TAG`, which is what reaches the manifest, so a
+  # misnamed key would also publish a run whose engine version is blank.
+  # `git archive` takes a SHA wherever it takes a tag, so the mechanism is
+  # unchanged.
+  #
+  # Compare SHAs and never dates: the branch was rebased, so the author date
+  # (2026-10-08) sits under the committer date (2026-10-13) and a date is not
+  # an identifier here.
+  tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
+  upstream: https://github.com/percona/percona-server.git
+  # No `submodules:` key, deliberately: all four of the pin's submodules are
+  # switched off in the build instead, which takes four cmake flags, one of
+  # them non-obvious. Listing them here the way mariadb.yml lists libmariadb
+  # would make the build fetch from three more hosts. See docker/percona/
+  # Dockerfile note 2, which names each submodule beside the flag that handles
+  # it and records which flag spellings were measured to work.
+
+image:
+  runtime: vector-bench/percona-runtime
+  bench: vector-bench/percona-bench
+  base: ubuntu:24.04
+
+build:
+  type: RelWithDebInfo
+  # MUST equal the march of every other engine BUILT FROM SOURCE -- mariadb,
+  # mariadb123, alisql and pgvector, all x86-64-v3. (mongodb and valkey are
+  # installed from packages and declare `march: none`; there is nothing of
+  # ours compiled in them to mismatch.) Those five compile SIMD distance
+  # kernels, and a different flag on one turns the benchmark into a comparison
+  # of compiler flags -- see CLAUDE.md's "Never mix -march between engines". The
+  # value is written to /opt/percona/.march in the image so both `march`
+  # readers can report which one was actually used (docs/09 §4.8).
+  march: x86-64-v3
+  # The flags that switch off the four submodules a `git archive` cannot ship,
+  # plus the large MySQL components with no bearing on vector search. They are
+  # also spelled out in docker/percona/Dockerfile's cmake invocation, which is
+  # the copy the build actually depends on: `scripts/build-images.sh` appends
+  # these as ${CMAKE_FLAGS} *after* the Dockerfile's own, so a value here can
+  # only confirm or override, never remove. Both copies carry the same values,
+  # and docker/percona/Dockerfile note 2 is where the reasoning lives.
+  #
+  # WITHOUT_COMPONENT_KEYRING_KMIP=1 is the non-obvious one, and it is a value
+  # spelling rather than a flag choice: the component's gate is
+  # `IF(NOT DEFINED WITH_… AND NOT DEFINED WITHOUT_… OR WITH_…)`, so defining
+  # the WITHOUT_ symbol is what closes it. Measured, not reasoned -- the
+  # Dockerfile note records which spellings were tried.
+  cmake_flags:
+    - -DWITH_COREDUMPER=OFF
+    - -DWITH_AUTH_OPENID_CONNECT=OFF
+    - -DWITH_ROCKSDB=OFF
+    - -DWITHOUT_COMPONENT_KEYRING_KMIP=1
+    - -DWITH_NDB=OFF
+    - -DWITH_ROUTER=OFF
+    - -DWITH_MYSQLX=OFF
+    - -DWITH_UNIT_TESTS=OFF
+    - -DWITH_SSL=system
+    - -DWITH_ZLIB=system
+  extra_cxxflags: ""
+
+# There is deliberately no `sql:` block, and this file is the first engine
+# config written after the blocks were removed rather than one they were
+# removed from. Every statement the ops harness sends is built in
+# harness/drivers/mysql_family.py -- harness/ is mounted into the bench
+# container on its own and cannot read config/, so nothing here could ever be
+# executed. The statements that do belong to this engine and are not in that
+# file are `runtime.probe`'s below and docker/percona/init.sql's, which
+# --init-file runs on every start.
+#
+# The removed blocks had drifted precisely because no reader existed:
+# `index_plan_marker: "v"` against a driver that names the index `vi`, a
+# `create_table` with no `tag` column beside its own `tag` filter, and no
+# mention of `ctag`. tests/test_c1_engine_sql.py fails if a block comes back.
+
+# Server knobs, per fairness pass. {buffer_bytes} etc. are filled in by the
+# orchestrator from the resource pass.
+server:
+  common:
+    # --no-defaults is NOT listed here. mysqld requires it to be the first
+    # argument; the entrypoint supplies it there, and a second copy arriving
+    # later makes the server exit 2 at startup.
+    - --skip-name-resolve
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    # UNLIMITED, AND NOT {graph_cache_bytes}. This is a decided policy and the
+    # full argument is docs/09 §3; the short version is that
+    # innodb_hnsw_max_memory is not the same KIND of limit as MariaDB's
+    # mhnsw_max_cache_size or AliSQL's vidx_hnsw_cache_size. Those two are
+    # caches: a graph larger than the cache still works, read back from the
+    # companion table, and performance degrades. Percona's is a hard
+    # allocation ceiling with no per-node eviction -- exceeding it FAILS THE
+    # STATEMENT with ER_CAPACITY_EXCEEDED, and not only during ingest: the
+    # limit is re-checked as a cold search faults nodes in, so a post-restart
+    # query phase can die after the expensive part is already paid for.
+    #
+    # Feeding it {graph_cache_bytes} would therefore compare a cache budget
+    # against a wall: at normalized.yml's graph_cache_fraction the three
+    # engines would get the same byte count and one of them could not finish
+    # the load at M=32 on glove-100, where the floor alone exceeds 1 GiB. A
+    # benchmark in which one engine errors and two degrade is reporting on a
+    # difference in limit semantics, not on index quality.
+    #
+    # At 0 the graph is bounded only by the container's memory limit, which
+    # the orchestrator already sets and already records -- so Percona is held
+    # to the same TOTAL budget as every other engine, measured where the
+    # others' budgets are measured.
+    #
+    # The audit trail for that is `Innodb_hnsw_memory_used`, recorded per
+    # phase, and EVERY FIGURE TAKEN FROM IT MUST CARRY THE CAVEAT that it
+    # omits the node map (HNSW::m_nodes, roughly 30-50 bytes per node on the
+    # normal heap) and search scratch space. At glove-100's 1,183,514 rows
+    # that is 35.5-59.2 MB unreported per vector index. It is a FLOOR on graph
+    # memory, not a measurement of it.
+    - --innodb-hnsw-max-memory=0
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    # Same policy, same reasoning, in both passes: the asymmetry against the
+    # other two MySQL-family engines is structural and is reported rather than
+    # tuned away.
+    - --innodb-hnsw-max-memory=0
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --skip-log-bin
+
+# InnoDB only, and by the server's construction rather than by our choice: the
+# vector index is InnoDB's. A profile asking for anything else gets a server
+# error naming the engine instead of silently getting InnoDB.
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB]
+
+capabilities:
+  # The one capability that separates Percona from the rest of the MySQL
+  # family here: it has BOTH a build-time (`ef_construction`) and a query-time
+  # (`innodb_hnsw_ef_search`) effort knob. CLAUDE.md's "Structural
+  # asymmetries" bullet says ef_construction "is exposed only by pgvector and
+  # Valkey", which this engine makes false -- see the report notes in docs/09.
+  ef_construction_tunable: true
+  m_per_index: true
+  # Unlike alisql, whose VIDX raises ER_NOT_SUPPORTED_YET on every vector
+  # operation outside READ COMMITTED. No test in the pinned tree's
+  # percona_vector suite sets an isolation level to make vector DML work.
+  requires_read_committed: false
+  filtered_search: true
+
+# Percona's optimizer CAN decline the index, but never for cost reasons, and
+# the distinction decides what this guard is protecting against.
+# vector-common/vector_constants.h gives vector index access
+# `prohibitive_cost = 1e100`, "Chosen so that it always loses against any other
+# access method, since a vector index is only ever activated for ORDER BY ...
+# LIMIT" -- so activation is a SHAPE match, not a cost decision. That is the
+# opposite of AliSQL, which costs the index against a full scan and picks the
+# scan at larger LIMITs. The shapes that fall off the index are no LIMIT,
+# ORDER BY ... DESC, a metric the graph was not built for, DISTANCE() only in
+# WHERE, and both arguments non-constant. Each returns exact results slowly,
+# which is the failure this check exists to make loud.
+#
+# The marker itself is NOT here and must not come back: the plan check lives in
+# the driver (`MySQLDialect.plan_marker` = "vector_ann") and nowhere else. An
+# `index_plan_marker` key in a config was both unread and wrong for both
+# MariaDB versions.
+plan_guard:
+  verify_index_used: true
+  force_index_hint: "FORCE INDEX (vi)"
+
+# Runtime facts the orchestrator needs to start and speak to this engine.
+runtime:
+  # After valkey (60), which puts it last in every chart and table: the
+  # original three first, then the engines added later. Directory discovery is
+  # alphabetical and would have put it between mongodb and pgvector.
+  order: 70
+  driver: PerconaDriver
+  # Class name ann-benchmarks expects in the generated config.yml. The
+  # validator refuses a duplicate, and it must: ann-benchmarks keys result
+  # files on this name, so two engines sharing one means the second reports
+  # the first's recall -- which is the defect `mariadb123` exists to prevent.
+  #
+  # `PerconaSearch` is the MONGODB engine, not this one. The two names are
+  # close enough to swap by accident and swapping them is exactly that defect.
+  ann_constructor: PerconaServer
+  port: 3306
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/data
+  credentials:
+    user: "bench"
+    password: "bench"
+  group: extra
+  probe:
+    - "sh"
+    - "-c"
+    - "/opt/percona/bin/mysql -ubench -pbench --socket=/var/run/vbench/percona.sock -e 'SELECT 1' >/dev/null 2>&1"
+  # #ff7f0e and `P` are both unused by the six engines already in the charts
+  # (#1f77b4, #d62728, #2ca02c, #5fa8d3, #9467bd, #e377c2; o, s, ^, s, v, D).
+  #
+  # webui/static/fields.js carries a SECOND copy of the colour and the label
+  # and must match this block character for character. The front end is static
+  # and cannot read this registry, so that is the one place in the addition
+  # where two files are kept in step by hand.
+  chart:
+    color: "#ff7f0e"
+    marker: "P"
+    linestyle: "-"
+    label: "Percona Server (InnoDB HNSW)"
+  label: "Percona Server (InnoDB HNSW)"

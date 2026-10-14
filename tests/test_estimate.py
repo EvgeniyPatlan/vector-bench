@@ -132,8 +132,11 @@ def _iterative_scan_gate_name() -> str:
 def _one_hour_per_pass_term(plan):
     """A probe term worth one hour per (engine, dataset, pass).
 
-    `main` with one pass is six engines x two datasets, so it adds exactly
-    12 h — a number the extension tests can state rather than derive.
+    `main` with one pass is SEVEN engines x two datasets, so it adds exactly
+    14 h — a number the extension tests can state rather than derive. It was
+    12 h over six engines, before `config/engines/percona.yml` existed; the
+    quantity is "one hour per engine per dataset", so this figure moves with
+    the engine list by construction and a reader should expect it to.
     """
     return est_mod._QueryTerm(
         name="test term", typical_s=3600.0, worst_s=3600.0,
@@ -228,7 +231,7 @@ class TestTotalHoursStillMeansIngest:
         assert after["total_hours"] == before["total_hours"]
         assert after["per_engine_hours"] == before["per_engine_hours"]
         assert after["worst_case_total_hours"] == round(
-            before["worst_case_total_hours"] + 12.0, 2)
+            before["worst_case_total_hours"] + 14.0, 2)
 
     def test_long_run_is_still_the_ingest_warning(self):
         """The warning text is about M values reloading the corpus, so the flag
@@ -260,19 +263,24 @@ class TestTheConcurrencyTermIsTimeNotQueries:
     times per point. Each point runs for a fixed span whatever the engine
     manages, so this term is exact.
 
-    By hand, for `main`, one pass, six engines, two datasets:
+    By hand, for `main`, one pass, SEVEN engines, two datasets:
         6 points x 30 s x 3 repeats               =   540 s per ops unit
         ops units per (engine, dataset): 1 each,
             except pgvector, which runs both
-            pgvector_build_modes               -> 7 units per dataset
-        7 units x 2 datasets x 1 pass             =    14 unit-instances
-        14 x 540 s = 7,560 s                      =  2.10 h
+            pgvector_build_modes               -> 8 units per dataset
+        8 units x 2 datasets x 1 pass             =    16 unit-instances
+        16 x 540 s = 8,640 s                      =  2.40 h
+
+    Over the six engines that preceded Percona the same arithmetic gave 7
+    units per dataset, 14 unit-instances and 2.10 h. Percona contributes one
+    ops unit per dataset like every engine except pgvector: `percona.yml` is
+    the only profile that sets `percona_build_modes`, and `main` does not.
     """
 
     def test_main(self):
         t = term(est("main"), "concurrency windows")
-        assert t["typical_hours"] == 2.10
-        assert t["worst_hours"] == 2.10
+        assert t["typical_hours"] == 2.40
+        assert t["worst_hours"] == 2.40
         assert t["bounded"] is True
 
     def test_the_client_count_list_is_counted_not_summed(self):
@@ -892,25 +900,35 @@ class TestTheWholeQueryEstimateForMain:
         assert [t["name"] for t in e["query_terms"]] == [
             "concurrency windows", "filtered search", "churn re-insert",
             "churn reader baseline"]
+        # `churn re-insert`'s TYPICAL does not move with the seventh engine,
+        # and that is the whole estimate.py repair visible in one figure:
+        # Percona has no measured ingest rate, so it contributes no modelled
+        # duration at all rather than a guessed one. Its WORST does move,
+        # because the budget is a ceiling the profile sets per step and
+        # applies to every engine whether or not anyone has measured it.
         assert term(e, "churn re-insert")["typical_hours"] == 4.77
-        assert term(e, "churn re-insert")["worst_hours"] == 14.00
+        assert term(e, "churn re-insert")["worst_hours"] == 16.00
         assert term(e, "filtered search")["typical_hours"] == 0.0
-        assert term(e, "filtered search")["worst_hours"] == 7.00
-        # 2 fractions x 30 s x 14 ops units across main's six engines and two
-        # datasets = 840 s = 0.233 h, and it is both the typical figure and
-        # the ceiling because the window is a fixed span.
-        assert term(e, "churn reader baseline")["typical_hours"] == 0.23
-        assert term(e, "churn reader baseline")["worst_hours"] == 0.23
+        assert term(e, "filtered search")["worst_hours"] == 8.00
+        # 2 fractions x 30 s x 16 ops units across main's SEVEN engines and
+        # two datasets = 960 s = 0.267 h, and it is both the typical figure
+        # and the ceiling because the window is a fixed span. Over six
+        # engines it was 14 units, 840 s and 0.23 h.
+        assert term(e, "churn reader baseline")["typical_hours"] == 0.27
+        assert term(e, "churn reader baseline")["worst_hours"] == 0.27
         # Neither query figure moves with the ann M grid: every term here
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 7.10
-        assert e["query_hours_worst"] == 23.33
-        # The totals do move, by the one extra ann M value: ingest went from
-        # 69.77 h to 93.06 h.
-        assert e["typical_total_hours"] == 100.16
-        assert e["worst_case_total_hours"] == 116.39
+        assert e["query_hours"] == 7.44
+        assert e["query_hours_worst"] == 26.67
+        # The totals move with the ENGINE LIST as well as with the ann M
+        # grid. Over six engines these were 100.16 and 116.39; the INGEST
+        # half of both is unchanged at 93.06, because Percona is named in
+        # `engines_without_ingest_rate` and contributes nothing to it -- so
+        # every hour of the difference is query time.
+        assert e["typical_total_hours"] == 100.50
+        assert e["worst_case_total_hours"] == 119.73
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -921,10 +939,17 @@ class TestTheWholeQueryEstimateForMain:
 
     def test_the_per_engine_split_mirrors_the_ingest_one(self):
         e = est("main")
+        # Percona IS here, with a figure, while it is absent from
+        # `per_engine_hours` above -- and that asymmetry is the point. Query
+        # terms are spans the profile puts a clock on and need no engine
+        # rate; the ingest figure is rows divided by a rate, and needs one.
         assert e["query_per_engine_hours"] == {
             "mariadb": 1.43, "alisql": 2.33, "pgvector": 0.78,
             "mariadb123": 1.89, "mongodb": 0.34, "valkey": 0.34,
+            "percona": 0.33,
         }
+        assert "percona" not in e["per_engine_hours"]
+        assert e["engines_without_ingest_rate"] == ["percona"]
 
     def test_ops_disabled_means_no_ops_terms(self):
         e = est("m-sweep")
@@ -1059,11 +1084,14 @@ class TestTheExtensionPoint:
                             tuple(est_mod._QUERY_TERMS) + (_one_hour_per_pass_term,))
         after = est("main")
         assert [t["name"] for t in after["query_terms"]][-1] == "test term"
-        assert after["query_hours"] == round(before["query_hours"] + 12.0, 2)
+        # 14.0 and not 12.0: `_one_hour_per_pass_term` is one hour per
+        # (engine, dataset, pass) and `main` is seven engines x two datasets
+        # x one pass. Six engines gave 12.0.
+        assert after["query_hours"] == round(before["query_hours"] + 14.0, 2)
         assert after["query_hours_worst"] == round(
-            before["query_hours_worst"] + 12.0, 2)
+            before["query_hours_worst"] + 14.0, 2)
         assert after["worst_case_total_hours"] == round(
-            before["worst_case_total_hours"] + 12.0, 2)
+            before["worst_case_total_hours"] + 14.0, 2)
         out = printed("main")
         assert "test term" in out
         assert "one hour, flat" in out
@@ -1071,10 +1099,18 @@ class TestTheExtensionPoint:
     def test_a_term_may_decline_this_profile(self, monkeypatch):
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
                             tuple(est_mod._QUERY_TERMS) + (lambda plan: None,))
-        assert est("main")["query_hours"] == 7.10
+        # Unchanged by a term that declines: `main`'s query subtotal over all
+        # seven engines. It was 7.10 over six; Percona adds one ops unit per
+        # dataset and 0.33 h of it.
+        assert est("main")["query_hours"] == 7.44
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
-        """main has 7 ops units per dataset x 2 datasets = 14 per pass."""
+        """main has 8 ops units per dataset x 2 datasets = 16 per pass.
+
+        7 and 14 over the six engines that preceded Percona. Every engine is
+        one unit except pgvector, which runs both of its build modes on
+        `main`; Percona runs both only under `config/profiles/percona.yml`.
+        """
         def one_second_per_unit(plan):
             return est_mod._QueryTerm(
                 name="unit term", typical_s=1.0, worst_s=1.0,
@@ -1082,20 +1118,25 @@ class TestTheExtensionPoint:
         monkeypatch.setattr(est_mod, "_QUERY_TERMS", (one_second_per_unit,))
         one = est("main")
         two = est("main", passes=("normalized", "tuned"))
-        assert term(one, "unit term")["typical_seconds"] == 14.0
-        assert term(two, "unit term")["typical_seconds"] == 28.0
+        assert term(one, "unit term")["typical_seconds"] == 16.0
+        assert term(two, "unit term")["typical_seconds"] == 32.0
 
     def test_scope_pass_skips_the_ops_unit_multiplier(self, monkeypatch):
-        """12, not 14: six engines x two datasets, where unit scope would have
-        charged pgvector twice for its two build modes."""
+        """14, not 16: SEVEN engines x two datasets, where unit scope would
+        have charged pgvector twice for its two build modes.
+
+        The pair was 12 against 14 over six engines. What is being pinned is
+        the GAP between the two scopes -- one engine's worth of double
+        charging -- and that gap is still exactly one unit per dataset however
+        many engines there are."""
         def one_second_per_pass(plan):
             return est_mod._QueryTerm(
                 name="pass term", typical_s=1.0, worst_s=1.0,
                 basis="one second", bounded=True, scope="pass")
         monkeypatch.setattr(est_mod, "_QUERY_TERMS", (one_second_per_pass,))
-        assert term(est("main"), "pass term")["typical_seconds"] == 12.0
+        assert term(est("main"), "pass term")["typical_seconds"] == 14.0
         assert term(est("main", passes=("normalized", "tuned")),
-                    "pass term")["typical_seconds"] == 24.0
+                    "pass term")["typical_seconds"] == 28.0
 
     def test_an_unknown_scope_is_refused_loudly(self, monkeypatch):
         """Silently charging it once per (engine, dataset) is how a term meant
@@ -1174,7 +1215,7 @@ class TestThePrintedOutput:
         # moved with the ann grid where the two query figures below did not.
         assert "pgvector ~0.9 h" in out
         assert "~4.8 h typical" in out
-        assert "~14.0 h worst case" in out
+        assert "~16.0 h worst case" in out
 
     def test_a_term_with_a_ceiling_but_no_duration_prints_both(self):
         """Filtered search used to print "cost not quantified", because it had
@@ -1186,7 +1227,7 @@ class TestThePrintedOutput:
         `~0.0 h typical` alone would read as free. It is only not misleading
         because the worst case sits on the same line."""
         out = printed("main")
-        assert "filtered search        ~0.0 h typical, ~7.0 h worst case" in out
+        assert "filtered search        ~0.0 h typical, ~8.0 h worst case" in out
         # Anchored on the `=`, because "3,000 queries per ops unit" is a
         # substring of "13,000 queries per ops unit" -- the shape that has
         # cost this series four tests.
@@ -1195,8 +1236,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~116.4 h worst case" in out
-        assert "~100.2 h typical" in out
+        assert "~119.7 h worst case" in out
+        assert "~100.5 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
@@ -1271,11 +1312,17 @@ class TestThePrintedOutput:
 
     def test_a_profile_whose_cost_is_query_time_is_no_longer_silent(self):
         """smoke is 0.49 h of ingest — under the old 1 h gate, so it printed
-        nothing at all — against a 3.5 h churn ceiling across six engines."""
+        nothing at all — against a 4.0 h churn ceiling across seven engines.
+
+        0.49 h is six engines' ingest out of the seven the gate runs: Percona
+        has no measured rate and is named rather than modelled, so the figure
+        here is a floor and the printed block says so on its own line. The
+        worst case was ~5.2 h over six engines."""
         out = printed("smoke")
         assert "estimated ingest time" in out
         assert "churn re-insert" in out
-        assert "~5.2 h worst case" in out
+        assert "~5.9 h worst case" in out
+        assert "No measured ingest rate for percona" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1337,9 +1384,17 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
     def test_claude_mds_standing_figure_is_the_one_the_command_produces(self):
         """CLAUDE.md restates the cost convention as standing guidance, and the
         sentence names a command rather than an engine list: with `--engines`
-        omitted, `cli.py` resolves to all six KNOWN_ENGINES and `full.yml`
+        omitted, `cli.py` resolves to all seven KNOWN_ENGINES and `full.yml`
         declares no engines key. Quoting docs/07's three-engine figures there
-        left an operator planning ~270 h short of the worst case."""
+        left an operator planning ~270 h short of the worst case.
+
+        It fired again when Percona became the seventh engine: the worst case
+        over `full` at both passes went from ~1,006 h to ~1,046 h, because an
+        engine in the registry is an engine that command runs. The INGEST
+        figure did not move -- 726 h over the six engines with a measured
+        rate, with Percona named rather than modelled -- so the sentence now
+        has to say which of its two numbers covers which engines, and the
+        assertions below pin both."""
         path = os.path.join(VB_ROOT, "CLAUDE.md")
         with open(path) as fh:
             claude = fh.read()
@@ -1353,7 +1408,21 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
             e["ingest_hours"], abs=0.5)
         assert float(sentence.group("worst").replace(",", "")) == pytest.approx(
             e["worst_case_total_hours"], abs=0.5)
-        assert "all six engines" in claude
+        # Pinned as VOCABULARIES over whitespace-normalised text, not as exact
+        # phrases. The old `"all six engines" in claude` was neither: a reflow
+        # could put a newline inside a phrase that sits mid-sentence in
+        # hand-wrapped prose, and an exact phrase rejects correct rewrites --
+        # `"all seven engines"` fires on "all seven of the engines", "every one
+        # of the seven engines" and "all 7 engines", all of which say the same
+        # thing. The vocabularies live in `tests/test_e2_percona_wiring.py`
+        # with their own accepts and rejects asserted beside them.
+        from tests.test_e2_percona_wiring import _prose
+        _prose("the engine count is seven", claude)
+        # And the ingest half is labelled with the engines it actually covers,
+        # because it is a six-engine figure sitting in a seven-engine
+        # sentence. Without this the two numbers read as the same scope.
+        assert e["engines_without_ingest_rate"] == ["percona"]
+        _prose("the ingest figure covers six of the seven", claude)
 
     #: README's profile table claims "measured ingest only, the original
     #: three engines", which is docs/07 §1's hand method: the flat per-engine

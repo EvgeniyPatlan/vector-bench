@@ -1,0 +1,144 @@
+# Percona-only profile — the two questions only this engine can answer.
+#
+# NOT a comparison profile. It runs one engine, so nothing here contributes to
+# the seven-way chart; `main` and `full` do that. What this measures is two
+# within-engine axes that have no counterpart on MariaDB or AliSQL, which is
+# exactly why they do not belong in `main`: an axis only one engine has would
+# add a dimension to the shared grid that the other six cannot be placed on.
+#
+# NOTHING HERE HAS EVER BEEN RUN, and Percona's ingest rate is unmeasured, so
+# `./run-benchmark.sh run --profile percona` prints an estimate that names the
+# engine in `engines_without_ingest_rate` rather than giving it an hour figure.
+# Run the smoke gate first; it is the run that supplies the rate.
+name: percona
+description: Percona Server alone — ef_construction sweep and both build modes
+
+engines: [percona]
+
+datasets:
+  - fashion-mnist-784-euclidean
+
+k: 10
+runs: 1
+
+# Deep-merged onto whichever resource pass is selected
+# (`config.merge_resource_overrides`), so this adds an extra without editing a
+# shared pass and changing every other profile.
+resources:
+  extras:
+    # THE ef_construction SWEEP ITSELF. Read by `ann_pass.render_config` only
+    # under `--resource-pass tuned`, which is the one branch that takes a list
+    # — see the note beside `ann.percona_ef_construction`.
+    #
+    # The server accepts 1..4096 and defaults to 200. These bracket the
+    # default by a factor of four either way, which is enough to show whether
+    # the knob moves the frontier at all before anyone spends a wider sweep on
+    # it. Three values, three full corpus reloads: at 20,000 rows that is
+    # minutes, which is the whole reason the dataset here is the small one.
+    percona_ef_construction: [50, 200, 800]
+
+ann:
+  enabled: true
+  # One M value. The axis under test here is ef_construction, and sweeping M
+  # beside it multiplies the reloads without separating the two effects —
+  # every M value reloads the whole corpus, which is this repo's dominant
+  # cost. M=16 because that is where `main` and `smoke` sit, so a curve from
+  # here can be read beside one from there.
+  m_values: [16]
+  ef_search: [10, 20, 40, 80, 160]
+
+  # THE FIRST AXIS, and the value here is the NORMALIZED pass's pin rather
+  # than the sweep. Percona is the only MySQL-family engine in this study with
+  # a build-time effort knob as well as a query-time one, and that is the
+  # finding this profile exists to turn into a measurement.
+  #
+  # **The sweep is `resources.extras.percona_ef_construction` below and lands
+  # in the TUNED pass**, which is where `ann_pass.render_config` reads a list
+  # at all: the normalized branch coerces this key to a single int by
+  # construction (`[int(ann.get("percona_ef_construction", 200))]`), exactly
+  # as it does for pgvector's and Valkey's. So `--resource-pass normalized`
+  # measures the vendor default and `--resource-pass tuned` measures the
+  # sweep, and a scalar here with sweep-shaped prose beside it would have
+  # claimed a measurement this profile never takes.
+  #
+  # Not bent for this profile even though the usual fairness argument for
+  # pinning — a knob only one engine has must not become a tuning axis the
+  # others lack — plainly does not apply to a one-engine run. Bending it
+  # would mean a per-profile exception inside `render_config`, and the tuned
+  # pass already does the job.
+  percona_ef_construction: 200
+
+  batch: false
+
+  # `percona_build_modes` IS NOT SET HERE, AND SETTING IT HERE IS AN ERROR
+  # THAT COSTS THIS PROFILE BOTH OF ITS AXES. The second axis lives under
+  # `ops:` below; this note is here because `ann:` is where
+  # `pgvector_build_modes` sits and is therefore where someone will reach
+  # for it.
+  #
+  # `ann_pass.render_config` is handed the whole profile and POLICES
+  # `ann.percona_build_modes`: the ann overlay module reads no `build_mode`,
+  # so any value but `["post"]` would render two run groups differing only in
+  # a `method_param` nothing reads — two identical recall curves under two
+  # labels — and it raises instead. The raise is correct. What it costs if the
+  # key is in this block is everything:
+  #
+  #   * `run --profile percona` fails its ann phase (`cli._run_unit`),
+  #   * `render --profile percona` raises UNCAUGHT out of `cmd_render`, which
+  #     loops over KNOWN_ENGINES — so a one-engine profile tracebacks,
+  #   * and `percona_ef_construction` below, which only `render_config`
+  #     reads, is then never swept at all.
+
+ops:
+  enabled: true
+  # `build` is the workload this profile is for: it is the one that records
+  # `ingest_wall_s`, `build_wall_s` and `index_bytes` separately, which is
+  # what makes a bulk build comparable to an incremental one. `concurrency`
+  # and `filtered` are kept because they are cheap at this corpus size and a
+  # build-mode change can move query latency as well as build cost — an index
+  # built in one pass over sorted data is not laid out like one grown row by
+  # row. `churn` is deliberately out: Percona's repair path rebuilds the whole
+  # graph (docs/09 §2.7), so a churn phase here would cost on the order of a
+  # bulk build per fraction and tell us nothing about either axis above.
+  workloads: [build, concurrency, filtered]
+  m_values: [16]
+  ef_search: 100
+  # Small enough that both build modes fit in minutes rather than hours. This
+  # profile answers "does the knob/mode matter", not "what is the number on a
+  # million rows"; `main` is for the latter.
+  subset_rows: 20000
+  load_threads: 1
+  max_queries: 200
+  client_counts: [1, 4]
+  concurrency_duration_s: 8
+  selectivities: [0.10]
+
+  # THE SECOND AXIS, and the one with a result that reaches beyond this
+  # engine. pgvector already runs both build modes, but pgvector is also the
+  # only Postgres here — so today "bulk is cheaper than incremental" and
+  # "Postgres differs from MySQL here" are the same observation and cannot be
+  # separated. A second both-modes curve on a MySQL-family server separates
+  # them. That is the value, and it is narrower than "a new capability".
+  #
+  # **IT LIVES UNDER `ops:` AND `pgvector_build_modes` LIVES UNDER `ann:`,
+  # and the difference is load-bearing rather than untidy.** pgvector's list
+  # drives both passes, because its overlay module reads `build_mode`; this
+  # one drives the ops pass alone, because Percona's does not. Under `ann:`
+  # it would be seen by `ann_pass.render_config`, which refuses it — see the
+  # note at the end of the `ann:` block for what that costs.
+  #
+  # Read by `orchestrator/cli.py`'s ops loop and counted by
+  # `estimate._ops_units`, both through one `{engine: (block, key)}` mapping
+  # that the two files are tested to agree on.
+  #
+  # So this profile's ann phase runs one curve per `ef_construction` value and
+  # its ops phase runs two units per M value, and the build-mode result comes
+  # from the ops records — which is where `build_wall_s`, `ingest_wall_s` and
+  # `index_bytes` live anyway, so nothing is lost by the ann half's absence
+  # except a recall curve per mode.
+  #
+  # `post` is a real bulk build here and not the no-op it is for MariaDB and
+  # AliSQL: `PerconaDriver.create_schema` leaves the vector index out of the
+  # table definition in this mode and `create_index` adds it with one
+  # `ALTER TABLE … ADD VECTOR KEY … ALGORITHM=INPLACE` afterwards.
+  percona_build_modes: [post, incremental]
