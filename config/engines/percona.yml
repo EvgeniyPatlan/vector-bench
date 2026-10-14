@@ -65,9 +65,35 @@ build:
   # `IF(NOT DEFINED WITH_… AND NOT DEFINED WITHOUT_… OR WITH_…)`, so defining
   # the WITHOUT_ symbol is what closes it. Measured, not reasoned -- the
   # Dockerfile note records which spellings were tried.
+  #
+  # WITH_CURL=bundled was not chosen, it was measured -- by five failed
+  # configures of this tree on 2026-10-14, the first time anyone built it.
+  # The attempt before it took the remediation the error itself prints
+  # ("You can disable CURL with -DWITH_CURL=0", CMakeLists.txt:2127) and
+  # configure then died somewhere else entirely:
+  #
+  #     CMake Error at components/keyrings/keyring_vault/CMakeLists.txt:33
+  #       Not building Keyring Vault Component, could not find CURL library
+  #
+  # Percona's Keyring Vault component fails hard when the curl target is
+  # missing instead of skipping itself, so switching curl off is not on offer
+  # here. `bundled` is the value Percona's own build uses --
+  # build-ps/build-binary.sh's CMAKE_COMMON_FLAGS carries `-DWITH_CURL=bundled`
+  # beside -DWITH_ZLIB=bundled, -DWITH_LIBEVENT=bundled and -DWITH_ZSTD=bundled
+  # -- and the source tree ships its own copy, so it needs no system libcurl.
+  #
+  # The lesson that cost those five rounds, written down because it will come
+  # back for the eighth engine: on this tree, switching a dependency OFF breaks
+  # a Percona component that wanted the target, while installing the dependency
+  # does not. It was learned twice -- first with LDAP, where three
+  # -DWITH_AUTHENTICATION_*=OFF flags cleared CMakeLists.txt:2075 and then hit
+  # plugin/auth_ldap, a Percona plugin with its own unconditional check that no
+  # upstream flag governs. The fix for all of them is the builder stage's apt
+  # list in docker/percona/Dockerfile, not a flag.
   cmake_flags:
     - -DWITH_COREDUMPER=OFF
     - -DWITH_AUTH_OPENID_CONNECT=OFF
+    - -DWITH_CURL=bundled
     - -DWITH_ROCKSDB=OFF
     - -DWITHOUT_COMPONENT_KEYRING_KMIP=1
     - -DWITH_NDB=OFF
