@@ -1307,7 +1307,27 @@ class TestPostgresStatements:
             assert (row[0], row[1], row[2]) == (
                 i, int(attrs.tag[i]), int(attrs.ctag[i]))
 
-    def test_both_write_paths_use_one_copy_statement(self):
+    def test_both_write_paths_name_the_same_columns_in_the_same_order(self):
+        """The property `COPY_SQL` and `INSERT_SQL` exist for, now that C4 has
+        split the two write paths across two statement KINDS.
+
+        The bulk-mode load streams a COPY; churn's re-insert sends batched
+        INSERTs, because it writes into a table whose HNSW index already
+        exists and was otherwise getting Postgres's bulk fast-path while the
+        MySQL family re-inserted through `executemany`. One shared string can
+        no longer hold the two column lists together, so this does: same
+        columns, same order, same table, across two statements. A column
+        added to one and not the other fails against a four-column table --
+        on the churn path, after the delete has already happened.
+
+        Honest: both lists are `['id', 'tag', 'ctag', 'embedding']`. Mutant
+        (`INSERT_SQL`'s two scalars swapped): `['id', 'ctag', 'tag',
+        'embedding']` against the COPY's unchanged order, while both
+        statements still contain both column names and would both satisfy a
+        substring test. Mutant (the re-insert mirroring `ctag` from the tag
+        array): the ctag assertion below reads `[0, 1, 2, 3]` where the
+        fixture's ctag values are `[900, 901, 902, 903]`.
+        """
         rows = 4
         attrs = distinct_attrs(rows)
         vectors = numpy.zeros((rows, DIM), dtype=numpy.float32)
@@ -1315,9 +1335,16 @@ class TestPostgresStatements:
         bulk.load(vectors, attrs)
         churn = pg_driver()
         churn.insert_rows([50, 51, 52, 53], vectors, attrs)
-        assert bulk._cur.copies[0][0] == churn._cur.copies[0][0]
-        assert [row[0] for row in churn._cur.copies[0][1]] == [50, 51, 52, 53]
-        assert [row[2] for row in churn._cur.copies[0][1]] == \
+        copy_sql, _streamed = bulk._cur.copies[0]
+        insert_sql, written = churn._cur.many[0]
+        assert copy_columns(copy_sql) == \
+            insert_columns_and_placeholders(insert_sql)[0]
+        # The table, which the old form got for free from comparing the two
+        # statement strings and a parsed column list does not cover.
+        assert copy_sql.startswith("COPY t1 (")
+        assert insert_sql.startswith("INSERT INTO t1 (")
+        assert [row[0] for row in written] == [50, 51, 52, 53]
+        assert [row[2] for row in written] == \
             [int(t) for t in attrs.ctag]
 
     def test_prepare_is_kept_on_the_filtered_path_for_each_column(self):
