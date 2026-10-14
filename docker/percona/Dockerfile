@@ -107,15 +107,51 @@ ARG CMAKE_FLAGS=""
 ARG EXTRA_CXXFLAGS=""
 ARG JOBS=0
 
-# Same shape as the AliSQL builder stage. `file` is used by the strip pass at
-# the end; `python3` is required by the MySQL build itself (comp_err and the
-# generated-source steps), not by the benchmark.
+# NOT the same shape as the AliSQL builder stage any more, and the difference
+# is measured. `file` is used by the strip pass at the end; `python3` is
+# required by the MySQL build itself (comp_err and the generated-source steps),
+# not by the benchmark. Everything from libldap2-dev onwards is this tree's
+# own requirement, found on 2026-10-14 by building it for the first time.
+#
+# AliSQL builds from the same MySQL lineage with none of them, so this is not
+# a MySQL-family cost -- it is what Percona Server 9.0 plus its own components
+# need. Four separate configure failures asked for four of these:
+#
+#   CMakeLists.txt:2075   -DWITH_AUTHENTICATION_LDAP=ON, but missing system
+#                         libraries  (fed by the LDAP, SASL and KERBEROS
+#                         warnings together -- any one of the three trips it)
+#   cmake/rpc.cmake:108   Could not find rpc/rpc.h in /usr/include or
+#                         /usr/include/tirpc            -> libtirpc-dev
+#   plugin/auth_ldap/CMakeLists.txt:21
+#                         Required LDAP dev library not found -- a PERCONA
+#                         plugin with its own unconditional check, which no
+#                         upstream -DWITH_AUTHENTICATION_* flag governs
+#   components/keyrings/keyring_vault/CMakeLists.txt:33
+#                         could not find CURL library, after -DWITH_CURL=0
+#                         had been set to clear an earlier failure
+#
+# Only rpc.cmake offers no way out but the package; the others each tempted a
+# flag first, and each flag moved the failure rather than removing it. Hence
+# the rule recorded beside cmake_flags in config/engines/percona.yml: on this
+# tree, switching a dependency off breaks a component that wanted the target.
+#
+# The list is the subset of this tree's own build-ps/percona-server-9.0_builder.sh
+# `install_deps()` that gates configure, filtered to packages noble actually
+# has -- the vendor list also names gcc-8 through gcc-15, valgrind, doxygen,
+# python-mysqldb, dh-systemd, libzstd1-dev and libncurses5-dev, several of
+# which have no candidate here. Note libpam0g-dev and not the vendor's
+# `libpam-dev`, which resolves to nothing on noble. It is a SUPERSET rather
+# than a minimal set: with -DWITH_CURL=bundled and the vendor's bundled
+# libevent/zstd, several of these are probably unnecessary, and nothing here
+# can run a build to find out which, so none were pruned.
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake bison pkg-config \
       libssl-dev libncurses-dev libudev-dev libaio-dev \
       libnuma-dev zlib1g-dev libedit-dev \
-      python3 file
+      python3 file \
+      libldap2-dev libsasl2-dev libkrb5-dev libcurl4-openssl-dev libtirpc-dev \
+      libpam0g-dev liblz4-dev libzstd-dev libevent-dev libre2-dev libwrap0-dev
 
 WORKDIR /src
 COPY source.tar /tmp/source.tar
@@ -141,6 +177,7 @@ RUN set -eux; \
       -DMYSQL_SERVER_SUFFIX="-vector-bench" \
       -DWITH_COREDUMPER=OFF \
       -DWITH_AUTH_OPENID_CONNECT=OFF \
+      -DWITH_CURL=bundled \
       -DWITH_ROCKSDB=OFF \
       -DWITHOUT_COMPONENT_KEYRING_KMIP=1 \
       -DWITH_NDB=OFF \
