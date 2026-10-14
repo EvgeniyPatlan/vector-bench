@@ -58,6 +58,7 @@ from harness.drivers import valkey as valkey_mod                      # noqa: E4
 from harness.drivers.base import (ConnectionSpec, EngineDriver,       # noqa: E402
                                   RowAttrs)
 from harness.metrics import records                                   # noqa: E402
+from harness.metrics import stats                                     # noqa: E402
 from harness.workloads import churn as cw                             # noqa: E402
 from harness.workloads.context import RunContext                      # noqa: E402
 from tests.fake_driver import (DIM, FakeDriver, K, N_QUERIES,         # noqa: E402
@@ -98,6 +99,18 @@ PR4_UNCONDITIONAL_KEYS = frozenset({
 
 #: What only a step that actually ran a repair path carries, per §4.2 item 6.
 PR4_MAINTENANCE_KEYS = frozenset({"maintenance", "maintenance_s"})
+
+#: What PR 5 §5.1 item 4 adds to every churn record that measured anything:
+#: "Write extra.recall_ci95 and extra.qps_ci95 on calibration, filtered and
+#: churn records." Unconditional on the engine, like PR 4's three above, so it
+#: is folded into the exact-key assertions rather than being special-cased
+#: there -- the point of those assertions is that a record cannot grow a key
+#: nobody declared, and the way to keep that true is to declare the key.
+#:
+#: Taken from `harness.metrics.stats` rather than spelled as two literals: a
+#: typo in a literal here would silently assert a key the harness never
+#: writes, and the frozenset would still have the right size.
+PR5_UNCONDITIONAL_KEYS = frozenset({stats.RECALL_CI_KEY, stats.QPS_CI_KEY})
 
 #: Every driver class the harness can instantiate, taken from the registry
 #: rather than listed here.
@@ -1083,7 +1096,7 @@ class TestADriverWithoutHooksRecordsWhatItAlwaysDid:
 
         step = rows[1]
         assert set(step["extra"]) == PRE_PR4_STEP_KEYS | \
-            PR4_UNCONDITIONAL_KEYS
+            PR4_UNCONDITIONAL_KEYS | PR5_UNCONDITIONAL_KEYS
         assert step["extra"]["repair_path"] == "none"
         assert step["extra"]["maintenance_state"] == "before"
         assert step["extra"]["index_sync_s"] == 0.0
@@ -1101,7 +1114,16 @@ class TestADriverWithoutHooksRecordsWhatItAlwaysDid:
                                    ef_half=1.0, ef_search=512)
         run_churn(ctx, driver, dataset)
         baseline = written(ctx)[0]
-        assert set(baseline["extra"]) == {records.OPS_MEASUREMENT_VERSION_KEY}
+        # PR 5 §5.1 item 4 puts the two interval keys on every churn record,
+        # the baseline included -- and it has to, because the baseline is the
+        # x=0 point every churn fraction is measured against, so a report
+        # that drew error bars on the churned points and none on the baseline
+        # would show the comparison as exact at the one place it is not.
+        # `maintenance_state` is still absent, which is what this test was
+        # named for.
+        assert set(baseline["extra"]) == {
+            records.OPS_MEASUREMENT_VERSION_KEY} | PR5_UNCONDITIONAL_KEYS
+        assert "maintenance_state" not in baseline["extra"]
 
 
 class TestTheTypeGateOnMaintain:

@@ -42,19 +42,26 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy
 
 from ..datasets import (FILTER_CTAG, FILTER_TAG, Dataset,
-                        cached_ground_truth, filter_values, recall_at_k)
+                        cached_ground_truth, filter_values, recall_at_k,
+                        recall_per_query)
 from ..drivers.base import EngineDriver, IndexSpec, RowAttrs
 from ..metrics.latency import LatencyCollector, Timer
 from ..metrics.records import PHASE_CHURN, Record
+from ..metrics.stats import ci_fields
 from ..progress import Heartbeat, Progress
 from .clients import DriverFactory, PoolError, PoolWindow
 # PR 4 §4.3's reader pool. Its own module because inlining it here breaches
-# the repo's stated 800-line maximum badly: the two files are 1,130 lines
-# today and splice back into ONE file of 1,066, which is 266 over. (An earlier
-# revision of this comment said 907 and 107 over -- that was the figure before
-# the module grew its own header, and it understated the case.
-# `tests/test_t4b_readers.py` now measures the splice so neither number can
-# drift again.) The block has one caller each and no state, so it moved rather
+# the repo's stated 800-line maximum badly;
+# `test_the_line_count_the_split_is_justified_by_is_the_real_one` in
+# `tests/test_t4b_readers.py` splices the two files back together, computes by
+# how much, and fails if that stops being true. (The exact figures used to be
+# quoted here and in `churn_readers.py`. They went stale three times -- an
+# earlier revision said 907 and 107 over, which was the count before the
+# module grew its own header and understated the case -- and each restatement
+# had to move whenever either file changed by a line, including for changes to
+# unrelated functions. The claim a reader acts on is "badly over the ceiling";
+# the arithmetic behind it belongs in the test that can recompute it.)
+# The block has one caller each and no state, so it moved rather
 # than being compressed into prose that no longer explains anything. The names
 # below are re-exported because `DEFAULT_CHURN_READERS` is read from
 # `harness/main.py` the way `DEFAULT_CHURN_BUDGET_S` is, and the two should be
@@ -77,19 +84,32 @@ DEFAULT_FRACTIONS = (0.10, 0.25)
 
 def _measure(driver: EngineDriver, queries: numpy.ndarray, k: int,
              id_map: Dict[int, int], truth: numpy.ndarray,
-             warmup: int = 20) -> Dict[str, float]:
-    """Query and score against ground truth translated through `id_map`."""
+             warmup: int = 20) -> Tuple[Dict[str, float], Dict[str, object]]:
+    """Query and score against ground truth translated through `id_map`.
+
+    Returns the record fields AND, separately, PR 5 §5.1 item 4's interval
+    keys. Two values rather than one dict because the first is splatted
+    straight into `Record(**common, ..., **measured)` as top-level columns
+    while the intervals belong in `extra` -- and every caller here already
+    builds its own `extra` with the churn state in it, so merging them in
+    here would mean this function deciding what another record's `extra`
+    contains."""
     for i in range(min(warmup, len(queries))):
         driver.query(queries[i], k)
 
     collector = LatencyCollector(warmup=0)
     returned: List[List[int]] = []
+    # Kept beside the collector for the reason `calibrate._measure_point`
+    # keeps its own: `_samples` is private and a bootstrap needs the samples.
+    latencies: List[float] = []
     progress = Progress(len(queries), "churn queries", prefix=driver.name)
     collector.start()
     for q in queries:
         started = time.perf_counter()
         ids = driver.query(q, k)
-        collector.add(time.perf_counter() - started)
+        elapsed = time.perf_counter() - started
+        collector.add(elapsed)
+        latencies.append(elapsed)
         returned.append(ids)
         progress.step()
     collector.stop()
@@ -103,9 +123,14 @@ def _measure(driver: EngineDriver, queries: numpy.ndarray, k: int,
     )
     stats = collector.stats()
     out = stats.as_dict()
+    # Scored against the TRANSLATED truth, which is the whole point of this
+    # function, so the interval has to be drawn from the same per-query
+    # vector the mean is -- not from a second call against `truth`.
+    per_query = recall_per_query(returned, translated, k)
     out["recall_at_k"] = round(recall_at_k(returned, translated, k), 6)
     out["qps"] = round(collector.qps(clients=1), 2)
-    return out
+    return out, ci_fields(PHASE_CHURN, recall_per_query=per_query or None,
+                          latencies_s=latencies or None)
 
 
 def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
@@ -174,7 +199,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     # a comparison of engine settings.
     driver.prepare_churn()
 
-    baseline = _measure(driver, queries, ctx.k, {}, truth)
+    baseline, baseline_ci = _measure(driver, queries, ctx.k, {}, truth)
     print(
         f"[churn] {driver.name}: baseline recall@{ctx.k}={baseline['recall_at_k']:.4f} "
         f"qps={baseline['qps']:,.1f}"
@@ -184,6 +209,10 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         churn_fraction=0.0, rows=n_rows,
         index_bytes=driver.index_bytes(), **baseline,
         notes="baseline before any churn",
+        # The one churn record that had no `extra` at all before PR 5. An
+        # empty dict is dropped by `Record.to_dict`, so a run whose baseline
+        # measured nothing still writes the record it always did.
+        extra=dict(baseline_ci),
     ))
 
     id_map: Dict[int, int] = {}
@@ -454,7 +483,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             # run is not what anyone reads a month later.
             step_extra["readers_failed"] = str(reader_failure)
 
-        after = _measure(driver, queries, ctx.k, id_map, truth)
+        after, after_ci = _measure(driver, queries, ctx.k, id_map, truth)
         drop = baseline["recall_at_k"] - after["recall_at_k"]
         print(
             f"[churn] {driver.name}: after {fraction:.0%} churn "
@@ -472,7 +501,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
             churn_fraction=fraction, rows=driver.count_rows(),
             index_bytes=driver.index_bytes(), **after,
-            extra={**step_extra,
+            extra={**step_extra, **after_ci,
                    "maintenance_state": "before",
                    "recall_drop_vs_baseline": round(drop, 6)},
         ))
@@ -584,9 +613,12 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
 
     **`repair_path` and `index_sync_s` are still read nowhere**, and that is
     stated rather than left to be discovered. Counted across `report/`: at the
-    base all four keys had 0 occurrences; they are now `maintenance` 20,
-    `maintenance_state` 13, `repair_path` 1 -- and that one is inside a
-    docstring, not a read -- and `index_sync` 0.
+    base all four keys had 0 occurrences; they are now `maintenance` 25,
+    `maintenance_state` 14, `repair_path` 1 -- and that one is inside a
+    docstring, not a read -- and `index_sync` 0. (They were 20 and 13 before
+    PR 5 §5.1 item 6 grouped the churn table's tie column by maintenance
+    state and §5.2 cited the two-maintenance-state pairing defect in
+    `report/crosscheck.py`. Neither added a `repair_path` read.)
     `tests/test_t4b_readers.py` asserts those four counts, so this paragraph
     cannot drift from the directory it describes.
 
@@ -603,7 +635,7 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     """
     if not isinstance(what, str) or not what:
         return
-    repaired = _measure(driver, queries, ctx.k, id_map, truth)
+    repaired, repaired_ci = _measure(driver, queries, ctx.k, id_map, truth)
     print(
         f"[churn] {driver.name}: {what} took {maintenance_s:.1f}s; "
         f"recall@{ctx.k}={repaired['recall_at_k']:.4f} "
@@ -615,7 +647,7 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
         **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
         churn_fraction=fraction, rows=driver.count_rows(),
         index_bytes=driver.index_bytes(), **repaired,
-        extra={**step_extra,
+        extra={**step_extra, **repaired_ci,
                "maintenance_state": "after",
                "maintenance": what,
                "maintenance_s": round(maintenance_s, 3),

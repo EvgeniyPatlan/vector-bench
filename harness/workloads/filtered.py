@@ -53,10 +53,11 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 import numpy
 
 from ..datasets import (FILTER_COLUMNS, FILTER_TAG, Dataset, cached_ground_truth,
-                        filtered_truth_for, recall_at_k)
+                        filtered_truth_for, recall_at_k, recall_per_query)
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector, LatencyStats
 from ..metrics.records import PHASE_FILTERED, Record
+from ..metrics.stats import ci_fields
 from ..progress import Heartbeat, Progress
 from .context import RunContext
 
@@ -255,6 +256,15 @@ class _PointResult(NamedTuple):
     #: was truncated but not WHICH loop was.
     warmup_executed: int
     warmup_planned: int
+    #: Per-query latencies in seconds, for PR 5 §5.1 item 3's QPS interval.
+    #: Defaulted so that a caller constructing this for a point that measured
+    #: nothing gets an empty interval rather than a TypeError -- the same
+    #: reason `stats` is Optional. Kept here rather than read out of
+    #: `LatencyCollector._samples`, which is private and which the window
+    #: trimming is free to filter. An empty TUPLE and not an empty list: a
+    #: mutable default on a NamedTuple is shared by every instance that omits
+    #: it, and nothing here needs it to be mutable.
+    latencies: Sequence[float] = ()
 
 
 def _measure_point(driver: EngineDriver, queries: numpy.ndarray, k: int,
@@ -349,6 +359,7 @@ def _measure_point(driver: EngineDriver, queries: numpy.ndarray, k: int,
     # predicate forces the engine to examine many more candidates to find k
     # that qualify — so this loop needs progress of its own.
     progress = Progress(planned, label, prefix=driver.name)
+    latencies: List[float] = []
     collector.start()
     for q in queries:
         if time.time() - started > budget_s:
@@ -356,7 +367,9 @@ def _measure_point(driver: EngineDriver, queries: numpy.ndarray, k: int,
             break
         query_started = time.perf_counter()
         ids = driver.query_filtered(q, k, threshold, column=column)
-        collector.add(time.perf_counter() - query_started)
+        elapsed = time.perf_counter() - query_started
+        collector.add(elapsed)
+        latencies.append(elapsed)
         returned.append(ids)
         if len(ids) < k:
             short_results += 1
@@ -373,6 +386,7 @@ def _measure_point(driver: EngineDriver, queries: numpy.ndarray, k: int,
         returned=returned, short_results=short_results, stats=stats,
         qps=collector.qps(clients=1) if returned else 0.0,
         warmup_executed=warmup_executed, warmup_planned=warmup_planned,
+        latencies=latencies,
     )
 
 
@@ -518,8 +532,12 @@ def _measure_and_record(ctx: RunContext, driver: EngineDriver,
     near_pass = [i for i in range(point.executed) if passes[i]]
     near_fail = [i for i in range(point.executed) if not passes[i]]
 
-    recall = (recall_at_k(point.returned, truth, ctx.k)
-              if point.executed else None)
+    # One call, two consumers: the published mean and the samples §5.1 item 4
+    # draws its interval from. `recall_at_k` is itself `sum(per_query) / n`
+    # (see `datasets.recall_per_query`), so taking the mean here keeps the
+    # point and the bar on one arithmetic rather than two.
+    per_query = recall_per_query(point.returned, truth, ctx.k)
+    recall = (sum(per_query) / len(per_query)) if point.executed else None
     recall_near_pass = _group_recall(point.returned, truth, ctx.k, near_pass)
     recall_near_fail = _group_recall(point.returned, truth, ctx.k, near_fail)
     insufficient = point.executed < MIN_SAMPLE_QUERIES
@@ -544,7 +562,7 @@ def _measure_and_record(ctx: RunContext, driver: EngineDriver,
     _record_point(ctx, common, filt, ef_search, index_used, point, recall,
                   recall_near_pass, recall_near_fail, len(near_pass),
                   len(near_fail), insufficient, mode, declared_budget,
-                  column)
+                  column, per_query=per_query)
 
 
 def _record_point(ctx: RunContext, common: Dict[str, object], filt,
@@ -552,7 +570,8 @@ def _record_point(ctx: RunContext, common: Dict[str, object], filt,
                   recall: Optional[float], recall_near_pass: Optional[float],
                   recall_near_fail: Optional[float], near_pass_queries: int,
                   near_fail_queries: int, insufficient: bool,
-                  mode: Optional[str], budget_s: float, column: str) -> None:
+                  mode: Optional[str], budget_s: float, column: str,
+                  per_query: Optional[Sequence[float]] = None) -> None:
     """Write one filtered record.
 
     `selectivity=filt.actual_selectivity` is the fix this file owed. What was
@@ -629,6 +648,26 @@ def _record_point(ctx: RunContext, common: Dict[str, object], filt,
             "time_bounded": point.time_bounded,
             "insufficient_sample": insufficient,
             "filtered_budget_s": budget_s,
+            # PR 5 §5.1 item 4. Over the queries that actually RAN, which on a
+            # budget-stopped point is fewer than `queries_planned` -- and that
+            # is the case the interval matters most for: `insufficient_sample`
+            # already says the recall came from under 50 queries, and this
+            # says how wide that makes it.
+            #
+            # `per_query` is threaded down from `_point` rather than
+            # recomputed here. Recomputing would be a second call to
+            # `recall_per_query` on the same inputs, and two calls are the
+            # only way for the bar and the point to disagree.
+            #
+            # (`recall` is NOT already rounded when it arrives -- an earlier
+            # revision of this comment said it was. It is rounded in the
+            # `recall_at_k=` argument near the top of this same `Record`,
+            # which is why it cannot be reused for an interval anyway: the
+            # interval needs the per-query samples, not the mean at any
+            # precision.)
+            **ci_fields(PHASE_FILTERED,
+                        recall_per_query=per_query or None,
+                        latencies_s=point.latencies or None),
             "iterative_scan": mode,
             **({"tag_threshold": filt.threshold}
                if column == FILTER_TAG else {}),

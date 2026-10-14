@@ -1,11 +1,16 @@
 """The reader pool that runs while the churn writer re-inserts (PR 4 §4.3).
 
 Its own module because inlining it in `churn.py` breaches this repo's stated
-800-line maximum badly -- the two files are 1,130 lines and splice back into
-one file of 1,066, which is 266 over, measured by
-`tests/test_t4b_readers.py` rather than asserted here -- and because the block
-is cohesive: one caller each, no state, and everything here is about one
-question: what does a read cost while this engine is taking writes?
+800-line maximum badly;
+`tests/test_t4b_readers.py::test_the_line_count_the_split_is_justified_by_is_the_real_one`
+splices the two back together, computes by how much, and fails if that stops
+being true. The figure is not repeated here: it was stated in this docstring
+and in `churn.py`'s, went stale three times in two days, and the number was
+never the argument -- "badly over the ceiling" is.
+
+The other half of the reason is cohesion: one caller each, no state, and
+everything here is about one question: what does a read cost while this engine
+is taking writes?
 
 The answer is published as a ratio, `p99 under writes / baseline p99`, and that
 shape is the reason this module is as careful as it is. Two ratios have already

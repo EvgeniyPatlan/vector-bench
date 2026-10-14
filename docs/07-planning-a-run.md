@@ -56,14 +56,15 @@ everything else.
 Ingest time only, before any query runs. Three engines, from the measured rates
 above — hand arithmetic, kept because it shows where the cost comes from. **The
 live figures are in the next table**, and two rows here no longer agree with any
-method:
+method († and ‡). A third marker, §, flags a row whose figure is current but
+whose profile changed for a reason worth knowing before you plan around it:
 
 | Profile | Datasets | Passes | Ingest |
 | --- | --- | --- | ---: |
 | `dev` | tiny synthetic | 1 | ~1 min |
 | `smoke` | fashion-mnist | 1 | ~30 min |
 | `quick` | fashion-mnist, glove-100 | 1 | ~35 h † |
-| `main` | glove-100, sift-128 | 1 | **~46 h (~2 days)** |
+| `main` | glove-100, sift-128 | 1 | **~61 h (~2.5 days)** § |
 | `full` | all four | 2 | **~272 h (~11 days)** |
 | `mariadb-blog` | dbpedia-openai-1000k | 1 | **~10.5 h** (measured) ‡ |
 
@@ -78,6 +79,28 @@ real figure from §6 — 3.3 h MariaDB, 6.6 h AliSQL, ~0.5 h pgvector — and it
 one load each. The profile runs the recall phase and the ops phase, and each
 loads the corpus for its own M value, so the run pays it about twice: the
 estimator says ~21 h.
+
+§ **`main` grew an M value for a cross-check, not for the frontier.**
+PR 5 §5.2 matches an ops calibration point to an ann recall point at the same
+`M`, and `main` swept `ann.m_values: [8, 32]` against `ops.m_values: [16]` —
+grids that never meet, so the report's "Consistency checks" section was empty
+by construction. `ann.m_values` is now `[8, 16, 32]`, which is a third full
+reload of both corpora per engine: this row went from ~46 h to ~61 h by the
+hand method and the estimator's figure from ~51.1 h to ~68.1 h. Restricting
+M=16 to sift-128 alone would have saved about half of the increase, and needs
+a per-dataset ann axis the config does not have.
+
+**That increase is an upper bound, and by a knowable amount.** The estimator
+charges every M value the same corpus reload at one rate per engine — 147
+rows/s for MariaDB on glove-100, which `orchestrator/estimate.py` states is
+the observed *mid-grid* number. M=16 is the cheap middle of this grid: the
+table in §1 measures it at ~200 rows/s, so the extra M really costs ~1.6 h
+there against the ~2.2 h the estimate charges, and the estimate is high on
+the marginal M by about a third. The same flat rate makes the *total* low:
+§1's measured per-M times sum to ~7.4 h for the three-value grid where three
+flat loads charge ~6.7 h, about 9% under. So plan against the printed figure
+— it is the conservative one for the decision this footnote is about — and
+do not read either number as a measurement of a per-M cost.
 
 `full` describes the complete measurement space. It is not a recommendation.
 Running it end to end is a deliberate decision to spend a fortnight, and
@@ -100,7 +123,7 @@ engines:
 | `dev` | 1 | ~0.0 h | ~0.0 h | ~0.2 h | **~0.2 h** |
 | `smoke` | 1 | ~0.3 h | ~0.1 h | ~2.7 h | **~3.0 h** |
 | `quick` | 1 | ~36.2 h | ~1.95 h | ~12.3 h | **~48.5 h** |
-| `main` | 1 | ~51.1 h | ~4.5 h | ~13.3 h | **~64.4 h** |
+| `main` | 1 | ~68.1 h | ~4.5 h | ~13.3 h | **~81.4 h** |
 | `full` | 2 | ~532.0 h | ~48.5 h | ~160.0 h | **~692.0 h** |
 | `mariadb-blog` | 1 | ~21.3 h | ~1.25 h | ~2.8 h | **~24.2 h** |
 
@@ -139,9 +162,10 @@ it is:
 A run prints all of it before starting:
 
 ```
+
 estimated ingest time (loading only, before any queries):
-  mariadb ~13.2 h  |  alisql ~37.2 h  |  pgvector ~0.7 h
-  total ~51.1 h across 1 pass(es), 2 M value(s)
+  mariadb ~17.5 h  |  alisql ~49.7 h  |  pgvector ~0.9 h
+  total ~68.1 h across 1 pass(es), 3 M value(s)
   ! This is a long run. Each M value costs a full reload of every dataset,
     and MHNSW/VIDX build incrementally at a few hundred rows/s. Reduce
     ann.m_values or the dataset list to cut it roughly proportionally.
@@ -157,7 +181,7 @@ estimated query time (the parts the profile puts a clock on):
                            2 churn fraction(s) x 30s of 4 reader(s) before each step's deletes, fixed by the profile not by the engine
   subtotal ~4.5 h typical, ~13.3 h worst case
 
-estimated run time ~55.6 h typical, ~64.4 h worst case
+estimated run time ~72.7 h typical, ~81.4 h worst case
   Plan against the worst case: a run materially longer than it is a bug.
   Each budgeted term tests its deadline before starting work, so it can overrun
     by the one query or slice already running when the budget expires.
@@ -169,6 +193,7 @@ estimated run time ~55.6 h typical, ~64.4 h worst case
       churn repair path: on an engine with one (pgvector of the six), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
       concurrency warm-up: 50 queries per client before each measured window
       filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
+
 ```
 
 Read it. It is the cheapest part of the whole exercise.
@@ -191,8 +216,8 @@ ask for.
 | Scope | Ingest |
 | --- | ---: |
 | `--profile full --resource-pass both` | 272 h |
-| `--profile main` | 46 h |
-| `--profile main --datasets glove-100-angular` | **25 h** |
+| `--profile main` | 61 h |
+| `--profile main --datasets glove-100-angular` | **33 h** |
 | `--profile main --datasets glove-100-angular --phases ops` | 8 h |
 
 If you run one thing, run this:

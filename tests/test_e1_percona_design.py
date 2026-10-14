@@ -1560,11 +1560,11 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", "def prepare_churn"),
     "harness/drivers/base.py:374":
         ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "churn.py:484-485":
+    "churn.py:513-514":
         ("harness/workloads/churn.py", "what = driver.maintain()"),
     "harness/workloads/build.py:12-16":
         ("harness/workloads/build.py", "ingest_wall_s"),
-    "harness/datasets.py:423":
+    "harness/datasets.py:492":
         ("harness/datasets.py", "1,183,514 training rows"),
     "harness/main.py:209-211":
         ("harness/main.py", "def _detect_march"),
@@ -1580,7 +1580,7 @@ CITED_IN_REPO = {
         ("orchestrator/ops_pass.py", "VB_ENGINE_TAG"),
     "orchestrator/engines.py:63-65":
         ("orchestrator/engines.py", "def _source_tag"),
-    "docs/07-planning-a-run.md:481":
+    "docs/07-planning-a-run.md:506":
         ("docs/07-planning-a-run.md", "60,000-row smoke"),
     "docker/alisql/entrypoint-alisql.sh:94":
         ("docker/alisql/entrypoint-alisql.sh", 'local u; u="$(user_args)"'),
@@ -1876,7 +1876,7 @@ class TestTheMemoryArithmeticReproduces:
         """Arithmetic, from the repo's own row count and Percona's stated range.
 
         Not a measurement and §3 says so: the row count is supplied from
-        harness/datasets.py:423 and 30-50 bytes/node is Percona's own estimate.
+        harness/datasets.py:492 and 30-50 bytes/node is Percona's own estimate.
         """
         datasets = open(os.path.join(VB_ROOT, "harness", "datasets.py")).read()
         assert "1,183,514 training rows" in datasets
@@ -1920,7 +1920,7 @@ class TestTheMemoryArithmeticReproduces:
         """The finding that changes what can be run: glove-100 at M=32 exceeds
         the default on the floor alone, so the load is guaranteed to stop.
 
-        The row count is this repo's own, quoted at harness/datasets.py:423.
+        The row count is this repo's own, quoted at harness/datasets.py:492.
         """
         datasets = open(os.path.join(VB_ROOT, "harness", "datasets.py")).read()
         assert "1,183,514 training rows" in datasets

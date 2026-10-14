@@ -640,7 +640,7 @@ Two consequences, and they pull in opposite directions:
   nothing to test. It does not, so a reader can be mid-scan while the graph is
   replaced under it, which is exactly the state that assertion marked.
 - **The churn phase's writers stop for the whole rebuild.** On a 1M-row corpus
-  that is on the order of a bulk build (§2.5), and `churn.py:484-485` times the
+  that is on the order of a bulk build (§2.5), and `churn.py:513-514` times the
   call, so the cost is recorded — but any concurrent write workload is paused,
   not slowed, and that belongs in `docs/07-planning-a-run.md` before anyone
   schedules it.
@@ -668,7 +668,7 @@ not a tidy-up:
   recall. Read the options back out of `SHOW CREATE TABLE` (§2.3) and re-send
   them rather than re-deriving them from the profile.
 - It rebuilds the whole graph, so on a 1M-row corpus it costs on the order of a
-  whole bulk build. `churn.py:484-485` times the call, so the cost is recorded
+  whole bulk build. `churn.py:513-514` times the call, so the cost is recorded
   rather than hidden, but a churn phase that previously ran in minutes for the
   MySQL family will not for Percona. That belongs in `docs/07-planning-a-run.md`
   before anyone schedules it.
@@ -741,7 +741,7 @@ against a server. The chain is:
 | Input | Status |
 |---|---|
 | per-row floor formula `dims × 4 + 2 × M × 8` | **measured on Percona**, in the sense that it is the floor an MTR test asserts the server stays above — `hnsw_memory_used.result:63`, `SET @floor = 1000 * (64 * 4 + 2 * 16 * 8);` with `:64-67` asserting `actual >= floor` and `actual <= 2 × floor + 2 × 65536` |
-| row counts | **supplied** — from this repo (`harness/datasets.py:423` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md:481` calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
+| row counts | **supplied** — from this repo (`harness/datasets.py:492` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md:506` calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
 | dimensionality | **supplied** — from the dataset names |
 | `M` | **supplied** — from the profiles |
 | 1 GiB default | **measured** — `innodb_hnsw_max_memory_basic.result:3-5` |
@@ -812,7 +812,7 @@ or search scratch space."
 
 So the gauge is a floor on true graph memory, not a measurement of it. At
 glove-100's 1,183,514 rows that is **35.5 to 59.2 MB unreported** — inputs: the
-row count is **supplied** (`harness/datasets.py:423`) and the 30-to-50-bytes
+row count is **supplied** (`harness/datasets.py:492`) and the 30-to-50-bytes
 range is **Percona's own stated estimate**, so the figure is a projection from a
 range, not a measurement, and it is one node map per vector index. Small against
 a 16 GB container and not small against a 1 GiB ceiling: under policy (2) it is

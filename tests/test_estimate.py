@@ -147,20 +147,38 @@ def _one_hour_per_pass_term(plan):
 class TestTheIngestEstimateDidNotMove:
     """These were the numbers on origin/master. The task that added query time
     was explicitly not allowed to change them, and the published docs quote
-    them, so they are pinned rather than recomputed."""
+    them, so they are pinned rather than recomputed.
+
+    **`main` moved once, deliberately, and this records why.** PR 5 §5.2 item
+    4 needed the ann M grid and the ops M to meet, or the report's
+    "Consistency checks" section is empty by construction on the profile the
+    human actually runs. `config/profiles/main.yml` therefore went from
+    `ann.m_values: [8, 32]` to `[8, 16, 32]`, which is a third full reload of
+    both corpora per engine: all six engines went from 69.77 h to 93.06 h of
+    ingest. Every other profile is untouched, `full` included, which is why
+    `CLAUDE.md`'s standing figure does not move with it.
+
+    Nothing else may move them. A diff that changes a number here without
+    changing a profile is the drift this class exists to catch.
+    """
 
     def test_main_one_pass(self):
         e = est("main")
-        assert e["total_hours"] == 69.77
+        assert e["total_hours"] == 93.06
         assert e["per_engine_hours"] == {
-            "mariadb": 13.15, "alisql": 37.24, "pgvector": 0.68,
-            "mariadb123": 18.62, "mongodb": 0.03, "valkey": 0.05,
+            "mariadb": 17.54, "alisql": 49.66, "pgvector": 0.91,
+            "mariadb123": 24.83, "mongodb": 0.05, "valkey": 0.07,
         }
-        assert (e["m_values"], e["ops_m_values"], e["passes"]) == (2, 1, 1)
+        # Three ann M values now, one ops M. The pair is the whole point of
+        # the change: `ops_m_values` is still 1 and `ann.m_values` contains
+        # it, which is what makes §5.2's match key able to meet.
+        assert (e["m_values"], e["ops_m_values"], e["passes"]) == (3, 1, 1)
+        assert 16 in load_profile("main")["ann"]["m_values"]
+        assert load_profile("main")["ops"]["m_values"] == [16]
         assert e["long_run"] is True
 
     def test_main_both_passes_is_exactly_double(self):
-        assert est("main", passes=("normalized", "tuned"))["total_hours"] == 139.57
+        assert est("main", passes=("normalized", "tuned"))["total_hours"] == 186.1
 
     def test_main_ops_only(self):
         """Dropping the recall phase drops the ann M grid from the estimate."""
@@ -181,7 +199,7 @@ class TestTheIngestEstimateDidNotMove:
         """`total_hours` keeps its published meaning; `ingest_hours` is the
         unambiguous name for the same figure, for code written from now on."""
         e = est("main")
-        assert e["ingest_hours"] == e["total_hours"] == 69.77
+        assert e["ingest_hours"] == e["total_hours"] == 93.06
 
 
 # ---------------------------------------------------------------------------
@@ -214,19 +232,22 @@ class TestTotalHoursStillMeansIngest:
 
     def test_long_run_is_still_the_ingest_warning(self):
         """The warning text is about M values reloading the corpus, so the flag
-        that triggers it stays keyed on ingest. pgvector alone is 0.68 h of
-        loading and 7.28 h of worst-case run time, and the M-reload warning
+        that triggers it stays keyed on ingest. pgvector alone is 0.91 h of
+        loading and 7.58 h of worst-case run time, and the M-reload warning
         would be the wrong thing to print about it.
 
         The worst case grew in T3c -- the filtered budget turned a term with
         no ceiling into one with a real one -- and again in T4b, by the churn
         reader baseline: 30 s per churn fraction, and pgvector pays it twice
         per (dataset, pass) because its two build modes are two ops units.
-        `long_run` did not move either time, which is the property being
-        pinned."""
+        The ingest figure grew in T5b, when PR 5 §5.2 added M=16 to
+        `main`'s ann grid. `long_run` did not move any of the three times,
+        which is the property being pinned: pgvector bulk-builds, so a third
+        reload costs it a quarter of an hour and the M-reload warning would
+        still be the wrong thing to print."""
         e = est("main", engines=["pgvector"])
-        assert e["total_hours"] == 0.68
-        assert e["worst_case_total_hours"] == 7.35
+        assert e["total_hours"] == 0.91
+        assert e["worst_case_total_hours"] == 7.58
         assert e["long_run"] is False
 
 
@@ -880,10 +901,16 @@ class TestTheWholeQueryEstimateForMain:
         # the ceiling because the window is a fixed span.
         assert term(e, "churn reader baseline")["typical_hours"] == 0.23
         assert term(e, "churn reader baseline")["worst_hours"] == 0.23
+        # Neither query figure moves with the ann M grid: every term here
+        # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
+        # That is the half of the D1 change worth pinning -- if a query term
+        # ever starts scaling with the ann grid, these two lines catch it.
         assert e["query_hours"] == 7.10
         assert e["query_hours_worst"] == 23.33
-        assert e["typical_total_hours"] == 76.87
-        assert e["worst_case_total_hours"] == 93.10
+        # The totals do move, by the one extra ann M value: ingest went from
+        # 69.77 h to 93.06 h.
+        assert e["typical_total_hours"] == 100.16
+        assert e["worst_case_total_hours"] == 116.39
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1132,9 +1159,9 @@ class TestThePrintedOutput:
     def test_the_ingest_block_is_unchanged_word_for_word(self):
         out = printed("main")
         assert ("\nestimated ingest time (loading only, before any queries):\n"
-                "  mariadb ~13.2 h  |  alisql ~37.2 h  |  pgvector ~0.7 h  |  "
-                "mariadb123 ~18.6 h  |  mongodb ~0.0 h  |  valkey ~0.1 h\n"
-                "  total ~69.8 h across 1 pass(es), 2 M value(s)\n") in out
+                "  mariadb ~17.5 h  |  alisql ~49.7 h  |  pgvector ~0.9 h  |  "
+                "mariadb123 ~24.8 h  |  mongodb ~0.1 h  |  valkey ~0.1 h\n"
+                "  total ~93.1 h across 1 pass(es), 3 M value(s)\n") in out
         assert "! This is a long run." in out
 
     def test_query_time_is_a_separate_block_with_both_figures(self):
@@ -1142,7 +1169,10 @@ class TestThePrintedOutput:
         assert "estimated query time" in out
         assert "concurrency windows" in out
         assert "churn re-insert" in out
-        assert "~0.7 h" in out
+        # pgvector's ingest line. Not a query figure -- it is here because
+        # this block is asserted against the whole printed output, and it
+        # moved with the ann grid where the two query figures below did not.
+        assert "pgvector ~0.9 h" in out
         assert "~4.8 h typical" in out
         assert "~14.0 h worst case" in out
 
@@ -1165,8 +1195,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~93.1 h worst case" in out
-        assert "~76.9 h typical" in out
+        assert "~116.4 h worst case" in out
+        assert "~100.2 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
@@ -1324,6 +1354,219 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
         assert float(sentence.group("worst").replace(",", "")) == pytest.approx(
             e["worst_case_total_hours"], abs=0.5)
         assert "all six engines" in claude
+
+    #: README's profile table claims "measured ingest only, the original
+    #: three engines", which is docs/07 §1's hand method: the flat per-engine
+    #: rates times the number of full corpus loads. Spelled here because the
+    #: rates live in prose in two documents and nothing executable held them.
+    HAND_RATES = {"mariadb": 150.0, "alisql": 55.0, "pgvector": 3000.0}
+
+    #: Every row of README's profile table: `(basis, passes, tolerance)`.
+    #:
+    #: The basis is per row because the table's is not uniform, and pretending
+    #: otherwise is how two of these went wrong. Four rows come from the flat
+    #: rates above. `mariadb-blog` does NOT: dbpedia-openai-1000k is 1,536
+    #: dims and loads far slower than those rates imply -- docs/07 measures
+    #: MariaDB at 3.3 h for its million rows, about 84 rows/s against the flat
+    #: 150 -- so that row comes from the estimator, which carries a dimension
+    #: penalty. Using the flat method there gives 14 h against the estimator's
+    #: 21 h, and README carried 72 h.
+    #:
+    #: Tolerances are the row's own rounding, not slack for drift: a row
+    #: printed as "~35 h" cannot be pinned tighter than its last digit. The
+    #: `smoke` row is in MINUTES and rounded to the nearest ten, so it gets
+    #: ten minutes.
+    README_ROWS = {
+        "smoke": ("hand", 1, 0.17),
+        "quick": ("hand", 1, 1.0),
+        "main": ("hand", 1, 1.0),
+        "full": ("hand", 2, 2.0),
+        "mariadb-blog": ("estimator", 1, 1.0),
+    }
+
+    #: The one row with no pin, and why. `_DATASET_ROWS` has no count for
+    #: `tiny-16-euclidean` -- it is generated by `make-tiny-dataset.sh`, not
+    #: downloaded -- so neither basis can produce a figure, and "~1 min" is a
+    #: statement about a synthetic corpus rather than a derived number.
+    #: Named here so `test_every_readme_row_is_pinned_or_named` can insist the
+    #: exclusion list is exactly this and a new row cannot slip in unpinned.
+    README_UNPINNED = {"dev"}
+
+    def _hand_ingest_hours(self, profile_name, passes=1,
+                           honour_subset=True):
+        """The hand method, over whichever datasets the profile declares.
+
+        `len(ann.m_values) + len(ops.m_values)` full reloads per
+        (engine, dataset), because every M value reloads the whole corpus on
+        both paths. Verified against the figures docs/07 carried before T5b:
+        45.8 h for `main` at `[8, 32]`, 24.8 h for glove alone, 8.3 h for
+        glove ops-only.
+
+        `honour_subset` charges the OPS phase `ops.subset_rows` where the
+        profile sets one, and it is not optional for correctness: `smoke`
+        caps its ops phase at 20,000 of fashion-mnist's 60,000, and ignoring
+        that overstates the row by 16 minutes -- which is how a round of this
+        task came to report README's `smoke` figure as stale when it was
+        right. The parameter exists so
+        `test_the_subset_cap_is_what_makes_smoke_agree` can show the
+        difference rather than assert it.
+        """
+        profile = load_profile(profile_name)
+        ann = profile.get("ann") or {}
+        ops = profile.get("ops") or {}
+        ann_loads = (len(ann.get("m_values", [16]))
+                     if ann.get("enabled", True) else 0)
+        ops_loads = (len(ops.get("m_values", [16]))
+                     if ops.get("enabled", True) else 0)
+        subset = ops.get("subset_rows") if honour_subset else None
+        total = 0.0
+        for dataset in profile.get("datasets", []):
+            rows = est_mod._DATASET_ROWS.get(dataset)
+            assert rows, f"no row count for {dataset}"
+            ops_rows = min(subset, rows) if subset else rows
+            for rate in self.HAND_RATES.values():
+                total += rows / rate * ann_loads
+                total += ops_rows / rate * ops_loads
+        return total / 3600.0 * passes
+
+    def _expected_readme_hours(self, profile_name):
+        basis, passes, _tol = self.README_ROWS[profile_name]
+        if basis == "hand":
+            return self._hand_ingest_hours(profile_name, passes=passes)
+        return est(profile_name, engines=self.THREE,
+                   passes=("normalized", "tuned")[:passes])["ingest_hours"]
+
+    #: A row of README's profile table. The figure is optionally bold, and
+    #: optionally in minutes, so both are captured rather than assumed.
+    README_ROW = re.compile(
+        r"^\| \*{0,2}`(?P<profile>[a-z-]+)`\*{0,2} \|[^|]*\| "
+        r"\*{0,2}~(?P<value>[\d.]+) (?P<unit>h|min)\*{0,2} \|", re.M)
+
+    def _readme_table(self):
+        path = os.path.join(VB_ROOT, "README.md")
+        with open(path) as fh:
+            readme = fh.read()
+        rows = {m.group("profile"): m for m in self.README_ROW.finditer(readme)}
+        assert len(rows) >= 6, (
+            f"README's profile table is gone or was reshaped; found "
+            f"{sorted(rows)}")
+        return readme, rows
+
+    def test_the_hand_method_reproduces_the_pre_t5b_published_figures(self):
+        """The arithmetic, pinned against three figures docs/07 published.
+
+        **This leg does NOT protect the helper from common-mode error, and an
+        earlier revision of this docstring claimed it did.** It defines its
+        own `hand()` closure below and never calls `_hand_ingest_hours`; the
+        two formulas differ in the ops term, this one hard-coding `+ 1` where
+        the helper takes `len(ops.m_values)`. So it pins a SIBLING
+        implementation: it establishes that the flat-rate arithmetic
+        reproduces 45.8 / 24.8 / 8.3 h, which is worth having because those
+        are the numbers docs/07 carried before T5b, but a helper wrong in the
+        same direction as the README would survive it.
+
+        What does protect against that is
+        `test_every_readme_ingest_figure_matches_its_basis`'s `full` row,
+        which runs `_hand_ingest_hours` itself at `len(ops.m_values) == 3` --
+        a branch the closure here cannot reach -- and agrees with README's
+        ~272 h. That leg is the control; this one is the reference.
+        """
+        rows = est_mod._DATASET_ROWS
+        glove, sift = "glove-100-angular", "sift-128-euclidean"
+
+        def hand(m_values, datasets, phases=("ann", "ops")):
+            loads = (len(m_values) if "ann" in phases else 0) + (
+                1 if "ops" in phases else 0)
+            return sum(rows[d] / rate * loads
+                       for d in datasets
+                       for rate in self.HAND_RATES.values()) / 3600.0
+
+        assert hand([8, 32], [glove, sift]) == pytest.approx(45.8, abs=0.1)
+        assert hand([8, 32], [glove]) == pytest.approx(24.8, abs=0.1)
+        assert hand([8, 32], [glove], phases=("ops",)) == pytest.approx(
+            8.3, abs=0.1)
+        assert load_profile("main")["ann"]["m_values"] == [8, 16, 32]
+
+    def test_the_subset_cap_is_what_makes_smoke_agree(self):
+        """`ops.subset_rows`, and the wrong flag it produced when ignored.
+
+        Honest (the cap honoured): 0.56 h, 34 minutes, against README's
+            "~30 min".
+        Mutant (the cap ignored, which is how this helper was first written):
+            0.84 h, 50 minutes -- which reads as a stale row and was reported
+            as one. The row was right and the method was wrong.
+        """
+        honest = self._hand_ingest_hours("smoke")
+        mutant = self._hand_ingest_hours("smoke", honour_subset=False)
+        assert load_profile("smoke")["ops"]["subset_rows"] == 20000
+        assert est_mod._DATASET_ROWS["fashion-mnist-784-euclidean"] == 60000
+        assert honest == pytest.approx(0.56, abs=0.01)
+        assert mutant == pytest.approx(0.84, abs=0.01)
+        assert round(honest * 60) == 34 and round(mutant * 60) == 50
+        # The honest figure agrees with the published row; the mutant does
+        # not, which is the whole content of the mistake.
+        _readme, rows = self._readme_table()
+        shown = float(rows["smoke"].group("value")) / 60.0
+        assert honest == pytest.approx(shown, abs=self.README_ROWS["smoke"][2])
+        assert mutant != pytest.approx(shown,
+                                       abs=self.README_ROWS["smoke"][2])
+
+    @pytest.mark.parametrize("profile", sorted(README_ROWS))
+    def test_every_readme_ingest_figure_matches_its_basis(self, profile):
+        """README's front-page table, row by row.
+
+        It had no pin at all until T5b, and that is how three of its six rows
+        came to be wrong at once: `main` 33% low because this task added an M
+        value and moved every other published figure but not this one,
+        `quick` 2.5x low because docs/07's own † footnote corrected it and
+        README never followed, and `mariadb-blog` 3.4x high from a figure no
+        method produces. A reader uses this table to decide whether to start
+        a run that takes days.
+        """
+        _readme, rows = self._readme_table()
+        basis, _passes, tolerance = self.README_ROWS[profile]
+        match = rows.get(profile)
+        assert match, f"README has no `{profile}` row"
+        shown = float(match.group("value"))
+        if match.group("unit") == "min":
+            shown /= 60.0
+        expected = self._expected_readme_hours(profile)
+        assert shown == pytest.approx(expected, abs=tolerance), (
+            f"README says ~{match.group('value')} {match.group('unit')} for "
+            f"`{profile}`; the {basis} basis gives {expected:.2f} h. A "
+            f"profile changed and this row did not move with it.")
+
+    def test_every_readme_row_is_pinned_or_named(self):
+        """A new profile row cannot arrive unpinned.
+
+        The failure this table has had is not a wrong number -- it is a
+        number nothing checked. So the set of rows is asserted, not just the
+        ones that happen to be listed.
+        """
+        _readme, rows = self._readme_table()
+        assert set(rows) == set(self.README_ROWS) | self.README_UNPINNED, (
+            f"README's profile table lists {sorted(rows)}; this test pins "
+            f"{sorted(self.README_ROWS)} and names {sorted(self.README_UNPINNED)} "
+            f"as unpinnable. Add the new row to one of the two.")
+        # The exclusion is real, not a convenience: the only unpinned row is
+        # unpinned because no basis can produce a figure for it.
+        for profile in self.README_UNPINNED:
+            datasets = load_profile(profile).get("datasets", [])
+            assert any(est_mod._DATASET_ROWS.get(d) is None
+                       for d in datasets), (
+                f"`{profile}` is in README_UNPINNED but every dataset it "
+                f"declares has a row count, so it can be pinned like the "
+                f"rest.")
+
+    def test_the_caption_still_describes_the_basis_the_pin_uses(self):
+        """R7: the table's caption is what tells a reader what the numbers
+        mean, and the pin is only honest if the two agree. Both the flat-rate
+        basis and the two rows that depart from it are named in the prose."""
+        readme, _rows = self._readme_table()
+        assert "measured ingest only, the original three engines" in readme
+        # The two departures the pin encodes.
+        assert "ops.subset_rows" in readme
+        assert "not derived from the per-engine rates above" in readme
 
     def test_the_stale_rows_stay_marked(self):
         """The first table's `quick` and `mariadb-blog` rows match no method,

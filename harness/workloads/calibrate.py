@@ -46,10 +46,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..datasets import Dataset, cached_ground_truth, recall_at_k
+from ..datasets import (Dataset, cached_ground_truth, recall_at_k,
+                        recall_per_query)
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector
 from ..metrics.records import PHASE_CALIBRATION, Record
+from ..metrics.stats import ci_fields
 from ..progress import Heartbeat, Progress
 from .context import RunContext
 
@@ -253,30 +255,51 @@ def _measure_point(driver: EngineDriver, ctx: RunContext, queries,
 
     collector = LatencyCollector(warmup=0)
     returned: List[List[int]] = []
+    # Kept beside the collector rather than read back out of it. The collector
+    # owns `_samples` privately and its public surface is summary statistics;
+    # a bootstrap needs the samples themselves, and reaching into the private
+    # list from a workload is the kind of coupling that breaks the next time
+    # the collector grows a window-trimming rule that drops some of them.
+    latencies: List[float] = []
     progress = Progress(len(queries), f"calibration ef={ef}",
                         prefix=driver.name)
     collector.start()
     for q in queries:
         started = time.perf_counter()
         ids = driver.query(q, ctx.k)
-        collector.add(time.perf_counter() - started)
+        elapsed = time.perf_counter() - started
+        collector.add(elapsed)
+        latencies.append(elapsed)
         returned.append(ids)
         progress.step()
     collector.stop()
     progress.finish()
 
+    per_query = recall_per_query(returned, truth, ctx.k)
     point = CalibrationPoint(
         ef_search=int(ef), effective_ef=effective,
         recall_at_k=recall_at_k(returned, truth, ctx.k),
         qps=collector.qps(clients=1),
     )
-    return point, collector.stats(), index_used
+    # PR 5 §5.1 item 4. Computed here, where the samples are, rather than in
+    # `_record`: the per-query recalls and the per-query latencies are the two
+    # biggest things this function holds and neither has any reason to outlive
+    # it.
+    return (point, collector.stats(), index_used,
+            ci_fields(PHASE_CALIBRATION, recall_per_query=per_query,
+                      latencies_s=latencies))
 
 
 def _record(common: Dict[str, object], point: CalibrationPoint, stats,
             index_used: bool, target_recall: float, position: int,
-            grid_size: int, warmup: int) -> Record:
-    """The record for one grid point."""
+            grid_size: int, warmup: int,
+            ci: Optional[Dict[str, object]] = None) -> Record:
+    """The record for one grid point.
+
+    `ci` defaults to None rather than to `{}` so that a caller which has no
+    interval to add writes a record with the keys absent, which is the shape
+    every record written before PR 5 has.
+    """
     return Record(
         **common,
         phase=PHASE_CALIBRATION,
@@ -298,6 +321,9 @@ def _record(common: Dict[str, object], point: CalibrationPoint, stats,
             "grid_position": position,
             "grid_size": grid_size,
             "warmup_queries": warmup,
+            # PR 5 §5.1 item 4's two keys, last so that a future named key
+            # above cannot be silently overwritten by one of them.
+            **(ci or {}),
         },
     )
 
@@ -351,8 +377,8 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
 
     points: List[CalibrationPoint] = []
     for position, ef in enumerate(grid):
-        point, stats, index_used = _measure_point(driver, ctx, queries, truth,
-                                                  ef, warmup)
+        point, stats, index_used, ci = _measure_point(
+            driver, ctx, queries, truth, ef, warmup)
         points.append(point)
 
         print(f"[calibrate] {driver.name}: ef_search={ef} "
@@ -364,7 +390,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         ctx.recorder.write(_record(
             common, point, stats, index_used, target_recall,
             position=position, grid_size=len(grid),
-            warmup=min(warmup, len(queries))))
+            warmup=min(warmup, len(queries)), ci=ci))
 
         # Early stop: two consecutive points at the target settle both the
         # selection rule and the question, and every larger ef is pure cost.

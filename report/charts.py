@@ -383,25 +383,169 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
 # Build cost
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# PR 5 §5.1 item 6: "show intervals as whiskers on churn and filtered charts".
+# ---------------------------------------------------------------------------
+
+#: `extra` key holding a recall interval, written by `stats.ci_fields`.
+#: Spelled here rather than imported at module scope for the reason
+#: `generate.consistency_checks` gives: `report/` and `harness/` mount
+#: separately and a top-level `harness` import from this package has crashed
+#: report generation at the end of a long run. `recall_whiskers` imports the
+#: reader function in its body; this constant only names a dict key.
+RECALL_CI_EXTRA_KEY = "recall_ci95"
+
+
+def recall_whiskers(rows: Sequence[Dict[str, Any]], xs: Sequence[Any],
+                    ys: Sequence[Any], key: str = RECALL_CI_EXTRA_KEY):
+    """The `(x, y, yerr)` an `errorbar` call needs, for the rows that have one.
+
+    Returns `None` when no row in the series carries a usable interval, so a
+    caller can skip the `errorbar` entirely rather than drawing a series of
+    zero-length bars -- which would read as "measured with no uncertainty" on
+    a chart where most points simply predate the field.
+
+    `yerr` is asymmetric and clamped at zero. The published mean is rounded to
+    six places (`records` stores `round(recall, 6)`) while the interval bounds
+    are not, so a point can sit a few units in the twelfth decimal outside its
+    own interval; matplotlib raises `ValueError: 'yerr' must not contain
+    negative values` on that, which would lose the whole figure at the end of
+    a run to a rounding artifact. Clamped rather than widened, so the bar
+    never claims more spread than was measured.
+    """
+    from harness.metrics.stats import Interval
+
+    lower, upper, px, py = [], [], [], []
+    for row, x, y in zip(rows, xs, ys):
+        if y is None:
+            continue
+        interval = Interval.from_field((row.get("extra") or {}).get(key))
+        if interval is None or not interval.usable:
+            continue
+        px.append(x)
+        py.append(y)
+        lower.append(max(0.0, float(y) - interval.low))
+        upper.append(max(0.0, interval.high - float(y)))
+    if not px:
+        return None
+    return px, py, [lower, upper]
+
+
+def draw_recall_whiskers(ax, rows: Sequence[Dict[str, Any]],
+                         xs: Sequence[Any], ys: Sequence[Any],
+                         color: str) -> bool:
+    """Draw the whiskers for one series onto one axis. True if it drew any.
+
+    `zorder=2`, between the near_pass/near_fail band the filtered chart fills
+    at `zorder=1` and the markers at `zorder=5`/`6`: a bar under the band is
+    invisible and a bar over the "returned fewer than k" ring would hide the
+    mark it is there to draw attention to.
+
+    No `label`, so the legend keeps one entry per series. A second handle per
+    engine would double the legend's width on a six-engine run, and the
+    footnote under the figure explains the bars once for all of them.
+    """
+    drawn = recall_whiskers(rows, xs, ys)
+    if drawn is None:
+        return False
+    px, py, yerr = drawn
+    ax.errorbar(px, py, yerr=yerr, fmt="none", ecolor=color, elinewidth=1.2,
+                capsize=3, capthick=1.2, alpha=0.75, zorder=2)
+    return True
+
+
+#: Added to a chart title when at least one series drew whiskers. Only then:
+#: on a run of archived records nothing carries an interval, and a legend
+#: explaining bars that are not on the figure is worse than no explanation.
+WHISKER_TITLE_NOTE = "bars = 95% bootstrap CI of the recall"
+
+
 def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                stem: str) -> Optional[Dict[str, str]]:
-    """Build time, peak memory and index size against M, side by side."""
+    """Build cost against M: time to a queryable index, the bulk build step on
+    its own, peak memory and index size.
+
+    **The first two panels are a fix, and the defect was a published one.**
+    This chart used to plot the raw `build_wall_s` of every engine on one axis
+    under a "lower is better" arrow. That field is two different quantities:
+    `workloads/build.py` writes `effective_build = build_seconds if not
+    incremental else load.wall_seconds`, so for pgvector in bulk mode it is
+    the `CREATE INDEX` call alone and for MariaDB MHNSW and AliSQL VIDX it is
+    the ENTIRE million-row load, because they maintain the graph on every
+    INSERT and there is no separable step to time.
+
+    `build.py`'s own module docstring exists to prevent exactly this. It
+    records the two figures separately "so the report can say 'pgvector's bulk
+    build is N x cheaper than its own incremental build' and 'pgvector's
+    incremental build costs X versus MHNSW's Y' -- two honest claims instead
+    of one misleading one". The build TABLE honoured that through
+    `render._index_build_kind`; this chart read `extra.separable_build`
+    nowhere and selected on dataset and non-null alone.
+
+    The gap had also just widened for a reason with nothing to do with index
+    building: adding the `ctag` filter column slows the load, which raises the
+    incremental engines' `build_wall_s` because it IS the load time, while
+    pgvector's bulk figure is untouched -- the index build reads only the
+    vector column.
+
+    So the axes now compare like with like:
+
+    * **Time to a queryable index** is `generate.time_to_queryable_index_s`:
+      ingest + build for a bulk engine, the single figure for an incremental
+      one. Every point on it is the same quantity, which is what makes both of
+      the claims above answerable from it -- the first as one engine's two
+      build modes, the second as two engines.
+    * **Bulk index build step** is the raw `build_wall_s` restricted to
+      records whose build WAS separable. An incremental engine has no point
+      there, which is the honest rendering of "there is no such step", and no
+      number on that panel includes a corpus load.
+
+    A record whose `separable_build` is absent appears on neither: the two
+    formulas differ by a whole corpus load and nothing in the record says
+    which applies. Those engines are named in the subtitle rather than
+    dropped silently -- see `generate.BUILD_KIND_UNRECORDED` for why absence
+    has no honest reading here.
+    """
+    from report.generate import (BUILD_KIND_BULK, BUILD_KIND_UNRECORDED,
+                                 build_kind, time_to_queryable_index_s)
+
     plotted_records = [r for r in records if r.get("dataset") == dataset
                        and r.get("build_wall_s") is not None]
     if not plotted_records:
         return None
     by_series, labels, storages, degrees = _grouped(plotted_records)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
+    def bulk_build_step(record):
+        """`build_wall_s`, but only where it is a build STEP.
+
+        Returning None for every other kind is what keeps a corpus load off
+        this panel. Reading the field directly here instead would restore the
+        defect above in one line, which is why this is a named function with
+        this docstring rather than a field name in the table below.
+        """
+        if build_kind(record) != BUILD_KIND_BULK:
+            return None
+        return record.get("build_wall_s")
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.6))
     fig.patch.set_alpha(0.0)
+    #: `(value of one record, axis label, tick formatter)`. A CALLABLE and not
+    #: a field name: the first two panels are derivations rather than columns,
+    #: and a bare field name is the form that let the misleading panel be
+    #: written in the first place.
     panels = [
-        ("build_wall_s", "Index build time (s)  (lower is better ↓)", None),
-        ("peak_rss_bytes", "Peak server memory  (lower is better ↓)", _bytes_formatter),
-        ("index_bytes", "Index size on disk  (lower is better ↓)", _bytes_formatter),
+        (time_to_queryable_index_s,
+         "Time to a queryable index (s)  (lower is better ↓)", None),
+        (bulk_build_step,
+         "Bulk index build step (s)  (bulk builds only)", None),
+        (lambda r: r.get("peak_rss_bytes"),
+         "Peak server memory  (lower is better ↓)", _bytes_formatter),
+        (lambda r: r.get("index_bytes"),
+         "Index size on disk  (lower is better ↓)", _bytes_formatter),
     ]
 
     any_data = False
-    for ax, (field, label, formatter) in zip(axes, panels):
+    for ax, (value_of, label, formatter) in zip(axes, panels):
         ax.patch.set_alpha(0.0)
         ax.set_xlabel("M (graph degree)")
         ax.set_ylabel(label, fontsize=10)
@@ -414,8 +558,8 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
             style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
             points = sorted(
-                ((r.get("m"), r.get(field)) for r in rows
-                 if r.get("m") is not None and r.get(field) is not None),
+                ((r.get("m"), value_of(r)) for r in rows
+                 if r.get("m") is not None and value_of(r) is not None),
                 key=lambda p: p[0],
             )
             if not points:
@@ -434,7 +578,15 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=10,
                    loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
-    fig.suptitle(f"Index build cost — {dataset}", fontsize=13, y=1.14)
+    unrecorded = sorted({str(r.get("engine")) for r in plotted_records
+                         if build_kind(r) == BUILD_KIND_UNRECORDED})
+    subtitle = f"Index build cost — {dataset}"
+    if unrecorded:
+        subtitle += (
+            f"\n{len(unrecorded)} engine(s) left off the first two panels "
+            f"({', '.join(unrecorded)}): their records do not say whether the "
+            f"build was separable, so the build time cannot be placed")
+    fig.suptitle(subtitle, fontsize=13, y=1.14)
     fig.tight_layout()
     return _save(fig, out_dir, stem)
 
@@ -883,15 +1035,24 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[1].set_ylabel("Queries per second  (higher is better ↑)", fontsize=10)
     axes[1].set_yscale("log")
 
+    any_whiskers = False
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
         style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["selectivity"])
         sel = [r["selectivity"] for r in rows]
+        recalls = [r.get("recall_at_k") for r in rows]
 
-        axes[0].plot(sel, [r.get("recall_at_k") for r in rows],
+        axes[0].plot(sel, recalls,
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6,
                      label=labels[key])
+        # §5.1 item 6, on the recall panel only. The QPS panel's interval is
+        # `extra.qps_ci95` and it is deliberately not drawn: that axis is
+        # logarithmic and spans three decades here, so a bar a few percent
+        # wide is shorter than the marker and says nothing a reader can see.
+        # The number and its interval are both in the filtered table.
+        if draw_recall_whiskers(axes[0], rows, sel, recalls, style["color"]):
+            any_whiskers = True
         axes[1].plot(sel, [r.get("qps") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
@@ -949,7 +1110,9 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     fig.suptitle(
         f"{titled}\n○ = returned fewer than k results   "
         f"□ = stopped by the time budget   ✕ = under 50 queries   "
-        f"band = near_pass vs near_fail recall", fontsize=11, y=1.18
+        f"band = near_pass vs near_fail recall"
+        + (f"   {WHISKER_TITLE_NOTE}" if any_whiskers else ""),
+        fontsize=11, y=1.18
     )
     fig.tight_layout()
     return _save(fig, out_dir, stem)
@@ -1013,6 +1176,7 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     axes[0].set_ylabel("Recall@k  (higher is better ↑)", fontsize=10)
     axes[1].set_ylabel("Queries per second  (higher is better ↑)", fontsize=10)
 
+    any_whiskers = False
     for key, rows in sorted(by_series.items(), key=lambda kv: str(kv[0])):
         style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["churn_fraction"])
@@ -1024,19 +1188,31 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         label = labels[key[:SERIES_KEY_WIDTH]]
         if len(states) > 1 and key[SERIES_KEY_WIDTH]:
             label += f" / {key[SERIES_KEY_WIDTH]} repair"
-        axes[0].plot(fractions, [r.get("recall_at_k") for r in rows],
+        recalls = [r.get("recall_at_k") for r in rows]
+        axes[0].plot(fractions, recalls,
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6,
                      label=label)
         axes[1].plot(fractions, [r.get("qps") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
+        # §5.1 item 6. The recall panel only, for the reason the filtered
+        # chart gives -- and here there is a second one: the x=0 baseline
+        # record joins BOTH maintenance series, so its bar is drawn twice in
+        # the same place. That is honest (it IS the same measurement, and it
+        # is the point each series is compared against) and it is why the bar
+        # at x=0 looks heavier than the others.
+        if draw_recall_whiskers(axes[0], rows, fractions, recalls,
+                                style["color"]):
+            any_whiskers = True
 
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, frameon=False, fontsize=10,
                    loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
-    fig.suptitle(f"Index degradation under churn — {dataset}", fontsize=13, y=1.14)
+    fig.suptitle(f"Index degradation under churn — {dataset}"
+                 + (f"\n{WHISKER_TITLE_NOTE}" if any_whiskers else ""),
+                 fontsize=13, y=1.14)
     fig.tight_layout()
     return _save(fig, out_dir, stem)
 
