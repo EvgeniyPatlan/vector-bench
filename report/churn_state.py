@@ -215,6 +215,25 @@ def during_writes_rows(records: List[Dict[str, Any]]
             "p99_ratio": ratio,
             "writer_rows_per_s": extra.get("writer_rows_per_s_with_readers"),
             "client_bound": extra.get("client_bound"),
+            # Whether the readers ran the queries their count implies. Carried
+            # because EVERY figure on this row depends on it -- the p99 ratio,
+            # both throughputs and the writer rate beside them. A pool that
+            # served one query at a time measures a p99 of a read that waited
+            # for Python's interpreter lock, not of one the engine was slow to
+            # answer; and the readers are threads in the writer's own
+            # interpreter, so the same stall starves the writer in the client.
+            # `extra.scaling_status` on this record is the DURING-WRITES
+            # window's, which is the window every published figure here comes
+            # from; the baseline's is carried separately so a reader can see
+            # whether the two halves of the ratio were measured in the same
+            # regime. See `harness/workloads/clients.py`.
+            "served_concurrency": extra.get("served_concurrency"),
+            "outstanding_concurrency": extra.get("outstanding_concurrency"),
+            "scaling_status": extra.get("scaling_status"),
+            "baseline_scaling_status": extra.get(
+                "reader_baseline_scaling_status"),
+            "baseline_served_concurrency": extra.get(
+                "reader_baseline_served_concurrency"),
             "ratio_disagrees": (
                 ratio is not None and stamped is not None
                 and abs(ratio - stamped) > DURING_WRITES_RATIO_TOLERANCE),

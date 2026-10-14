@@ -318,6 +318,14 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             "move between releases in ways the others will not.\n"
         )
 
+    # Appended only when it has something to say. `parts` being empty is what
+    # selects the "no validity problems were detected" ending below, so a
+    # blank string pushed on here would retire that sentence on every clean
+    # run -- silently, because the section it replaces renders as nothing.
+    scaling = _scaling_refused_section(summary)
+    if scaling:
+        parts.append(scaling)
+
     if summary.get("recall_floor_gaps"):
         parts.append(
             "\n### Recall floors an engine never approached\n\n"
@@ -522,6 +530,90 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             "index, no filtered query returned short, and the environment raised no "
             "warnings.\n"
         )
+    return "".join(parts)
+
+
+def _scaling_refused_section(summary: Dict[str, Any]) -> str:
+    """Validity: the scaling efficiencies this report refuses to publish.
+
+    In Validity and not only in the concurrency footnote, because this is the
+    section a reader is told to read before the charts and because the
+    concurrency chart is the headline of the whole report. A caveat that lives
+    only under the table it qualifies is a caveat read after the conclusion
+    has been drawn.
+
+    The row carries what was served against what was offered, the throughput
+    that is still a real measurement, and the client CPU — which is the one
+    figure that separates the two causes. Named per point rather than per
+    engine: a pool can serve its concurrency at four clients and lose it at
+    thirty-two, and "this engine is affected" would hide which half of its
+    curve is readable.
+    """
+    refused = _scaling_refused(summary)
+    if not refused:
+        return ""
+    parts = [
+        "\n### Scaling efficiencies this report will not publish\n\n"
+        "`Scaling efficiency` divides an N-client throughput by N times a "
+        "one-client throughput. **That is a statement about the engine only "
+        "if N queries were actually in flight**, and at the points below "
+        "fewer than half of them were: the queries each window counted, times "
+        "their median latency, divided by the window, came out below half the "
+        "client count. The efficiency figure there is not a measurement of "
+        "how this engine scales, so the table prints "
+        f"*{SCALING_REFUSED_CELL}* in that cell and the chart's efficiency "
+        "panel omits the point. **The QPS and the latency percentiles are "
+        "left in place and are real**: the pool did answer that many queries "
+        "at those latencies. It is the division by the client count that has "
+        "no basis.\n\n"
+        "**Two things produce this and the measurement cannot separate "
+        "them.** The clients may have serialized — they are Python threads in "
+        "one interpreter, and a client library that does not release the "
+        "interpreter lock around its socket wait makes them take turns — or "
+        "the engine may itself answer one query at a time, in which case "
+        "there is a real finding here, but it is \"this engine serializes "
+        "queries\" and not \"this engine scales at 0.25\". The Client CPU "
+        "column is the evidence that distinguishes them: roughly one core "
+        "over the window points at the clients, roughly none points at the "
+        "engine. Two engines in one run settle it between themselves, because "
+        "they do not share a client library — pgvector goes through psycopg3 "
+        "and the MySQL family through MariaDB Connector/C — so one of them "
+        "scaling where the other does not is a property of the client.\n",
+    ]
+    rows = []
+    for r in sorted(refused, key=lambda r: (r.get("dataset") or "",
+                                            r.get("engine") or "",
+                                            r.get("clients") or 0)):
+        extra = r.get("extra") or {}
+        rows.append([
+            _label(r.get("engine", "?")), r.get("dataset", "?"),
+            _storage(r), str(r.get("clients", "—")),
+            _fmt(extra.get("served_concurrency"), 2),
+            _fmt(extra.get("outstanding_concurrency"), 2),
+            _fmt(r.get("qps"), 0),
+            # The figure that is not published, shown here and nowhere else.
+            # Withholding it from the table and then hiding it entirely would
+            # make the refusal uncheckable; this is the one place a reader can
+            # see what was refused and why.
+            _fmt(extra.get("scaling_efficiency"), 2),
+            _fmt(extra.get("client_cpu_seconds"), 1, " s"),
+        ])
+    parts.append(_md_table(
+        ["Engine", "Dataset", "Storage", "Clients", "Queries in service",
+         "Queries outstanding", "QPS", "Efficiency withheld", "Client CPU"],
+        rows))
+    parts.append(
+        "\n**Queries outstanding is the exact figure and is not the one the "
+        "refusal uses.** It is the sum of every in-window query's duration "
+        "over the window — Little's law with no estimator in it — and it "
+        "counts a query waiting for the interpreter lock as being in flight, "
+        "because from the client's clock it is. Measured against five "
+        "synthetic drivers whose efficiency ran from 0.25 to 1.00, it stayed "
+        "between 0.98 and 1.00 of the client count on all of them: exact, and "
+        "blind to the thing this section is about. It is printed because the "
+        "pair is the diagnostic — outstanding at the client count while in "
+        "service sits near one is the signature of time spent waiting for a "
+        "lock rather than for the engine.\n")
     return "".join(parts)
 
 
@@ -886,6 +978,36 @@ def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
 #: short result set.
 CLIENT_BOUND_MARK = "○"
 
+#: The mark on a point whose pool never ran the queries its client count
+#: implies, so no scaling efficiency is rendered for it at all.
+#:
+#: A DIFFERENT mark from `CLIENT_BOUND_MARK` and a stronger one, because the
+#: two say different things. A hollow point is a figure with a caveat: the
+#: clients were busy, so read it carefully. This one is a figure that is not
+#: published, because the premise it divides by -- that N clients offered N
+#: concurrent queries -- did not hold. The cell carries no number to qualify.
+#:
+#: `⊘` and not a letter: it has to survive both output paths of this file and
+#: it must not be mistaken for a footnote index. `_inline_md` converts only
+#: `` ` `` and `**`, so it reaches the HTML unchanged.
+SCALING_REFUSED_MARK = "⊘"
+
+#: What the Scaling-efficiency cell says instead of a number, in the one case
+#: where the harness refused it. Words and not only the mark: a column of bare
+#: glyphs makes a reader hunt for the footnote, and this is the one cell in
+#: the table whose content is a refusal rather than a measurement.
+SCALING_REFUSED_CELL = f"{SCALING_REFUSED_MARK} not measurable"
+
+#: `extra.scaling_status` when the pool served materially fewer queries than
+#: it had clients. Declared here rather than imported from
+#: `harness.workloads.clients`, and NOT because the import would fail -- the
+#: report container mounts `harness/` too, which is why the two
+#: `harness.metrics.stats` imports in this file work. It is that they are
+#: function-scope on purpose: `harness.workloads.clients` pulls numpy and
+#: every driver module in to obtain one string. The two declarations are
+#: pinned together by `tests/test_g1_client_concurrency.py`.
+SCALING_CONCURRENCY_NOT_ACHIEVED = "concurrency_not_achieved"
+
 #: Footnote marks for the two statuses the ef sweep can end on without having
 #: put an engine at the target recall. `report/charts.py` imports these rather
 #: than spelling the glyphs again: the chart's dagger and the table's dagger
@@ -1179,7 +1301,10 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
                                    r.get("storage_engine") or "",
                                    r.get("clients") or 0)):
         extra = r.get("extra") or {}
-        eff = extra.get("scaling_efficiency")
+        # The efficiency is read inside `_efficiency_cell`, not here: the
+        # decision whether to print it at all is that function's, and a local
+        # copy of the number beside it is how a caller comes to render one
+        # thing while the cell says another.
         # A point measured once carries no spread, and the difference between
         # "measured once" and "repeated and stable" is the difference between
         # a number and a result.
@@ -1205,7 +1330,13 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _fmt(r.get("latency_p50_ms"), 3),
             _fmt(r.get("latency_p95_ms"), 3),
             _fmt(r.get("latency_p99_ms"), 3),
-            _fmt(eff, 2) if eff is not None else "—",
+            _efficiency_cell(extra),
+            # The evidence for that cell, beside it. All three -- the client
+            # count, what was served and the ratio's verdict -- for the reason
+            # the client-CPU column carries its numerator and denominator: a
+            # refusal a reader cannot check is indistinguishable from a bug in
+            # the refusal.
+            _served_cell(extra, r.get("clients")),
             # What the engines' caches were actually shown. A reader comparing
             # a version-2 report to a version-3 one needs these two to see why
             # the throughput moved: the same QPS over a pool of 500 and a pool
@@ -1217,9 +1348,60 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
     return _md_table(
         ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread",
          "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
-         "Scaling efficiency", "Query pool", "Reuse", "Client CPU"],
+         "Scaling efficiency", "Queries in service", "Query pool", "Reuse",
+         "Client CPU"],
         rows,
     ) + _concurrency_notes(summary)
+
+
+def _efficiency_cell(extra: Dict[str, Any]) -> str:
+    """The Scaling-efficiency cell, or a refusal where it is not measurable.
+
+    **The refusal is the point of this function.** `scaling_efficiency` is
+    this section's headline, and it is an N-client throughput divided by N
+    times a one-client throughput -- a statement about the engine only if N
+    queries were in flight. A live `smoke` run of MariaDB measured 2,920.7 q/s
+    at one client and 2,927.5 at four with every latency percentile unchanged,
+    which is about one query in service: the 0.25 it printed describes the
+    client, and rendering it in this column presents it as a property of the
+    database.
+
+    An em dash, as everywhere else in this file, where there is simply no
+    figure -- a point with no one-client baseline to divide by. The refusal
+    cell is a different thing and looks different: there IS a number in the
+    record and this report will not print it.
+
+    A record with no `scaling_status` at all renders as it always did, which
+    is every record written before this existed. Absence is not a refusal:
+    treating it as one would blank the efficiency column of every archived run
+    in the results tree and read as a regeneration fault.
+    """
+    if extra.get("scaling_status") == SCALING_CONCURRENCY_NOT_ACHIEVED:
+        return SCALING_REFUSED_CELL
+    eff = extra.get("scaling_efficiency")
+    return _fmt(eff, 2) if eff is not None else "—"
+
+
+def _served_cell(extra: Dict[str, Any], clients: Any) -> str:
+    """How many queries the pool had in service, against how many it had
+    clients.
+
+    `served / clients` written out as a pair rather than as the ratio the
+    status is computed from, because the two numbers are what a reader needs
+    in order to check the verdict: `2.0 of 4` is self-explaining where `0.50`
+    needs the footnote to say what it is a share of. The same argument the
+    Client CPU column's numerator and denominator are kept for.
+
+    An em dash where the figure was not recorded, which is every record
+    written before this existed, and where the window counted no query.
+    """
+    served = extra.get("served_concurrency")
+    if served is None:
+        return "—"
+    text = f"{served:,.2f} of {clients}" if clients else f"{served:,.2f}"
+    if extra.get("scaling_status") == SCALING_CONCURRENCY_NOT_ACHIEVED:
+        return f"{text} {SCALING_REFUSED_MARK}"
+    return text
 
 
 def _client_cpu_cell(extra: Dict[str, Any]) -> str:
@@ -1286,6 +1468,26 @@ _CONCURRENCY_NOTES = (
         f"that the engine was the limit**; a flat Client CPU column beside a "
         f"falling QPS curve is the case to re-measure with the clients as "
         f"processes rather than threads.\n",
+        f"\n**Queries in service** is how many queries the pool actually had "
+        f"being answered on average, against how many clients it ran: the "
+        f"queries the window counted times their median latency, divided by "
+        f"the window. **Scaling efficiency divides an N-client throughput by "
+        f"N times a one-client throughput, so it describes the engine only if "
+        f"N queries were in flight** — and where this column says they were "
+        f"not, the efficiency cell reads *{SCALING_REFUSED_CELL}* and no "
+        f"number is published. The threshold is half the client count, picked "
+        f"at the middle of a measured gap: five synthetic drivers of "
+        f"identical 0.325 ms query cost put this ratio at 0.22–0.25 where the "
+        f"pool served one query and 0.94–1.00 where it served four, with "
+        f"nothing in between. **A genuinely saturated server is not flagged**, "
+        f"and that is the case the threshold was chosen to protect: a real "
+        f"queue raises the whole latency distribution, median included, so "
+        f"the modelled saturated server sits at 0.98 of its client count "
+        f"while its efficiency falls to 0.28. Two things produce a refusal "
+        f"and nothing the client measures separates them — the clients "
+        f"serialized on Python's interpreter lock, or the engine answers one "
+        f"query at a time — so read the Client CPU cell beside it: about one "
+        f"core points at the clients, about none points at the engine.\n",
 )
 
 
@@ -1319,6 +1521,20 @@ def _client_cpu_gap_note(unmeasured: int, total: int) -> str:
         f"differently.\n")
 
 
+def _scaling_refused(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Concurrency points whose scaling efficiency this report will not print.
+
+    One place, read by the footnote under the table, by the Validity section
+    and by the chart, so a point drawn as refused in one and published in
+    another is not possible. Three readers of one condition each deciding it
+    for themselves is how a chart comes to disagree with the table beside it,
+    which reads as a rendering bug rather than as the measurement it is.
+    """
+    return [r for r in summary.get("concurrency", []) or []
+            if (r.get("extra") or {}).get("scaling_status")
+            == SCALING_CONCURRENCY_NOT_ACHIEVED]
+
+
 def _concurrency_notes(summary: Dict[str, Any]) -> str:
     """The fixed footnote, plus whatever this run has to say for itself."""
     rows = summary.get("concurrency", []) or []
@@ -1336,6 +1552,18 @@ def _concurrency_notes(summary: Dict[str, Any]) -> str:
         parts.append(
             f"\nClient-bound points in this run: {where}. Re-measure these "
             f"with more client CPUs before reading them as engine ceilings.\n")
+    refused = _scaling_refused(summary)
+    if refused:
+        where = ", ".join(sorted(
+            f"{_label(r.get('engine', '?'))} at {r.get('clients')} clients"
+            for r in refused))
+        parts.append(
+            f"\n**No scaling efficiency is published for {len(refused)} "
+            f"point(s) in this run: {where}.** The pool served fewer than "
+            f"half the queries its client count implies at those points, so "
+            f"the efficiency figure there is not a measurement of how this "
+            f"engine scales. The Validity section names them with the "
+            f"numbers.\n")
     parts.append(_client_cpu_gap_note(len(unmeasured), len(rows)))
     if early:
         parts.append(
@@ -1818,6 +2046,12 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
             # readers may have been part of the ceiling, so the figure is not
             # evidence about the engine.
             ratio_cell += " ○"
+        if s.get("scaling_status") == SCALING_CONCURRENCY_NOT_ACHIEVED:
+            # Stronger than the hollow point, and on the WRITER cell as well
+            # below: the readers did not run concurrently, so this p99 is a
+            # read that waited for a lock rather than one the engine was slow
+            # to answer, and the writer beside it was starved in the client.
+            ratio_cell += f" {SCALING_REFUSED_MARK}"
         # A window that counted no query has no throughput and no
         # percentile, and the cell says so rather than printing the 0.0 the
         # record carries. `clients.client_cpu` makes the argument for the
@@ -1841,12 +2075,20 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
             ratio_cell,
             f"{_empty_or(s.get('baseline_qps'), baseline_empty, 0)} → "
             f"{_empty_or(s.get('under_writes_qps'), under_empty, 0)}",
-            _fmt(s.get("writer_rows_per_s"), 1, " rows/s"),
+            _fmt(s.get("writer_rows_per_s"), 1, " rows/s")
+            + (f" {SCALING_REFUSED_MARK}"
+               if s.get("scaling_status")
+               == SCALING_CONCURRENCY_NOT_ACHIEVED else ""),
+            # What the readers actually had in service, against how many there
+            # were. The evidence for both marks above, in the row that carries
+            # them.
+            (f"{s['served_concurrency']:,.2f} of {s.get('readers')}"
+             if s.get("served_concurrency") is not None else "—"),
         ])
     parts.append(_md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
          "Readers", "Reader p99", "p99 under writes", "Reader QPS",
-         "Writer rate"],
+         "Writer rate", "Reads in service"],
         table_rows))
     if any(s.get("ratio_disagrees") for s in rows_in):
         parts.append(
@@ -1874,6 +2116,28 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
             f"`extra.reader_under_writes_window_s` is the length it managed. "
             f"A zero printed here would read as a throughput collapse, which "
             f"is the one thing it is not.\n")
+    serialized = [s for s in rows_in
+                  if s.get("scaling_status")
+                  == SCALING_CONCURRENCY_NOT_ACHIEVED]
+    if serialized:
+        parts.append(
+            f"\n{SCALING_REFUSED_MARK} **The readers did not run "
+            f"concurrently at {len(serialized)} of these points**, so neither "
+            f"the p99 ratio nor the writer rate beside it is evidence about "
+            f"the engine. `Reads in service` is the queries each "
+            f"during-writes window counted times their median latency over "
+            f"the window; below half the reader count, the pool was answering "
+            f"about one read at a time whatever it was asked for. **The "
+            f"writer rate is affected in the same direction and for a reason "
+            f"specific to this measurement**: the readers are threads in the "
+            f"writer's own interpreter, so reads that serialize on the "
+            f"interpreter lock starve the writer inside the client rather "
+            f"than inside the engine, and `extra.reinsert_rows_per_s` becomes "
+            f"a measurement of Python. The churn step record carries the same "
+            f"status as `extra.reader_scaling_status` for exactly that "
+            f"reason. As in the concurrency section, a serializing client and "
+            f"an engine that answers one query at a time look the same from "
+            f"here; `extra.client_cpu_seconds` is what tells them apart.\n")
     if any(s.get("client_bound") for s in rows_in):
         parts.append(
             "\n○ The readers used more than 80% of their container's CPUs, so "
