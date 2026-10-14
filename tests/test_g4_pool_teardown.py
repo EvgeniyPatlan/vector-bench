@@ -25,20 +25,42 @@ The two:
   past `JOIN_TIMEOUT_S` by an unbounded amount. A client that DIES mid-send
   was already handled: its pipe closes and `recv` raises.
 
-**Mutation discipline (R4).** Both repairs are probed by patching the system
-under test AT RUN TIME -- never by editing a file on disk -- and each
-docstring carries the honest reading and the mutant reading, both measured.
-Two of the three mutants are a `monkeypatch.setattr` on a `ClientPool` or
-`Client` method, which is why those methods exist as named methods at all: a
-repair spelled inline in `start` and again in `stop` could only be mutated by
-editing the file, and a copy is how one of the two came to be missing in the
-first place.
+* **`_transfer_cut` was set and never read on `stop`'s exit-status path.**
+  The watchdog can fire while a `recv` of an already-complete payload is
+  landing -- `cancel()` is then a no-op, `recv` returns, `absorb` records no
+  error, and the exit code is `-SIGKILL`. `ClientPool.stop` read that as a
+  client killed from outside and failed a window whose spans are entire,
+  claiming they "cover only part of the window". `TRANSFER_GRACE_S` narrows
+  that race; `Client.ended_by_this_pool` is what closes it.
+
+**Mutation discipline (R4), counted rather than described.** Every repair is
+probed by patching the system under test AT RUN TIME -- never by editing a
+file on disk -- and each docstring carries the honest reading and the mutant
+reading, both measured. There are **five** mutants and **four** of them are a
+`monkeypatch.setattr` on a `ClientPool` or `Client` attribute:
+
+1. `ClientPool._join_attendants` -> a no-op (monkeypatch).
+2. one live thread at fork time, against the same fork after joining it --
+   a **subprocess with and without the thread, not a monkeypatch**, because
+   the warning is a property of the whole process and this suite is known to
+   leak one.
+3. `Client._recv_by` -> the unbounded `self._from_client.recv()` (monkeypatch).
+4. `Client._cut_off_transfer` -> one that kills without recording
+   (monkeypatch).
+5. `Client.ended_by_this_pool` -> `False` (monkeypatch).
+
+An earlier revision of this paragraph said "two of the three mutants", which
+was wrong in both numbers and is the class of inaccuracy the first commit of
+this branch is about. The monkeypatch targets are why those four exist as
+NAMED attributes at all: a repair spelled inline in `start` and again in
+`stop` could only be mutated by editing the file, and a copy is how one of
+the two came to be missing in the first place.
 
 **No measured throughput or latency is asserted here**, for the reason
 `test_g3_process_clients.py` gives about a shared box. What is asserted is a
-thread count, a warning count, and whether a bounded call returned inside its
-own bound -- none of which a busy machine can move in the direction that
-would make a broken repair pass.
+thread count, a warning count, an exit code, and whether a bounded call
+returned inside its own bound -- none of which a busy machine can move in the
+direction that would make a broken repair pass.
 """
 
 from __future__ import annotations
@@ -538,6 +560,120 @@ class TestAStalledTransferCannotOutlastThePoolDeadline:
         assert "SIGKILL" in mutant, mutant
         assert "partway through sending its spans" not in mutant, mutant
         assert honest != mutant
+
+
+def _lingering_tell(real_tell):
+    """A `_tell` that sends the window payload in full and then stays alive.
+
+    IN THE CHILD, and the opposite shape to `_stalling_tell`: the payload is
+    COMPLETE and buffered in the pipe, so a parent `recv` succeeds whenever it
+    runs. The child then sleeps, which is what leaves it killable -- without
+    that it would exit 0 the instant `run` returned and there would be no
+    non-zero exit code for `stop` to misread.
+    """
+    def _tell(self, phase, error, collector, results):
+        real_tell(self, phase, error, collector, results)
+        if phase == "window":
+            time.sleep(600)
+    return _tell
+
+
+class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
+    """The race `TRANSFER_GRACE_S` narrows and `ended_by_this_pool` closes.
+
+    `_cut_off_transfer` sets the flag and kills. If it fires while a `recv` of
+    an already-complete payload is landing, `watchdog.cancel()` is a no-op,
+    `recv` returns normally and `absorb` records no error -- but the client's
+    exit code is now `-SIGKILL`. `ClientPool.stop`'s exit-status check reads
+    any non-zero code as a client killed from outside and says "the spans it
+    sent cover only part of the window, so this is not a measurement".
+
+    Both halves of that are false here: the spans are entire, and the signal
+    came from this pool. `_transfer_cut` was set and never read on that path,
+    so the flag looked like a guard while only `absorb`'s message branch used
+    it. Reachable in a real run only once the pool's shared `JOIN_TIMEOUT_S`
+    is spent, which is why it is driven directly here rather than waited for.
+
+    The race is driven, not raced: `_recv_by` is replaced with one that calls
+    the real `_cut_off_transfer` FIRST and then does the real `recv`. That is
+    the losing interleaving every time instead of once in a while, which is
+    the only way a probe for a race can be a probe rather than a lottery.
+    """
+
+    def _pool(self, base, queries, monkeypatch) -> cl.ClientPool:
+        monkeypatch.setattr(cl, "JOIN_TIMEOUT_S", PROBE_JOIN_S)
+        monkeypatch.setattr(cp.Client, "_tell",
+                            _lingering_tell(cp.Client._tell))
+
+        def cut_then_recv(self, deadline):
+            self._cut_off_transfer()
+            return self._from_client.recv()
+
+        monkeypatch.setattr(cp.Client, "_recv_by", cut_then_recv)
+        return cl.ClientPool(factory_for(base), queries, 2, K, 32,
+                             spec_for(queries), warmup=1)
+
+    def _run(self, base, queries, monkeypatch):
+        """Return (window or None, raised or None) plus what the pool saw."""
+        pool = self._pool(base, queries, monkeypatch)
+        pool.start("g4 kill after a complete transfer", prefix="g4")
+        time.sleep(0.05)
+        try:
+            try:
+                window = pool.stop()
+                raised = None
+            except cl.PoolError as exc:
+                window, raised = None, exc
+            codes = [w.exitcode for w in pool._workers]
+            cut = [w.ended_by_this_pool for w in pool._workers]
+            errors = [w.error for w in pool._workers]
+            return window, raised, codes, cut, errors
+        finally:
+            for worker in pool._workers:
+                worker.reap()
+
+    def test_the_window_survives_a_kill_this_pool_sent(self, base, queries,
+                                                       monkeypatch):
+        """Honest and mutant, as whether `stop` published or raised.
+
+        Both arms see the same pool state, which is what makes this one
+        experiment: exit codes **[-9, -9]**, `ended_by_this_pool` **[True,
+        True]**, and `Client.error` **[None, None]** -- every payload arrived
+        complete and no client failed.
+
+        HONEST: `stop` returns a `PoolWindow` and the window is published.
+        MUTANT (`ended_by_this_pool` forced to False, which is the state
+        before this repair, with `_transfer_cut` set and unread): `stop`
+        raises `PoolError` "2 of 2 client processes ended abnormally after
+        reporting; first: client ..., it was killed by SIGKILL. The spans it
+        sent cover only part of the window, so this is not a measurement" --
+        a sound window failed, over a signal the harness sent, with a claim
+        about the payload that is factually wrong.
+        """
+        window, raised, codes, cut, errors = self._run(base, queries,
+                                                       monkeypatch)
+        assert raised is None, (
+            f"a window whose payloads all arrived complete was failed: "
+            f"{raised}")
+        assert window is not None and window.qps is not None
+        # The pool state both arms share, asserted so neither arm can be
+        # passing for a reason other than the branch under test.
+        assert all(code == -9 for code in codes), codes
+        assert all(cut), cut
+        assert errors == [None, None], errors
+
+        monkeypatch.setattr(cp.Client, "ended_by_this_pool",
+                            property(lambda self: False))
+        _w, mutant, m_codes, _m_cut, m_errors = self._run(base, queries,
+                                                          monkeypatch)
+        assert isinstance(mutant, cl.PoolError), (
+            "forcing `ended_by_this_pool` False changed nothing, so `stop` "
+            "does not read it and this repair is unproven")
+        assert "SIGKILL" in str(mutant), str(mutant)
+        assert "cover only part of the window" in str(mutant), str(mutant)
+        # Same state, opposite outcome: that is the pair.
+        assert all(code == -9 for code in m_codes), m_codes
+        assert m_errors == [None, None], m_errors
 
 
 class TestEveryDriverFamilyIsStillClassified:

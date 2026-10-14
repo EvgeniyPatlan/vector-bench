@@ -622,8 +622,19 @@ class ClientPool:
         # client at the end of a long window: without this check the pool
         # would publish the partial window as a measurement of the engine.
         # Checked after the two above so the more specific message wins.
+        #
+        # EXCEPT a client THIS POOL killed at the span-transfer deadline,
+        # which is not something that happened to the window. Two states, and
+        # neither belongs here: if the transfer really was cut short, `absorb`
+        # recorded a `ClientDied` and the `failures` branch above already
+        # raised with the right message; if the payload landed complete while
+        # the watchdog was firing, the spans are ENTIRE and the only thing
+        # wrong is the signal this pool sent. Counting that as "ended
+        # abnormally after reporting ... the spans it sent cover only part of
+        # the window" would fail a sound window and blame the harness's own
+        # SIGKILL on the engine. `Client.ended_by_this_pool` has the race.
         killed = [(w, w.exitcode) for w in self._workers
-                  if w.exitcode not in (0, None)]
+                  if w.exitcode not in (0, None) and not w.ended_by_this_pool]
         if killed:
             worker, code = killed[0]
             for each in self._workers:
