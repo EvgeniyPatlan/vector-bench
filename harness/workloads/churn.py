@@ -49,8 +49,8 @@ from ..metrics.records import PHASE_CHURN, Record
 from ..progress import Heartbeat, Progress
 from .clients import DriverFactory, PoolError, PoolWindow
 # PR 4 §4.3's reader pool. Its own module because inlining it here breaches
-# the repo's stated 800-line maximum badly: the two files are 1,119 lines
-# today and splice back into ONE file of 1,055, which is 255 over. (An earlier
+# the repo's stated 800-line maximum badly: the two files are 1,130 lines
+# today and splice back into ONE file of 1,066, which is 266 over. (An earlier
 # revision of this comment said 907 and 107 over -- that was the figure before
 # the module grew its own header, and it understated the case.
 # `tests/test_t4b_readers.py` now measures the splice so neither number can
@@ -636,9 +636,20 @@ def _sync_shape(driver) -> Dict[str, object]:
     engine records, what a hook nobody implemented records, and what a mongot
     that was already caught up records -- and H1's acceptance criterion is
     "non-zero or a reason documented", which a bare zero cannot satisfy.
+
+    A driver that also publishes `index_sync_detail` gets that carried too,
+    as a second key. The note is prose, so reading it back means matching a
+    sentence; the detail is the same facts as fields -- the final indexed
+    count, the count expected, the polls, which condition ended the wait and
+    which signal was binding -- which is what makes "did this engine's index
+    actually arrive?" a query over a run rather than a careful read.
     """
     note = getattr(driver, "index_sync_note", None)
-    return {"index_sync_note": note} if note else {}
+    detail = getattr(driver, "index_sync_detail", None)
+    out = {"index_sync_note": note} if note else {}
+    if detail:
+        out["index_sync_detail"] = detail
+    return out
 
 
 def _write_shape(driver) -> Dict[str, object]:

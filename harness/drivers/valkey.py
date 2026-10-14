@@ -35,7 +35,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy
 
@@ -91,6 +91,54 @@ CHURN_BATCH = int(os.environ.get("VB_VALKEY_CHURN_BATCH", "1000"))
 #: WARNING / had not.
 INDEX_SYNC_TIMEOUT_S = 900.0
 
+#: What the caller expects FT.INFO's `num_docs` to DO while a wait runs. One
+#: wait serves two callers that want opposite things from the same comparison,
+#: and until now only the first of them got it. `delete_ids` watches the count
+#: fall TO the target, which is exactly what `num_docs <= expected` says. A
+#: re-insert raises the count towards the target, so it starts BELOW it and
+#: that comparison is already true when the wait begins: measured against a
+#: scripted FT.INFO with the queue drained, the shipped wait returned after
+#: 1 poll with the index 200 documents short of the target, and after 1 poll
+#: with the index holding nothing at all. `DOCS_AT_MOST` stays the default
+#: because it is what every existing caller of this wait means; the insert
+#: path names `DOCS_EQUAL` for itself.
+DOCS_AT_MOST = "at_most"
+DOCS_EQUAL = "equal"
+
+#: `DOCS_EQUAL` is equality and not `>=`, and that is the other half of the
+#: repair. `>=` fixes the direction and keeps the trap: the mutation queue has
+#: been observed drained while this index reported 481 documents MORE than the
+#: keyspace held, so "at least the expected count" can be satisfied by stale
+#: entries while the new rows are still unindexed. Measured, that mutant ends
+#: the wait at 1 poll holding 2,481 documents against an expected 2,000, where
+#: equality waits the 3 polls it takes to actually reach 2,000. Only equality
+#: catches both an undercount and an overcount.
+#:
+#: An index that converges a document or two off the target would then wait out
+#: the whole of INDEX_SYNC_TIMEOUT_S and publish every Valkey churn as "timed
+#: out" -- a worse lie than the one being fixed. So a count that has STOPPED
+#: MOVING also ends the wait: off target, and said so in `index_sync_detail`
+#: and in the published note rather than hidden. It is the rule the
+#: `expected_docs is None` branch already used, now named -- this many
+#: consecutive readings equal to the one before.
+DOCS_SETTLED_POLLS = 2
+
+#: And the escape has a floor, because `DOCS_SETTLED_POLLS` repeats is four
+#: seconds at a two-second poll, which is not evidence that an index has
+#: finished. Measured on this driver before the floor existed: readings
+#: 1,800 / 1,800 / 1,800 / 1,900 / 2,000 with the queue drained ended the wait
+#: at 3 polls reporting "(200 short)" -- an index that was still converging
+#: and reached the target two polls later -- and a flat reading of zero ended
+#: it after 4 seconds holding nothing at all. The only thing separating that
+#: from a correct exit is `queued == 0`, and the queue is the signal this file
+#: documents as unreliable: the 481-document incident IS "the queue drained
+#: while the index disagreed". A GC or CPU-contention stall mid-re-insert
+#: produces exactly that shape -- queue momentarily empty, count flat for a
+#: few seconds -- so the escape waits out a real stall before concluding the
+#: count has stopped. A small poll count beside a large gap is what a
+#: premature exit looks like in the note, and the note says so.
+DOCS_SETTLED_FLOOR_S = 30.0
+
 # Long enough that no honest write hits it, short enough that a reply which is
 # never coming does not hold the machine until someone notices. Never None:
 # that is what turned a stalled churn into a run that hung overnight.
@@ -144,6 +192,58 @@ def _optional_int(value) -> Optional[int]:
         return None
 
 
+def _docs_ready(docs: Optional[int], expected: Optional[int],
+                expectation: str, settled_for: int,
+                elapsed_s: float) -> Tuple[bool, str]:
+    """Has the indexed document count reached what the caller expects of it?
+
+    Lifted out of the polling loop because the two callers of that loop want
+    opposite things from this one comparison (see `DOCS_AT_MOST`), and because
+    a condition this easy to get backwards is worth testing without a clock in
+    the way -- `elapsed_s` is passed in rather than read here for that reason.
+    Returns the verdict and the phrase naming which condition produced it:
+    "the queue drained" and "the count arrived" are different measurements,
+    and the record could not previously tell them apart.
+    """
+    if expectation not in (DOCS_AT_MOST, DOCS_EQUAL):
+        # Validated before anything else, so no earlier branch can let a
+        # misspelling through. A typo would otherwise reinstate the delete
+        # path's comparison on the insert path -- the exact defect this
+        # parameter was added to fix -- and publish "num_docs fell to the
+        # expected count" for a count that rose and never arrived. Measured
+        # before this check existed: 'eqaul', 'EQUAL', 'exact', '' and None
+        # all returned ready for an index 200 documents short.
+        raise ValueError(f"unknown docs_expectation {expectation!r}; expected "
+                         f"{DOCS_AT_MOST!r} or {DOCS_EQUAL!r}")
+    if docs is None:
+        # This build reports no document count. The queue is then the only
+        # signal there is; waiting on a number nobody publishes would hang
+        # every churn rather than guard one. `wait_index_synced` publishes
+        # that this is what happened, because it is the same shape as the
+        # defect this parameter exists to fix.
+        return True, "this build publishes no num_docs"
+    stopped_moving = settled_for >= DOCS_SETTLED_POLLS
+    if expected is None:
+        # Nothing to compare against: settle instead, which needs two
+        # consecutive readings so a single sample cannot end the wait. No
+        # floor here: this branch is what `scripts/verify-valkey-churn.py`
+        # drives, it predates the churn hooks, and nothing measured asks for
+        # its timing to change.
+        return stopped_moving, "num_docs stopped moving"
+    if expectation == DOCS_EQUAL:
+        if docs == expected:
+            return True, "num_docs reached the expected count"
+        # Off target: only after `DOCS_SETTLED_FLOOR_S`, so a few seconds of
+        # a stalled re-insert cannot be read as a finished one.
+        return (stopped_moving and elapsed_s >= DOCS_SETTLED_FLOOR_S,
+                "num_docs stopped moving while still off target")
+    # `DOCS_AT_MOST` by elimination, the expectation having been checked at
+    # the top: the count falls TO the target on the delete path, and may land
+    # below it when some of the ids handed to `delete_ids` were not in the
+    # keyspace, which is why this is not equality.
+    return docs <= expected, "num_docs fell to the expected count"
+
+
 def encode_vector(vector) -> bytes:
     """FLOAT32 little-endian, which is what the module expects in PARAMS."""
     return numpy.asarray(vector, dtype="<f4").tobytes()
@@ -171,6 +271,13 @@ class ValkeyDriver(EngineDriver):
         # it already reads `write_batch_used` below: an engine with nothing to
         # say simply has no such attribute. See `wait_index_synced`.
         self.index_sync_note: Optional[str] = None
+        # What the last wait actually OBSERVED, as opposed to what it rested
+        # on: the final count, the count expected, how many polls, which
+        # condition ended it and which signal was binding. The note is prose
+        # rendered from this; this is the thing a live smoke run has to
+        # produce, because no fake can settle whether a real index converges
+        # to the expected count, sits a few short of it, or overcounts.
+        self.index_sync_detail: Optional[Dict[str, Any]] = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -477,11 +584,19 @@ class ValkeyDriver(EngineDriver):
                 conn.delete(*keys[start:start + CHURN_BATCH])
         finally:
             conn.close()
-        self._wait_for_mutations(expected_docs=max(0, before - len(keys)))
+        # `DOCS_AT_MOST` is named rather than defaulted: this is the call the
+        # shared wait's comparison was written for -- the indexed count falls
+        # TO the target here -- and the insert path that also uses that wait
+        # needs the opposite. Saying which one this is at the call site is
+        # what stops the next reader from "fixing" the comparison for the
+        # other caller and silently unguarding this one.
+        self._wait_for_mutations(expected_docs=max(0, before - len(keys)),
+                                 docs_expectation=DOCS_AT_MOST)
 
     def _wait_for_mutations(self, expected_docs: Optional[int] = None,
-                            timeout_s: float = 900.0) -> float:
-        """Let the index absorb a mass delete before writing into it again.
+                            timeout_s: float = 900.0,
+                            docs_expectation: str = DOCS_AT_MOST) -> float:
+        """Let the index absorb a batch of mutations before measuring it.
 
         DEL returns as soon as the key is gone; removing the vector from the
         HNSW graph is separate work, and FT.INFO reports a mutation queue
@@ -495,15 +610,40 @@ class ValkeyDriver(EngineDriver):
         reported 481 documents more than the keyspace held. So the document
         count is waited on too, against the number the caller knows to expect,
         and a missing field is reported rather than treated as agreement.
+
+        `docs_expectation` is how the caller says what it expects that count
+        to do -- see `DOCS_AT_MOST`. The comparison used to be the delete
+        path's unconditionally, which left the document half of this wait
+        satisfied before the insert path's first poll.
+
+        Whatever ends the wait, what it saw lands in `index_sync_detail`. A
+        wait that returns an elapsed time and nothing else cannot be audited:
+        0.0s because the index was already there, and 0.0s because the only
+        condition still in force was trivially true, are the same number.
         """
         started = time.time()
         last_report = started
         settled_for = 0
         previous: Optional[int] = None
         announced_missing = False
+        polls = 0
+        docs: Optional[int] = None
+        queued: Optional[int] = None
+        # Carried forward rather than computed at the end, so the reading that
+        # ends the wait does not erase what had been holding it open. A wait
+        # that ends on its first poll bound on nothing, and the record has to
+        # be able to say that too.
+        blocked_by = "neither: the first reading already agreed"
+
+        def observed(ended: str, timed_out: bool) -> Dict[str, Any]:
+            return {"expected_docs": expected_docs, "observed_docs": docs,
+                    "queue_size": queued, "polls": polls,
+                    "docs_expectation": docs_expectation, "ended_by": ended,
+                    "binding_signal": blocked_by, "timed_out": timed_out}
 
         while time.time() - started < timeout_s:
             info = self._ft_info()
+            polls += 1
             queued = _optional_int(info.get("mutation_queue_size"))
             if queued is None and not announced_missing:
                 announced_missing = True
@@ -513,25 +653,20 @@ class ValkeyDriver(EngineDriver):
             docs = _optional_int(info.get("num_docs"))
 
             queue_drained = queued in (None, 0)
-            if docs is None:
-                # This build reports no document count either. The queue is
-                # then the only signal there is; waiting on a number nobody
-                # publishes would hang every churn rather than guard one.
-                docs_ready = True
-            elif expected_docs is None:
-                # Nothing to compare against: settle instead, which needs two
-                # consecutive readings so a single sample cannot end the wait.
-                settled_for = settled_for + 1 if docs == previous else 0
-                docs_ready = settled_for >= 2
-            else:
-                docs_ready = docs <= expected_docs
+            settled_for = settled_for + 1 if docs == previous else 0
+            docs_ready, ended_by = _docs_ready(docs, expected_docs,
+                                               docs_expectation, settled_for,
+                                               time.time() - started)
             previous = docs
 
             if queue_drained and docs_ready:
+                self.index_sync_detail = observed(ended_by, False)
                 return time.time() - started
+            blocked_by = ("the mutation queue" if docs_ready else
+                          "the document count" if queue_drained else "both")
 
             if time.time() - last_report >= PROGRESS_INTERVAL_S:
-                print(f"[valkey] index absorbing deletes: "
+                print(f"[valkey] index catching up: "
                       f"num_docs={docs if docs is not None else '?'}"
                       f"{f' (target {expected_docs:,})' if expected_docs is not None else ''}"
                       f", queued={queued if queued is not None else 'n/a'}, "
@@ -540,72 +675,146 @@ class ValkeyDriver(EngineDriver):
             time.sleep(2)
 
         waited = time.time() - started
-        print(f"[valkey] WARNING: the index had not absorbed the delete after "
-              f"{waited:.0f}s. Writing into it anyway; treat what follows as a "
-              f"measurement of an index that was still catching up.",
-              file=sys.stderr, flush=True)
+        self.index_sync_detail = observed("the wait gave up", True)
+        print(f"[valkey] WARNING: the index had not caught up after "
+              f"{waited:.0f}s ({self.index_sync_detail}). Measuring it "
+              f"anyway; treat what follows as a measurement of an index that "
+              f"was still catching up.", file=sys.stderr, flush=True)
         return waited
 
     def wait_index_synced(self, expected_rows: int) -> float:
         """Let the index absorb the re-inserted rows before re-measuring.
 
-        Delegates to `_wait_for_mutations`, which already waits on the one
-        signal this build publishes -- FT.INFO's mutation queue -- and already
-        knows that the queue alone has been caught reading drained while the
-        index disagreed with the keyspace by 481 documents.
+        Delegates to `_wait_for_mutations`, which waits on FT.INFO's mutation
+        queue and on the indexed document count, and which already knows that
+        the queue alone has been caught reading drained while the index
+        disagreed with the keyspace by 481 documents.
 
-        **The document-count half of that wait does not bind on an insert,
-        and a reader of `extra.index_sync_s` needs to know it.** The condition
-        there is `docs <= expected_docs`, written for the delete path it was
-        added for, where the count falls TO the target. After a re-insert the
-        count rises to the target, so it starts below it and the comparison is
-        satisfied by an index that has absorbed none of the writes. What is
-        left guarding this call is the mutation queue, which is the weaker of
-        the two signals by the measurement that put the document count there.
-        PR 4 §4.1 item 2 asks for the delegation in those words, so the
-        delegation is what this does; a direction-aware comparison is a change
-        to `_wait_for_mutations` and to the delete path that shares it.
+        **The document half of that wait used to be dead on this path**, and
+        the first version of this hook published the fact instead of fixing
+        it. The comparison was `docs <= expected_docs`, written for the delete
+        path, where the count falls TO the target; a re-insert raises it, so
+        the comparison was already satisfied when the wait began. Measured
+        against a scripted FT.INFO with the queue drained, that form returned
+        after **1 poll** with the index 200 documents short of the target, and
+        after **1 poll** with the index holding nothing at all -- leaving the
+        mutation queue, the weaker of the two signals by the measurement that
+        put the count there, as the only thing guarding a published recall
+        figure. `DOCS_EQUAL` is passed below so the count binds here, and
+        `delete_ids` names `DOCS_AT_MOST` so its own behaviour is untouched:
+        2,000 falling to 1,800 against an expected 1,800 is 3 polls either
+        way, measured.
 
-        So the limitation is published rather than left to be inferred from
-        this docstring: `index_sync_note` says what the wait rested on, and
-        `churn.run` carries it into the record beside `index_sync_s`. Without
-        it this engine would routinely publish a bare `index_sync_s: 0.0` --
-        indistinguishable from a synchronous engine and from a hook nobody
-        implemented -- in the one engine where that zero is most misleading,
-        because Valkey is the engine whose writes have actually stopped
-        returning mid-churn and cost two runs.
+        **Equality, not `>=`.** `>=` repairs the direction and keeps the
+        trap -- see `DOCS_EQUAL`, which also carries the stopped-moving escape
+        that keeps an index converging a document or two off the target from
+        waiting out INDEX_SYNC_TIMEOUT_S and publishing the churn as "timed
+        out".
 
-        **The note hedges the direction claim rather than asserting it, and
-        the hedge is a measurement.** The document half is not dead on the
-        insert path; it is dead only while the index UNDERCOUNTS. Driving the
-        real `_wait_for_mutations` with FT.INFO readings and no sleeping: a
-        count of 1,800 against an expected 2,000 ends the wait in **1 poll**,
-        while a count of 2,481 against the same 2,000 -- the 481-document
-        overcount this file's own docstring is built around -- takes **4
-        polls**, so there the count is exactly what bound it. A note saying
-        "the queue was the only signal" would be false in the one case the
-        surrounding prose cares most about.
+        **What the wait saw is published, not inferred.** `index_sync_note`
+        renders `index_sync_detail` -- the final count, the count expected,
+        the polls, which condition ended the wait and which signal was
+        binding -- and `churn.run` carries the note into the record beside
+        `index_sync_s`. Which is also how the one open question about this
+        engine gets settled: no fake can say whether a real index converges to
+        the expected count, stops a few short of it, or comes back over, and
+        the first live run now answers that instead of another argument about
+        it. Without any of this the engine would publish a bare
+        `index_sync_s: 0.0`, indistinguishable from a synchronous engine and
+        from a hook nobody implemented, in the one engine where that zero is
+        most misleading: Valkey is the engine whose writes have actually
+        stopped returning mid-churn and cost two runs.
         """
+        # Cleared first: `delete_ids` earlier in the same churn step left its
+        # own readings here, and a note that rendered those would describe the
+        # delete's 1,800 documents as the re-insert's. The published sentence
+        # has to be about the wait it is attached to.
+        self.index_sync_detail = None
         waited = self._wait_for_mutations(expected_docs=int(expected_rows),
-                                         timeout_s=INDEX_SYNC_TIMEOUT_S)
+                                          timeout_s=INDEX_SYNC_TIMEOUT_S,
+                                          docs_expectation=DOCS_EQUAL)
+        seen = self._observed_sync_phrase()
+        ended_by = (self.index_sync_detail or {}).get("ended_by")
+        off_target = ended_by == "num_docs stopped moving while still off target"
+        no_count = ended_by == "this build publishes no num_docs"
         if waited >= INDEX_SYNC_TIMEOUT_S:
             # `_wait_for_mutations` warns on stderr and returns anyway, so
             # without this branch the record would carry the timeout's elapsed
             # time under a sentence describing a wait that finished.
             self.index_sync_note = (
                 f"the index had not absorbed the re-insert after "
-                f"{waited:.0f}s and the wait gave up; what follows measures "
-                f"an index that was still catching up")
+                f"{waited:.0f}s and the wait gave up{seen}; what follows "
+                f"measures an index that was still catching up")
+        elif off_target:
+            # Deliberately not "settled in 30.0s". The full sentence is
+            # honest either way, but a skim takes away the first three words,
+            # and "settled" beside a small number is what a reader carries
+            # into a recall table. This wait did not reach what it was
+            # waiting for.
+            self.index_sync_note = (
+                f"stopped off target after {waited:.1f}s{seen}. A small poll "
+                f"count beside a large gap is what a premature exit looks "
+                f"like: the count is only treated as stopped after "
+                f"{DOCS_SETTLED_FLOOR_S:.0f}s, but the queue reading that "
+                f"lets it end at all has been seen draining while this index "
+                f"disagreed with the keyspace by 481 documents")
+        elif no_count:
+            # The one case where nothing about the count was checked at all,
+            # so it must not lead with "settled" either -- same reason as the
+            # branch above. "settled in 0.0s" here would be the most
+            # misleading sentence this driver can write.
+            self.index_sync_note = (
+                f"the document count could not be checked{seen}; the "
+                f"{waited:.1f}s this took means the queue was empty, not that "
+                f"the index had absorbed the re-insert")
         else:
             self.index_sync_note = (
-                f"settled in {waited:.1f}s. `_wait_for_mutations` waits on "
-                f"FT.INFO's mutation queue and on `num_docs <= "
-                f"{int(expected_rows):,}`; the count half was written for the "
-                f"delete path, where the count falls TO the target, so after a "
-                f"re-insert it binds only while the index is OVERCOUNTING "
-                f"(measured 4 polls at 2,481 docs against 2,000, 1 poll at "
-                f"1,800) and otherwise the queue is the only signal left")
+                f"settled in {waited:.1f}s{seen}. The insert path waits for "
+                f"`num_docs == {int(expected_rows):,}`, not the delete path's "
+                f"`num_docs <= {int(expected_rows):,}` that this shared wait "
+                f"was written with: a re-insert starts BELOW the target, where "
+                f"`<=` is satisfied already, which left FT.INFO's mutation "
+                f"queue as the only signal guarding the measurement -- "
+                f"measured, 1 poll with the index 200 docs short. Equality "
+                f"rather than `>=` because the queue has been observed drained "
+                f"while the index reported 481 documents more than the "
+                f"keyspace held")
+        print(f"[valkey] index sync: {self.index_sync_note}", flush=True)
         return waited
+
+    def _observed_sync_phrase(self) -> str:
+        """The last wait's own readings, for the published note.
+
+        Empty when there are no readings to report, which is what a caller
+        that stubs the wait out sees. A sentence a reader can act on needs the
+        numbers and not just the condition: an index that lands exactly on the
+        target, one that stops two short and one that comes back 481 over are
+        three different engines, and only this phrase tells them apart in a
+        record that otherwise holds one float.
+        """
+        detail = self.index_sync_detail or {}
+        docs, expected = (detail.get("observed_docs"),
+                          detail.get("expected_docs"))
+        if not detail or expected is None:
+            return ""
+        if docs is None:
+            # The twin of the original defect, and it has to be said out loud:
+            # a build that publishes no `num_docs` leaves the document half
+            # satisfied unconditionally and the queue as the only guard, which
+            # is the state this call was changed to get out of. Without this
+            # clause the note is byte-identical to one from a wait that was
+            # stubbed out entirely.
+            return (f": FT.INFO published no num_docs in this build, so after "
+                    f"{detail['polls']} poll(s) the mutation queue was the "
+                    f"only signal guarding this measurement and the document "
+                    f"half was satisfied unconditionally")
+        gap = docs - expected
+        where = ("exactly on target" if gap == 0 else
+                 f"{abs(gap):,} {'over' if gap > 0 else 'short'}")
+        return (f": num_docs={docs:,} against an expected {expected:,} "
+                f"({where}) after {detail['polls']} poll(s), ended because "
+                f"{detail['ended_by']}; the binding signal was "
+                f"{detail['binding_signal']}")
 
     def insert_rows(self, ids: Sequence[int], vectors: numpy.ndarray,
                     attrs: Union[RowAttrs, Sequence[int], numpy.ndarray]

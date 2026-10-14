@@ -321,24 +321,88 @@ the difference read as a property of the engine.
 
 **An asynchronous index is confirmed caught up before re-measuring.**
 `wait_index_synced(rows)` runs after the re-insert, and its cost is recorded as
-`extra.index_sync_s`. For Valkey it waits on FT.INFO's mutation queue; for
-Percona Search it polls `$vectorSearch` for the newest written document until
-the index returns it. The other four engines maintain their index on the write
+`extra.index_sync_s`. For Valkey it waits on FT.INFO's mutation queue and on
+its indexed document count, both of them; for Percona Search it polls
+`$vectorSearch` for the newest written document until the index returns it.
+The other four engines maintain their index on the write
 path and record `0.0`. "The engine is slow and inaccurate" and "we asked before
 the index was ready" are the same numbers in a record otherwise.
 
-**A small `index_sync_s` for Valkey is weaker evidence than it looks**, and a
-reader of the published number needs to know which way. The shared wait it
-delegates to tests two conditions — the mutation queue, and the indexed
-document count against the row count expected — but the count comparison was
-written for the delete path, where the count falls *to* the target. A
-re-insert raises it towards the target instead, so that half is already
-satisfied when the wait begins and stops binding unless the index is
-*over*counting. The queue is then the only signal in force, and the queue has
-been observed drained while the index still disagreed with the keyspace by 481
-documents. So a near-zero `index_sync_s` on Valkey means "the mutation queue
-was empty", not "the index had absorbed the writes"; every record carries
-`extra.index_sync_note` saying which of the two it rested on.
+**`index_sync_s` for Valkey is a wait on both signals.** The shared wait tests
+FT.INFO's mutation queue and the indexed document count against the row count
+expected, and each caller says which way it expects that count to move: the
+delete path waits for it to fall *to* the target, the re-insert for
+`num_docs == rows`. Equality rather than "at least", because the queue has been
+observed drained while the index reported 481 documents more than the keyspace
+held, so a count that is merely large enough can be stale entries. An index
+that converges near but not on the target ends the wait when the count stops
+moving, reported as off target rather than as a timeout. Every record carries
+`extra.index_sync_note` with what the wait observed: the final count, the
+expected count, the polls, which condition ended it and which of the two
+signals was binding.
+
+**When that note says the count ended off target, the direction names the
+mechanism — and both mechanisms push the published figure the same way,
+down.** A count *short* of the target means rows that were written are not in
+the graph yet, so the queries that follow cannot return them. A count *over*
+means the graph still holds entries the keyspace does not; the churn path
+scores with `harness/datasets.py:recall_at_k` against truth translated through
+the re-insert's id map, which is an id intersection, and a stale id is absent
+from that translated set by construction. Every stale id returned therefore
+consumes a top-k slot and contributes nothing. Measured on that function with
+two of five true neighbours re-inserted, a result of stale ids and a result
+missing the two new rows both score **0.6000** where a correct one scores
+**1.0000**. So an off-target count understates recall either way and cannot
+inflate it, and the direction tells you which repair to look for rather than
+which way to read the number. The note reports the gap as `(n short)` or
+`(n over)`; `n` is the figure any tolerance would have to be set from, and
+until a live run produces one, none is assumed.
+
+**Reading that note after a run.** It is on every churn record:
+
+```bash
+jq -r 'select(.phase=="churn" and .extra.index_sync_note)
+       | [.extra.index_sync_s, .extra.index_sync_note] | @tsv' \
+   results/<run-id>/ops-valkey-*.jsonl
+```
+
+The same sentence appears once per churn step in the run log as
+`[valkey] index sync: …`, and a wait that gives up also prints what it saw to
+stderr. The clause to read is the one after the leading phrase —
+`num_docs=N against an expected M (…) after K poll(s), ended because …; the
+binding signal was …` — and there are seven things it can say:
+
+| The note says | What it means |
+| --- | --- |
+| `settled in …` · `(exactly on target)` · binding signal the document count, with K > 1 | The index converges exactly, and the count is what the wait rested on. Roughly `2·(K−1)` seconds of indexing lag now sits inside `index_sync_s`; while this wait compared with `<=` that lag sat inside the recall measurement instead. |
+| the same with K = 1 and binding signal `neither: the first reading already agreed` | The index was already at the target when the wait began. Nothing is wrong and nothing is proven: this is what a corpus too small to lag looks like. |
+| `settled in …` with binding signal the mutation queue | The queue outlasted the count on that step. Both signals agree; the count cost nothing and added nothing there. |
+| `stopped off target after …` with `(n short)` or `(n over)` and a large K | The count stopped `n` documents from the keyspace after being given at least 30 s to continue. `n` is the figure a tolerance would be set from, and the direction names the mechanism (above). |
+| `stopped off target after 30.0s` with K at the floor (16 polls) | The count was flat from the first readings. A small poll count beside a large gap is what a stall during the re-insert looks like, not a converged index — check the queue reading in the same sentence, because an empty queue is what makes this exit possible and an empty queue has been wrong before. |
+| `the wait gave up …` with `index_sync_s: 900.0` | In fifteen minutes the count neither arrived nor stopped moving. That step's post-churn recall measures an index that was still indexing; it should not be published unqualified. |
+| `FT.INFO published no num_docs in this build` | The document half was satisfied unconditionally and the queue was the only guard — the state this wait was changed to get out of. `index_sync_s` then means "the queue was empty", nothing more. |
+
+**The same facts are on the record as fields, not only as prose.** Beside the
+note, each churn record carries `extra.index_sync_detail`: `observed_docs`,
+`expected_docs`, `queue_size`, `polls`, `docs_expectation`, `ended_by`,
+`binding_signal` and `timed_out`. So the table above is a query rather than a
+careful read — for instance, every churn step across a run whose index did not
+arrive exactly:
+
+```bash
+jq -r 'select(.phase=="churn" and .extra.index_sync_detail)
+       | select(.extra.index_sync_detail.observed_docs
+                != .extra.index_sync_detail.expected_docs)
+       | [.engine, .churn_fraction, .extra.index_sync_s,
+          .extra.index_sync_detail.observed_docs,
+          .extra.index_sync_detail.expected_docs,
+          .extra.index_sync_detail.polls,
+          .extra.index_sync_detail.ended_by] | @tsv' \
+   results/<run-id>/ops-*.jsonl
+```
+
+An engine whose driver publishes neither key carries neither, exactly as it
+carried no `index_sync_note` before.
 
 **The engines with a repair path are measured twice per churn step, and the
 second fraction starts from the post-maintenance state.** Each step writes a
