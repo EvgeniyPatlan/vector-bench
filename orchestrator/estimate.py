@@ -200,6 +200,20 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
         # here stops the printed caveat reading as "churn is fully bounded".
         "churn delete: ops.churn_fractions of the corpus removed per step, "
         "with no budget bounding the delete itself",
+        # PR 4 §4.2's repair path, and the item `_QUERY_TERMS` below records
+        # as owed-and-disclosed. Two costs, neither modellable: a THIRD
+        # ops.max_queries measurement per fraction on the engines that have a
+        # repair path (pgvector alone of the six), and the repair itself --
+        # `VACUUM (ANALYZE)` over a table a quarter of whose rows are
+        # tombstones, for which this repo has no figure at any corpus size,
+        # because no live engine has been run for PR 4. Named separately from
+        # the re-measurement line above because that line is about the two
+        # measurements every engine pays and this one is about the engines
+        # that repair.
+        "churn repair path: on an engine with one (pgvector of the six), "
+        "driver.maintain() per churn fraction plus a third ops.max_queries "
+        "measurement of the repaired index -- the repair has no measured "
+        "rate at any corpus size and nothing caps either",
     ),
     "concurrency": (
         "concurrency warm-up: 50 queries per client before each measured "
@@ -618,6 +632,93 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
     )
 
 
+def _churn_reader_baseline(plan: _QueryPlan) -> Optional[_QueryTerm]:
+    """The reader pool's baseline window, which is PR 4 §4.3's only new wall.
+
+    Exact, and one of only two terms here that is: the window is a fixed
+    `READER_BASELINE_WINDOW_S` per churn fraction whatever the engine manages,
+    for the same reason the concurrency windows are fixed -- a slow
+    configuration cannot stretch the run indefinitely and every measurement
+    covers an identical span.
+
+    The readers that run DURING the re-insert cost no wall clock of their own:
+    they start after the delete, stop when `_reinsert` returns, and the
+    re-insert was going to happen anyway (it is `_churn_reinsert` above). What
+    they can do is slow the writer down, which makes the re-insert's own
+    modelled duration optimistic -- but that duration already uses the LOAD
+    rate against a re-insert measured 350x slower on Valkey, so a read-load
+    correction on top of it would be a refinement of a figure whose error is
+    dominated by something else entirely. Said here rather than modelled.
+
+    None when the pool is off, which is `ops.churn_readers: 0` and is what
+    `dev` runs: no readers, no baseline window, no cost.
+    """
+    if "churn" not in plan.workloads or plan.rows <= 0:
+        return None
+    readers = _churn_readers_declared(plan.ops)
+    if readers <= 0:
+        return None
+    fractions = _churn_steps(plan)
+    if not fractions:
+        return None
+    seconds = fractions * CHURN_READER_BASELINE_WINDOW_S
+    return _QueryTerm(
+        name="churn reader baseline", typical_s=seconds, worst_s=seconds,
+        basis=(f"{fractions} churn fraction(s) x "
+               f"{CHURN_READER_BASELINE_WINDOW_S:.0f}s of {readers} reader(s) "
+               f"before each step's deletes, fixed by the profile not by the "
+               f"engine"),
+        bounded=True)
+
+
+#: Seconds of reader traffic before each churn step's deletes. Matches
+#: `harness.workloads.churn_readers.READER_BASELINE_WINDOW_S`, which is not
+#: importable here -- the orchestrator runs on the host and the harness runs in
+#: a container -- and is pinned against it by `tests/test_t4b_readers.py`.
+CHURN_READER_BASELINE_WINDOW_S = 30.0
+
+
+def _churn_readers_declared(ops: Dict[str, Any]) -> int:
+    """`ops.churn_readers` as the orchestrator will emit it.
+
+    Mirrors `ops_pass._churn_readers`, including its treatment of `null` as
+    "use the default" rather than as 0: a cleared key means the profile wants
+    whatever the harness default is, and reading it as "no readers" would make
+    the estimate omit a cost the run then pays.
+    """
+    value = ops.get("churn_readers", DEFAULT_CHURN_READERS_ESTIMATE)
+    return int(DEFAULT_CHURN_READERS_ESTIMATE if value is None else value)
+
+
+#: Matches `harness.workloads.churn_readers.DEFAULT_CHURN_READERS` and
+#: `ops_pass.DEFAULT_CHURN_READERS`; all three are pinned together by
+#: `tests/test_t4b_readers.py`.
+DEFAULT_CHURN_READERS_ESTIMATE = 4
+
+
+def _churn_steps(plan: _QueryPlan) -> int:
+    """How many churn fractions actually churn something.
+
+    The same walk `_churn_reinsert` does and `churn.run` does: fractions are
+    cumulative, so [0.10, 0.25] is two steps and [0.10, 0.10] is one. A
+    separate function because three terms now need the count and a fourth
+    reader of this file should not have to re-derive "cumulative" from the
+    loop.
+    """
+    fractions = [float(f) for f in plan.ops.get("churn_fractions", [0.1])]
+    steps = 0
+    churned_so_far = 0.0
+    for fraction in fractions:
+        step = max(0.0, fraction - churned_so_far)
+        if step <= 0:
+            continue
+        if int(round(step * plan.rows)) == 0:
+            continue
+        churned_so_far = fraction
+        steps += 1
+    return steps
+
+
 # The extension point. Each entry takes a `_QueryPlan` and returns a
 # `_QueryTerm` or None ("this profile does not run it"). Everything else --
 # both totals, the per-engine split, the printed block and /api/estimate --
@@ -630,14 +731,45 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
 #                                became a real ceiling and the column loop
 #                                doubled the points. The mode factor is still
 #                                outstanding and the docstring says why
-#   T4a  churn maintenance    -- gate on "churn" in plan.workloads
+#   T4a  churn maintenance    -- DONE, but as a DISCLOSURE rather than a
+#                                term, in _PER_QUERY_OPS_COSTS["churn"].
+#                                Written as a term first and reverted, with
+#                                the measurement: pgvector's repaired
+#                                re-measurement is ops.max_queries queries
+#                                per fraction that nothing caps, and
+#                                maintain() itself has no measured rate at
+#                                any corpus size, so the term had to report
+#                                bounded=False. Since
+#                                query_worst_case_is_a_ceiling is an all()
+#                                over the terms, that ONE term turned the
+#                                printed worst case from a ceiling into a
+#                                figure for main, smoke, quick, full and
+#                                tuned-complete at once -- and it did so
+#                                while charging a churn query loop, which is
+#                                the exact cost this file has always
+#                                disclosed rather than charged. The two
+#                                churn measurements that predate PR 4 are in
+#                                that same disclosure for that same reason.
+#                                A ceiling nobody measured is worse than a
+#                                named cost outside the figure.
+#   T4b  churn reader baseline -- DONE, in _churn_reader_baseline: 30 s per
+#                                fraction, exact and genuinely bounded --
+#                                fixed by the profile, not by the engine, the
+#                                way the concurrency windows are. The readers
+#                                during the re-insert add no wall of their
+#                                own
 #
 # Ordered as the profiles order `ops.workloads`, so the printed block reads in
-# the order the run pays the costs.
+# the order the run pays the costs. The churn reader baseline follows the
+# re-insert because the two belong to the same workload, not because it runs
+# later -- it is measured before each step's deletes, and the deletes
+# themselves are not a term here. (An earlier revision said "the two churn
+# terms"; the maintenance one came back as a disclosure, so there is one.)
 _QUERY_TERMS: Tuple[Callable[[_QueryPlan], Optional[_QueryTerm]], ...] = (
     _concurrency_windows,
     _filtered_search,
     _churn_reinsert,
+    _churn_reader_baseline,
 )
 
 

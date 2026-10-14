@@ -219,11 +219,14 @@ class TestTotalHoursStillMeansIngest:
         would be the wrong thing to print about it.
 
         The worst case grew in T3c -- the filtered budget turned a term with
-        no ceiling into one with a real one -- and `long_run` did not move,
-        which is the property being pinned."""
+        no ceiling into one with a real one -- and again in T4b, by the churn
+        reader baseline: 30 s per churn fraction, and pgvector pays it twice
+        per (dataset, pass) because its two build modes are two ops units.
+        `long_run` did not move either time, which is the property being
+        pinned."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.68
-        assert e["worst_case_total_hours"] == 7.28
+        assert e["worst_case_total_hours"] == 7.35
         assert e["long_run"] is False
 
 
@@ -840,28 +843,47 @@ class TestACapIsPrintedAsACapNotADuration:
 
 class TestTheWholeQueryEstimateForMain:
     """The aggregate, so a reader can see the number the convention now refers
-    to and check it against the parts: 2.10 h of concurrency windows and 4.77 h
-    of modelled churn re-insert, against a 14.00 h churn ceiling and a 7.00 h
-    filtered one.
+    to and check it against the parts: 2.10 h of concurrency windows, 4.77 h
+    of modelled churn re-insert and 0.23 h of churn reader baseline, against a
+    14.00 h churn ceiling and a 7.00 h filtered one.
 
     T3c moved the worst case and left the typical figure alone, which is what
     a budget does: 6 filtered points per ops unit x 300 s is a ceiling nothing
     had before, and no rate exists to turn any of it into a duration. So
-    `query_hours` is unchanged at 6.87 and `query_hours_worst` went 16.10 ->
-    23.10."""
+    `query_hours` was unchanged at 6.87 and `query_hours_worst` went 16.10 ->
+    23.10.
+
+    T4b moved BOTH by the same 0.23 h, which is what an exact term does:
+    `ops.churn_readers` readers are measured for 30 s before each churn step's
+    deletes, main has 2 churn fractions, and the window is fixed by the
+    profile rather than by the engine -- so it is a duration and a ceiling at
+    once, like the concurrency windows. 7.10 and 23.33. The readers that run
+    DURING the re-insert add no term: they stop when `_reinsert` returns, and
+    that is `churn re-insert` above.
+
+    The repaired re-measurement PR 4 §4.2 added is deliberately NOT a term
+    here -- see `_QUERY_TERMS` for the measurement that reverted it, and
+    `test_the_unmodelled_costs_are_named_one_by_one` for where it is named
+    instead."""
 
     def test_the_parts_and_the_totals(self):
         e = est("main")
         assert [t["name"] for t in e["query_terms"]] == [
-            "concurrency windows", "filtered search", "churn re-insert"]
+            "concurrency windows", "filtered search", "churn re-insert",
+            "churn reader baseline"]
         assert term(e, "churn re-insert")["typical_hours"] == 4.77
         assert term(e, "churn re-insert")["worst_hours"] == 14.00
         assert term(e, "filtered search")["typical_hours"] == 0.0
         assert term(e, "filtered search")["worst_hours"] == 7.00
-        assert e["query_hours"] == 6.87
-        assert e["query_hours_worst"] == 23.10
-        assert e["typical_total_hours"] == 76.64
-        assert e["worst_case_total_hours"] == 92.87
+        # 2 fractions x 30 s x 14 ops units across main's six engines and two
+        # datasets = 840 s = 0.233 h, and it is both the typical figure and
+        # the ceiling because the window is a fixed span.
+        assert term(e, "churn reader baseline")["typical_hours"] == 0.23
+        assert term(e, "churn reader baseline")["worst_hours"] == 0.23
+        assert e["query_hours"] == 7.10
+        assert e["query_hours_worst"] == 23.33
+        assert e["typical_total_hours"] == 76.87
+        assert e["worst_case_total_hours"] == 93.10
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -873,8 +895,8 @@ class TestTheWholeQueryEstimateForMain:
     def test_the_per_engine_split_mirrors_the_ingest_one(self):
         e = est("main")
         assert e["query_per_engine_hours"] == {
-            "mariadb": 1.40, "alisql": 2.30, "pgvector": 0.71,
-            "mariadb123": 1.85, "mongodb": 0.30, "valkey": 0.30,
+            "mariadb": 1.43, "alisql": 2.33, "pgvector": 0.78,
+            "mariadb123": 1.89, "mongodb": 0.34, "valkey": 0.34,
         }
 
     def test_ops_disabled_means_no_ops_terms(self):
@@ -911,6 +933,28 @@ class TestAMissingQueryRateIsReportedNotInvented:
         assert any("ef_search" in n for n in names)          # the recall sweep
         assert any("churn" in n for n in names)
         assert any("warm-up" in n for n in names)
+
+    def test_the_churn_repair_path_is_disclosed_and_not_charged(self):
+        """PR 4 §4.2's repair path, in one list and never both.
+
+        The same rule `test_the_filtered_query_loop_is_charged_and_not_also_
+        disclaimed` enforces in the other direction: output that charges for a
+        cost and calls it unmodelled in the same breath tells a reader
+        nothing. Anchored on the entry's own prefix rather than on the
+        substring "maintain", which `churn re-measurement` could grow at any
+        time without anyone noticing this assertion had stopped binding.
+        """
+        e = est("main")
+        assert "churn maintenance" not in [t["name"] for t in e["query_terms"]]
+        repair = [n for n in e["query_costs_not_modelled"]
+                  if n.startswith("churn repair path:")]
+        assert len(repair) == 1, repair
+        assert "driver.maintain() per churn fraction" in repair[0]
+        assert "no measured rate" in repair[0]
+        # The reader baseline IS charged, so it must not also be disclaimed.
+        assert "churn reader baseline" in [t["name"] for t in e["query_terms"]]
+        assert not [n for n in e["query_costs_not_modelled"]
+                    if "reader" in n], e["query_costs_not_modelled"]
 
     def test_the_filtered_query_loop_is_charged_and_not_also_disclaimed(self):
         """The query loop may appear in one list or the other, never both:
@@ -963,10 +1007,24 @@ class TestAMissingQueryRateIsReportedNotInvented:
 
 class TestTheExtensionPoint:
     """T1d (concurrency repeats), T2a (the ef-calibration sweep), T3c (the
-    filtered budget) and T4a (churn maintenance) each owe this function one
-    named term. Adding one is: write a function taking a `_QueryPlan` and
-    returning a `_QueryTerm` or None, and append it to `_QUERY_TERMS`. Nothing
-    else may need to change, and this test is what says so."""
+    filtered budget) and T4b (the churn reader baseline) each owe this
+    function one named term. Adding one is: write a function taking a
+    `_QueryPlan` and returning a `_QueryTerm` or None, and append it to
+    `_QUERY_TERMS`. Nothing else may need to change, and this test is what
+    says so.
+
+    T4a's churn maintenance was the fifth, and it is the one that came back as
+    a disclosure instead. It was written as a term and reverted on a
+    measurement: the repaired re-measurement is a churn query loop that
+    nothing caps, so the term had to report `bounded=False`, and
+    `query_worst_case_is_a_ceiling` is an `all()` over the terms -- so that
+    one term turned the printed worst case from a ceiling into a figure for
+    main, smoke, quick, full and tuned-complete at once. The two churn
+    measurements that predate PR 4 are disclosed rather than charged for
+    exactly that reason, and this one now joins them. A ceiling nobody
+    measured is worse than a named cost outside the figure, and
+    `test_the_churn_repair_path_is_disclosed_and_not_charged` below is what
+    keeps it in one list and not both."""
 
     def test_an_added_term_reaches_every_total_and_the_print(self, monkeypatch):
         before = est("main")
@@ -986,7 +1044,7 @@ class TestTheExtensionPoint:
     def test_a_term_may_decline_this_profile(self, monkeypatch):
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
                             tuple(est_mod._QUERY_TERMS) + (lambda plan: None,))
-        assert est("main")["query_hours"] == 6.87
+        assert est("main")["query_hours"] == 7.10
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 7 ops units per dataset x 2 datasets = 14 per pass."""
@@ -1098,7 +1156,7 @@ class TestThePrintedOutput:
         `~0.0 h typical` alone would read as free. It is only not misleading
         because the worst case sits on the same line."""
         out = printed("main")
-        assert "filtered search      ~0.0 h typical, ~7.0 h worst case" in out
+        assert "filtered search        ~0.0 h typical, ~7.0 h worst case" in out
         # Anchored on the `=`, because "3,000 queries per ops unit" is a
         # substring of "13,000 queries per ops unit" -- the shape that has
         # cost this series four tests.
@@ -1107,8 +1165,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~92.9 h worst case" in out
-        assert "~76.6 h typical" in out
+        assert "~93.1 h worst case" in out
+        assert "~76.9 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run

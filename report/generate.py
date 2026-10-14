@@ -558,6 +558,20 @@ def summarize(records: List[Dict[str, Any]],
                        s["m"] or 0,
                        str(s["build_mode"]), str(s["storage_engine"])))
 
+    # PR 4 §4.3: one row per during-writes record, with the p99-under-writes
+    # ratio recomputed from that record's own two percentiles. Built in
+    # `report/churn_state.py` rather than in `render.py` for the reason
+    # `filter_strategies` above is: the grouping that keeps two ops units
+    # apart is the correctness property, and it belongs in one place that a
+    # test can mutate.
+    #
+    # Imported in the function body, not at module scope: `churn_state` reads
+    # `OPS_UNIT_FIELDS` and `ops_unit` from here, so a top-level import either
+    # way round is a cycle. The same shape `filtered_chart_entries` uses for
+    # `report.charts`.
+    from report.churn_state import during_writes_rows
+    summary["churn_during_writes"] = during_writes_rows(records)
+
     # Build-cost and concurrency headlines.
     for phase, key in _PHASE_GROUPS:
         summary[key] = [r for r in records if r.get("phase") == phase]

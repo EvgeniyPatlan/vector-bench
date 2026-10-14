@@ -363,6 +363,49 @@ reads the `"before"` records across fractions and gets exactly it. Under the
 alternative, the repaired state would exist only at the end and pgvector's
 repair cost could not be attributed to a fraction at all.
 
+The rendered report now names which of the two states each row describes. It
+did not until PR 4 §4.3: nothing in `report/` read `extra.maintenance_state`,
+so the churn table printed two rows per fraction whose engine, dataset,
+storage and churn columns were identical and whose recall and index size were
+not, the charts drew a line through both, and the retention ratio returned
+each fraction's pair in sorted order with nothing to say which was which. The
+table's `Repair` column, a separate series per state on the degradation chart,
+and the exclusion of the repaired measurement from the retention ratio are
+that fix. The retention ratio is against the *pre-churn* baseline — a state
+before any maintenance — so a repaired measurement over it answers a
+different question from the one its axis asks, and `charts.churn` is where
+that comparison belongs.
+
+**Reads are measured while the writer re-inserts.** `ops.churn_readers`
+readers (4 by default) query the index, unfiltered and at the calibrated
+`ef_search`, for the whole of each step's re-insertion. The same pool is first
+measured for 30 s before that step's deletes, and the headline figure is the
+ratio of the two p99 latencies: what a read costs while the engine is taking
+writes. A churn number measured with nothing else touching the index describes
+a maintenance window rather than a database under load, and the two can differ
+by more than the engines differ from each other.
+
+Three things about that ratio, because a ratio of two noisy quantities is the
+shape this report has published wrong twice before:
+
+- **Both percentiles come from one pool.** The client count, the query pool,
+  k, the `ef_search` and the ops unit — M, build mode, storage engine,
+  resource pass — are identical across the two windows, the harness refuses to
+  divide them otherwise, and both land in a single record so nothing
+  downstream has to pair two records. The table prints both percentiles beside
+  the ratio so a reader can do the division.
+- **Readers compute no recall.** The corpus is mid-change while they run, so
+  no ground truth describes it; `recall_at_k` is null on those records rather
+  than zero.
+- **It is a ratio of wall clocks, and should be read as a direction and a
+  magnitude.** Treat its decimals as the box's rather than the engine's.
+
+`extra.reinsert_rows_per_s` on a churn step record is therefore now a write
+rate measured *with* those readers running, and `extra.readers` beside it says
+how many. `ops.churn_readers: 0` measures the write-only rate, which is the
+quantity this report showed before PR 4 and is not the same quantity;
+`config/profiles/dev.yml` runs that pass.
+
 ## 3. Fairness
 
 Two passes are run. Both are reported; neither alone is the answer.

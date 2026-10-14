@@ -961,12 +961,45 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
 def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
           stem: str) -> Optional[Dict[str, str]]:
-    """Recall and QPS after successive delete/re-insert cycles."""
-    plotted_records = [r for r in records if r.get("dataset") == dataset
+    """Recall and QPS after successive delete/re-insert cycles.
+
+    **One series per (configuration, maintenance state), which is a fix.** PR 4
+    §4.2 writes two records per churn fraction -- the index as the churn left
+    it and the index after the engine's repair path ran -- and this chart
+    grouped by configuration alone, so both landed at the same x in one
+    series. Measured on the synthetic driver, 9 of 9 runs of one
+    configuration: x = [0.0, 0.1, 0.1, 0.25, 0.25], one series, so each
+    fraction was drawn as a vertical segment rather than as two curves. A line
+    through both is a line no configuration ever produced.
+
+    The pre-churn baseline record names no state, so it joins BOTH series: it
+    is the x=0 point each of them is measured against, and giving it to one
+    would leave the other starting at its first churn fraction.
+
+    `churn_measurements` excludes the reader-pool records §4.3 writes. Their
+    `qps` is aggregate throughput over `ops.churn_readers` clients against a
+    corpus that is mid-change, and they carry no recall at all; on this chart
+    they would be a third point per fraction, several times higher on the QPS
+    panel and absent from the recall one.
+    """
+    from report.churn_state import churn_measurements, maintenance_state
+
+    plotted_records = [r for r in churn_measurements(records)
+                       if r.get("dataset") == dataset
                        and r.get("churn_fraction") is not None]
     if not plotted_records:
         return None
-    by_series, labels, storages, degrees = _grouped(plotted_records)
+    _, labels, storages, degrees = _grouped(plotted_records)
+
+    # Keyed `series_key(r) + (state,)` and sliced back with
+    # `SERIES_KEY_WIDTH`, which is the idiom `churn_impact` below already uses
+    # to widen this key by the resource pass and the build mode.
+    states = {maintenance_state(r) for r in plotted_records} - {None}
+    by_series: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for r in plotted_records:
+        state = maintenance_state(r)
+        for member in (sorted(states) if state is None else [state]):
+            by_series.setdefault(series_key(r) + (member,), []).append(r)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     fig.patch.set_alpha(0.0)
@@ -984,10 +1017,17 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         style = series_style(rows[0], storages.get(key[0]), degrees.get(key[0]))
         rows = sorted(rows, key=lambda r: r["churn_fraction"])
         fractions = [r["churn_fraction"] for r in rows]
+        # The state is named only when the figure actually holds more than one
+        # of them, the way `churn_impact` names the pass and the build mode:
+        # on a run of engines with no repair path every entry would otherwise
+        # read "... / before", which is a distinction the run never made.
+        label = labels[key[:SERIES_KEY_WIDTH]]
+        if len(states) > 1 and key[SERIES_KEY_WIDTH]:
+            label += f" / {key[SERIES_KEY_WIDTH]} repair"
         axes[0].plot(fractions, [r.get("recall_at_k") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6,
-                     label=labels[key])
+                     label=label)
         axes[1].plot(fractions, [r.get("qps") for r in rows],
                      color=style["color"], marker=style["marker"],
                      linestyle=style["linestyle"], linewidth=1.8, markersize=6)
@@ -1361,11 +1401,48 @@ def churn_retention(records: List[Dict[str, Any]], dataset: str
     the first and both post-churn points were divided by it -- turning a real
     3% MyISAM loss and an 84% InnoDB loss into two numbers that were each
     wrong by the ratio between the two baselines.
+
+    **The repaired measurement is excluded, and that is the fix for a second
+    instance of the same defect.** PR 4 §4.2 writes two records per churn
+    fraction -- before and after the engine's repair path -- and this function
+    put both in one series' point list. Since it returns `sorted(points)`, the
+    pair arrived duplicated at every x AND indistinguishable by position:
+    measured on the synthetic driver, x = [0.1, 0.1, 0.25, 0.25] in 9 of 9
+    runs of one configuration.
+
+    Excluded rather than split into two series, and the reason is the
+    denominator rather than the plumbing. This ratio is against the PRE-CHURN
+    baseline, a state before any maintenance ran, so a repaired measurement
+    over it answers "what did churn plus the repair cost?" -- a different
+    question from the one the axis asks, and one that cannot share an axis
+    labelled "QPS as a fraction of pre-churn" without saying which of the two
+    each line is. The repaired state is not lost: `charts.churn` draws it as
+    its own series and `render._churn_table` gives it its own row with the
+    `Repair` column naming what ran.
+
+    This does NOT claim to fix the ratios above 1.0 that this chart can
+    produce, and no mechanism is asserted for them. On the synthetic driver,
+    which runs no vacuum at all, 2 of 9 runs had BOTH points at a fraction
+    above 1.0 -- so the un-maintained measurement outran the baseline too, and
+    "a vacuum makes it faster" is refuted as the explanation there. It is
+    jitter in a 50-query QPS figure whose spread was 6,028 to 16,811 across
+    those runs. Whether a real engine's post-repair throughput can beat its
+    own pre-churn baseline is plausible and unmeasured.
+
+    The reader-pool records §4.3 writes are excluded by `churn_measurements`
+    for a harder reason: their `qps` is aggregate throughput over
+    `ops.churn_readers` clients, so dividing it by a single-client baseline
+    publishes a retention of roughly the reader count on an axis where 1.0
+    means "no degradation".
     """
+    from report.churn_state import churn_measurements, maintenance_state
+
     baseline: Dict[Tuple[Any, ...], float] = {}
     after: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
-    for r in records:
-        if r.get("phase") != "churn" or r.get("dataset") != dataset or not r.get("qps"):
+    for r in churn_measurements(records):
+        if r.get("dataset") != dataset or not r.get("qps"):
+            continue
+        if maintenance_state(r) == "after":
             continue
         key = series_key(r) + (r.get("resource_pass"), r.get("build_mode"))
         if (r.get("churn_fraction") or 0) == 0:
@@ -1393,8 +1470,15 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                         "Cumulative fraction of rows deleted and re-inserted",
                         "QPS as a fraction of pre-churn  (higher is better ↑)",
                         figsize=(9, 5.2))
-    churn_records = [r for r in records if r.get("phase") == "churn"
-                     and r.get("dataset") == dataset and r.get("qps")]
+    # The same record set `churn_retention` derived `retained` from, so the
+    # legend text and the `next(...)` style lookup below describe the series
+    # that were actually plotted. `series_labels` compares records within an
+    # engine to find what varies, so feeding it a set the ratio excluded can
+    # name an axis no plotted line differs on.
+    from report.churn_state import churn_measurements
+
+    churn_records = [r for r in churn_measurements(records)
+                     if r.get("dataset") == dataset and r.get("qps")]
     labels = series_labels(churn_records)
     storages: Dict[str, List[Optional[str]]] = {}
     for key in {series_key(r) for r in churn_records}:

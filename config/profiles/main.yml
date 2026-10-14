@@ -110,4 +110,17 @@ ops:
   # estimate's filtered term has to gain the factor with it.
   filtered_budget_s: 300
   churn_fractions: [0.10, 0.25]
+  # PR 4 §4.3. Readers querying the index while the churn writer re-inserts,
+  # so the churn section reports what a read costs under writes rather than
+  # what it costs in a maintenance window with nothing else touching the
+  # index. Stated rather than left to the harness default because this is the
+  # headline profile and the figure it publishes -- p99 under writes over
+  # baseline p99 -- is only interpretable beside the number of readers that
+  # produced it.
+  #
+  # The cost is a 30 s baseline reader window before each step's deletes, per
+  # churn fraction per ops unit; the readers themselves run concurrently with
+  # a re-insert that was going to happen anyway and add no wall clock of their
+  # own. `ops.churn_readers: 0` is the write-only pass.
+  churn_readers: 4
   pgvector_iterative_scan: [off, relaxed_order]

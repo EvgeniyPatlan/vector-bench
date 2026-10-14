@@ -57,3 +57,16 @@ ops:
   # mode is a flagged point and not a missing one.
   filtered_budget_s: 60
   churn_fractions: [0.10]
+  # Off here, and this is the §4.3 item 7 pass rather than an omission: a
+  # readers=0 churn step measures the write-only re-insert rate, which is the
+  # quantity the report showed before PR 4 and is not the same quantity as a
+  # rate measured against concurrent readers. Keeping one shipped profile on
+  # it means that rate stays measurable instead of being a setting nobody
+  # runs.
+  #
+  # It also keeps dev what dev is for. The reader baseline is a fixed 30 s per
+  # churn fraction and dev churns one fraction, so it is exactly 30 s per
+  # engine for all six -- half of a cycle CLAUDE.md documents as ~1 min per
+  # engine. `smoke` runs the pool on the default 4, so the path is exercised
+  # by the profile that gates a long run.
+  churn_readers: 0
