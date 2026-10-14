@@ -695,7 +695,7 @@ def _driver_classes() -> Dict[str, Any]:
     config change rather than a code change.
     """
     from .mongo import MongoDriver
-    from .mysql_family import AliSQLDriver, MariaDBDriver
+    from .mysql_family import AliSQLDriver, MariaDBDriver, PerconaDriver
     from .valkey import ValkeyDriver
 
     return {
@@ -704,6 +704,12 @@ def _driver_classes() -> Dict[str, Any]:
         "PostgresDriver": PostgresDriver,
         "MongoDriver": MongoDriver,
         "ValkeyDriver": ValkeyDriver,
+        # A new architecture only because four of its differences are
+        # behaviour rather than dialect values -- `capabilities()` varies with
+        # the build mode, `effective_ef` clamps, `maintain()` runs a real
+        # repair path, and the index leaves the table definition in bulk-build
+        # mode. Everything else about it is a `MySQLDialect`.
+        "PerconaDriver": PerconaDriver,
     }
 
 
@@ -727,6 +733,7 @@ def _driver_table() -> Dict[str, Any]:
         "pgvector": classes["PostgresDriver"],
         "mongodb": classes["MongoDriver"],
         "valkey": classes["ValkeyDriver"],
+        "percona": classes["PerconaDriver"],
     }
 
 

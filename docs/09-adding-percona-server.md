@@ -234,7 +234,7 @@ of 4 (`vector-common/vector_constants.h:96-102`). On a little-endian host the
 bytes are then stored verbatim; the `WORDS_BIGENDIAN` branch at `:7117-7128`
 byte-swaps, so the wire format is **little-endian float32** either way.
 
-So **`harness/drivers/mysql_family.py:46`'s `to_binary_f32()` produces exactly
+So **`harness/drivers/mysql_family.py:58`'s `to_binary_f32()` produces exactly
 the right bytes**, and `overlay/.../vb_mysql.py:51`'s copy does too. Three
 caveats, in descending order of how likely they are to bite:
 
@@ -293,9 +293,15 @@ tables lacking a BIGINT UNSIGNED single column primary key'
 and `…/r/pk_combinations.result:16` records the same message for a table with no
 primary key at all, with `:4-5` calling it a "current temporary restriction".
 
-**Both of this repo's table definitions declare `id INT PRIMARY KEY`** —
-`overlay/.../vb_mysql.py:96` and `harness/drivers/mysql_family.py:145`. Percona
-refuses both. The Percona DDL must say `id BIGINT UNSIGNED PRIMARY KEY`.
+**Both of this repo's table definitions declared `id INT PRIMARY KEY`** —
+`overlay/.../vb_mysql.py:96`, which still does, and the ops driver, which no
+longer does. Percona refuses that column outright, so the Percona DDL must say
+`id BIGINT UNSIGNED PRIMARY KEY`, and §4.1's answer was to make the type a
+`Dialect` field: `harness/drivers/mysql_family.py:234` now reads
+`id {self.dialect.pk_type} PRIMARY KEY` with `pk_type` defaulting to `"INT"`,
+so MariaDB and AliSQL emit exactly what they emitted before. The ann overlay
+needs no such field because `percona/module.py` overrides `create_table`
+outright.
 
 That is a real, if small, asymmetry the report should state rather than bury:
 Percona's clustered index and its aux table's `base_pk` are both 4 bytes per row
@@ -905,6 +911,26 @@ Then:
   hunting an engine bug that is not there. No MTR test could catch this, because
   MTR output is always TRADITIONAL; the suite spells the keyword out anyway at
   `…/r/optimizer.result:488`. `percona/module.py` already does this.
+
+  **The risk this creates for the OTHER two engines is settled, and it was a
+  real one rather than a theoretical one.** `explain_uses_vector_index` is
+  shared: hardening it sends `EXPLAIN FORMAT=TRADITIONAL` to MariaDB and AliSQL
+  as well, and a server that rejected the keyword would have turned the ops
+  plan check into a **permanent false negative on three engines to protect
+  one** — every configuration reported as not using its index, the whole
+  Validity section full, and the one engine the change was for the only one
+  working. Established by reading the three parsers rather than by assuming
+  MySQL-family compatibility: MariaDB 11.8.8 `sql/sql_yacc.yy:14865-14874`,
+  MariaDB 12.3.2 `:15297-15308` and AliSQL 8.0.44 `:14163-14171` all accept
+  `FORMAT = TRADITIONAL` in the `describe` rule. Recorded here because "it is
+  the default, so the keyword must be accepted" is the kind of inference this
+  document is not allowed to make.
+
+  The ann overlay's shared `_verify_plan` is deliberately NOT hardened, and
+  that is a different judgement rather than an inconsistency: its check is
+  name-only, and an index name appears in `TREE` and `JSON` output too, so the
+  keyword would buy it nothing. Only a check that reads the `type` column
+  needs the format pinned.
 - `capabilities()` (`:438-439`) currently returns a constant
   `{"incremental_index": True, "ef_construction_tunable": False}`. For Percona
   both values change, and `incremental_index` must depend on
@@ -918,7 +944,7 @@ Then:
 ### 4.2 `harness/drivers/postgres.py` — `_driver_classes()`
 
 `_driver_classes()` at **`postgres.py:689`** is the driver-class-name registry.
-Add one entry, `"PerconaDriver": PerconaDriver`, to the dict at `:701-707` and
+Add one entry, `"PerconaDriver": PerconaDriver`, to the dict at `:701-713` and
 import it from `.mysql_family` at `:698`. Its docstring is explicit that this is
 "one entry per architecture, not per engine" — Percona is a new architecture
 only because of the dialect gaps in §4.1; once those are `Dialect` fields it is
@@ -1029,39 +1055,60 @@ right behaviour and worth not "fixing" by loosening it.
 
 ### 4.5 `webui/static/fields.js` — colour and label
 
-Two literal maps at the top of the file, each listing all six engines:
+Two literal maps at the top of the file, each listing every engine:
 
-- `:3-6` — `ENGINE_COLOR`, declared at `:3` with its entries on `:4-5`. Add `percona: "#ff7f0e",`.
-- `:7-11` — `ENGINE_LABEL`, declared at `:7` with its entries on `:8-10`. Add `percona: "Percona Server (InnoDB HNSW)",`.
+- `ENGINE_COLOR` gained `percona: "#ff7f0e",`.
+- `ENGINE_LABEL` gained `percona: "Percona Server (InnoDB HNSW)",`.
+
+(Written without line numbers on purpose. These two maps grow by a line per
+engine, so a citation here rots on every addition while pointing at nothing a
+reader could not find by name in a twelve-line file.)
 
 Both must match `config/engines/percona.yml`'s `chart.color` and `label`
 character for character. They are a separate copy of the same facts — the
 front end is static and cannot read the engine registry — so this is the one
 place in the addition where two files have to be kept in step by hand.
 
-`:149` is a chart hint reading "What the index costs to make. pgvector
-bulk-builds; MHNSW and VIDX build on every INSERT." That sentence becomes
-incomplete with Percona in the chart (§2.5) and should gain it.
+The index-build chart's hint read "What the index costs to make. pgvector
+bulk-builds; MHNSW and VIDX build on every INSERT." That sentence is
+incomplete with Percona in the chart (§2.5) and now names the third
+behaviour. Scoped to the ops path, which is the only path where Percona's
+build mode is a real axis — see §4.10.
 
 ### 4.6 Profiles
 
 - `config/profiles/smoke.yml` — the gate before every long run. It names no
-  engines, so Percona joins automatically once the registry knows it; the only
-  edit needed is to the `description`, which says "all six engines". Its
+  engines, so Percona joins automatically once the registry knows it; the
+  `description` said "all six engines" and now says seven. Its
   20,000-row ops subset and 60,000-row ann set both fit the default
   `innodb_hnsw_max_memory` (§3), so **the smoke run will not exercise the memory
   ceiling** — that has to be checked deliberately.
 - `config/profiles/main.yml` and `full.yml` — no engine list to edit, but §3
   says the memory setting must be right before either is started, and §2.7 says
   the churn phase now costs a full graph rebuild per fraction for this engine.
-- A new Percona-only profile is the natural home for the two things only this
-  engine can show: an `ef_construction` sweep, and `build_mode: [post,
-  incremental]` as a within-engine comparison. Neither belongs in `main`,
-  because neither has a counterpart on MariaDB or AliSQL.
+- `config/profiles/percona.yml` is the new Percona-only profile and is the home
+  for the two things only this engine can show: an `ef_construction` sweep, and
+  `build_mode: [post, incremental]` as a within-engine comparison. Neither
+  belongs in `main`, because neither has a counterpart on MariaDB or AliSQL.
+  **The build-mode half runs on the ops path only**, and the ann half could not
+  be delivered — see §4.10.
 - `docs/07-planning-a-run.md` carries the cost model (`_INGEST_ROWS_PER_S` in
   `orchestrator/estimate.py`). Percona's ingest rate is unmeasured, so it has no
-  entry, and an estimate for it would be a guess presented as a plan. Leave it
+  entry, and an estimate for it would be a guess presented as a plan. It stays
   out until the smoke run supplies one.
+
+  **Leaving it out was not enough on its own, and that was a defect rather than
+  a gap.** `_effective_rate` ended in `_INGEST_ROWS_PER_S.get(engine, 300)`, so
+  an engine with no entry was silently modelled at 300 rows/s — 2x the measured
+  MariaDB figure and 5.5x the measured AliSQL one, for an engine that builds its
+  graph inside every INSERT. On `main` that put 9.10 h of invented ingest into a
+  published total (102.16 h against the honest 93.06 h) with nothing printed to
+  say the number was a guess, and it contradicted the comment four lines above
+  the table it read from: "an estimate that is optimistic by 3x is worse than
+  none". The fallback now returns `None`, and `estimate_load_hours` reports
+  `engines_without_ingest_rate` on the same terms as the query half's
+  `engines_without_query_rate` — named, excluded from the total, and said so in
+  the printed block.
 
 ### 4.7 Already written by this task
 
@@ -1090,7 +1137,7 @@ its `case` ends at `:141` with `*) die "engine '$engine' has no known
 build-arg (alias_of=$base)"`, so a missing entry is an immediate, clear failure
 rather than a silent one. The entry follows the convention at `:129-131` —
 `percona) bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;` — and
-`docker/percona/Dockerfile:113` declares `ARG PERCONA_TAG` to receive it.
+`docker/percona/Dockerfile:164` declares `ARG PERCONA_TAG` to receive it.
 `prepare-sources.sh` must ship a `git archive` of the pinned SHA (`:98` is the
 pattern) and must *not* try to carry submodules.
 
@@ -1099,27 +1146,33 @@ pattern) and must *not* try to carry submodules.
 There are two independent `-march` readers, in two different containers, and
 only one of them is reachable from the overlay module.
 
-**The ann path.** `VBMySQLBase._image_march()` (`overlay/.../vb_mysql.py:537-545`)
-reads a fixed pair of paths, `/opt/mariadb/.march` and `/opt/alisql/.march`, and
-returns `"unknown"` otherwise. `percona/module.py` overrides it to try
-`/opt/percona/.march` first and then fall back, so **the ann path is already
-correct** in the file this task wrote.
+**The ann path.** `VBMySQLBase._image_march()` (`overlay/.../vb_mysql.py:538-564`)
+read a fixed pair of paths, `/opt/mariadb/.march` and `/opt/alisql/.march`, and
+returned `"unknown"` otherwise. `percona/module.py` overrode it to try
+`/opt/percona/.march` first and then fall back, so **the ann path was already
+correct** in the file the design task wrote.
 
-**The ops path, which the override cannot reach.** `harness/main.py:209-211` has
+**The ops path, which the override cannot reach.** `harness/main.py:209-227` has
 its own:
 
 ```python
-209  def _detect_march() -> str:
-210      for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
-211                   "/opt/pgvector-artifacts/.march"):
+227      for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
+228                   "/opt/pgvector-artifacts/.march",
+229                   "/opt/percona/.march"):
 ```
 
-consumed at `:264` as `march=args.march or _detect_march()`. That runs in the
+consumed at `:283` as `march=args.march or _detect_march()`. That runs in the
 **harness container**, which mounts `harness/` and not `overlay/`, so no
 override in an ann-benchmarks module can affect it. `orchestrator/ops_pass.py`
 contains the string `march` zero times, so nothing passes `--march` in and the
 `or` falls through to the detector. **Percona's ops records would therefore
-carry `march: "unknown"` too.** Add `"/opt/percona/.march"` to that tuple.
+have carried `march: "unknown"` too**, with its ann records looking fine —
+half a run measured and nothing saying which half.
+
+**Both tuples now carry the path and the override is gone**, which is what the
+last paragraph of this section asks for. `percona/module.py` keeps a comment
+where the override was, naming the second reader, so that the absence reads as
+a decision rather than as an omission someone should repair.
 
 Either blank field is the failure shape this project has already paid for once:
 a probe that hard-codes a fixed set and whose figure reaches a published
@@ -1185,7 +1238,7 @@ and the previous revision of this document never mentioned it.
 `render_config()` (from `:112`) dispatches on engine name and ends:
 
 ```python
-216        raise ValueError(f"unknown engine: {engine}")
+288        raise ValueError(f"unknown engine: {engine}")
 ```
 
 The branches are `:137` (`if engine in MARIADB_ENGINES + ("alisql",)`), `:154`
@@ -1206,6 +1259,50 @@ things §4.6 proposes actually need:
 So §4.6's Percona-only profile is not a profile edit alone; it is a profile
 edit plus a `render_config` branch. The failure without it is loud — a
 `ValueError` at render time, before anything is built — which is the good kind.
+
+#### The `build_modes` half of that could not be delivered, and this is why
+
+**`ann.percona_build_modes` is REFUSED by the new branch, not honoured.** This
+is the one item in §4 that the follow-on task stopped on rather than
+implemented, and the reason is a file §4.7 marks **done**.
+
+`pgvector/module.py` and `valkey/module.py` each read `build_mode` out of
+`method_param`, validate it against `("post", "incremental")`, branch on it in
+`fit`, and report it back in `get_additional`. **`algorithms/percona/module.py`
+contains the string zero times, and so does the `VBMySQLBase` it inherits
+from.** Emitting the key anyway would produce two run groups, `post_build` and
+`incremental_build`, differing only in a `method_param` nothing reads — two
+*identical* recall curves under two labels, with no field in the record to say
+they were the same measurement. That is the shape this repo guards against
+everywhere else, so `render_config` raises with a message naming the missing
+support instead.
+
+Three consequences worth carrying:
+
+- **The ops half is real and is where the comparison comes from.**
+  `PerconaDriver.capabilities()` derives `incremental_index` from
+  `IndexSpec.build_mode`, and `create_schema`/`create_index` split the index
+  out of the table definition in `post` mode, so `build_wall_s` times a genuine
+  bulk build. `config/profiles/percona.yml` runs both modes through the ops
+  path. Since `build_wall_s` and `index_bytes` are ops-only fields anyway, the
+  measurement §2.5 argues for is available — it is the *recall* curve per build
+  mode that is not.
+- **§4 never mentions `orchestrator/cli.py`, and it had to change.** The ops
+  path hard-coded `build_modes = ["post"] if engine != "pgvector" else …`, so
+  `PerconaDriver`'s build-mode support was unreachable from a profile until
+  that lookup became per-engine. `estimate._ops_units` carries the same list
+  and had to match, or the printed estimate is short by a whole ops unit of
+  every query term. Both now read a shared two-engine mapping.
+- **It makes Percona a fourth engine that cannot supply the build-mode
+  cross-check.** `report/crosscheck.py:build_mode_axis_engines` drops the axis
+  for any engine whose recall path is silent about it, which was MariaDB,
+  MariaDB 12.3 and AliSQL — engines for which a build mode is *meaningless*.
+  Percona joins them for a different reason: the axis is real for it and the
+  recall path just does not say so.
+
+Giving the overlay module a `build_mode` the way pgvector's and valkey's have
+one is a small, well-precedented change that would close all three at once. It
+is not this task's file.
 
 ## 5. The smoke run, and what it has to survive
 
@@ -1306,7 +1403,7 @@ Two things it deliberately does not do:
   what makes that cost visible: it is how `ddl0loader.cc:273`, cited in §0's
   commit table, was caught unclassified the first time the guard ran.
 - **Bare `:N` continuations are covered but not discovered.** Where the
-  document writes "`postgres.py:689` … the dict at `:701-707`", the second
+  document writes "`postgres.py:689` … the dict at `:701-713`", the second
   citation has no path inside its backticks, so the parser cannot see it. The
   four such citations that point into this repo are checked explicitly. A
   *new* one could be added without a row and nothing would notice. That is the
@@ -1422,7 +1519,7 @@ unknowns look less urgent.
    boot, and `docker/percona/init.sql` uses the server default
    `caching_sha2_password` instead. The **ann pass** connects over a unix socket
    (`vb_mysql.py:237`, `unix_socket=`), where the cleartext exchange is allowed.
-   The **ops harness** connects over TCP (`mysql_family.py:90-97`, `host=`/`port=`),
+   The **ops harness** connects over TCP (`mysql_family.py:162-172`, `host=`/`port=`),
    where `caching_sha2_password` needs TLS or the server's RSA public key.
    `caching_sha2_password_auto_generate_rsa_keys` defaults ON so the key exists;
    whether Connector/C 3.3.x asks for it without an explicit option is untested.
@@ -1455,12 +1552,14 @@ unknowns look less urgent.
    just fixed `IGNORE INDEX … FOR ORDER BY (vk)` being ignored for them. If a
    future caller switches the hint on, a `FORCE INDEX` the parser rejects turns
    every plan check into an exception instead of a plan.
-8. **The ops path's `march` field.** §4.8: `harness/main.py:209-211` is a second
+8. **The ops path's `march` field.** §4.8: `harness/main.py:209-227` is a second
    `-march` reader in a different container, which no overlay override can
-   reach, so Percona's ops records read `march: "unknown"` until that tuple
-   gains `/opt/percona/.march`. Listed here rather than only in §4 because it is
-   a thing to *look at in the first smoke run's records* — it will not fail
-   anything, it will just quietly be wrong.
+   reach. Both tuples now carry `/opt/percona/.march`, so this should read the
+   image's real value — but *nothing in this repository can prove that*, since
+   proving it means a built image with a `/opt/percona/.march` in it. It stays
+   on this list for that reason, and because it is a thing to **look at in the
+   first smoke run's records**: it will not fail anything, it will just
+   quietly say `unknown` if the file is not where the Dockerfile puts it.
 ### Three items struck from this list, and why
 
 Each was on it in a previous revision. All three are now settled from the

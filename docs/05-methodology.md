@@ -874,17 +874,32 @@ differently or does not name at all.
 - **Storage engine** is not in the key. `--storage-engine` defaults to
   `InnoDB` for every engine, so pgvector's ops records say `InnoDB` while its
   ann module reports `heap`; Valkey's says `memory` and Percona Search's
-  `wiredTiger`. Requiring equality would empty the check for three of six
-  engines on a naming difference. It is used to pair rows *inside* a key,
-  under the same normalisation the rest of the report uses, and is shown on
-  every row.
+  `wiredTiger`. Requiring equality would empty the check for three of seven
+  engines on a naming difference. (Percona Server is not a fourth: its ann
+  module reports `InnoDB`, like the rest of the MySQL family.) It is used to
+  pair rows *inside* a key, under the same normalisation the rest of the
+  report uses, and is shown on every row.
 - **Build mode** is in the key, but only for the engines that have one. The
-  MariaDB, MariaDB 12.3 and AliSQL ann modules write no `build_mode` at all,
-  while the ops harness stamps `post` on every record regardless of what the
-  engine did — for MHNSW and VIDX the graph is maintained on every INSERT
-  whatever that field says. So the axis is dropped wherever the recall sweep
-  is silent about it and kept wherever it is not, and a row whose build mode
-  was not matched on is marked.
+  MariaDB, MariaDB 12.3, AliSQL and Percona Server ann modules write no
+  `build_mode` at all — four of seven — while the ops harness stamps `post`
+  on every record regardless of what the engine did. For MHNSW and VIDX the
+  graph is maintained on every INSERT whatever that field says. So the axis is
+  dropped wherever the recall sweep is silent about it and kept wherever it is
+  not, and a row whose build mode was not matched on is marked.
+
+  **Percona Server is the fourth for a different reason from the other three,
+  and it is the one worth knowing about.** MHNSW and VIDX have no separable
+  bulk build, so a build mode would be meaningless for them. Percona Server
+  has one — `PerconaDriver` splits `create_schema` and `create_index` on
+  `IndexSpec.build_mode`, and `config/profiles/percona.yml` runs both modes
+  through the ops path — but its *ann* module does not read `build_mode`,
+  which is why `orchestrator/ann_pass.py` refuses `ann.percona_build_modes`
+  rather than emitting two identical recall curves. So for this engine the
+  axis is real on the ops path and silent on the recall path, and dropping it
+  here is still right: the ann records genuinely say nothing about it. The
+  build-mode comparison for Percona therefore comes from the ops records —
+  `build_wall_s`, `ingest_wall_s` and `index_bytes`, which are ops-only
+  fields anyway — and not from a pair of recall curves.
 
 **An empty list has two causes and the report distinguishes them.** "No `M` is
 measured by both paths" is a profile choice: the recall sweep varies `M`

@@ -442,7 +442,7 @@ def draw_recall_whiskers(ax, rows: Sequence[Dict[str, Any]],
     mark it is there to draw attention to.
 
     No `label`, so the legend keeps one entry per series. A second handle per
-    engine would double the legend's width on a six-engine run, and the
+    engine would double the legend's width on a seven-engine run, and the
     footnote under the figure explains the bars once for all of them.
     """
     drawn = recall_whiskers(rows, xs, ys)
@@ -757,7 +757,7 @@ def _calibration_marks(records: List[Dict[str, Any]], dataset: str
 
     # Only where a target was pursued at all. On `ef_mode: fixed` every engine
     # lacks a status, the title already says the chart is at a fixed ef, and
-    # marking all six as exceptions to a claim nobody made would be noise.
+    # marking all seven as exceptions to a claim nobody made would be noise.
     from .loaders import calibration_targets
     if calibration_targets([r for r in records
                             if r.get("dataset") == dataset]):

@@ -213,7 +213,13 @@ class TestNoEngineConfigDeclaresSQL:
 
         A scan pointed at an empty or wrong directory returns `[]` too. This
         pins what was scanned: every engine the orchestrator would load, with
-        the four SQL-family configs the blocks used to live in among them.
+        the SQL-family configs the blocks used to live in among them.
+
+        `percona` is in the list without ever having carried a block. It is
+        the first SQL-family engine config written AFTER the blocks were
+        removed, and it is in scope for the assertion above for exactly that
+        reason: the risk this file guards against is a block coming BACK, and
+        a new config written from an old example is the likeliest way.
         """
         configs = engine_configs()
         from orchestrator import engines as registry_mod
@@ -221,7 +227,8 @@ class TestNoEngineConfigDeclaresSQL:
         assert sorted(configs) == loaded, (
             f"scanned {sorted(configs)} but the orchestrator loads {loaded}")
         family = sql_family(configs)
-        assert family == ["alisql", "mariadb", "mariadb123", "pgvector"], (
+        assert family == ["alisql", "mariadb", "mariadb123", "percona",
+                          "pgvector"], (
             f"the configs the blocks lived in are {family}")
         # And every one of them parsed to something, so `"sql" in config` was
         # asked of a real mapping rather than of an empty one.

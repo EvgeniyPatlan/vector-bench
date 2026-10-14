@@ -625,8 +625,8 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     Neither gap is an oversight. `repair_path` names the MECHANISM an engine
     has ("vacuum_analyze", "none") where the `Repair` column already names
     what actually ran on that row, so a column for it would repeat the row
-    beside it for five of six engines and disagree with it for none;
-    `index_sync_s` is 0.0 for the four engines that maintain their index on
+    beside it for five of seven engines and disagree with it for none;
+    `index_sync_s` is 0.0 for the five engines that maintain their index on
     the write path, and PR 4 §4.1's own acceptance for it is "non-zero or a
     reason documented" -- which `extra.index_sync_note` carries and which no
     shipped profile has yet produced a non-zero reading for. Both are

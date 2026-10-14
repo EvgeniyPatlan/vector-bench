@@ -163,15 +163,27 @@ CLAIMS = {
             "The client_bound half is satisfied by reading that flag",
             "The client_bound half is exactly what the flag reports",
         ]),
-    "only pgvector has a repair path": dict(
-        pattern=r"(only pgvector (has|declares|defines)|"
-                r"pgvector is the only engine with) a repair path",
+    # Was "only pgvector has a repair path", which was true until Percona
+    # Server declared `index-replace`. The vocabulary fixes the SET -- both
+    # engines named, and MongoDB excluded -- rather than a count or a
+    # sentence, so the next engine to acquire one fails this instead of
+    # quietly joining a number nobody re-read.
+    "two engines have a repair path: pgvector and percona server": dict(
+        pattern=r"(two engines|pgvector and percona|percona server and "
+                r"pgvector)\b.{0,160}?a repair path"
+                r"|a repair path\b.{0,160}?"
+                r"(pgvector and percona|percona server and pgvector)",
         accepts=[
-            "Only pgvector has a repair path.",
-            "Only pgvector declares a repair path, and MongoDB inherits none.",
-            "pgvector is the only engine with a repair path in the tree.",
+            "Two engines have a repair path: pgvector and Percona Server.",
+            "pgvector and Percona Server are the two that declare a repair "
+            "path; MongoDB inherits none.",
+            "There is a repair path on pgvector and Percona Server, and "
+            "nowhere else.",
+            "Exactly two engines have a repair path, pgvector and Percona "
+            "Server, and they are not comparable in cost.",
         ],
         rejects=[
+            "Only pgvector has a repair path.",
             "pgvector and MongoDB both have a repair path.",
             "Every engine has a repair path of some kind.",
         ]),
@@ -288,7 +300,7 @@ CLAIMS = {
         pattern=r"section\b(?:(?!\bnot\b|\bno longer\b|\buntil\b)[\s\S])"
                 r"{0,40}?\bexists\b",
         accepts=[
-            "**This section now exists.** `report/crosscheck.py:308`'s",
+            "**This section now exists.** `report/crosscheck.py:327`'s",
             "This section exists now, and here is what to read in it.",
             "The consistency section exists as of #16.",
         ],
@@ -472,10 +484,20 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", "def wait_index_synced"),
     "harness/drivers/postgres.py:172":
         ("harness/drivers/postgres.py", 'repair_path = "vacuum_analyze"'),
+    # The second repair path, added when Percona Server landed. Cited beside
+    # pgvector's so §4 item 4's "two engines" is a pointer and not a count a
+    # reader has to take on trust.
+    "harness/drivers/mysql_family.py:751":
+        ("harness/drivers/mysql_family.py", 'repair_path = "index-replace"'),
     "harness/datasets.py:456-468":
         ("harness/datasets.py", "1.04%-3.47% of the rows (median 1.43%)"),
-    "orchestrator/estimate.py:139":
-        ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine, 300)"),
+    # Was `:139`, anchored on `_INGEST_ROWS_PER_S.get(engine, 300)` -- the
+    # defect §5 item 2 was written about. That line is gone: the fallback now
+    # returns None, and the section cites the repaired call instead. The
+    # anchor deliberately has NO default argument in it, so the old spelling
+    # coming back fails this row rather than satisfying it.
+    "orchestrator/estimate.py:161":
+        ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine)"),
     "orchestrator/estimate.py:43":
         ("orchestrator/estimate.py",
          "Measured ingest rates, rows/s, on a Xeon Gold 6230."),
@@ -483,23 +505,23 @@ CITED_IN_REPO = {
         ("orchestrator/estimate.py", "by 3x is worse than none"),
     "orchestrator/estimate.py:50":
         ("orchestrator/estimate.py", '"mariadb": 150'),
-    "config/profiles/main.yml:178":
+    "config/profiles/main.yml:181":
         ("config/profiles/main.yml", "churn_readers: 4"),
-    "config/profiles/dev.yml:72":
+    "config/profiles/dev.yml:74":
         ("config/profiles/dev.yml", "churn_readers: 0"),
     "docs/05-methodology.md:470-477":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:965-966":
+    "docs/05-methodology.md:980-981":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
-    "config/profiles/main.yml:107":
+    "config/profiles/main.yml:110":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
     "config/profiles/main.yml:84-87":
         ("config/profiles/main.yml",
          "+17.04 h of ingest for"),
-    "report/crosscheck.py:308":
+    "report/crosscheck.py:327":
         ("report/crosscheck.py", "def consistency_checks"),
-    "report/crosscheck.py:103":
+    "report/crosscheck.py:105":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
     "report/render.py:2328":
         ("report/render.py", "## 10. Consistency checks"),
@@ -510,16 +532,16 @@ CITED_IN_REPO = {
     "report/render.py:1953":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:897":
+    "docs/05-methodology.md:912":
         ("docs/05-methodology.md",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/09-adding-percona-server.md:676":
+    "docs/09-adding-percona-server.md:682":
         ("docs/09-adding-percona-server.md",
          "is not a cache, and that is a fairness problem"),
     "docs/09-adding-percona-server.md:736-775":
         ("docs/09-adding-percona-server.md",
          "These figures are projections, not measurements."),
-    "docs/09-adding-percona-server.md:833-836":
+    "docs/09-adding-percona-server.md:841-844":
         ("docs/09-adding-percona-server.md",
          "the gate cannot surface this at all"),
 }
@@ -1069,8 +1091,8 @@ class TestItemFiveLeftTheTableForAReasonThatStillHolds:
         # The three things §4 item 5 tells the reader to look at. Named
         # individually because "the section exists" is not advice.
         assert "coverage" in section.lower(), section[:200]
-        assert "report/crosscheck.py:103" in section
-        assert "report/crosscheck.py:308" in section
+        assert "report/crosscheck.py:105" in section
+        assert "report/crosscheck.py:327" in section
 
     def test_the_document_records_why_the_row_left(self):
         """An audit trail, not a deletion. The next reader of §3 should be able
@@ -1241,7 +1263,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
         assert "report/render.py:1953" in section
-        assert "docs/05-methodology.md:897" in section
+        assert "docs/05-methodology.md:912" in section
 
 
 # ---------------------------------------------------------------------------
@@ -1387,14 +1409,25 @@ class TestTheChurnHooksAreReadFromTheDrivers:
                      "MariaDBDriver", "AliSQLDriver"):
             assert name in found, sorted(found)
 
-    def test_only_pgvector_declares_a_repair_path(self):
+    def test_exactly_two_drivers_declare_a_repair_path(self):
+        """**This read `only pgvector` and fired when Percona Server landed**,
+        which is the direction it should fire in: §4 item 4 is about which
+        engines get a before/after maintenance panel, and an engine that
+        acquired a repair path without this page noticing would have been
+        given one silently -- or denied one it had earned.
+
+        Percona's is the expensive one of the two: a whole graph rebuild per
+        churn fraction against pgvector's VACUUM. A value assertion, so a
+        third fails here rather than passing.
+        """
         from harness.drivers.base import EngineDriver
         assert EngineDriver.repair_path == "none"
         overriding = {name: cls.repair_path
                       for name, cls in self._drivers().items()
                       if cls.repair_path != "none"}
-        assert overriding == {"PostgresDriver": "vacuum_analyze"}, overriding
-        _claim("only pgvector has a repair path")
+        assert overriding == {"PostgresDriver": "vacuum_analyze",
+                              "PerconaDriver": "index-replace"}, overriding
+        _claim("two engines have a repair path: pgvector and percona server")
         _claim("mongodb inherits the no-repair default")
 
     def test_mongodb_and_valkey_override_the_sync_wait_and_not_the_repair(self):
@@ -1567,28 +1600,54 @@ class TestTheMethodologyGapsAreDerived:
 class TestTheEstimatorFallbackIsRecomputed:
     """§5 item 2's figures and its ratio, from the table itself."""
 
-    def test_the_fallback_is_the_rate_an_unknown_engine_is_modelled_at(self):
+    def test_an_unmeasured_engine_is_named_rather_than_modelled(self):
         """Called, not read off the literal.
 
-        `_effective_rate` is what the estimate is built from, and on a dataset
-        the module knows nothing about both penalties are 1.0 -- so the rate it
-        returns for an unknown engine IS the fallback. A test that only matched
-        the `300` in the source would pass against a `.get` whose result had
-        stopped reaching the estimate.
+        `_effective_rate` is what the estimate is built from, so what it
+        returns for an unknown engine IS the behaviour this section describes.
+        A test that only matched a number in the source would pass against a
+        `.get` whose result had stopped reaching the estimate.
+
+        **THE DEFECT THIS SECTION DESCRIBED IS FIXED, AND THIS TEST WAS
+        INVERTED BY THE FIX.** It asserted `_effective_rate(unknown, …) == 300`
+        and that `estimate.py` still contained `.get(engine, 300)` -- it was
+        pinning a live defect in place, correctly, while it was live. The
+        fallback now returns `None` and the engine is named in
+        `engines_without_ingest_rate`, so the assertions are the mirror
+        image: no number, and a name in the gap list.
+
+        The historical figure is still checked against the document, because
+        §5 item 2 quotes it to make the argument -- it just no longer has to
+        be what the code does.
         """
         from orchestrator import estimate
         claimed = re.search(r"modelled at (\d+) rows/s", _doc())
-        assert claimed, "docs/10 no longer prints the fallback"
-        fallback = float(claimed.group(1))
+        assert claimed, "docs/10 no longer states what the old fallback was"
+        assert float(claimed.group(1)) == 300.0
+
         assert "no-such-engine" not in estimate._INGEST_ROWS_PER_S
-        assert estimate._effective_rate(
-            "no-such-engine", "no-such-dataset") == fallback
-        # And a known engine does not get it, which is what makes the figure
-        # a fallback rather than the rate everything is modelled at.
-        assert estimate._effective_rate(
-            "alisql", "no-such-dataset") != fallback
-        assert f".get(engine, {claimed.group(1)})" in _cited_body(
-            "orchestrator/estimate.py", "139")
+        # No number at all, which is the repair.
+        assert estimate._effective_rate("no-such-engine",
+                                        "no-such-dataset") is None
+        # And a measured engine still gets one, so this is a gap report and
+        # not a function that has stopped working.
+        assert estimate._effective_rate("alisql", "no-such-dataset") > 0
+        # The defect's spelling must not come back as CODE. Matched with the
+        # assignment, because both `estimate.py` and this page quote the old
+        # form in prose to explain the repair -- a bare substring check fired
+        # on that explanation, which is the inverse vacuity: a negative
+        # assertion failing on text that agrees with it.
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "estimate.py")).read()
+        assert "base = _INGEST_ROWS_PER_S.get(engine, 300)" not in source
+        assert "base = _INGEST_ROWS_PER_S.get(engine)" in source
+        # The engine the section is about is named, not modelled.
+        e = estimate.estimate_load_hours(
+            {"name": "t", "ann": {"m_values": [16]}, "ops": {"m_values": [16]}},
+            ["mariadb", "percona"], ["glove-100-angular"], ["normalized"],
+            ["ann", "ops"])
+        assert e["engines_without_ingest_rate"] == ["percona"]
+        assert "percona" not in e["per_engine_hours"]
 
     def test_the_mysql_family_rates_are_the_ones_the_document_prints(self):
         from orchestrator import estimate

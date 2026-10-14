@@ -374,12 +374,23 @@ class EngineDriver(abc.ABC):
     def effective_ef(self, ef: int, k: int) -> int:
         """How many candidates this engine will really search for `ef`.
 
-        For every engine here except one the answer is `ef`, which is why this
-        is a concrete method rather than another abstract one. MongoDB clamps:
-        `numCandidates` below `limit` cannot return `limit` rows, so it raises
-        the low end of the grid to k and the calibration records have to say so
-        -- a reader comparing two engines at "ef 10" needs to know that one of
-        them looked at 10 candidates and the other at k.
+        For most engines here the answer is `ef`, which is why this is a
+        concrete method rather than another abstract one. TWO clamp, and both
+        clamp to k:
+
+        * MongoDB -- `numCandidates` below `limit` cannot return `limit` rows,
+          so it raises the low end of the grid to k.
+        * Percona Server -- `innodb_hnsw_ef_search`'s own help text states the
+          contract ("the effective width is max(ef, LIMIT)") and the engine
+          passes the variable beside `std::max<size_t>(limit, 1)` on the scan
+          path. Unlike MongoDB's, this clamp bites at no grid point this repo
+          currently sweeps at k=10; it is implemented anyway because the
+          inherited identity would be wrong at the one point where it mattered
+          and silently right everywhere else.
+
+        Either way the calibration records have to say so -- a reader
+        comparing two engines at "ef 10" needs to know that one of them looked
+        at 10 candidates and the other at k.
 
         Takes `k` because the only clamp in this codebase is against k. The
         spec names the shape `effective_ef(ef)`, and a one-argument version

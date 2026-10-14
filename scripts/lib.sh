@@ -24,6 +24,7 @@ export VB_BUILDCTX="${VB_WORK}/buildctx"
 export VB_REPO_MARIADB="${VB_REPO_MARIADB:-$(cd "${VB_ROOT}/.." && pwd)/server}"
 export VB_REPO_ALISQL="${VB_REPO_ALISQL:-$(cd "${VB_ROOT}/.." && pwd)/AliSQL}"
 export VB_REPO_ANNB="${VB_REPO_ANNB:-$(cd "${VB_ROOT}/.." && pwd)/ann-benchmarks}"
+export VB_REPO_PERCONA="${VB_REPO_PERCONA:-$(cd "${VB_ROOT}/.." && pwd)/percona-server}"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,11 +63,18 @@ need_docker() {
 }
 
 # Refuse to run if it would write into one of the read-only vendor repos.
+#
+# The loop below must list EVERY repo exported above. A vendor checkout absent
+# from it gets no protection at all -- not weaker protection, none -- while the
+# three beside it look like the rule is enforced. CLAUDE.md names these as
+# read-only inputs that must never be checked out, fetched into or modified,
+# and this function is the only thing that enforces that sentence.
 assert_not_vendor_repo() {
   local target
   target="$(cd "$1" 2>/dev/null && pwd || echo "$1")"
   local repo
-  for repo in "$VB_REPO_MARIADB" "$VB_REPO_ALISQL" "$VB_REPO_ANNB"; do
+  for repo in "$VB_REPO_MARIADB" "$VB_REPO_ALISQL" "$VB_REPO_ANNB" \
+              "$VB_REPO_PERCONA"; do
     [[ -d "$repo" ]] || continue
     local canon; canon="$(cd "$repo" && pwd)"
     if [[ "$target" == "$canon" || "$target" == "$canon"/* ]]; then

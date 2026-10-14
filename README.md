@@ -1,6 +1,6 @@
 # vector-bench
 
-Benchmark framework comparing **built-in vector search** across six databases,
+Benchmark framework comparing **built-in vector search** across seven databases,
 all using an HNSW index:
 
 | Engine key | Engine | Version | Implementation |
@@ -11,10 +11,11 @@ all using an HNSW index:
 | `mariadb123` | MariaDB | 12.3.2 | MHNSW, a second version |
 | `mongodb` | Percona Search for MongoDB | mongot 1.70.3 | Lucene HNSW in a sidecar process |
 | `valkey` | Valkey + valkey-search | 9.1 | HNSW, entirely in memory |
+| `percona` | Percona Server | MySQL 9.7.1 + `vector-mvp` | InnoDB HNSW (`storage/innobase`) |
 
 The first three are the original comparison and what `build` produces by
 default; the rest are opt-in, because each is another image to compile or
-another process to stand up. `run` measures all six unless told otherwise.
+another process to stand up. `run` measures all seven unless told otherwise.
 
 Every one runs HNSW, so the comparison isolates **implementation quality**
 rather than algorithm choice. They are not otherwise alike — one keeps the
@@ -343,7 +344,8 @@ dataset. Use `main`, read the estimate the run prints, and see
 numbers by 2× during development. The harness reports CPU, SIMD and cpuset
 problems in its Validity section, but a concurrent workload is invisible to it.
 
-**Never mix `-march` between engines.** All three compile SIMD distance kernels.
+**Never mix `-march` between engines.** All five that are compiled from source
+compile SIMD distance kernels (mongodb and valkey are installed from packages).
 Rebuilding one with a different value turns the benchmark into a comparison of
 compiler flags. Use `native` when the build host is the benchmark host,
 `x86-64-v3` when images must move between machines.
@@ -361,10 +363,19 @@ exact results slowly — indistinguishable in the output from "very accurate but
 slow". Every driver runs `EXPLAIN` per configuration and records whether the
 index was used; anything that was not appears in the report's Validity section.
 
-**Both MySQL-family engines ship a 16 MiB graph cache by default**
+**MariaDB and AliSQL ship a 16 MiB graph cache by default**
 (`mhnsw_max_cache_size`, `vidx_hnsw_cache_size`) — far too small for any real
 corpus. The framework sets both from the resource profile so neither is judged
 on a value its vendor plainly intended you to change.
+
+**Percona Server's `innodb_hnsw_max_memory` is not a third one of those.** It is
+a hard allocation ceiling rather than a cache: exceeding it fails the statement
+instead of evicting anything, and the check is re-applied as a cold search
+faults the graph back in after a restart. It is therefore set to `0`
+(unlimited), so the container's memory limit bounds it as it does every other
+engine, and `Innodb_hnsw_memory_used` is recorded per phase — a figure that
+excludes the node map and so is a floor on graph memory, not a measurement of
+it. See [docs/09](docs/09-adding-percona-server.md) §3.
 
 ---
 

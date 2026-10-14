@@ -190,7 +190,7 @@ estimated run time ~72.7 h typical, ~81.4 h worst case
       recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set
       churn re-measurement: ops.max_queries before churn and again after each churn fraction
       churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
-      churn repair path: on an engine with one (pgvector of the six), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
+      churn repair path: on an engine that has one (pgvector's VACUUM (ANALYZE) and Percona Server's index replace), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
       concurrency warm-up: 50 queries per client before each measured window
       filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
 

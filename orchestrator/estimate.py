@@ -131,12 +131,36 @@ def _size_penalty(dataset: str) -> float:
     return max(0.05, (rows / _REFERENCE_ROWS) ** 0.55)
 
 
-def _effective_rate(engine: str, dataset: str) -> float:
-    """Rows/s for this engine on this corpus: measured if known, else modelled."""
+def _effective_rate(engine: str, dataset: str) -> Optional[float]:
+    """Rows/s for this engine on this corpus, or None -- never a guess.
+
+    Three outcomes, in order: a rate measured for this exact (engine, dataset)
+    pair; the engine's reference rate scaled for width and corpus size; and
+    **None**, when this repo has measured neither.
+
+    The third used to be `_INGEST_ROWS_PER_S.get(engine, 300)`, and that
+    default contradicted the comment above the table it read from. The table's
+    own history is the argument: rates guessed at 400/150/5600 off a 60,000-row
+    smoke run were optimistic by 2.7x against the first real 1.18M-row load,
+    and "an estimate that is optimistic by 3x is worse than none". 300 rows/s
+    is 2x the measured MariaDB figure and 5.5x the measured AliSQL one, so a
+    new MySQL-family engine -- one building an HNSW graph inside every INSERT,
+    which is the slowest shape here -- was modelled as the fastest of the three
+    with nothing printed to say the number was invented.
+
+    `None` is the same answer `_query_qps` already gives for a missing query
+    rate, and it is handled the same way: the engine is NAMED in
+    `engines_without_ingest_rate` and left out of the total, rather than folded
+    into it behind a number a reader cannot tell from a measurement. An engine
+    enters the published figure by being measured, which is how every rate in
+    the two tables above got there.
+    """
     measured = _MEASURED_ROWS_PER_S.get((engine, dataset))
     if measured:
         return float(measured)
-    base = _INGEST_ROWS_PER_S.get(engine, 300)
+    base = _INGEST_ROWS_PER_S.get(engine)
+    if base is None:
+        return None
     return base / (_dim_penalty(dataset) * _size_penalty(dataset))
 
 
@@ -203,17 +227,27 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
         # PR 4 §4.2's repair path, and the item `_QUERY_TERMS` below records
         # as owed-and-disclosed. Two costs, neither modellable: a THIRD
         # ops.max_queries measurement per fraction on the engines that have a
-        # repair path (pgvector alone of the six), and the repair itself --
-        # `VACUUM (ANALYZE)` over a table a quarter of whose rows are
-        # tombstones, for which this repo has no figure at any corpus size,
-        # because no live engine has been run for PR 4. Named separately from
+        # repair path (pgvector and Percona Server, two of the seven), and the
+        # repair itself -- pgvector's `VACUUM (ANALYZE)` over a table a
+        # quarter of whose rows are tombstones, or Percona's index replace,
+        # which rebuilds the entire HNSW graph and so costs on the order of a
+        # bulk build per fraction. This repo has no figure for either at any
+        # corpus size, because no live engine has been run. Named separately from
         # the re-measurement line above because that line is about the two
         # measurements every engine pays and this one is about the engines
         # that repair.
-        "churn repair path: on an engine with one (pgvector of the six), "
-        "driver.maintain() per churn fraction plus a third ops.max_queries "
-        "measurement of the repaired index -- the repair has no measured "
-        "rate at any corpus size and nothing caps either",
+        # The engine list is named rather than counted, and the count it used
+        # to carry ("pgvector of the six") was wrong the moment a seventh
+        # engine with a repair path landed. Percona's is an index replace,
+        # which rebuilds the whole HNSW graph -- on a 1M-row corpus that is on
+        # the order of a bulk build per churn fraction, so it is the larger of
+        # the two unmeasured repairs disclosed here, not a footnote to
+        # pgvector's VACUUM.
+        "churn repair path: on an engine that has one (pgvector's VACUUM "
+        "(ANALYZE) and Percona Server's index replace), driver.maintain() "
+        "per churn fraction plus a third ops.max_queries measurement of the "
+        "repaired index -- the repair has no measured rate at any corpus "
+        "size and nothing caps either",
     ),
     "concurrency": (
         "concurrency warm-up: 50 queries per client before each measured "
@@ -302,8 +336,24 @@ def _ops_units(profile: Dict[str, Any], engine: str) -> int:
     ops = profile.get("ops", {}) or {}
     ann = profile.get("ann", {}) or {}
     m_values = max(1, len(ops.get("m_values", [16])))
-    if engine == "pgvector":
-        build_modes = max(1, len(ann.get("pgvector_build_modes", ["post"])))
+    # Mirrors `cli.py`'s `_OPS_BUILD_MODE_KEYS`, and must: this is how many
+    # times the ops workloads actually run, so an engine whose second build
+    # mode the runner executes and this does not count is an estimate short by
+    # a whole unit of every query term. pgvector and Percona are the two
+    # engines with a separable bulk build; for the rest `post` is a no-op and
+    # a second mode would be the same measurement twice.
+    #
+    # The BLOCK is part of the key and not an implementation detail:
+    # pgvector's list drives the ann render as well as the ops loop and lives
+    # with the ann configuration, while Percona's drives the ops loop alone
+    # and lives under `ops:` precisely so `ann_pass.render_config` cannot see
+    # it. `cli.py` carries the argument at length.
+    mode_ref = {"pgvector": ("ann", "pgvector_build_modes"),
+                "percona": ("ops", "percona_build_modes")}.get(engine)
+    if mode_ref:
+        block, key = mode_ref
+        source = ann if block == "ann" else ops
+        build_modes = max(1, len(source.get(key, ["post"])))
     else:
         build_modes = 1
     if engine in ann_pass.MARIADB_ENGINES:
@@ -330,7 +380,11 @@ class _QueryPlan(NamedTuple):
     engine: str
     dataset: str
     rows: int
-    write_rows_per_s: float
+    # Optional for the same reason `query_qps` is, and now with the same
+    # meaning: None is "nothing here has measured an ingest rate for this
+    # engine", not zero. A term that needs it must say so rather than
+    # multiply by a default -- see `_churn_reinsert`.
+    write_rows_per_s: Optional[float]
     query_qps: Optional[float]
     units: int
     passes: int
@@ -588,7 +642,19 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
     # TypeError, matching `_filtered_search` and `ops_pass`'s `_budget_arg`.
     budget = float(plan.ops.get("churn_budget_s", 1800) or 0.0)
     uncapped = budget <= 0
+    # None means no ingest rate has ever been measured for this engine, which
+    # is a different state from a rate of zero and is reported differently:
+    # there is no duration to model, so `typical` stays at 0.0 and the basis
+    # says why. That is exactly what `_filtered_search` above does when
+    # `plan.query_qps` is None -- `typical_s=0.0` beside a real ceiling, with
+    # "at a rate nothing here has measured" in the basis -- and the pair is
+    # the honest reading rather than a claim that the work is free.
+    #
+    # It replaces `rate > 0 else budget`, which charged the whole budget as
+    # the TYPICAL figure for an engine nothing had measured. No engine could
+    # reach that branch when it was written, so no published figure moves.
     rate = plan.write_rows_per_s
+    modelled = rate is not None and rate > 0
     typical = 0.0
     worst = 0.0
     rows = 0
@@ -605,19 +671,21 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
         if uncapped:
             # No ceiling to collapse onto, so the modelled duration is all
             # there is -- and it is a figure, not a bound.
-            typical += count / rate if rate > 0 else 0.0
+            typical += count / rate if modelled else 0.0
         else:
-            typical += min(count / rate, budget) if rate > 0 else budget
+            typical += min(count / rate, budget) if modelled else 0.0
             worst += budget
     if rows <= 0:
         return None
+    at_rate = (f"at ~{rate:,.0f} rows/s (the load rate; re-insert can be far "
+               f"slower)" if modelled
+               else "at a rate nothing here has measured")
     if uncapped:
         return _QueryTerm(
             name="churn re-insert",
             typical_s=typical,
             worst_s=typical,
-            basis=(f"{rows:,} rows written back at ~{rate:,.0f} rows/s (the "
-                   f"load rate; re-insert can be far slower); "
+            basis=(f"{rows:,} rows written back {at_rate}; "
                    f"ops.churn_budget_s turns the cap off, so this is a "
                    f"figure and not a ceiling"),
             bounded=False,
@@ -626,8 +694,8 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
         name="churn re-insert",
         typical_s=typical,
         worst_s=worst,
-        basis=(f"{rows:,} rows written back at ~{rate:,.0f} rows/s (the load "
-               f"rate; re-insert can be far slower), {budget:.0f}s cap/step"),
+        basis=(f"{rows:,} rows written back {at_rate}, "
+               f"{budget:.0f}s cap/step"),
         bounded=True,
     )
 
@@ -926,14 +994,39 @@ def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
     ops_m = max(1, len(profile.get("ops", {}).get("m_values", [16])))
     per_engine: Dict[str, float] = {}
     unknown: List[str] = [d for d in datasets if d not in _DATASET_ROWS]
+    # An engine this repo has no ingest rate for, on any dataset the plan
+    # loads. Keyed on the RATE and not on the row count, which is the care
+    # `_estimate_query_hours`'s `engines_without_query_rate` takes for the
+    # same reason: `dev`'s only dataset has no row count, and every engine
+    # would land in this list if the test were "contributed no hours" rather
+    # than "has no rate". A missing row count is already named separately, in
+    # `datasets_without_estimate`, and belongs to the dataset.
+    no_ingest_rate: List[str] = [
+        e for e in engines
+        if datasets and all(_effective_rate(e, d) is None for d in datasets)]
 
     for engine in engines:
+        if engine in no_ingest_rate:
+            # Named above and left out, exactly as a dataset with no row count
+            # is skipped below. A key here would be `0.0`, and `0.0` in a
+            # column of hours reads as "costs nothing" -- the opposite of what
+            # is known about an engine that maintains an HNSW graph per INSERT.
+            continue
         engine_h = 0.0
         for dataset in datasets:
             rows = _DATASET_ROWS.get(dataset)
             if not rows:
                 continue
             effective = _effective_rate(engine, dataset)
+            if effective is None:
+                # Reachable only for an engine measured on SOME datasets and
+                # absent from `_INGEST_ROWS_PER_S`, which no engine is today:
+                # the per-engine table is keyed by engine alone, so an engine
+                # in it has a rate everywhere. Such an engine's figure would
+                # be a floor over the datasets it has a rate for, and the gap
+                # list above cannot say so because it requires ALL of them to
+                # be missing. Named here rather than left as a silent skip.
+                continue
             if "ann" in phases:
                 engine_h += (rows / effective) * m_count / 3600
             if "ops" in phases:
@@ -953,6 +1046,14 @@ def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
         "passes": len(passes),
         "phases": list(phases),
         "datasets_without_estimate": unknown,
+        # The ingest half of the disclosure `engines_without_query_rate` makes
+        # for the query half. An engine here contributed nothing to
+        # `total_hours`, so that figure is a total over the engines it could
+        # be computed for and not over the engines asked for -- a different
+        # quantity from the same plan with this list empty, which is why
+        # `print_load_estimate` says so rather than leaving a reader to
+        # notice a name missing from the per-engine line.
+        "engines_without_ingest_rate": no_ingest_rate,
         "long_run": total_h > 12,
         **query,
         "typical_total_hours": round(total_h + query["query_hours"], 2),
@@ -977,6 +1078,29 @@ def print_load_estimate(profile: Dict[str, Any], engines: List[str],
     print("  " + "  |  ".join(rows_per_pass))
     print(f"  total ~{total_h:.1f} h across {estimate['passes']} pass(es), "
           f"{estimate['m_values']} M value(s)")
+    # Printed immediately under the total, because it changes what the total
+    # is rather than adding a footnote to it: the figure above covers the
+    # engines on the per-engine line and no others. The sentence names the
+    # engines and both counts, so a reader can see at a glance that a
+    # seven-engine plan produced a six-engine figure -- and never has to
+    # reconcile a total against a per-engine line by subtraction.
+    #
+    # Deliberately not a modelled number for them. The ingest table's own
+    # history is that a guessed rate reached docs/07 and two web-UI renderers
+    # and was 2.7x optimistic; naming the gap costs a line and cannot be
+    # mistaken for a measurement.
+    missing = estimate["engines_without_ingest_rate"]
+    if missing:
+        counted = len(estimate["per_engine_hours"])
+        print(f"  ! No measured ingest rate for {', '.join(missing)}, so the "
+              f"total above is\n    {counted} of "
+              f"{counted + len(missing)} engine(s) and excludes "
+              f"{'them' if len(missing) > 1 else 'it'} entirely rather than "
+              f"modelling\n    "
+              f"{'them' if len(missing) > 1 else 'it'} at a guessed rate. A "
+              f"smoke run supplies the figure; until then the ingest\n    "
+              f"cost of this plan is higher than the number above, by an "
+              f"amount nothing here knows.")
     if estimate["long_run"]:
         print(f"  ! This is a long run. Each M value costs a full reload of every "
               f"dataset,\n    and MHNSW/VIDX build incrementally at a few hundred "

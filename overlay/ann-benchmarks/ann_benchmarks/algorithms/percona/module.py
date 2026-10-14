@@ -385,30 +385,24 @@ class PerconaServer(VBMySQLBase):
     # Reporting
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _image_march() -> str:
-        """Which -march the server binary was compiled with.
-
-        Overridden because the shared implementation reads a fixed pair of
-        paths — `/opt/mariadb/.march` and `/opt/alisql/.march` (vb_mysql.py:539)
-        — and this image writes `/opt/percona/.march` (docker/percona/Dockerfile,
-        builder stage). Without this override every Percona record would carry
-        `march: "unknown"`, and that is worse than a crash: "never mix -march
-        between engines" is one of this repo's stated invariants because all
-        seven engines compile SIMD distance kernels, and the field that would
-        catch a mixed build is the one that would have gone blank.
-
-        Reads this image's path first and then falls back to the shared pair, so
-        the method is correct in a hypothetical image carrying more than one.
-        """
-        for path in ("/opt/percona/.march", "/opt/mariadb/.march",
-                     "/opt/alisql/.march"):
-            try:
-                with open(path) as fh:
-                    return fh.read().strip()
-            except OSError:
-                continue
-        return "unknown"
+    # `_image_march()` IS DELIBERATELY NOT OVERRIDDEN HERE, and this comment is
+    # the record of why the override that used to sit at this spot was removed
+    # rather than kept.
+    #
+    # It read `/opt/percona/.march` first and then the shared pair, which was
+    # correct for the ann path and could never be correct for the other one.
+    # There are TWO independent `-march` readers in two different containers:
+    # this one, and `harness/main.py:_detect_march`, which runs in the harness
+    # container — it mounts `harness/` and not `overlay/`, so no module here
+    # can reach it, and `orchestrator/ops_pass.py` passes no `--march` for the
+    # `or` to fall back from. Percona's OPS records would have carried
+    # `march: "unknown"` with the ann records looking fine, which is the worst
+    # of the three possible states: half the run measured and nothing saying
+    # which half.
+    #
+    # `/opt/percona/.march` is now in both tuples — `vb_mysql.py:_image_march`
+    # and `harness/main.py:_detect_march` — so the engine after this one finds
+    # the paths where they belong instead of hitting the same thing twice.
 
     def get_additional(self) -> Dict[str, Any]:
         """The shared record, plus the build knob only this engine exposes.

@@ -4411,11 +4411,77 @@ class TestTheMSweepProfileIsolatesGraphDegree:
         assert load_profile("m-sweep")["ops"]["enabled"] is False
 
     def test_the_estimate_covers_every_engine(self):
-        """An estimate missing an engine silently falls back to a default that
-        was wrong by 3x the last time it mattered."""
+        """No engine is silently absent from the ingest estimate.
+
+        **The requirement this test enforces changed. The new form is NOT
+        stronger than the old one -- the two are logically incomparable**, and
+        saying otherwise was an overclaim worth correcting here rather than
+        leaving in a docstring. The old form was
+        `engine in _INGEST_ROWS_PER_S` for every known engine. It rejects a
+        state this one accepts (an engine with no rate at all) and this one
+        rejects states it could not see (an engine named AND counted, or in
+        neither bucket). Neither implies the other. This one is better
+        *aimed*, which is a different claim.
+
+        The old form was the only defence available while `_effective_rate`
+        ended in `_INGEST_ROWS_PER_S.get(engine, 300)`: a missing entry was
+        silently modelled at a default, so insisting the table was complete
+        was all one could do. It had two costs -- it was satisfiable by a
+        guess, which the table's own comment rejects ("an estimate that is
+        optimistic by 3x is worse than none"), and it required every future
+        engine to carry a number before anyone had measured one.
+
+        **The property that actually protects a reader is
+        `not (named & counted)` together with the two sets covering every
+        engine asked for**: an engine contributes to the published total or is
+        named as unmeasured, never both and never neither. That is what stops
+        a figure labelled "ingest" from quietly omitting an engine, and it
+        holds however many engines are measured.
+
+        **What this test does NOT catch, stated so nobody relies on it to:**
+        a plausible-looking guessed entry for Percona would satisfy every
+        assertion below -- it would simply move Percona from `named` to
+        `counted`. Nothing a test in this file can do distinguishes a measured
+        150 from an invented one. That line is held by review and by the rule
+        that a rate enters the table only from a run, not by this guard.
+        """
         from orchestrator.cli import _INGEST_ROWS_PER_S, KNOWN_ENGINES
+        from orchestrator.estimate import estimate_load_hours
+
+        def est(engines):
+            return estimate_load_hours(
+                {"name": "t", "ann": {"m_values": [16]},
+                 "ops": {"m_values": [16]}},
+                list(engines), ["glove-100-angular"], ["normalized"],
+                ["ann", "ops"])
+
+        estimate = est(KNOWN_ENGINES)
+        named = set(estimate["engines_without_ingest_rate"])
+        counted = set(estimate["per_engine_hours"])
+        # Exactly one bucket each, and the two together are everything asked
+        # for -- so an engine can neither be double-counted nor vanish.
+        assert not (named & counted), named & counted
+        assert named | counted == set(KNOWN_ENGINES), (
+            set(KNOWN_ENGINES) ^ (named | counted))
+        # And the bucket an engine lands in is the one the rate table implies.
         for engine in KNOWN_ENGINES:
-            assert engine in _INGEST_ROWS_PER_S, engine
+            assert (engine in _INGEST_ROWS_PER_S) ^ (engine in named), (
+                f"{engine} must be either measured or named as unmeasured, "
+                f"and exactly one of the two")
+
+        # NON-VACUITY, and deliberately not `assert named`. That form proved
+        # the gap list was derived only for as long as some real engine was
+        # unmeasured: it would FAIL the day every engine gained a rate, which
+        # is a guard that fires on a correct -- indeed better -- future state,
+        # and the next author would delete it. Injecting an engine nothing
+        # could ever have measured proves the same thing in both regimes.
+        probe = est(list(KNOWN_ENGINES) + ["e2-no-such-engine"])
+        assert "e2-no-such-engine" in probe["engines_without_ingest_rate"]
+        assert "e2-no-such-engine" not in probe["per_engine_hours"]
+        # ...and it contributed nothing, which is the half that matters: a
+        # named engine that still moved the total would be the old defect
+        # wearing a disclosure.
+        assert probe["total_hours"] == estimate["total_hours"]
 
 
 class TestThroughputThatRisesWithEffortIsFlagged:
@@ -4806,9 +4872,15 @@ class TestARunMeasuresEveryEngineByDefault:
     comparison was missing."""
 
     def test_the_default_is_every_known_engine(self):
+        # A value assertion, which is what makes it useful: an engine config
+        # added to config/engines/ without this line being updated fails here
+        # rather than silently joining every default run. `percona` is the
+        # seventh and was added by the task that wrote config/engines/
+        # percona.yml, which is the only way this set is ever meant to move.
         from orchestrator.cli import KNOWN_ENGINES
         assert set(KNOWN_ENGINES) == {"mariadb", "mariadb123", "alisql",
-                                      "pgvector", "valkey", "mongodb"}
+                                      "pgvector", "valkey", "mongodb",
+                                      "percona"}
 
     def test_run_defaults_to_all_of_them(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()

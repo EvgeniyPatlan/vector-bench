@@ -82,8 +82,11 @@ ann:
   # every dataset, so the printed figure would be wrong too.
   #
   # It costs a full reload of both corpora per engine: +17.04 h of ingest for
-  # the three headline engines and +23.29 h for all six, by
-  # `orchestrator/estimate.py`. Restricting it to sift-128 alone would have
+  # the three headline engines and +23.29 h for the six with a measured
+  # ingest rate, by `orchestrator/estimate.py`. (Seven engines run; Percona's
+  # rate is unmeasured, so the estimator names it rather than modelling it
+  # and it adds nothing to either figure. The label is the engine set, not
+  # the engine count.) Restricting it to sift-128 alone would have
   # saved about half of that (+8.12 h / +11.07 h).
   #
   # **The "~65%" above is the share over THIS grid, and that is worth saying

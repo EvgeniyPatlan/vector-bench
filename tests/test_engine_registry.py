@@ -41,11 +41,21 @@ GOLDEN = {
     "valkey": ("ValkeyDriver", "ValkeySearch", 6379, "/var/lib/vbench",
                None, ("", ""), "extra",
                "#e377c2", "D", "-", "Valkey (valkey-search)", "Valkey (valkey-search)"),
+    # Percona SERVER, InnoDB HNSW. `PerconaServer` and not `PerconaSearch`:
+    # that one is `mongodb` above, a different engine from the same vendor, and
+    # ann-benchmarks keys result files on this name -- so swapping the two
+    # would make one engine report the other's recall, which is the defect
+    # `mariadb123` exists to prevent.
+    "percona": ("PerconaDriver", "PerconaServer", 3306, "/var/lib/vbench",
+                "/server-data/data", ("bench", "bench"), "extra",
+                "#ff7f0e", "P", "-", "Percona Server (InnoDB HNSW)",
+                "Percona Server (InnoDB HNSW)"),
 }
 
 # The order a run iterates and a report presents: the original three, then the
 # engines added later. Directory discovery is alphabetical and would not.
-GOLDEN_ORDER = ("mariadb", "alisql", "pgvector", "mariadb123", "mongodb", "valkey")
+GOLDEN_ORDER = ("mariadb", "alisql", "pgvector", "mariadb123", "mongodb",
+                "valkey", "percona")
 
 
 @pytest.fixture(scope="module")
@@ -96,8 +106,11 @@ class TestRegistry:
     def test_groups(self):
         assert engines_mod.engines_in_group("original") == \
             ("mariadb", "alisql", "pgvector")
+        # A value assertion and not a membership one, deliberately: an engine
+        # added to config/engines/ and not to this tuple fails here rather
+        # than passing silently, which is what a `>=` or an `in` would do.
         assert engines_mod.engines_in_group("extra") == \
-            ("mariadb123", "mongodb", "valkey")
+            ("mariadb123", "mongodb", "valkey", "percona")
 
     def test_get_unknown_names_the_alternatives(self):
         with pytest.raises(ValueError) as excinfo:

@@ -830,8 +830,65 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
             return 0
 
         m_values = list(ops_cfg.get("m_values", [16]))
-        build_modes = (["post"] if engine != "pgvector"
-                       else list(profile.get("ann", {}).get("pgvector_build_modes", ["post"])))
+        # Which build modes the OPS phase runs for this engine. Keyed per
+        # engine because "both modes" is only meaningful for an engine that
+        # has both: MariaDB and AliSQL maintain the graph inside every INSERT
+        # and have no separable build, so a second mode for them would be the
+        # same measurement twice.
+        #
+        # Percona is the second engine here that genuinely has both -- it
+        # builds incrementally on INSERT and also has a real bulk path
+        # (`ALTER TABLE … ADD VECTOR KEY` from one clustered scan), which
+        # `PerconaDriver.create_schema`/`create_index` split on. It is added
+        # beside pgvector rather than instead of a general lookup because the
+        # list of engines that can answer the question is the thing being
+        # declared, and an engine that cannot would silently produce a
+        # duplicate curve.
+        #
+        # **THE TWO KEYS LIVE IN DIFFERENT BLOCKS, AND THAT IS THE FIX FOR A
+        # DEFECT RATHER THAN AN INCONSISTENCY.** `pgvector_build_modes` drives
+        # BOTH passes -- `ann_pass.render_config` emits a run group per mode
+        # and this loop runs an ops unit per mode -- so it belongs with the
+        # ann configuration and is read from there by both.
+        #
+        # Percona's drives the OPS pass only, because the ann overlay module
+        # reads no `build_mode` (see `ann_pass.render_config`'s percona
+        # branch, which REFUSES the ann key rather than emitting two identical
+        # curves). Putting it under `ann:` as `percona_build_modes` was tried
+        # and was wrong twice over: `render_config` is handed the whole
+        # profile and polices that key, so `run --profile percona` failed its
+        # ann phase and `render --profile percona` raised uncaught from
+        # `cmd_render` -- which loops over KNOWN_ENGINES, so the traceback
+        # arrived for a profile that names one engine. Under `ops:` the ann
+        # renderer structurally cannot see it, and the one profile that sets
+        # it gets both an ef_construction sweep on the ann side and both build
+        # modes on the ops side, which is what it exists for.
+        #
+        # Checked for every shipped profile by
+        # `tests/test_e2_percona_wiring.py::TestEveryShippedProfileRenders`.
+        #
+        # **The default is `["post"]` for Percona as it is for everyone else,
+        # and that is a real asymmetry rather than a neutral choice.** For
+        # MariaDB and AliSQL `post` is a no-op -- `create_index` does nothing
+        # and `capabilities()["incremental_index"]` is True, so the measured
+        # build is the incremental one either way. For Percona `post` is a
+        # genuine bulk build, so a profile that names no mode measures
+        # Percona's bulk build against the other two's incremental one. That
+        # is the honest default (it is each engine's idiomatic build, which is
+        # what `docs/05-methodology.md` says these comparisons report), but it
+        # is not like-for-like, and `build_mode` is on every record so the
+        # report can say which. `config/profiles/percona.yml` runs both.
+        _OPS_BUILD_MODE_KEYS = {
+            "pgvector": ("ann", "pgvector_build_modes"),
+            "percona": ("ops", "percona_build_modes"),
+        }
+        _mode_ref = _OPS_BUILD_MODE_KEYS.get(engine)
+        if _mode_ref:
+            _block, _key = _mode_ref
+            build_modes = list(
+                (profile.get(_block) or {}).get(_key, ["post"]))
+        else:
+            build_modes = ["post"]
         storage_engines = _ops_storage_engines(engine, profile, resources,
                                                resource_pass)
         worst_rc = 0

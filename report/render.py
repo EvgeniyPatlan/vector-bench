@@ -2094,7 +2094,7 @@ def _consistency_section(summary: Dict[str, Any]) -> str:
             f"harness stamps `InnoDB` on every engine from its own default "
             f"while the ann modules report `heap`, `memory` and `wiredTiger`, "
             f"so requiring equality there would empty this table for three of "
-            f"six engines for a naming reason. The Storage column carries the "
+            f"seven engines for a naming reason. The Storage column carries the "
             f"normalised value each row was paired on, so two units differing "
             f"only in storage engine are two rows here rather than one._\n"
             + dropped_axis_note + quantization_note
