@@ -256,6 +256,42 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # comparison of compiler flags. The value is written to /opt/percona/.march so
 # the ann overlay module can report which one the image actually used — see
 # overlay/.../percona/module.py, which overrides _image_march() for exactly this.
+#
+# `make --output-sync` is a diagnosability flag and it is not optional.
+# The first `build --engines percona` ever run ended with nothing more useful
+# than
+#
+#   make: *** [Makefile:166: all] Error 2
+#
+# as its final line. The compiler diagnostic and the `[ 26%] Building CXX
+# object ...` line that names the file it came from are written by two
+# different processes, so above -j1 they land apart, and the sub-make's own
+# `make[1]: *** Error 1` lands apart from the top-level `Error 2` as well.
+# Measured on GNU Make 4.3, a two-level recursive build at -j4 with one target
+# failing: without the flag the `error:` text sits three unrelated progress
+# lines below the target that produced it, with three more after it before the
+# top-level error; with `=target` it is the very next line. This image is built
+# at `nproc` jobs by default, which on the reference host is 80.
+#
+# `=target` and not `=recurse`: `recurse` groups output per recursive make, and
+# CMake's generated top-level Makefile recurses once into CMakeFiles/Makefile2
+# for the whole build, so `=recurse` would buffer every line until the build
+# ended -- no progress at all for the hours this takes. `=line` keeps progress
+# live but still splits a multi-line diagnostic from its own target.
+#
+# The flag goes AFTER -j"$JOBS" deliberately. `make -j` is the literal string
+# tests/test_e1_percona_design.py and tests/test_e4_percona_build_flags.py
+# split this file on to bound the cmake flag region, and they do not survive
+# its loss equally: test_e4 asserts the anchor is present and fails loudly,
+# while test_e1:350-351 splits without that assertion, so a missing separator
+# silently widens its region from the cmake invocation to end of file -- every
+# assertion still green over a bound that no longer exists. Measured, by
+# running both parses over a copy of this file with the flag moved ahead of
+# -j: the guarded region goes from every flag to none at all, while the
+# unguarded one keeps every flag and swallows the rest of the file with them,
+# as far down as `ARG PERCONA_TAG`. That asymmetry is why
+# tests/test_e5_percona_make_output_sync.py pins the flag's side of the
+# anchor rather than trusting either suite to notice.
 RUN set -eux; \
     JOBS="${JOBS:-0}"; [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS="$(nproc)"; \
     mkdir -p /build; \
@@ -280,7 +316,7 @@ RUN set -eux; \
       -DWITH_SSL=system \
       -DWITH_ZLIB=system \
       ${CMAKE_FLAGS} ; \
-    make -j"$JOBS"; \
+    make -j"$JOBS" --output-sync=target; \
     make install; \
     echo "${MARCH}" > /opt/percona/.march
 
