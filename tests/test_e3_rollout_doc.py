@@ -459,9 +459,9 @@ CITED_IN_REPO = {
     "orchestrator/manifest.py:80":
         ("orchestrator/manifest.py",
          '"ops_measurement_version": OPS_MEASUREMENT_VERSION'),
-    "harness/workloads/clients.py:108":
+    "harness/workloads/clients.py:166":
         ("harness/workloads/clients.py", "CLIENT_BOUND_UTIL = 0.80"),
-    "harness/workloads/clients.py:228-238":
+    "harness/workloads/clients.py:326-328":
         ("harness/workloads/clients.py",
          "return self.client_cpu_util > CLIENT_BOUND_UTIL"),
     "harness/workloads/clients.py:34-45":
@@ -474,7 +474,7 @@ CITED_IN_REPO = {
     "harness/workloads/churn.py:279-280":
         ("harness/workloads/churn.py",
          "readers are off, which is the one"),
-    "harness/workloads/churn_readers.py:121-122":
+    "harness/workloads/churn_readers.py:150-151":
         ("harness/workloads/churn_readers.py", "if readers <= 0:"),
     "harness/drivers/base.py:258":
         ("harness/drivers/base.py", 'repair_path: str = "none"'),
@@ -509,10 +509,10 @@ CITED_IN_REPO = {
         ("config/profiles/main.yml", "churn_readers: 4"),
     "config/profiles/dev.yml:74":
         ("config/profiles/dev.yml", "churn_readers: 0"),
-    "docs/05-methodology.md:470-477":
+    "docs/05-methodology.md:486-493":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:980-981":
+    "docs/05-methodology.md:1003-1004":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
     "config/profiles/main.yml:110":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
@@ -523,16 +523,16 @@ CITED_IN_REPO = {
         ("report/crosscheck.py", "def consistency_checks"),
     "report/crosscheck.py:105":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
-    "report/render.py:2328":
+    "report/render.py:2592":
         ("report/render.py", "## 10. Consistency checks"),
     # These two cited the stale sentences until they were corrected; they now
     # cite the corrected ones. The anchor is the same phrase in both files,
     # which is deliberate: it is the polarity-bearing clause, so a row that
     # still matched after a wrong rewrite would be a row worth nothing.
-    "report/render.py:1953":
+    "report/render.py:2217":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:912":
+    "docs/05-methodology.md:935":
         ("docs/05-methodology.md",
          "the grids meet, so an empty section there is the fault case"),
     "docs/09-adding-percona-server.md:682":
@@ -1262,8 +1262,8 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
     def test_the_document_names_both_places(self):
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
-        assert "report/render.py:1953" in section
-        assert "docs/05-methodology.md:912" in section
+        assert "report/render.py:2217" in section
+        assert "docs/05-methodology.md:935" in section
 
 
 # ---------------------------------------------------------------------------

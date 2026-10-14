@@ -1,10 +1,20 @@
-"""Latency accumulation and percentile reporting.
+"""Latency accumulation, percentile reporting, and what a window achieved.
 
 Percentiles are computed from every recorded sample rather than from a running
 approximation. At the query counts used here (10k test vectors per run) keeping
 all samples costs a few megabytes and removes a whole class of "is the p99
 real?" doubt. `nearest-rank` is used rather than interpolation so a reported p99
 is always a latency that actually occurred.
+
+Keeping every span is also what makes `WindowConcurrency` possible: how many
+queries a multi-client window actually had outstanding, and how many it had in
+service, are both sums over the spans this module already holds. They are here
+rather than in `harness/workloads/clients.py`, where the pool that reports them
+lives, for two reasons -- `span_disposition`'s definition of "inside the
+window" has to be the SAME one the percentiles and the throughput use, and
+`clients.py` was 846 lines against this repository's 800-line ceiling with the
+policy inlined. `SERVED_CONCURRENCY_FLOOR` and `scaling_status` follow the
+quantity they judge for the same reason `churn_readers.py` exists.
 """
 
 from __future__ import annotations
@@ -138,6 +148,210 @@ def span_disposition(started: Optional[float], finished: Optional[float],
             and started < window_start):
         return PREWINDOW_DISCARDED
     return None
+
+
+class WindowConcurrency(NamedTuple):
+    """How many queries a measured window actually had in it, two ways.
+
+    Both are derived from the spans the window already keeps, by the SAME
+    `span_disposition` call that decides which latencies and which returned
+    ids count -- so they describe exactly the queries the QPS beside them
+    counts. Neither needs a distributional assumption and neither needs a
+    field the record does not already carry.
+
+    `outstanding` is Little's law computed exactly: the integral of the
+    occupancy function over the window, divided by the window. Sum the spans
+    and you have the area; there is no estimator in it. It answers "how many
+    queries did the clients have in flight on average".
+
+    `served` is Little's law with the MEDIAN span rather than the mean. It
+    answers a different question -- "how many queries were in SERVICE on
+    average" -- and the two diverge by exactly the time a span spends waiting
+    for Python's interpreter lock instead of waiting for the engine.
+
+    **Which one a guard must use was settled by measurement, not by
+    preference, and the answer is not the exact one.** Five synthetic drivers
+    of identical nominal query cost (0.325 ms, the smoke run's observed p50)
+    were run through the real `ClientPool` at 1 and 4 clients
+    (CPython 3.12.3, 3 windows of 2 s per point, median window reported;
+    `tests/test_g1_client_concurrency.py` rebuilds four of the five regimes
+    and asserts the verdicts rather than the decimals):
+
+        driver                     efficiency   outstanding/n   served/n
+        sleep (releases the lock)        1.00           0.99        0.96
+        saturated server                 0.28           1.00        0.98
+        atomic C call holding the lock   0.27           0.99        0.22
+        Python spin holding the lock     0.25           0.98        0.25
+        half released, half held         0.52           1.00        0.96
+
+    `outstanding/n` is 0.98-1.00 on all five, across efficiencies from 0.25 to
+    1.00. It is BLIND, and the reason is mechanical rather than a matter of
+    noise: a thread that is waiting for the lock is still inside
+    `driver.query`, because the span's start instant is read in Python and the
+    interpreter can drop the lock at any bytecode boundary after it. The wait
+    lands inside the span, the stretched spans tile the wall, and the sum
+    approaches the client count however little work was served. The signature
+    in the same rows is a mean far above the median -- 1.025 ms against
+    0.227 ms for the atomic driver -- and a p99 of 16.7 ms where the p50 did
+    not move.
+
+    `served/n` separates the two regimes by a factor of four: 0.22-0.25 where
+    the pool served about one query, 0.96-0.98 where it served four. A
+    genuinely saturated server raises the WHOLE distribution, median
+    included -- 0.389 ms to 1.377 ms at four clients here -- so its `served`
+    stays at the client count and it is not flagged. That is the distinction
+    a guard has to get right.
+
+    `None`, never 0.0, when the window counted no query: zero is the claim
+    "the clients had nothing in flight", which cannot be true of a window
+    that executed queries, and it is the value a guard would read as
+    serialization on a window nobody measured.
+    """
+
+    outstanding: Optional[float]
+    served: Optional[float]
+
+
+def window_concurrency(collectors: Sequence["LatencyCollector"],
+                       wall_seconds: float,
+                       cutoff: Optional[float] = None,
+                       window_start: Optional[float] = None
+                       ) -> WindowConcurrency:
+    """The concurrency a window achieved, from the spans it already kept.
+
+    Beside `merge_collectors` and not inside it, because `merge_collectors`
+    returns `Record` columns and these two are not columns -- they belong in
+    the concurrency record's `extra` the way the client-CPU figures do. In
+    this module rather than in the workload, because the kept-span rule has to
+    be the SAME rule: one `span_disposition` call decides which spans the QPS
+    counts, which latencies the percentiles cover, which ids recall scores and
+    now which spans these two sum. Four definitions of "inside the window" is
+    how a published recall comes to describe a different query set from the
+    throughput beside it, which this module's own history records.
+
+    The median is `percentile(sorted, 0.50)` -- the same nearest-rank function
+    and the same definition `latency_p50_ms` is reported with -- so a reader
+    can check `served` against the record with one multiplication:
+    `queries_executed x latency_p50_ms / 1000 / window`. An interpolating
+    median here would make that arithmetic disagree with the published p50 and
+    the check would read as a bug in the guard.
+    """
+    kept: List[float] = []
+    for c in collectors:
+        for sample in c._samples:
+            if span_disposition(sample.started, sample.finished,
+                                window_start, cutoff) is None:
+                kept.append(sample.seconds)
+    if not kept or wall_seconds <= 0:
+        return WindowConcurrency(None, None)
+    kept.sort()
+    return WindowConcurrency(
+        outstanding=sum(kept) / wall_seconds,
+        served=len(kept) * percentile(kept, 0.50) / wall_seconds,
+    )
+
+
+#: Share of the client count that must have been IN SERVICE before a scaling
+#: efficiency is reportable as a property of the engine. Below it the harness
+#: records a status instead and the report refuses to render the figure.
+#: `scaling_status` below says what the statuses mean; `WindowConcurrency`
+#: above says why `served` and not the exact `outstanding` is compared.
+#:
+#: 0.5 IS MEASURED, and the measurement is the GAP it sits in. Five synthetic
+#: drivers of identical 0.325 ms query cost through the real `ClientPool` at 1
+#: and 4 clients, three 2 s windows each, median window
+#: (CPython 3.12.3; `docs/05-methodology.md` §7 has the full table and
+#: `tests/test_g1_client_concurrency.py` the reproducible form):
+#:
+#:     driver                     efficiency   served/clients   flagged?
+#:     releases the lock                1.00             0.96   no
+#:     saturated server                 0.28             0.98   no
+#:     holds the lock (two forms)  0.25-0.27        0.22-0.25   YES
+#:     half released, half held         0.52             0.96   no
+#:     any driver at 1 client           1.00        0.94-1.00   no
+#:
+#: Two populations, 0.22-0.25 and 0.94-1.00, with nothing measured between:
+#: 0.5 is a factor of two from each side and no plausible move of it changes
+#: a verdict. The midpoint of a measured gap is the whole justification.
+#:
+#: **The saturated-server row is the one this has to get right.** That driver
+#: IS the bottleneck -- latency rises with the client count, throughput is
+#: flat and efficiency falls to 0.28, the shape a reader would call an engine
+#: ceiling, and it is one. Its median span rose with it, 0.389 ms to
+#: 1.377 ms, so its `served` stayed at the client count and it is NOT
+#: flagged. A real queue raises the whole distribution; a lock stall raises
+#: only the tail.
+SERVED_CONCURRENCY_FLOOR = 0.5
+
+#: The pool served about as many queries as it had clients, so a scaling
+#: efficiency measured over it describes the engine.
+SCALING_OK = "ok"
+
+#: The pool served materially fewer queries at once than it had clients, so
+#: whatever `scaling_efficiency` came out of it is not n-client scaling of
+#: this engine. Named for the OBSERVATION and not for a cause, deliberately:
+#: see `scaling_status` for the two causes a client's own clock cannot
+#: separate.
+SCALING_CONCURRENCY_NOT_ACHIEVED = "concurrency_not_achieved"
+
+#: Both statuses, for a report or a test that wants to assert it has handled
+#: every one. A tuple rather than a set so the order is the order they are
+#: documented in.
+SCALING_STATUSES = (SCALING_OK, SCALING_CONCURRENCY_NOT_ACHIEVED)
+
+
+def served_fraction(served: Optional[float],
+                    clients: int) -> Optional[float]:
+    """`served` as a share of the client count.
+
+    The quantity the floor is compared against, as one expression in one
+    place, so `scaling_status` and anything printing the evidence cannot
+    divide by two different denominators. `None` propagates: a window that
+    counted no query has no fraction, and a 0.0 here reads as total
+    serialization to every consumer.
+    """
+    if served is None or clients <= 0:
+        return None
+    return served / clients
+
+
+def scaling_status(served: Optional[float],
+                   clients: int) -> Optional[str]:
+    """Whether a scaling efficiency over this window is reportable.
+
+    Here rather than in `harness/workloads/clients.py`, where it was written
+    and where `PoolWindow.scaling_status` still exposes it: this module owns
+    the quantity, the floor belongs beside the quantity it judges, and
+    `clients.py` was 846 lines against this repository's 800-line ceiling
+    with the policy inlined. `churn_readers.py` exists for the same reason.
+
+    `None` -- not `SCALING_OK` -- when there is nothing to judge: a window
+    that counted no query has no spans to sum, and "the pool achieved its
+    concurrency" and "nobody could look" are different statements, exactly as
+    `PoolWindow.client_bound` distinguishes them for an unreadable CPU
+    counter. The report must render the two differently or the absence reads
+    as a pass.
+
+    `SCALING_CONCURRENCY_NOT_ACHIEVED` NAMES THE OBSERVATION, NOT A CAUSE,
+    deliberately. Two things produce it and a client's own clock cannot tell
+    them apart: the CLIENTS serialized on Python's interpreter lock, the case
+    the live smoke run exposed, which makes the efficiency a property of the
+    harness; or the SERVER serialized, in which case there is a real finding
+    -- but it is "this engine serializes queries", not "this engine scales at
+    0.25", which is a different claim needing a different presentation. Both
+    make the published number wrong, so both are refused and the report
+    states both readings. `client_cpu_seconds` separates them in practice,
+    roughly one core against roughly none, and travels beside the status in
+    the record. Putting the CPU figure INSIDE the condition was rejected for
+    the reason `clients.CLIENT_BOUND_UTIL` is a cautionary tale: a CPU term
+    reintroduces the blindness this quantity was added to fix.
+    """
+    fraction = served_fraction(served, clients)
+    if fraction is None:
+        return None
+    if fraction < SERVED_CONCURRENCY_FLOOR:
+        return SCALING_CONCURRENCY_NOT_ACHIEVED
+    return SCALING_OK
 
 
 class LatencyCollector:

@@ -622,8 +622,14 @@ def _is_concurrency_point(record: Dict[str, Any], dataset: str) -> bool:
 #: decimals, and its docstring has the measured reason. PR 2 §2.3.3 writes the
 #: title with a literal `0.95`, and `{0.95:g}` is exactly `0.95`, so the
 #: default target renders the spec's own string.
+#: `FLOOR_MARK, UNCALIBRATED_MARK` stay adjacent and in that order, out of
+#: alphabetical sequence, because
+#: `tests/test_g2_operating_point_doc.py::test_the_chart_imports_the_marks_rather_than_respelling_them`
+#: pins that exact substring -- §2.0's point being that a chart's mark and a
+#: table's footnote cannot drift apart. A new name goes after them.
 from .render import (FLOOR_MARK, UNCALIBRATED_MARK,  # noqa: E402
-                     UNREACHED_MARK, _fmt_target)
+                     UNREACHED_MARK, SCALING_CONCURRENCY_NOT_ACHIEVED,
+                     _fmt_target)
 
 
 def _uncalibrated_engines(records: List[Dict[str, Any]], dataset: str
@@ -915,8 +921,21 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                          color=style["color"], marker=style["marker"],
                          linestyle=style["linestyle"], linewidth=1.8, markersize=6)
 
+        # The efficiency panel omits a point whose pool never ran the queries
+        # its client count implies, and omitting it is the whole intent rather
+        # than a shortcut. This panel's y axis is labelled "1.0 = linear" and
+        # drawn against a linear-scaling reference line: a point placed on it
+        # asserts that N clients delivered this share of N clients' work. For
+        # a pool that served about one query, that assertion is false whatever
+        # marker it is drawn with, and a hollow point would still put it on
+        # the line to be read off. The table prints the refusal in words, the
+        # Validity section names the point and shows the figure it withheld,
+        # and the QPS and latency panels keep the point because those ARE
+        # measurements. See `report/render.SCALING_CONCURRENCY_NOT_ACHIEVED`.
         eff = [(c, (r.get("extra") or {}).get("scaling_efficiency"))
-               for c, r in zip(clients, rows)]
+               for c, r in zip(clients, rows)
+               if (r.get("extra") or {}).get("scaling_status")
+               != SCALING_CONCURRENCY_NOT_ACHIEVED]
         eff = [(c, v) for c, v in eff if v is not None]
         if eff:
             axes[2].plot([p[0] for p in eff], [p[1] for p in eff],
@@ -940,7 +959,14 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                             facecolors="none", edgecolors=style["color"],
                             linewidths=1.6, zorder=5)
             efficiency = extra.get("scaling_efficiency")
-            if efficiency is not None:
+            # A point can be both client-bound and refused, and the refusal
+            # wins on this panel: the line above omitted it, and hollowing it
+            # here would put it back on the linear-scaling reference the panel
+            # is read against. The QPS panel still hollows it, because a
+            # client-bound throughput is a measurement with a caveat.
+            if (efficiency is not None
+                    and extra.get("scaling_status")
+                    != SCALING_CONCURRENCY_NOT_ACHIEVED):
                 axes[2].scatter([r["clients"]], [efficiency], s=140,
                                 facecolors="none", edgecolors=style["color"],
                                 linewidths=1.6, zorder=5)

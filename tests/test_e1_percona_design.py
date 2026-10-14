@@ -1640,7 +1640,7 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", "def prepare_churn"),
     "harness/drivers/base.py:374":
         ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "churn.py:513-514":
+    "churn.py:522-523":
         ("harness/workloads/churn.py", "what = driver.maintain()"),
     "harness/workloads/build.py:12-16":
         ("harness/workloads/build.py", "ingest_wall_s"),

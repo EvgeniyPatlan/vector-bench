@@ -431,16 +431,39 @@ pool delivered a quarter of its throughput and `client_bound` stayed `False`.
 (Those run figures are measurements of a live `smoke` run and of that
 reproduction, not of this document.)
 
+**What that 0.177 is a measurement OF, which this section stated too
+loosely.** `read_own_cpu_usec` opens `/sys/fs/cgroup/cpu.stat`. In a real run
+that is the harness container's own cgroup, which is the quantity
+`client_cpu_util` claims. On a bare host it is the **root** cgroup — the whole
+machine: measured on a developer box, it reported **2.421 cores** burned while
+the reading process slept. So the quotient describes the clients only when the
+harness is in its own container, and the 0.177 is a figure from such a run
+rather than something a checkout can reproduce. **This is documented one file
+away and is easy to walk past**, which is how it was walked past here: the
+docstring of `tests/test_harness.py`'s
+`test_a_known_number_of_saturated_cores_reads_back_as_that_many` already says
+`/sys/fs/cgroup` is the root cgroup on a host, "so the counter also sees the
+rest of the machine: a sibling worktree running its own suite lands in the
+numerator" — which is why that test **retries rather than loosens** its
+ceiling. Read that docstring before reaching for this counter; the helper
+beside it is the one everybody reaches for first.
+
+**None of this weakens the point above.** A CPU-utilisation threshold cannot
+see a lock stall whatever the counter's scope, because the lock prevents the
+very consumption the threshold looks for. A wider scope makes the reading too
+HIGH, not too low, so it cannot explain a 0.177 away.
+
 So `client_bound` is **sufficient and not necessary**: a point it marks was
 client-limited, and a point it does not mark is not thereby evidence that the
 engine was the limit. The signature of the case it misses is **flat QPS with
 flat latency** — throughput that stops rising while the percentiles do not
 move, which no saturating engine produces, because an engine at its limit
 makes queries wait and that shows in p95 and p99. `scaling_efficiency` beside
-it is the other half of the reading. An instrument that measures achieved
-concurrency directly from the query spans is being added; until it lands, read
-those two together and treat an unmarked flat point as unexplained rather than
-as an engine result.
+it is the other half of the reading. **That instrument has landed** — §7 has
+it: the harness now measures from the query spans how many queries a window
+had in service, refuses to publish a scaling efficiency where that is far
+below the client count, and carries the measurement showing the obvious
+formulation of it, summing the spans, is blind to this very case.
 
 ### 2.4 Filtered / hybrid search (ops harness)
 
@@ -1050,4 +1073,128 @@ Stated up front so readers can judge relevance:
   Results are pinned to the tags in the manifest and go stale quickly.
 - **Client-side overhead.** ann-benchmarks drives queries from Python. At high
   QPS the client can become the bottleneck; the harness records client CPU
-  utilisation so this is detectable rather than silent.
+  utilisation so this is detectable rather than silent. CPU utilisation is not
+  sufficient on its own — see §7, which is about the case it cannot see.
+
+## 7. Multi-client throughput and whether the clients achieved it
+
+The ops harness runs its concurrency clients, and the churn workload's readers,
+as **Python threads in one interpreter**, each with its own connection. That
+makes every multi-client figure conditional on something the figure itself does
+not state: that the pool really had *N* queries in flight. `Scaling efficiency`
+divides an *N*-client throughput by *N* times a one-client throughput, so if
+the clients took turns it reports a property of the harness in a column a
+reader will take for a property of the database.
+
+**This was found by a live run, not by reading the code.** §2.3 has that run
+and what it shows — flat QPS with flat latency at four clients, about one query
+in flight, `client_bound` false at a `client_cpu_util` of 0.177 against its
+0.80 threshold — and this section does not repeat it. Read §2.3 first; it is
+the reason this one exists. One figure from the same run belongs here rather
+than there because it is a *write* rate: the churn writer managed 12.0 rows/s,
+2,000 rows in 166.8 s, against four concurrent readers, where the modelled
+MariaDB ingest is about 150 rows/s.
+
+**What the harness now records, and why it is not a CPU threshold.** Every
+measured window reports two figures derived from the spans it already keeps:
+
+| Field | What it is |
+| --- | --- |
+| `extra.outstanding_concurrency` | The exact time-average number of queries **outstanding**: the sum of every in-window query's duration, divided by the window. No estimator, no distributional assumption. |
+| `extra.served_concurrency` | The queries the window counted times their **median** latency, divided by the window — the robust estimate of how many were **in service**. |
+| `extra.scaling_status` | `ok`, or `concurrency_not_achieved` when `served_concurrency` fell below half the client count. |
+
+Where the status is `concurrency_not_achieved` the report prints no scaling
+efficiency for that point at all, the chart's efficiency panel omits it, and
+the Validity section names the point and shows the figure it withheld. The QPS
+and the percentiles stay: the pool did answer that many queries at those
+latencies, and it is the division by the client count that has no basis.
+
+The threshold is half the client count, and it sits in the middle of a measured
+gap. Five synthetic drivers of identical 0.325 ms per-query cost, differing only
+in what they do with the interpreter lock, were run through the real client pool
+at one and four clients — three two-second windows per point, median window,
+CPython 3.12.3. The drivers are a throwaway harness rather than part of this
+repository; what is reproducible from the tree is
+`tests/test_g1_client_concurrency.py`, which builds the same four regimes and
+asserts the verdicts:
+
+| Driver | Efficiency at 4 | `served / clients` | `outstanding / clients` |
+| --- | --- | --- | --- |
+| releases the lock (`time.sleep`) | 1.00 | 0.96 | 0.99 |
+| **saturated server** (latency rises with the client count) | 0.28 | **0.98** | 1.00 |
+| atomic C call holding the lock | 0.27 | 0.22 | 0.99 |
+| Python spin holding the lock | 0.25 | 0.25 | 0.98 |
+| half released, half held | 0.52 | 0.96 | 1.00 |
+
+Two things to read off it. **A genuinely saturated server is not flagged**,
+which is the case the threshold exists to protect: a real queue raises the whole
+latency distribution, median included, so that row's `served` stays at the
+client count while its efficiency falls to 0.28. And **the exact figure is the
+blind one** — `outstanding` is 0.98–1.00 of the client count on all five rows,
+across efficiencies from 0.25 to 1.00, because a query waiting for the lock is
+still inside the client's timed region and the stretched spans tile the window.
+It is recorded anyway, because the pair is the diagnostic: outstanding at the
+client count while in service sits near one is the signature of time spent
+waiting for a lock rather than for the engine.
+
+**`client_bound` is kept, and §2.3 says why it cannot see this.** Nothing here
+replaces it: a client container that genuinely runs out of CPU is a real case
+and `scaling_status` cannot name it as a CPU limit, while a lock ceiling
+prevents the very CPU consumption `client_cpu_util` looks for. The two
+quantities are complementary and both are recorded.
+
+One correction to how §2.3's 0.177 should be read, because it bears on every
+use of that counter: `read_own_cpu_usec` opens `/sys/fs/cgroup/cpu.stat`, which
+**outside a container is the root cgroup — the whole machine**. Measured on a
+bare host, it reported 2.421 cores burned while the reading process slept. So
+`client_cpu_util` is only a measurement of the clients when the harness runs
+in its own container, which is how a real run runs it; the 0.177 is carried
+through this repository as a figure from such a run and not as something a
+test on a developer box can reproduce. `PoolWindow.client_bound`'s docstring
+says so beside the number.
+
+**The churn workload's write rate depends on this too, and by more than the
+read figures do.** `extra.reinsert_rows_per_s` is measured against
+`ops.churn_readers` concurrent readers, and those readers are threads in the
+*writer's own interpreter* — so readers that take turns starve the writer
+inside the client rather than inside the engine. Measured against the synthetic
+driver with a 4 ms write slice and four readers whose per-query cost is
+identical in both arms: readers that release the lock put that published rate
+at 948.2 rows/s, and readers that hold it put the same figure at 41.1 — a
+factor of 23, from nothing but what the client library does with a lock. The
+reader pool's status therefore travels onto the step record that publishes the
+rate, as `extra.reader_scaling_status`, and the during-writes table marks the
+writer cell as well as the latency ratio.
+
+**What is read rather than measured.** Whether a particular client library
+releases the interpreter lock around its socket wait is a property of that
+library's C extension, and no measurement here settles it: these tests start no
+server. The engines do not share a library — pgvector goes through **psycopg3**
+and both MySQL-family engines through **MariaDB Connector/Python** over
+Connector/C, which `docker/_shared/requirements-mysql.txt` explains is
+deliberate so the two are not compared through different clients. The next real
+run settles it for free: if pgvector's efficiency sits near 1.0 at four clients
+while MariaDB's sits near 0.25, the difference is in the client library and not
+in the engines.
+
+**Running the clients as processes is the fix for the limit, and it has not
+been done.** It is the only way to remove a shared interpreter lock from the
+measurement path, and it is an architectural change rather than a correction.
+The cost, so the decision can be taken rather than discovered: each client
+becomes an OS process with its own copy of the query set, so the harness
+container's memory grows with the client count (at 32 clients and a 1M×784
+float32 corpus the query set alone is the dominant term, and it is currently
+shared); the barrier that opens the window, the stop event, the per-client
+latency collectors and the merge over one shared wall all become
+inter-process — a `multiprocessing.Barrier`, a shared `Event` and a queue or
+shared-memory path for the spans — and the wall-clock instants on both sides of
+the window have to come from a clock the processes agree on; `PoolError`'s
+discipline that a client failure fails the record rather than hanging has to be
+re-established against process death rather than thread exceptions; and the
+client-CPU accounting, which today reads one cgroup counter for the whole
+harness container, keeps working only if every client process stays inside that
+cgroup. It would also change what every published multi-client number means, so
+it invalidates comparison with every run measured before it — an
+`OPS_MEASUREMENT_VERSION` bump by the same rule version 3's query-pool change
+earned one. None of that is attempted here.

@@ -50,6 +50,22 @@ made the chart above misleading until they were added:
    what that flag can and cannot see -- it catches a saturated cpuset and not
    a saturated interpreter lock, and the difference has been measured.
 
+4. **Whether the pool ran the queries its client count implies.** The
+   `scaling_efficiency` this workload publishes divides an N-client
+   throughput by N times a one-client throughput, and that is a statement
+   about the engine ONLY IF N queries were in flight. A live `smoke` run of
+   MariaDB measured 2,920.7 q/s at one client and 2,927.5 at four with every
+   latency percentile unchanged, which is about one query in service and an
+   efficiency of 0.25 that is a property of the client. Every window
+   therefore records `extra.outstanding_concurrency` (the exact time-average
+   number outstanding), `extra.served_concurrency` (the median-span estimate
+   of how many were in service) and `extra.scaling_status`; where the status
+   is `concurrency_not_achieved` the report renders no efficiency figure at
+   all and names the point in its Validity section. The quantity is computed
+   from the spans the window already keeps, so it is engine- and
+   library-agnostic and catches serialization whatever produced it -- which a
+   CPU threshold cannot. See `clients.SERVED_CONCURRENCY_FLOOR`.
+
 PR 4 §4.3 item 3 moved the client, the barrier, the window trimming and the CPU
 accounting into `clients.py`, because churn's readers need all four and a
 second implementation of them would start out agreeing and then drift. Nothing
@@ -78,9 +94,10 @@ from ..metrics.resources import own_cpu_count, read_own_cpu_usec  # noqa: F401
 # Re-exported under the names they had here because that is how the existing
 # tests and `report/` reach them, and "concurrency tests unchanged" is the
 # only thing that proves the lift changed nothing.
-from .clients import (CLIENT_BOUND_UTIL, Answer,  # noqa: F401
-                      ClientPool, DriverFactory, Instruments, client_cpu,
-                      shard_queries)
+from .clients import (CLIENT_BOUND_UTIL,  # noqa: F401
+                      SCALING_CONCURRENCY_NOT_ACHIEVED,
+                      SERVED_CONCURRENCY_FLOOR, Answer, ClientPool,
+                      DriverFactory, Instruments, client_cpu, shard_queries)
 from .context import RunContext
 
 _client_cpu = client_cpu
@@ -142,6 +159,15 @@ class _Window(NamedTuple):
     client_cpu_seconds: Optional[float]
     client_cpus: int
     client_cpu_util: Optional[float]
+    #: How many queries this window actually had outstanding and in service,
+    #: and whether a scaling efficiency over it is reportable at all. Carried
+    #: on the sample rather than recomputed from the median window later, for
+    #: the reason the recall is: "the status of the median window" has to be
+    #: true by construction and not by a second indexing expression that can
+    #: drift into being some other window's.
+    outstanding_concurrency: Optional[float]
+    served_concurrency: Optional[float]
+    scaling_status: Optional[str]
 
 
 def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
@@ -253,8 +279,20 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             _warn_client_bound(clients, window.client_cpu_util,
                                window.client_cpus, window.client_cpu_seconds)
 
+        # Whether the pool served as many queries as it had clients. Taken
+        # from the SAME median window, by the same rule as its recall and its
+        # client CPU: a status computed from one window beside a throughput
+        # figure from another would be a caveat about a measurement nobody
+        # published.
+        if window.scaling_status == SCALING_CONCURRENCY_NOT_ACHIEVED:
+            _warn_concurrency_not_achieved(
+                clients, window.served_concurrency,
+                window.outstanding_concurrency, window.client_cpu_seconds,
+                window.client_cpu_util)
+
         _print_point(common["engine"], clients, ctx.k, qps, recall, merged,
-                     efficiency, spread, len(samples))
+                     efficiency, spread, len(samples),
+                     window.scaling_status)
 
         ctx.recorder.write(Record(
             **common,
@@ -323,6 +361,26 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                                     if window.client_cpu_util is not None
                                     else None),
                 "client_bound": client_bound,
+                # Whether the pool actually ran `clients` queries at once,
+                # which is the premise `scaling_efficiency` above is
+                # meaningless without. `outstanding_concurrency` is the exact
+                # time-average number outstanding and `served_concurrency`
+                # the median-span estimate of how many were in service; they
+                # diverge by the time a span spends waiting for the
+                # interpreter lock rather than for the engine, and
+                # `scaling_status` is keyed to the second because the first
+                # was measured blind to that -- see
+                # `clients.SERVED_CONCURRENCY_FLOOR` for the five-driver
+                # table. Both are recorded, never the status alone: the
+                # status is a comparison against a floor, and a reader has to
+                # be able to see how far from it the point sat.
+                "outstanding_concurrency": (
+                    round(window.outstanding_concurrency, 3)
+                    if window.outstanding_concurrency is not None else None),
+                "served_concurrency": (
+                    round(window.served_concurrency, 3)
+                    if window.served_concurrency is not None else None),
+                "scaling_status": window.scaling_status,
             },
         ))
 
@@ -418,6 +476,49 @@ def _warn_client_bound(clients: int, util: float, cpus: int,
         file=sys.stderr, flush=True)
 
 
+def _warn_concurrency_not_achieved(clients: int, served: Optional[float],
+                                   outstanding: Optional[float],
+                                   cpu_seconds: Optional[float],
+                                   util: Optional[float]) -> None:
+    """Say so when the pool never ran the queries its client count implies.
+
+    On stderr and while the run is happening, like the client-bound and
+    recall-spread checks, and for a stronger reason than either: this is the
+    one condition that makes the headline figure of this workload
+    unpublishable, and the operator reading the log is the only person who can
+    still do something about it before the run ends.
+
+    Both causes are named. A client's own clock cannot separate them -- see
+    `clients.PoolWindow.scaling_status` -- and the client-CPU figure beside
+    them is the evidence that can, so it is printed here rather than left to
+    be looked up in the record: roughly one core of client CPU points at the
+    clients, roughly none points at the server. Printed even when it is
+    absent, as `n/a`, because "no counter" and "no CPU" are not the same
+    reading and this is the line that would otherwise conflate them.
+    """
+    served_text = f"{served:.2f}" if served is not None else "n/a"
+    outstanding_text = (f"{outstanding:.2f}" if outstanding is not None
+                        else "n/a")
+    cores_text = f"{cpu_seconds:.1f} CPU-seconds" if cpu_seconds is not None \
+        else "no readable CPU counter"
+    util_text = f"{util:.0%}" if util is not None else "n/a"
+    print(
+        f"[concurrency] CONCURRENCY NOT ACHIEVED: at {clients} client(s) the "
+        f"pool had {served_text} quer(ies) in service on average, below the "
+        f"{SERVED_CONCURRENCY_FLOOR:.0%} of {clients} this figure needs. "
+        f"The scaling efficiency at this point is NOT a property of the "
+        f"engine and the report refuses to render it. Two readings produce "
+        f"this and the clients cannot tell them apart: the clients serialized "
+        f"on Python's interpreter lock, or the engine itself answers one "
+        f"query at a time. The client container spent {cores_text} "
+        f"({util_text} of its CPUs) over this window -- about one core points "
+        f"at the clients, about none points at the engine. "
+        f"{outstanding_text} quer(ies) were OUTSTANDING on average, and that "
+        f"figure counts lock waiting as flight, which is why it is not the "
+        f"one compared here.",
+        file=sys.stderr, flush=True)
+
+
 def _ms(value: Optional[float]) -> str:
     """A latency for the operator's line, or `n/a` where there is none.
 
@@ -430,7 +531,7 @@ def _ms(value: Optional[float]) -> str:
 def _print_point(engine: str, clients: int, k: int, qps: float,
                  recall: Optional[float], merged: Dict[str, float],
                  efficiency: Optional[float], qps_spread: float,
-                 windows: int) -> None:
+                 windows: int, scaling_status: Optional[str] = None) -> None:
     """The operator's one line per data point.
 
     Separate from `run` because it is presentation, and because every one of
@@ -439,8 +540,17 @@ def _print_point(engine: str, clients: int, k: int, qps: float,
     completed, and a spread means nothing from a single window. Formatting
     that beside the measurement is what pushed `run` past the length this
     repository asks of a function.
+
+    An efficiency the report will refuse is printed as `refused` here rather
+    than as its number. The live log is what the operator reads while the run
+    happens, and the smoke run that exposed this printed `efficiency=0.25` on
+    a line whose every other figure said the pool had one client's worth of
+    work in it. A number on this line that the report will not publish is the
+    same number read twice with two different meanings.
     """
     eff_text = f"{efficiency:.2f}" if efficiency is not None else "n/a"
+    if scaling_status == SCALING_CONCURRENCY_NOT_ACHIEVED:
+        eff_text = "refused"
     spread_text = f" spread={qps_spread:.1f}%" if windows > 1 else ""
     recall_text = f"{recall:.4f}" if recall is not None else "n/a"
     print(
@@ -532,4 +642,7 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
         client_cpu_seconds=window.client_cpu_seconds,
         client_cpus=window.client_cpus,
         client_cpu_util=window.client_cpu_util,
+        outstanding_concurrency=window.outstanding_concurrency,
+        served_concurrency=window.served_concurrency,
+        scaling_status=window.scaling_status,
     )
