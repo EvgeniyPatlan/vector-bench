@@ -130,6 +130,23 @@ ARG JOBS=0
 #                         could not find CURL library, after -DWITH_CURL=0
 #                         had been set to clear an earlier failure
 #
+#   CMakeLists.txt:2075   again, with libsasl2-dev installed and LDAP found:
+#                         `Cannot find SASL development libraries` is what
+#                         cmake/sasl.cmake prints, and the dev package is not
+#                         what it was missing. MYSQL_CHECK_SASL looks for the
+#                         SCRAM *plugin* -- FIND_LIBRARY(NAMES scram
+#                         PATH_SUFFIXES sasl2) -- and returns without warning
+#                         only when it finds one. libsasl2-dev ships nothing
+#                         under sasl2/ at all; the unversioned
+#                         sasl2/libscram.so symlink FIND_LIBRARY needs comes
+#                         from libsasl2-modules, a RUNTIME package. The
+#                         warning's own install hint names
+#                         libsasl2-modules-gssapi-mit beside the dev package
+#                         for this reason, and the vendor's install_deps lists
+#                         both. Measured by unpacking all three .debs for
+#                         noble, after a --no-cache rebuild proved the dev
+#                         package was installed and the check failed anyway.
+#
 # Only rpc.cmake offers no way out but the package; the others each tempted a
 # flag first, and each flag moved the failure rather than removing it. Hence
 # the rule recorded beside cmake_flags in config/engines/percona.yml: on this
@@ -151,7 +168,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnuma-dev zlib1g-dev libedit-dev \
       python3 file \
       libldap2-dev libsasl2-dev libkrb5-dev libcurl4-openssl-dev libtirpc-dev \
-      libpam0g-dev liblz4-dev libzstd-dev libevent-dev libre2-dev libwrap0-dev
+      libpam0g-dev liblz4-dev libzstd-dev libevent-dev libre2-dev libwrap0-dev \
+      libsasl2-modules libsasl2-modules-gssapi-mit
 
 WORKDIR /src
 COPY source.tar /tmp/source.tar
