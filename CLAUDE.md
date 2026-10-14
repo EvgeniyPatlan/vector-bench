@@ -122,7 +122,7 @@ build the image, done. The Engines tab in the web UI does exactly this.
 **A new architecture needs code:**
 
 ```
-config/engines/<e>.yml                                  runtime: block + build + SQL dialect
+config/engines/<e>.yml                                  runtime: block + build + server flags
 harness/drivers/<e>.py                                  + register in _driver_classes()
                                                         (harness/drivers/postgres.py)
 overlay/ann-benchmarks/ann_benchmarks/algorithms/<e>/   module.py + config.yml
@@ -153,9 +153,17 @@ These are the reasons the code looks over-defensive. Do not relax them.
 - **Every engine can fall back to a full table scan** — exact results, slowly, indistinguishable
   in output from "very accurate but slow". Every driver implements
   `explain_uses_vector_index()` and it is called per configuration; anything that missed the
-  index goes into the report's Validity section. Note the marker itself lives in the driver
-  (`Dialect.index_name` for the MySQL family) — the `sql.index_plan_marker` key in
-  `config/engines/*.yml` is documentation only and is read by nothing.
+  index goes into the report's Validity section. The marker lives in the driver
+  (`Dialect.index_name` for the MySQL family) and nowhere else. `config/engines/*.yml` once
+  carried an `sql:` block naming it too, alongside a `create_table` and a `query_filtered`,
+  and this bullet used to describe that key as "documentation only and read by nothing".
+  Read by nothing it was — and **also wrong**: `mariadb.yml` and `mariadb123.yml` declared
+  `index_plan_marker: "v"` where the driver names the index `vi`, and the real check is a
+  substring test against the joined EXPLAIN text, so `"v"` would have accepted almost any
+  plan. The rest of the block had drifted the same way, for the same reason: a `create_table`
+  with no `tag` column beside its own `tag` filter, and then no mention of `ctag` while every
+  live driver created it. The blocks are gone and `tests/test_c1_engine_sql.py` fails if one
+  returns.
 - **The ann results tree at `results/annb/<pass>/<fingerprint>/` is shared across runs.**
   ann-benchmarks caches by algorithm and index parameters only — it has no idea how much
   memory or how many cores the engine had. `ann_fingerprint()` keys the tree by the resource

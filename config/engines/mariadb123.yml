@@ -60,32 +60,21 @@ build:
     - -DWITH_SSL=system
     - -DWITH_ZLIB=system
 
-# How this engine expresses vector search. Consumed by the ops-harness driver
-# and by the doc generator so the manual instructions never drift from the code.
-sql:
-  # Session setup executed on every connection before any vector work.
-  session_setup:
-    - "SET SESSION default_storage_engine = InnoDB"
-  # {dim}, {metric}, {m}, {engine} are substituted by the driver.
-  create_table: |
-    CREATE TABLE {table} (
-      id INT PRIMARY KEY,
-      v VECTOR({dim}) NOT NULL,
-      VECTOR INDEX (v) M={m} DISTANCE={metric}
-    ) ENGINE={engine}
-  # MariaDB accepts a raw little-endian float32 binary string for VECTOR.
-  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
-  vector_binding: binary_f32
-  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  set_ef_search: "SET mhnsw_ef_search = {ef_search}"
-  explain: "EXPLAIN {query}"
-  # A plan is only accepted if this appears in EXPLAIN output. Guards against
-  # silently benchmarking a brute-force scan.
-  index_plan_marker: "v"
-  metrics:
-    angular: cosine
-    euclidean: euclidean
+# There is deliberately no `sql:` block. Every statement the ops harness sends
+# is built in harness/drivers/mysql_family.py -- harness/ is mounted into the
+# bench container on its own and cannot read config/, so nothing here could
+# ever have been executed. The statements that do belong to this engine and are
+# not in that file are `runtime.probe`'s below, and the account setup in
+# docker/mariadb/init.sql that --init-file runs on every start.
+#
+# A block did sit here, and three separate things in it had gone wrong, none of
+# them noticed because no reader existed: a CREATE TABLE with no `tag` column
+# beside its own `tag` filter, no mention of `ctag` once that column arrived,
+# and `index_plan_marker: "v"` where the driver names the index `vi`. A single
+# `"v"` would have matched almost any EXPLAIN output, since the real check is a
+# substring test (`dialect.index_name in plan`) -- so the one key CLAUDE.md
+# defended as harmless documentation was both unread and wrong.
+# tests/test_c1_engine_sql.py fails if a block comes back.
 
 # Server knobs, per fairness pass. {mem_bytes} etc. are filled by the harness.
 server:

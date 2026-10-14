@@ -21,33 +21,16 @@ build:
   march: x86-64-v3
   optflags: "-O3 -fno-semantic-interposition"
 
-sql:
-  session_setup:
-    - "SET jit = off"
-  create_table: |
-    CREATE TABLE {table} (
-      id   int PRIMARY KEY,
-      tag  int,
-      embedding vector({dim})
-    )
-  # PLAIN storage keeps vectors inline instead of TOASTing them, which is what
-  # pgvector's own documentation recommends for benchmark-sized vectors.
-  post_create:
-    - "ALTER TABLE {table} ALTER COLUMN embedding SET STORAGE PLAIN"
-  create_index: |
-    CREATE INDEX {table}_embedding_idx ON {table}
-    USING hnsw (embedding {opclass}) WITH (m = {m}, ef_construction = {ef_construction})
-  insert: "INSERT INTO {table} (id, tag, embedding) VALUES (%s, %s, %s)"
-  copy: "COPY {table} (id, tag, embedding) FROM STDIN"
-  vector_binding: pgvector
-  query: "SELECT id FROM {table} ORDER BY embedding {op} %s LIMIT {k}"
-  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY embedding {op} %s LIMIT {k}"
-  set_ef_search: "SET hnsw.ef_search = {ef_search}"
-  explain: "EXPLAIN (FORMAT JSON) {query}"
-  index_plan_marker: "Index Scan"
-  metrics:
-    angular:   {opclass: vector_cosine_ops, op: "<=>"}
-    euclidean: {opclass: vector_l2_ops,     op: "<->"}
+# There is deliberately no `sql:` block. Every statement the ops harness sends
+# is built in harness/drivers/postgres.py -- harness/ is mounted into the bench
+# container on its own and cannot read config/, so nothing here could ever have
+# been executed. The one statement that belongs to this engine and is not in
+# that file is `runtime.probe`'s below.
+#
+# A block did sit here, drifting unnoticed because no reader existed: it
+# declared a nullable `tag` where the driver creates `tag int NOT NULL`, and
+# never mentioned `ctag` once that column arrived.
+# tests/test_c1_engine_sql.py fails if a block comes back.
 
 server:
   common:

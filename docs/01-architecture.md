@@ -153,8 +153,8 @@ measurement perturbs exactly what is being measured. See
 ### Where an engine is defined
 
 One file per engine, `config/engines/<name>.yml`, and the orchestrator reads the
-directory rather than a list. Besides the build recipe, server flags and SQL
-dialect, each carries a `runtime:` block:
+directory rather than a list. Besides the build recipe and the server flags,
+each carries a `runtime:` block:
 
 | Key | Used for |
 | --- | --- |

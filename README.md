@@ -421,7 +421,7 @@ vector-bench/
 ├── run-benchmark.sh          single entrypoint
 ├── config/profiles/          dev · smoke · quick · full — what to measure
 ├── config/resources/         normalized · tuned — how much machine
-├── config/engines/           per-engine build, flags, SQL dialect, runtime
+├── config/engines/           per-engine build, server flags, runtime
 ├── docker/                   multi-stage Dockerfiles + entrypoints
 ├── overlay/ann-benchmarks/   our algorithm modules (alisql is new)
 ├── harness/                  ops harness: drivers, workloads, metrics

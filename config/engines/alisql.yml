@@ -86,34 +86,20 @@ build:
   # default keeps mysqld and libduckdb on one ABI, which is what actually links.
   extra_cxxflags: ""
 
-sql:
-  # Vector features ship disabled, and every vector operation demands RC.
-  # Getting either of these wrong yields ER_VECTOR_DISABLED / ER_NOT_SUPPORTED_YET.
-  session_setup:
-    - "SET SESSION transaction_isolation = 'READ-COMMITTED'"
-    - "SET SESSION default_storage_engine = InnoDB"
-  global_setup:
-    - "SET GLOBAL vidx_disabled = OFF"
-  create_table: |
-    CREATE TABLE {table} (
-      id INT PRIMARY KEY,
-      v VECTOR({dim}) NOT NULL,
-      VECTOR INDEX vi (v) M={m} DISTANCE={metric}
-    ) ENGINE={engine}
-  # Field_vector::store() accepts a binary string of exactly 4*dim bytes, so we
-  # bind raw float32 exactly as for MariaDB rather than paying VEC_FROMTEXT()
-  # text-parsing cost. Keeping the client path identical across the two
-  # MySQL-family engines is what makes their ingest numbers comparable.
-  insert: "INSERT INTO {table} (id, v) VALUES (%s, %s)"
-  vector_binding: binary_f32
-  query: "SELECT id FROM {table} ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  query_filtered: "SELECT id FROM {table} WHERE tag < %s ORDER BY vec_distance_{metric}(v, %s) LIMIT {k}"
-  set_ef_search: "SET vidx_hnsw_ef_search = {ef_search}"
-  explain: "EXPLAIN {query}"
-  index_plan_marker: "vi"
-  metrics:
-    angular: COSINE
-    euclidean: EUCLIDEAN
+# There is deliberately no `sql:` block. Every statement the ops harness sends
+# is built in harness/drivers/mysql_family.py -- harness/ is mounted into the
+# bench container on its own and cannot read config/, so nothing here could
+# ever have been executed. The statements that do belong to this engine and are
+# not in that file are `runtime.probe`'s below, and docker/alisql/init.sql's,
+# which --init-file runs on every start.
+#
+# `SET GLOBAL vidx_disabled = OFF` is the one statement the removed block held
+# that a server genuinely needs, and it has two live homes, neither of them
+# here: ALISQL_DIALECT.global_setup in the driver, and init.sql -- which is
+# where tests/verify-alisql-traps.sh says it comes from. The rest of the block
+# had drifted unnoticed, because no reader existed: a CREATE TABLE with no
+# `tag` column beside its own `tag` filter, and no mention of `ctag` once that
+# column arrived. tests/test_c1_engine_sql.py fails if a block comes back.
 
 server:
   common:
