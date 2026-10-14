@@ -142,6 +142,7 @@ from harness.metrics.latency import (LatencyCollector,                # noqa: E4
 from harness.workloads import client_process as cp                    # noqa: E402
 from harness.workloads import clients as cl                           # noqa: E402
 from harness.workloads import pool_window as pw                       # noqa: E402
+from harness.workloads import transfer_deadline as td                 # noqa: E402
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
 from tests.retired_thread_pool import thread_window                   # noqa: E402
@@ -2108,15 +2109,22 @@ class TestTheSplitDidNotMovePatchTargets:
     patches on `clients` is checked here against the thing that reads it.
     """
 
-    def test_the_three_modules_are_each_inside_the_line_ceiling(self):
+    def test_the_modules_are_each_inside_the_line_ceiling(self):
         """The split's own reason, measured rather than asserted.
 
         If any one of them is over again, the split has stopped doing its job
         and whoever notices should be this test rather than a reviewer -- the
         argument `tests/test_t4b_readers.py` makes for the churn split.
+
+        **FOUR modules now, not three.** `client_process.py` reached 799 of
+        800 and the next change to it was a three-line correctness fix that
+        did not fit, so `transfer_deadline.py` took the span-transfer
+        deadline. A new module absent from this tuple is a module with no
+        ceiling, which is how the guard would stop covering the thing it is
+        named for.
         """
         sizes = {}
-        for mod in (cl, cp, pw):
+        for mod in (cl, cp, pw, td):
             lines = len(open(mod.__file__).read().splitlines())
             sizes[mod.__name__.rsplit(".", 1)[1]] = lines
         assert all(n <= 800 for n in sizes.values()), sizes

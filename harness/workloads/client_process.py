@@ -4,9 +4,13 @@ Split out of `harness/workloads/clients.py`, which owns the pool, the window
 and the measurement policy. The reason is this repository's 800-line ceiling
 and the reason the ceiling exists: `clients.py` stood at 791 lines before G3,
 so there was no substantive change to it that would have fitted. The same
-argument produced `metrics/latency.py` and `churn_readers.py`. **This file is
-now a few lines off that ceiling itself; the span-transfer deadline is the
-coherent piece to lift out next, and the answer is a split, not a reword.**
+argument produced `metrics/latency.py` and `churn_readers.py`. **It produced
+`transfer_deadline.py` too, and the cut was forced the same way**: this file
+reached 799 lines of 800 and the next change to it was a three-line
+correctness fix that did not fit, so the span-transfer deadline -- the
+watchdog, its two flags and the accessor `ClientPool.stop` reads -- went
+there. `TransferDeadline` is mixed into `Client` precisely so none of the
+patch targets moved; that module's docstring has the argument.
 
 **WHAT THE SPLIT HAD TO BE CAREFUL ABOUT, because this repository has been
 caught by it twice.** A module that re-exports a name does not SHARE it:
@@ -151,6 +155,12 @@ import numpy
 
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector
+# The span-transfer deadline, lifted out when this file reached the ceiling.
+# `TRANSFER_GRACE_S` is imported so `client_process.TRANSFER_GRACE_S` still
+# READS -- which is all anything does with it -- but `_recv_by` reads it out
+# of `transfer_deadline`'s globals, so rebinding it here reaches nothing.
+from .transfer_deadline import TRANSFER_GRACE_S  # noqa: F401
+from .transfer_deadline import TransferDeadline
 
 DriverFactory = Callable[[], EngineDriver]
 
@@ -165,17 +175,6 @@ DriverFactory = Callable[[], EngineDriver]
 #: start of a measured window.
 CLIENT_START_METHOD = "fork"
 
-#: Floor on how long a client that has STARTED sending its window payload is
-#: given to finish, used by `Client._recv_by` when the pool's SHARED deadline
-#: has already run out on earlier clients.
-#:
-#: **A floor, not a second timeout**: a zero-length watchdog would race a
-#: `recv` of an already complete payload, publishing the window on one run
-#: and failing it on the next. One second, because what it beats is a pipe
-#: read of bytes already there, and it costs `stop` at most this per client
-#: in an already pathological window against no limit before. It NARROWS
-#: that race; `ended_by_this_pool` closes it.
-TRANSFER_GRACE_S = 1.0
 
 #: The context the clients, the pipes and the two window flags come from.
 #: One context object for the module, so nothing can half-fork: mixing
@@ -314,7 +313,7 @@ def _exit_description(exitcode: Optional[int]) -> str:
     return f"it exited with status {exitcode}"
 
 
-class Client(_MP.Process):
+class Client(TransferDeadline, _MP.Process):
     """One benchmark client: own connection, own query slice, own latencies.
 
     A process and no longer a thread, which is the whole of G3: MariaDB
@@ -403,12 +402,13 @@ class Client(_MP.Process):
         #: Whether this client's window payload has been read off the pipe.
         #: Parent-side; `absorb` is idempotent so a second `stop` cannot hang.
         self._absorbed = False
-        #: Whether the pool's deadline, and not the client, ended the span
-        #: transfer. Parent-side, set by `_cut_off_transfer` and read through
-        #: `ended_by_this_pool`, so a kill this pool sent is never reported
-        #: as a client that died on its own -- different remedies, and
-        #: `_exit_description` would name SIGKILL for both.
+        #: The span-transfer deadline's two flags, set here because this is
+        #: where every other parent-side field is. INTENT: the deadline
+        #: fired. FACT: this pool killed a LIVE client. They are two because
+        #: only the fact may suppress `ClientPool.stop`'s exit-status report
+        #: -- `transfer_deadline.py` has why, and what one flag silenced.
         self._transfer_cut = False
+        self._killed_here = False
 
     # -- starting it -------------------------------------------------------
 
@@ -652,12 +652,17 @@ class Client(_MP.Process):
         `JOIN_TIMEOUT_S` without limit on the one call an operator cannot
         interrupt. One that DIES mid-send always raised. `_recv_by` closes it.
 
-        **NO PUBLISHED NUMBER CHANGES AND AN OUTCOME CAN.** Every figure is
-        fixed before this runs, but a bound can FAIL a window the unbounded
-        wait would have published late -- measured, a 1,000,000-span payload
-        takes 0.606 s to `recv` against the 1.0 s floor, where a realistic
-        ~100,000-span one takes 0.057 s. Remote, not absent, and the right
-        way round; `tests/test_g4_pool_teardown.py` has the pairs.
+        **NO PUBLISHED NUMBER CHANGES AND AN OUTCOME CAN**, and the
+        distinction is the point: "neither fix changes a measurement" is
+        exactly true of published NUMBERS -- every figure is fixed before
+        this runs -- and not of OUTCOMES, because a bound can FAIL a window
+        the unbounded wait would have published late. Measured: a
+        1,000,000-span / 100,000-result payload takes **0.606 s** to `recv`
+        against `TRANSFER_GRACE_S`'s 1.0 s floor, 61% of it, where a
+        realistic ~100,000-span one takes **0.057 s** and leaves ~17x margin.
+        Remote rather than absent, and the right way round -- a `stop` that
+        never returns is not a result either.
+        `tests/test_g4_pool_teardown.py` has the pairs.
         """
         if self._absorbed:
             return
@@ -704,65 +709,6 @@ class Client(_MP.Process):
             self.collector.add_span(started, finished)
         self.results = {int(offset): Answer(list(ids), began, ended)
                         for offset, (ids, began, ended) in results.items()}
-
-    def _recv_by(self, deadline: float) -> Any:
-        """`recv` this client's payload, bounded by the pool's deadline.
-
-        Killing the client is what unblocks a parent already inside `recv`:
-        closing the parent's own descriptor does not, because on Linux a
-        `close` never wakes a reader already blocked in `read` on that open
-        file description. Measured on a child that half-sent and then slept,
-        `recv` returned in 2.001 s against a 2.000 s watchdog where without
-        it it does not return at all.
-
-        A `threading.Timer` and not `signal.alarm`, which fires only in the
-        main thread while `stop` runs on the workload's; and not a
-        non-blocking read, because a `Connection` message is framed and a
-        partial read loses the frame. The timer is cancelled AND JOINED
-        rather than left to expire -- a lingering timer thread is a live
-        thread in the parent when the next pool forks, which is
-        `ClientPool._join_attendants`' condition from the other direction.
-        """
-        left = max(TRANSFER_GRACE_S, deadline - time.monotonic())
-        watchdog = threading.Timer(left, self._cut_off_transfer)
-        watchdog.daemon = True
-        watchdog.start()
-        try:
-            return self._from_client.recv()
-        finally:
-            watchdog.cancel()
-            watchdog.join(timeout=5.0)
-
-    @property
-    def ended_by_this_pool(self) -> bool:
-        """Whether THIS pool's span-transfer deadline killed the client.
-
-        Read by `ClientPool.stop`'s exit-status check, which otherwise reads
-        every non-zero exit code as a client killed from OUTSIDE and says
-        "the spans it sent cover only part of the window". **Both halves are
-        wrong for a client the watchdog killed after a COMPLETE transfer**:
-        `recv` returns, `absorb` records no error, the exit code is
-        `-SIGKILL`, and `stop` would fail a window whose spans are entire
-        over a signal the harness itself sent. `_transfer_cut` was set and
-        never read here, so the flag looked like a guard while only the
-        message branch used it. `tests/test_g4_pool_teardown.py` has the pair.
-        """
-        return self._transfer_cut
-
-    def _cut_off_transfer(self) -> None:
-        """End a client that is mid-send at the pool's deadline. PARENT side.
-
-        Runs on the watchdog thread and records the deadline BEFORE killing,
-        so neither reader of the flag races its own signal. `kill` and not
-        `terminate`: a client blocked in a `send` to a full pipe is in a
-        syscall its handler would not run promptly, and `reap` is idempotent.
-        """
-        self._transfer_cut = True
-        try:
-            if self.is_alive():
-                self.kill()
-        except (OSError, ValueError, AssertionError):  # pragma: no cover
-            pass
 
     def reap(self) -> None:
         """End this client and close the parent's end of its pipe.

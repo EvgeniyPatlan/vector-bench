@@ -470,7 +470,8 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:1007-1008` documents it.
+prints it above the numbers, and `docs/05-methodology.md:1007-1008`
+documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 

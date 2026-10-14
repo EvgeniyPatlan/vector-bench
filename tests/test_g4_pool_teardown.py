@@ -33,10 +33,19 @@ The two:
   claiming they "cover only part of the window". `TRANSFER_GRACE_S` narrows
   that race; `Client.ended_by_this_pool` is what closes it.
 
+* **And reading ONE flag there swallowed the opposite case.**
+  `_cut_off_transfer` sets the intent before its liveness check, so a client
+  already dead from an OUTSIDE kill sets it while this pool sends nothing --
+  and suppressing `stop`'s report on that flag hid a container memory limit
+  reaping a client, which is the case the branch was written for. The spans
+  are entire there too, so no wrong number is published and only the OOM
+  event goes silent. Two flags now: `_transfer_cut` the intent,
+  `_killed_here` the fact, and only the fact may suppress.
+
 **Mutation discipline (R4), counted rather than described.** Every repair is
 probed by patching the system under test AT RUN TIME -- never by editing a
 file on disk -- and each docstring carries the honest reading and the mutant
-reading, both measured. There are **five** mutants and **four** of them are a
+reading, both measured. There are **six** mutants and **five** of them are a
 `monkeypatch.setattr` on a `ClientPool` or `Client` attribute:
 
 1. `ClientPool._join_attendants` -> a no-op (monkeypatch).
@@ -48,13 +57,22 @@ reading, both measured. There are **five** mutants and **four** of them are a
 4. `Client._cut_off_transfer` -> one that kills without recording
    (monkeypatch).
 5. `Client.ended_by_this_pool` -> `False` (monkeypatch).
+6. `Client.ended_by_this_pool` -> the INTENT flag instead of the fact, which
+   is the ordering before the two flags were separated (monkeypatch).
 
 An earlier revision of this paragraph said "two of the three mutants", which
 was wrong in both numbers and is the class of inaccuracy the first commit of
-this branch is about. The monkeypatch targets are why those four exist as
-NAMED attributes at all: a repair spelled inline in `start` and again in
-`stop` could only be mutated by editing the file, and a copy is how one of
-the two came to be missing in the first place.
+this branch is about; it then said five and four, which this round made six
+and five. The monkeypatch targets are why those five exist as NAMED
+attributes at all: a repair spelled inline in `start` and again in `stop`
+could only be mutated by editing the file, and a copy is how one of the two
+came to be missing in the first place.
+
+**One mutation in this file was silently clobbered and the probe's own state
+assertion is what caught it** -- `_pool` set `_recv_by` after the caller did,
+so the outside-kill arm measured the wrong interleaving and came back with
+the fact flag True. `_recv_by` is a parameter of `_pool` now. That is the
+hazard R4 names, met in this file rather than quoted from it.
 
 **No measured throughput or latency is asserted here**, for the reason
 `test_g3_process_clients.py` gives about a shared box. What is asserted is a
@@ -600,7 +618,16 @@ class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
     the only way a probe for a race can be a probe rather than a lottery.
     """
 
-    def _pool(self, base, queries, monkeypatch) -> cl.ClientPool:
+    def _pool(self, base, queries, monkeypatch, recv_by=None) -> cl.ClientPool:
+        """A pool whose clients send in full, linger, and are then cut off.
+
+        `recv_by` is a PARAMETER and not something a caller patches around
+        this method, because patching `_recv_by` before calling it was
+        silently clobbered here: this method set its own and the caller's
+        mutation never reached the pool. The probe's own state assertion
+        caught it -- the fact flag came back True when the test needed the
+        outside-kill path -- which is why both flags are read back.
+        """
         monkeypatch.setattr(cl, "JOIN_TIMEOUT_S", PROBE_JOIN_S)
         monkeypatch.setattr(cp.Client, "_tell",
                             _lingering_tell(cp.Client._tell))
@@ -609,13 +636,20 @@ class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
             self._cut_off_transfer()
             return self._from_client.recv()
 
-        monkeypatch.setattr(cp.Client, "_recv_by", cut_then_recv)
+        monkeypatch.setattr(cp.Client, "_recv_by", recv_by or cut_then_recv)
         return cl.ClientPool(factory_for(base), queries, 2, K, 32,
                              spec_for(queries), warmup=1)
 
-    def _run(self, base, queries, monkeypatch):
-        """Return (window or None, raised or None) plus what the pool saw."""
-        pool = self._pool(base, queries, monkeypatch)
+    def _run(self, base, queries, monkeypatch, recv_by=None):
+        """What `stop` did, and the state both arms have to share.
+
+        Returns `(window, raised, exitcodes, facts, intents, errors)`. BOTH
+        flags, because the whole fix is that they differ: `intents` is
+        `_transfer_cut` (the deadline fired) and `facts` is `_killed_here`
+        (this pool killed a live client), and a probe that read only one
+        could not show which of them `stop` consults.
+        """
+        pool = self._pool(base, queries, monkeypatch, recv_by=recv_by)
         pool.start("g4 kill after a complete transfer", prefix="g4")
         time.sleep(0.05)
         try:
@@ -625,9 +659,10 @@ class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
             except cl.PoolError as exc:
                 window, raised = None, exc
             codes = [w.exitcode for w in pool._workers]
-            cut = [w.ended_by_this_pool for w in pool._workers]
+            facts = [w._killed_here for w in pool._workers]
+            intents = [w._transfer_cut for w in pool._workers]
             errors = [w.error for w in pool._workers]
-            return window, raised, codes, cut, errors
+            return window, raised, codes, facts, intents, errors
         finally:
             for worker in pool._workers:
                 worker.reap()
@@ -650,22 +685,24 @@ class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
         a sound window failed, over a signal the harness sent, with a claim
         about the payload that is factually wrong.
         """
-        window, raised, codes, cut, errors = self._run(base, queries,
-                                                       monkeypatch)
+        window, raised, codes, facts, intents, errors = self._run(
+            base, queries, monkeypatch)
         assert raised is None, (
             f"a window whose payloads all arrived complete was failed: "
             f"{raised}")
         assert window is not None and window.qps is not None
         # The pool state both arms share, asserted so neither arm can be
-        # passing for a reason other than the branch under test.
+        # passing for a reason other than the branch under test. Here this
+        # pool really did send the signal, so BOTH flags are set.
         assert all(code == -9 for code in codes), codes
-        assert all(cut), cut
+        assert all(facts), facts
+        assert all(intents), intents
         assert errors == [None, None], errors
 
         monkeypatch.setattr(cp.Client, "ended_by_this_pool",
                             property(lambda self: False))
-        _w, mutant, m_codes, _m_cut, m_errors = self._run(base, queries,
-                                                          monkeypatch)
+        _w, mutant, m_codes, _m_f, _m_i, m_errors = self._run(
+            base, queries, monkeypatch)
         assert isinstance(mutant, cl.PoolError), (
             "forcing `ended_by_this_pool` False changed nothing, so `stop` "
             "does not read it and this repair is unproven")
@@ -674,6 +711,69 @@ class TestAKillAfterACompleteTransferIsNotAnAbnormalDeath:
         # Same state, opposite outcome: that is the pair.
         assert all(code == -9 for code in m_codes), m_codes
         assert m_errors == [None, None], m_errors
+
+    def test_an_outside_kill_after_a_complete_transfer_is_still_reported(
+            self, base, queries, monkeypatch):
+        """The exclusion must not swallow the case the branch exists for.
+
+        **This is the probe that would have caught the LOW the exclusion
+        introduced.** `_cut_off_transfer` sets the INTENT flag before its
+        `is_alive()` check, so a client already dead from an OUTSIDE kill
+        sets it while this pool sends nothing. Suppressing `stop`'s report on
+        that flag therefore hid a container memory limit reaping a client --
+        and in that case the spans really are entire, so no wrong number is
+        published and the OOM event is simply silent. In a framework where
+        the container's memory limit is part of the measurement, that is the
+        event a reader most needs.
+
+        Driven, not raced: `_recv_by` is replaced with one that kills the
+        client from OUTSIDE the deadline path (a bare `self.kill()`, which is
+        what an OOM reap looks like to the parent), waits for it to die, then
+        calls the real `_cut_off_transfer` -- whose `is_alive()` is now False
+        -- and then the real `recv`, which still succeeds because the payload
+        is buffered.
+
+        Both arms see: exit code **-9**, `_transfer_cut` **True** (the intent
+        fired), `_killed_here` **False** (this pool sent nothing).
+
+        HONEST (`ended_by_this_pool` returns the FACT): `stop` raises
+        `PoolError` naming the abnormal exit, so the reap is reported.
+        MUTANT (the property returning the INTENT, which is the ordering
+        before this fix): `stop` returns a window and the kill is swallowed.
+        """
+        def kill_from_outside_then_cut(self, deadline):
+            self.kill()
+            self.join(timeout=10.0)
+            self._cut_off_transfer()
+            return self._from_client.recv()
+
+        def run():
+            return self._run(base, queries, monkeypatch,
+                             recv_by=kill_from_outside_then_cut)
+
+        window, raised, codes, facts, intents, errors = run()
+        assert all(code == -9 for code in codes), codes
+        assert errors == [None, None], errors
+        # The state that makes this the right experiment: the deadline fired
+        # (intent set) and this pool killed nothing (fact clear). If the two
+        # agreed here there would be nothing for the fix to distinguish.
+        assert all(intents), intents
+        assert not any(facts), facts
+        assert isinstance(raised, cl.PoolError), (
+            "an outside kill after a complete transfer was not reported, so "
+            "the `killed` exclusion swallows the OOM reap it exists for")
+        assert "SIGKILL" in str(raised), str(raised)
+        assert window is None
+
+        monkeypatch.setattr(cp.Client, "ended_by_this_pool",
+                            property(lambda self: self._transfer_cut))
+        m_window, m_raised, m_codes, _m_f, _m_i, _m_err = run()
+        assert m_raised is None, (
+            "reading the INTENT still reported the kill, so this probe does "
+            "not reach the ordering and the fix is unproven")
+        assert m_window is not None
+        assert all(code == -9 for code in m_codes), m_codes
+        assert m_window is not None and window is None
 
 
 class TestEveryDriverFamilyIsStillClassified:
