@@ -283,44 +283,51 @@ def window_concurrency(collectors: Sequence["LatencyCollector"],
 #: only the tail.
 #:
 #: **"A REAL QUEUE RAISES THE WHOLE DISTRIBUTION" IS TRUE OF THE FIVE DRIVERS
-#: ABOVE AND FALSE IN GENERAL, AND THAT IS WHY `efficiency` WAS ADMITTED TO
-#: THE RULE BELOW.** All five have a NARROW service time, so for all five
-#: `served / clients` and `p50 / mean` are the same number. They are the same
-#: number for a mechanical reason -- `served / outstanding == p50 / mean`
-#: identically, both being sums over one kept set, and `outstanding / clients`
-#: is 0.84-1.00 on every regime ever measured here -- so `served / clients`
-#: below a half IS `p50` below half the mean, which is a statement about
+#: ABOVE AND FALSE IN GENERAL, AND THAT IS WHY `efficiency` WAS ADMITTED TO THE
+#: RULE BELOW.** All five have a NARROW service time, so for all five
+#: `served / clients` and `p50 / mean` are the same number, for a mechanical
+#: reason -- `served / outstanding == p50 / mean` identically, both being sums
+#: over one kept set, and `outstanding / clients`
+#: is 0.949-0.996 over every regime and client count
+#: `tests/test_skewed_latency_is_not_serialization.py` rebuilds, and as low as
+#: 0.84 over the wider sweep behind this work, whose low came from a CPU-bound
+#: spinning thread arm at 8 clients that no test here reproduces -- so
+#: `served / clients` below a half IS `p50` below half the mean, a claim about
 #: LATENCY SKEW and not about how many clients ran. A two-mode service time
 #: with miss rate p and penalty s/f drives it under the floor whenever
 #: `s/f > (1+p)/p`: 4.3x at p=0.3, 11x at p=0.1, 21x at p=0.05. A graph cache
-#: smaller than the graph produces exactly that, and this comparison sizes
-#: those caches deliberately (`mhnsw_max_cache_size`, `vidx_hnsw_cache_size`).
+#: smaller than the graph produces that, and this comparison sizes those caches
+#: deliberately (`mhnsw_max_cache_size`, `vidx_hnsw_cache_size`).
 #:
 #: Measured on this tree through the real `ClientPool`, 4 clients, 2 s
 #: windows, better of two by qps, synthetic drivers that SLEEP -- releasing
 #: the lock, no shared queue, so the server is explicitly not the bottleneck
 #: (CPython 3.12.3, on a box whose other 20 cores were busy throughout; the
-#: lock-holding rows are the retired thread pool, which is the only arm that
-#: can still produce them, and the whole table is rebuilt by
-#: `tests/test_skewed_latency_is_not_serialization.py`):
+#: lock-holding row is the retired thread pool, which is the only arm that
+#: can still produce it). Every row but the fourth is rebuilt by
+#: `tests/test_skewed_latency_is_not_serialization.py`; the 5%-at-50x row is
+#: reported here and NOT rebuilt there, because the closed form below already
+#: covers p=0.05 and a seventh regime in that fixture costs 3 s of suite time
+#: for a third miss rate:
 #:
 #:     regime                        efficiency   served/clients   p50/mean
 #:     narrow latency (control)           0.998            0.973      0.988
 #:     30% of queries at 20x cost         0.984            0.163      0.164
 #:     10% at 50x                         0.959            0.191      0.193
-#:      5% at 50x                         1.000            0.327      0.331
+#:      5% at 50x (not rebuilt)           1.000            0.327      0.331
 #:     saturated server, narrow           0.277            0.989      0.994
 #:     saturated AND 30% at 20x           0.233            0.155      0.156
+#:     misses queue, 30% at 20x           0.299            0.050      0.051
 #:     clients took turns (threads)       0.248            0.246      0.252
 #:
-#: Rows two to four SCALED LINEARLY and were flagged `concurrency_not
-#: achieved` on `served / clients` alone -- the published reading of which is
-#: "the clients serialized, or the engine answers one query at a time", and
-#: neither was true of them. The column that holds is `efficiency`: 0.96-1.00
-#: where the pool scaled and 0.22-0.28 where it did not, with nothing
+#: Rows two to four SCALED LINEARLY and were flagged `concurrency_not_achieved`
+#: on `served / clients` alone -- published as "the clients serialized, or the
+#: engine answers one query at a time", and neither was true of them. The
+#: column that holds is `efficiency`: 0.96-1.00
+#: where the pool scaled and 0.23-0.30 where it did not, with nothing
 #: between them at this window length, and the same 0.5 is again the
 #: midpoint of the measured gap -- a
-#: factor of 1.9 below the lowest scaling row and 1.8 above the highest
+#: factor of 1.9 below the lowest scaling row and 1.7 above the highest
 #: non-scaling one. So ONE floor judges both estimators and there is no
 #: second constant to choose. A floor at 0.35 would publish a pool that
 #: delivered 40% of its clients' throughput, which is the refusal's own
@@ -328,6 +335,43 @@ def window_concurrency(collectors: Sequence["LatencyCollector"],
 #: 10%-at-50x row's 0.959 only on noise, and at 0.6 s windows that row
 #: measured as low as 0.789 for want of samples.
 SERVED_CONCURRENCY_FLOOR = 0.5
+
+#: The largest `scaling_efficiency` still read as a MEASUREMENT of the share
+#: of clients in service; above it `throughput_fraction` withholds and the
+#: median-span estimator decides alone. A share of clients in service cannot
+#: exceed 1, so a reading above 1 is sampling noise up to some point and a
+#: corrupt one-client baseline beyond it; the value cannot say which, so what
+#: is chosen is where to stop treating it as evidence. **Clamping to
+#: `min(efficiency, 1.0)` is the wrong repair** -- it turns an arbitrarily
+#: broken baseline into a confident 1.0, the rule's most permissive value.
+#:
+#: 2.0 IS MEASURED, and the measurement is the TAIL it clears: 42 readings of
+#: pools that genuinely scaled, through the real `ClientPool` at 1 and 4
+#: clients, best of two windows, as min / median / max over 14 readings each:
+#:
+#:     narrow       0.993 / 1.000 / 1.006   7 over 1.0
+#:     30% at 20x   0.889 / 1.010 / 1.126   9 over 1.0
+#:     10% at 50x   0.707 / 0.940 / 1.155   4 over 1.0
+#:
+#: plus 14 more at other window lengths whose maximum was 1.327. HALF of all
+#: legitimate readings exceed 1.0 and none of the 56 reached 1.5, so a ceiling
+#: AT 1.0 would withhold the term on half the points it exists for and restore
+#: the false positive on each. 2.0 is a factor of 1.5 above the highest
+#: legitimate reading measured, and is where a reading starts asserting twice
+#: as many queries in service as there were clients to hold them. At 1.5 the
+#: 1.327 reading has 13% of clearance, so the 10%-at-50x regime would be
+#: refused again on variance; at 1.2 that reading and a measured 1.268 are
+#: both withheld; at 10 the test is not a credibility test at all.
+#:
+#: **IT CATCHES A GROSSLY CORRUPT BASELINE AND NOTHING SUBTLER.** A baseline
+#: depressed by a factor of two inflates a genuine 0.25 to 0.50 -- under every
+#: ceiling above and over the floor -- so it is NO defence against
+#: `harness/workloads/concurrency.py`'s PER-CLIENT `warmup`, which makes the
+#: one-client baseline the least-warmed window in the sweep and the first
+#: measured. What sees that is `latency_p50_ms` across the sweep: a median
+#: that gets FASTER as clients are added cannot happen to any engine, and is
+#: not an input here today.
+CREDIBLE_EFFICIENCY_CEILING = 2.0
 
 #: The pool served about as many queries as it had clients, so a scaling
 #: efficiency measured over it describes the engine.
@@ -361,35 +405,77 @@ def served_fraction(served: Optional[float],
     return served / clients
 
 
-def throughput_fraction(efficiency: Optional[float]) -> Optional[float]:
-    """`scaling_efficiency` read as the share of the clients IN SERVICE.
+def throughput_fraction(efficiency: Optional[float],
+                        clients: int) -> Optional[float]:
+    """`scaling_efficiency` read as the share of the clients IN SERVICE, or
+    `None` where that reading is not evidence.
 
     THE SAME QUANTITY `served_fraction` ESTIMATES, which is why it can be
-    compared against the same floor, and the identity is not a coincidence:
-    at one client a span has no queue and no lock in it, so the one-client
-    throughput IS the reciprocal of the per-query service cost. Little's law
-    then gives the queries in service at n clients as
-    `qps_n x service_cost == qps_n / qps_1`, and dividing by n is exactly
-    `scaling_efficiency`. One estimator uses the n-client MEDIAN SPAN for the
-    service cost and the other the ONE-CLIENT MEAN, and that is the whole
+    compared against the same floor, and the correspondence is not a
+    coincidence: at one client a span has no queue and no lock in it, so the
+    one-client throughput is the reciprocal of the per-query CYCLE cost --
+    the service plus the client loop's own bookkeeping. Little's law then
+    gives the queries in service at n clients as
+    `qps_n x cycle_cost == qps_n / qps_1`, and dividing by n is exactly
+    `scaling_efficiency`. One estimator uses the n-client MEDIAN SPAN for
+    that cost and the other the ONE-CLIENT MEAN, and that is the whole
     difference between them.
 
-    Which makes their failure modes disjoint, which is the point.
+    CYCLE AND NOT SERVICE, and the gap is measured: `served_concurrency` at
+    ONE client is `qps_1 x p50_1`, which would be 1.0 if the two were the same
+    thing and reads 0.965-0.992 over the regimes here. So this estimator
+    over-reports the in-service share by 0.8-3.5% for these sleep-based
+    drivers -- negligible against the factor-of-1.8 margin at the floor, and
+    the SIGN of it is the whole reason the term is withheld at n=2 below.
+
+    Which makes their failure modes largely disjoint, which is the point.
     `served_fraction` is biased DOWN by latency skew, because a median span
     is not a mean service cost when the distribution has two modes; this one
-    is not, because a throughput is a count and a count has no quantile in
-    it. This one is instead biased down by a SERVER-SIDE queue -- the
-    saturated row's 0.281, where the engine really did answer about one query
-    at a time -- and `served_fraction` is not, because a queue raises the
-    median along with everything else.
+    is instead biased down by a SERVER-SIDE queue -- the saturated row's
+    0.277, where the engine really did answer about one query at a time --
+    and `served_fraction` is not, because a queue raises the median along
+    with everything else.
 
-    A pass-through, not arithmetic, and deliberately so: the name is the
-    argument, and a reader of `scaling_status` should not have to work out
-    that the efficiency beside it is a concurrency fraction. `None`
-    propagates, for the reason it propagates everywhere here: a point with no
-    one-client baseline to divide by has no efficiency, and 0.0 there would
-    read as total serialization.
+    **SKEW DOES NOT LEAVE THIS ESTIMATOR ALONE EITHER, AND SAYING IT DID WAS
+    WRONG.** A count has no quantile in it, but this is a RATIO of two counts
+    from windows of different sample size: `qps_1` estimates `1 / mean` from
+    the fewest samples in the sweep and `1 / mean` is convex, so by Jensen the
+    baseline is biased up and this fraction down, by an amount growing with
+    the service-time variance. Measured on the 10%-at-50x regime, whose true
+    efficiency is 1.00: readings of 0.707, 0.762 and 0.881 against a median of
+    0.940. **The direction is the safe one** -- an under-reported efficiency
+    can only leave the old false positive in place, never publish a point that
+    should have been refused -- so it bounds how far the repair reaches rather
+    than holing it.
+
+    THREE REASONS TO WITHHOLD, each making this `None` and leaving
+    `served_fraction` to decide alone:
+
+    * No efficiency at all -- no one-client baseline to divide by. A 0.0 here
+      would read as total serialization.
+    * `1 / clients` is not itself below the floor -- `clients <= 2` while the
+      floor is 0.5. A COMPLETELY serialized pool delivers one client's
+      throughput, so its efficiency IS `1 / clients`: 0.5 at two clients,
+      exactly the floor, deciding nothing. The median-span estimator works
+      there because its `outstanding / clients` factor is always under 1.0
+      and that bias carries it below the floor -- measured on the retired
+      thread pool at two clients, `served / clients` 0.4873/0.4919/0.4945
+      against efficiencies of 0.4987/0.4913/0.4992: three refusals out of
+      three, by margins of 0.0055 to 0.0127, where a `max` would have taken
+      the larger each time and sat on the floor. The reviewer of this change
+      measured 0.5008 there and published a pool whose clients were taking
+      turns. Derived from the floor, not written as `clients > 2`, so that
+      moving the floor moves this with it.
+    * The reading is above `CREDIBLE_EFFICIENCY_CEILING`, far enough above 1
+      to be a corrupt baseline rather than a measurement. That constant
+      carries the tail it was chosen to clear.
     """
+    if efficiency is None or clients <= 0:
+        return None
+    if 1.0 / clients >= SERVED_CONCURRENCY_FLOOR:
+        return None
+    if efficiency > CREDIBLE_EFFICIENCY_CEILING:
+        return None
     return efficiency
 
 
@@ -397,26 +483,34 @@ def achieved_fraction(served: Optional[float], clients: int,
                       efficiency: Optional[float] = None) -> Optional[float]:
     """The best estimate of the share of `clients` the pool had in service.
 
-    THE LARGER of the two estimators above, and the choice of `max` is the
-    whole content of this function. Each is exact in the regime the other is
-    biased in -- see `throughput_fraction` -- and both are biased in ONE
-    direction only, downwards: skew cannot inflate a median above a mean, and
-    a server-side queue cannot make a pool deliver throughput it did not
-    deliver. Two lower bounds on one quantity, so the larger is the better
-    bound and the smaller carries no information the larger lacks.
+    THE LARGER of the two estimators above, and that choice is the whole
+    content of this function. Each is biased in the regime the other is exact
+    in -- see `throughput_fraction` -- and both are biased DOWNWARDS only:
+    skew cannot inflate a median above a mean, and a server-side queue cannot
+    make a pool deliver throughput it did not deliver. Two lower bounds on one
+    quantity, so the larger is the better bound and the smaller carries no
+    information the larger lacks.
 
     `None` when `served_fraction` is None, and NOT the efficiency on its own:
-    a window that counted no query has nothing in it to have been in
-    service, and "nobody could look" has to stay distinguishable from a
-    verdict -- see `scaling_status`. An efficiency without a window is a
-    ratio of two throughputs one of which was never measured.
+    a window that counted no query has nothing in it to have been in service,
+    and "nobody could look" must stay distinguishable from a verdict -- see
+    `scaling_status`. An efficiency without a window is a ratio of two
+    throughputs one of which was never measured.
     """
     fraction = served_fraction(served, clients)
     if fraction is None:
         return None
-    throughput = throughput_fraction(efficiency)
+    throughput = throughput_fraction(efficiency, clients)
     if throughput is None:
         return fraction
+    # THE ARGUMENT ORDER IS LOAD-BEARING, NOT STYLE. `max` returns its FIRST
+    # argument unless a later one compares greater, and every comparison
+    # against a NaN is False -- so a NaN efficiency, which is what
+    # `qps_n / (clients * qps_1)` gives from a zero baseline, degrades to the
+    # median-span rule here. Reversed it returns the NaN, and
+    # `NaN < SERVED_CONCURRENCY_FLOOR` is False too, so every point in the run
+    # would publish. The ceiling above does not catch NaN either: `NaN >
+    # ceiling` is False as well. `float("inf")` it does catch.
     return max(fraction, throughput)
 
 
@@ -465,25 +559,61 @@ def scaling_status(served: Optional[float],
     **WHICH IS WHY NO THIRD STATUS WAS ADDED, having been considered.** The
     residue of the rule -- a pool that neither scaled nor kept its median at
     its client count -- holds BOTH causes, and they are indistinguishable
-    from this window: measured on this tree, clients taking turns on the
-    interpreter lock, a saturated server whose service time is also two-moded,
-    and a server whose cache misses queue on one shared resource all deliver a
-    throughput that does NOT rise with the client count, at an efficiency of
-    0.22-0.25 and a `served / clients` of 0.05-0.25 -- and the median span
-    failed to grow with the client count in two of the three, so even that
-    does not sort them. A value
-    meaning "withheld, cannot attribute" would therefore be a synonym for
-    this one, which already means exactly that, and it would have to be
-    plumbed through `report/` to say nothing new.
+    from THIS WINDOW, which is the whole weight the argument carries:
+    measured on this tree, clients taking turns on the interpreter lock, a
+    saturated server whose service time is also two-moded, and a server whose
+    cache misses queue on one shared resource all deliver a throughput that
+    does NOT rise with the client count, at an efficiency of 0.23-0.30 and a
+    `served / clients` of 0.05-0.25. Those are the two quantities the status
+    is computed from, and they do not sort the three.
+
+    **ONE QUANTITY OUTSIDE THE STATUS SORTS TWO OF THE THREE, and saying
+    otherwise was wrong.** `p50` at n clients over `p50` at one measured
+    x3.66-x3.73 for the saturated server and x3.62-x3.66 for the
+    saturated-and-skewed one over five builds, against x0.99-x1.01 for clients
+    taking turns: a queue moves the median and a stalled client does not, so a
+    third term on that growth would separate THOSE two. It is not promoted
+    because of the third regime, where cache misses queue on one shared
+    resource and the growth measured x1.00 -- its median query is a HIT that
+    never reaches the bottleneck. That is the realistic 1M-row shape and the
+    case such a term would get wrong, so the growth is reported beside the
+    status rather than inside it. A value meaning "withheld, cannot
+    attribute" would therefore still be a synonym for this one.
+
+    **`report/` IS NOT LEFT UNTOUCHED BY THIS, WHICH AN EARLIER VERSION OF
+    THIS DOCSTRING CLAIMED.** Keeping one status string means no new value has
+    to be rendered, and that is all it means. `report/render.py`'s concurrency
+    footnote is FIXED TEXT asserting that where the queries-in-service column
+    says the pool lacked its clients' worth in flight, the efficiency cell
+    reads "not measurable" and no number is published. Once a caller passes an
+    `efficiency`, a skewed-but-scaling point renders a served column well under
+    half its client count with an unmarked efficiency beside it, and that
+    footnote then says the opposite of what the table shows. Its "a real queue
+    raises the whole latency distribution, median included" is the claim
+    `SERVED_CONCURRENCY_FLOOR` now records as true only of a NARROW service
+    time. Both are the follow-up's, in a file this change does not touch.
 
     **What the `efficiency` term is for, then, is the case where NEITHER
-    reading is true**: a pool that scaled linearly and whose latency is
-    merely skewed. `SERVED_CONCURRENCY_FLOOR`'s docstring has that
-    measurement -- three regimes at efficiency 0.96-1.00 and
-    `served / clients` 0.16-0.33, every one of them flagged by the
-    median-span rule alone. A pool that delivered n times a one-client
-    throughput cannot have been starved, whatever shape its latency has, and
-    this is the term that says so.
+    reading is true**: a pool that scaled linearly and whose latency is merely
+    skewed. `SERVED_CONCURRENCY_FLOOR`'s docstring has that measurement --
+    three regimes at efficiency 0.96-1.00 and `served / clients` 0.16-0.33,
+    every one flagged by the median-span rule alone. A pool that delivered n
+    times a one-client throughput cannot have been starved, whatever shape its
+    latency has, and this is the term that says so.
+
+    **A SECOND ABSURDITY OF THE SAME DEFECT IS NOT FIXED HERE.** At ONE
+    client the median-span rule refuses a skewed point too: the 30%-at-20x
+    regime measured `served / clients` of 0.1428, 0.1764 and 0.2050 at a
+    single client, and this function returns `concurrency_not_achieved` for
+    all three -- so the harness says "the clients serialized, or the engine
+    answers one query at a time" about ONE client, which one client cannot do.
+    The efficiency there is 1.0 BY CONSTRUCTION and would publish them, but
+    `throughput_fraction` withholds any reading that `1 / clients` does not
+    put below the floor, and `1 / 1` does not. Admitting a tautology to reach
+    a right answer was rejected: the honest fix is that a one-client pool has
+    no concurrency to fail to achieve, which is a different statement from
+    anything this rule makes, and it is left to be decided rather than
+    smuggled in here.
     """
     fraction = achieved_fraction(served, clients, efficiency)
     if fraction is None:

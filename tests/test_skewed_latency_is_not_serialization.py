@@ -11,8 +11,10 @@ and a two-mode service time puts it there while the pool scales perfectly.
 **The arithmetic, which `TestTheConditionIsAStatementAboutLatencySkew` runs
 rather than quotes.** `served` and `outstanding` are sums over the same kept
 set, so `served / outstanding == p50 / mean` identically, and
-`outstanding / clients` is 0.84-1.00 on every regime this repository has ever
-measured. So `served / clients` is `p50 / mean` to within that factor. For a
+`outstanding / clients` is 0.949-0.996 over everything this file rebuilds and
+as low as 0.84 over the wider sweep behind it, whose low came from a CPU-bound
+spinning thread arm at 8 clients that no test here reproduces. So
+`served / clients` is `p50 / mean` to within that factor. For a
 service time that is `f` with probability `1-p` and `s` otherwise the median
 is `f` and the mean is `(1-p) f + p s`, so the refusal fires exactly when
 `s/f > (1+p)/p` -- 4.3x at p=0.3, 11x at p=0.1, 21x at p=0.05. A graph cache
@@ -29,39 +31,73 @@ queue, so the server is explicitly not the bottleneck:
     narrow latency (control)           0.998            0.973      0.988
     30% of queries at 20x cost         0.984            0.163      0.164
     10% at 50x                         0.959            0.191      0.193
-     5% at 50x                         1.000            0.327      0.331
+     5% at 50x (NOT rebuilt here)      1.000            0.327      0.331
     saturated server, narrow           0.277            0.989      0.994
     saturated AND 30% at 20x           0.233            0.155      0.156
+    misses queue, 30% at 20x           0.299            0.050      0.051
     clients took turns (threads)       0.248            0.246      0.252
 
 Rows two to four scaled LINEARLY and were all flagged
-`concurrency_not_achieved`. Those four rows were taken at 2 s windows on a box
-whose twenty cores were otherwise busy; the fixture below rebuilds the shape
-at 0.5 s and asserts verdicts and ratios rather than decimals, for the reason
+`concurrency_not_achieved`. Every row but the 5%-at-50x one is rebuilt by
+`REGIMES` below, and that one is reported and not rebuilt: the closed form
+already covers p=0.05 and an eighth regime costs 3 s of suite time for a third
+miss rate. The table was taken at 2 s windows on a box whose twenty cores were
+otherwise busy; the fixture rebuilds the shape at 0.5 s and asserts verdicts
+and ratios rather than decimals, for the reason
 `tests/test_g3_process_clients.py` gives.
 
 **The repair is a second estimator of one quantity, not a second threshold.**
 `scaling_efficiency` is `qps_n / (n x qps_1)`, and at one client a span holds
-no queue and no lock, so `qps_1` is the reciprocal of the per-query service
-cost: Little's law makes `efficiency` the share of the clients in service,
-computed from the one-client mean instead of the n-client median. The two are
-biased in disjoint regimes -- skew drags the median one down, a server-side
-queue drags the throughput one down -- and both only downwards, so the larger
-is the better bound and the SAME floor of 0.5 judges it. Measured, the
-efficiency column is 0.96-1.00 where the pool scaled and 0.22-0.28 where it
-did not, so 0.5 is again the midpoint of a measured gap -- a factor of 1.9
-below the lowest scaling row and 1.8 above the highest non-scaling one.
+no queue and no lock, so `qps_1` is the reciprocal of the per-query CYCLE cost
+-- service plus the client loop's bookkeeping, which `served_concurrency` at
+one client measures as 0.965-0.992 rather than 1.0. Little's law then makes
+`efficiency` the share of the clients in service, computed from the one-client
+mean instead of the n-client median. The two are biased in largely disjoint
+regimes -- skew drags the median one down, a server-side queue drags the
+throughput one down -- and both only downwards, so the larger is the better
+bound and the SAME floor of 0.5 judges it. Measured, the efficiency column is
+0.96-1.00 where the pool scaled and 0.22-0.30 where it did not, so 0.5 is
+again the midpoint of a measured gap -- a factor of 1.9 below the lowest
+scaling row and 1.7 above the highest non-scaling one.
+
+**THE REPAIR REACHES `clients >= 3` AND NOT BELOW, which is the review's
+finding and not a design choice.** A completely serialized pool's efficiency
+is exactly `1 / clients`, so at one and two clients the throughput estimator
+sits ON the floor and cannot discriminate; admitting it there dropped a true
+positive the old rule caught. `throughput_fraction` therefore withholds the
+term wherever `1 / clients` is not itself below the floor, and that withholds
+the FIX at one and two clients as well.
+`TestTwoClientsIsAKnifeEdgeForBothEstimators` measures both halves of that.
+Two consequences a reader of the follow-up needs: a skewed point at ONE client
+is still refused, and the harness still says "the clients serialized" about a
+single client (measured `served / clients` 0.1428, 0.1764 and 0.2050 for the
+30%-at-20x regime at one client); and `config/profiles/main.yml` sweeps two
+clients today, so the two-client point keeps the old rule's false positive
+until a profile stops asking for it.
 
 **WHAT THIS DOES NOT FIX, asserted rather than admitted in prose.**
 `TestTheResidueHoldsBothCausesAndCannotSeparateThem` measures a saturated
 server whose service time is ALSO two-moded, and a server whose cache misses
 queue on one shared resource. Both land at low efficiency AND low
-`served / clients` -- the same quadrant as clients genuinely taking turns, and
-within its measured range on all three quantities. No quantity in one window
-separates them, which is what `scaling_status`'s docstring has said since it
-was written: the status names the observation and both its causes are refused.
-That is why no third status was added. The term earns its place on the case
-where NEITHER reading is true -- a pool that scaled and is merely skewed.
+`served / clients` -- the same quadrant as clients genuinely taking turns, on
+both quantities the status is computed from. **One quantity OUTSIDE the status
+does separate one of the two**, and claiming otherwise was wrong: `p50` grows
+by a factor of 3.5 with the client count for the saturated regimes and not at
+all for a stalled client. It is not promoted to a third term because the
+miss-queue regime -- the realistic 1M-row shape, whose median query is a cache
+hit that never reaches the bottleneck -- fails to scale with a FLAT median and
+would be got wrong by it. `test_median_growth_sorts_one_residue_regime_and_
+not_the_other` measures both halves. So no third status was added: the status
+names the observation, both its causes are refused, and a value meaning
+"withheld, cannot attribute" would be a synonym for the one already there.
+
+**That is not the same as `report/` needing no change, which an earlier
+version of this docstring claimed.** Keeping one status string means no new
+value has to be rendered, and no more. `report/render.py`'s concurrency
+footnote is FIXED TEXT saying that where the queries-in-service column is
+below half the client count the efficiency cell publishes nothing -- which a
+skewed-but-scaling point will now contradict on the page. The follow-up owes
+that fix, in a file this change does not touch.
 
 **Mutation discipline (R4).** Every claim below is checked by injecting the
 regression at run time -- a monkeypatch, or a verbatim copy of the pre-change
@@ -237,6 +273,37 @@ def regime_saturated_skewed(p: float, penalty: float) -> Callable[[], None]:
     return spend
 
 
+def regime_miss_queue(p: float, penalty: float) -> Callable[[], None]:
+    """Cache HITS run free; only the MISSES queue on one shared resource.
+
+    **The realistic 1M-row shape, and the regime the no-third-status argument
+    rests on.** A graph cache smaller than the graph, with the misses
+    contending for one thing: a hit costs the fast mode and never reaches the
+    bottleneck, a miss costs `penalty` x fast x (misses in flight).
+
+    It matters because it is the one regime in which the median span does NOT
+    grow with the client count -- the median query is a HIT -- while the pool
+    still fails to scale. `p50` growth therefore separates the saturated
+    regimes from a stalled client and fails on this one, which is why it is
+    not promoted to a third term in the rule.
+    """
+    depth = MP.Value("i", 0)
+
+    def spend() -> None:
+        if _rng().random() >= p:
+            time.sleep(QUERY_S)
+            return
+        with depth.get_lock():
+            depth.value += 1
+            here = depth.value
+        try:
+            time.sleep(QUERY_S * penalty * here)
+        finally:
+            with depth.get_lock():
+                depth.value -= 1
+    return spend
+
+
 def regime_held() -> Callable[[], None]:
     """Clients genuinely taking turns: a C call that holds the lock.
 
@@ -256,6 +323,7 @@ REGIMES: Dict[str, Callable[[], Callable[[], None]]] = {
     "skew10x50": lambda: regime_skew(0.10, 50.0),
     "saturated": regime_saturated,
     "sat_skew30x20": lambda: regime_saturated_skewed(0.30, 20.0),
+    "miss30x20": lambda: regime_miss_queue(0.30, 20.0),
     "held": regime_held,
 }
 
@@ -282,21 +350,38 @@ LOW_VARIANCE_SKEW = ("skew30x20",)
 ENGINE_CEILING = ("saturated",)
 
 #: Did not scale and is skewed too: the residue, which holds both causes.
-AMBIGUOUS = ("sat_skew30x20",)
+#: Both are measured, because they fail DIFFERENTLY -- the saturated one's
+#: median grows with the client count and the miss-queue one's does not, and
+#: the second is why `p50` growth cannot become a third term.
+AMBIGUOUS = ("sat_skew30x20", "miss30x20")
+
+#: The residue regime whose median DOES grow with the client count, and the
+#: one whose median does not. Named so the pair cannot be mixed up by a
+#: reader of the test that reports it.
+RESIDUE_WITH_A_GROWING_MEDIAN = "sat_skew30x20"
+RESIDUE_WITH_A_FLAT_MEDIAN = "miss30x20"
 
 #: The counts at which a regime that fails to scale is UNAMBIGUOUSLY below
-#: the floor on the throughput estimator.
+#: the floor on the throughput estimator -- which is the same condition
+#: `throughput_fraction` admits the term under, `1 / clients < floor`, so this
+#: tuple and that predicate move together if the floor moves.
 #:
-#: **Two clients is not one of them, and that is a measurement rather than a
-#: convenience.** A pool that serializes completely delivers one client's
-#: throughput, so its efficiency is `1/n` -- which is 0.5 at two clients,
-#: exactly the floor, for both the true positive and the engine ceiling.
-#: Measured: the lock-holding thread arm read efficiency 0.497 and
-#: `served / clients` 0.496 at two clients, a hair under; the saturated server
-#: read 0.538, a hair over. `TestTwoClientsIsAKnifeEdgeForBothEstimators`
-#: reports that pair instead of asserting a verdict nobody can calibrate, and
-#: it is a property of the PRE-EXISTING floor and not of this change --
-#: `config/profiles/main.yml` sweeps two clients.
+#: **Two clients is not one of them, and the first version of this comment was
+#: WRONG about why.** It said the n=2 knife edge was "a property of the
+#: PRE-EXISTING floor and not of this change". It is not: a completely
+#: serialized pool's efficiency is exactly `1 / n`, so at two clients the
+#: throughput estimator sits ON the floor and carries no information, while
+#: the median-span estimator carries a systematic DOWNWARD bias -- its
+#: `outstanding / clients` factor is always under 1.0 -- that put it below the
+#: floor 3 times out of 3. Measured on the retired thread pool at two
+#: clients: `served / clients` 0.4873 / 0.4919 / 0.4945 against efficiencies
+#: of 0.4987 / 0.4913 / 0.4992, so a `max` over the two takes the larger and
+#: lands on the floor. A reviewer of this change measured 0.5008 there and
+#: PUBLISHED a pool whose clients were taking turns -- a true positive the old
+#: rule caught, dropped by the repair. `throughput_fraction` now withholds the
+#: term at `clients <= 2` for exactly that reason, and
+#: `TestTwoClientsIsAKnifeEdgeForBothEstimators` measures the pair.
+#: `config/profiles/main.yml` sweeps two clients today.
 UNAMBIGUOUS_COUNTS = tuple(c for c in CLIENT_COUNTS if c >= 4)
 
 
@@ -702,6 +787,11 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
             mutant = scaling_status(None, 4, 1.0)
         finally:
             latency_mod.achieved_fraction = original
+        # Restoration, asserted and not left to the `finally`. The two calls
+        # below reach the module-level import binding rather than this
+        # module's global, so they would pass with the mutant still in place
+        # and cannot stand in for this line.
+        assert latency_mod.achieved_fraction is original
         assert honest is None
         assert mutant == SCALING_OK
         assert honest != mutant
@@ -729,17 +819,143 @@ class TestTheRepairIsOneFloorOverTwoEstimators:
         assert scaling_status(0.8, 4) == SCALING_CONCURRENCY_NOT_ACHIEVED
         assert scaling_status(0.8, 4, 0.99) == SCALING_OK
 
-    def test_throughput_fraction_is_the_efficiency_itself(self):
-        """Named, not computed, and the name is the argument.
+    def test_throughput_fraction_is_the_efficiency_where_it_is_evidence(self):
+        """Named rather than computed, and withheld rather than rescaled.
 
         `scaling_efficiency` IS a concurrency fraction -- `qps_n / qps_1` is
-        Little's law with the one-client service cost, divided by n. A
-        function that rescaled it would be claiming otherwise.
+        Little's law with the one-client cycle cost, divided by n -- so a
+        function that RESCALED it would be claiming otherwise. What it does
+        instead is return `None` where the reading is not evidence.
         """
-        assert throughput_fraction(0.25) == 0.25
-        assert throughput_fraction(None) is None
+        assert throughput_fraction(0.25, 4) == 0.25
+        assert throughput_fraction(None, 4) is None
         assert achieved_fraction(0.8, 4, 0.9) == pytest.approx(
-            max(served_fraction(0.8, 4), throughput_fraction(0.9)))
+            max(served_fraction(0.8, 4), throughput_fraction(0.9, 4)))
+
+    @pytest.mark.parametrize("clients,admitted", [(1, False), (2, False),
+                                                  (3, True), (4, True),
+                                                  (8, True), (32, True)])
+    def test_the_term_is_withheld_where_one_over_clients_is_not_below_the_floor(
+            self, clients, admitted):
+        """The n=2 repair, as the predicate rather than as a verdict.
+
+        A COMPLETELY serialized pool delivers one client's throughput, so its
+        efficiency is exactly `1 / clients`. At one and two clients that is
+        not below the floor of 0.5, so the reading cannot distinguish total
+        serialization from perfect concurrency and is withheld. From three
+        clients up, `1 / clients` is 0.333 or less and the reading separates.
+
+        Honest: `throughput_fraction(0.9, 2)` is None and
+        `throughput_fraction(0.9, 3)` is 0.9. Mutant: the pre-repair form,
+        which returned the efficiency at every client count, is the identity
+        -- so the pair below is None against 0.9 at two clients.
+        """
+        got = throughput_fraction(0.9, clients)
+        mutant = 0.9           # the pre-repair body: `return efficiency`
+        assert (got == 0.9) is admitted, (clients, got)
+        if not admitted:
+            assert got is None
+            assert got != mutant
+        else:
+            assert got == mutant
+
+    def test_the_boundary_moves_with_the_floor_and_is_not_a_hard_coded_two(
+            self):
+        """Derived from the floor, read back by moving the floor.
+
+        Honest (floor 0.5): the term is withheld at two clients and admitted
+        at three. Mutant (floor rebound to 0.3 on
+        `harness.metrics.latency`): withheld at three and admitted at four,
+        because `1/3` is 0.333 which is no longer below it. A `clients > 2`
+        spelling would read 0.9 at three clients under both floors, which is
+        the dead-probe signature this names.
+        """
+        original = latency_mod.SERVED_CONCURRENCY_FLOOR
+        honest = (throughput_fraction(0.9, 2), throughput_fraction(0.9, 3),
+                  throughput_fraction(0.9, 4))
+        try:
+            latency_mod.SERVED_CONCURRENCY_FLOOR = 0.3
+            assert latency_mod.SERVED_CONCURRENCY_FLOOR != original
+            mutant = (throughput_fraction(0.9, 2), throughput_fraction(0.9, 3),
+                      throughput_fraction(0.9, 4))
+        finally:
+            latency_mod.SERVED_CONCURRENCY_FLOOR = original
+        assert latency_mod.SERVED_CONCURRENCY_FLOOR == original
+        assert honest == (None, 0.9, 0.9)
+        assert mutant == (None, None, 0.9)
+        assert honest != mutant
+
+    def test_a_superlinear_reading_is_withheld_rather_than_clamped(self):
+        """A share of the clients in service cannot exceed 1.
+
+        Honest (ceiling 2.0): an efficiency of 1e308 or of `inf` is withheld,
+        so a window at `served / clients` 0.2 is refused on the median alone.
+        Mutant (`CREDIBLE_EFFICIENCY_CEILING` rebound to `inf`, which is the
+        pre-repair behaviour of admitting any finite reading): the same window
+        reads `ok` -- a corrupt baseline publishing a point whose own spans
+        say one query in five was in service.
+
+        **Clamping is not the repair and the difference is read back here**:
+        `min(efficiency, 1.0)` would turn both of these into a confident 1.0,
+        the most permissive value the rule has.
+        """
+        original = latency_mod.CREDIBLE_EFFICIENCY_CEILING
+        honest = (scaling_status(0.8, 4, 1e308),
+                  scaling_status(0.8, 4, float("inf")))
+        try:
+            latency_mod.CREDIBLE_EFFICIENCY_CEILING = float("inf")
+            assert latency_mod.CREDIBLE_EFFICIENCY_CEILING != original
+            mutant = (scaling_status(0.8, 4, 1e308),
+                      scaling_status(0.8, 4, float("inf")))
+        finally:
+            latency_mod.CREDIBLE_EFFICIENCY_CEILING = original
+        assert latency_mod.CREDIBLE_EFFICIENCY_CEILING == original
+        assert honest == (SCALING_CONCURRENCY_NOT_ACHIEVED,) * 2
+        assert mutant == (SCALING_OK,) * 2
+        assert honest != mutant
+        # The clamp, run rather than described.
+        assert scaling_status(0.8, 4, min(1e308, 1.0)) == SCALING_OK
+        # And a legitimate reading just under the ceiling still counts, so
+        # the ceiling is not refusing everything above 1.0. The highest
+        # legitimate reading measured behind this file was 1.327.
+        assert throughput_fraction(1.327, 4) == 1.327
+        assert throughput_fraction(2.0, 4) == 2.0
+        assert throughput_fraction(2.0001, 4) is None
+
+    def test_a_nan_efficiency_degrades_to_the_old_rule(self):
+        """The argument order of `max` is load-bearing, and this reads it.
+
+        `qps_n / (clients * qps_1)` is NaN when the baseline window completed
+        nothing, and every comparison against a NaN is False -- so
+        `max(fraction, nan)` returns the FRACTION and the median-span rule
+        decides. The ceiling does not catch it, because `nan > ceiling` is
+        False too.
+
+        Honest: a NaN efficiency on a window at `served / clients` 0.2 reads
+        `concurrency_not_achieved`, exactly as the old rule did. Mutant
+        (`achieved_fraction` rebound with the arguments to `max` REVERSED):
+        the NaN propagates, `NaN < floor` is False, and the window reads
+        `ok` -- which would publish every point in a run whose baseline
+        measured nothing.
+        """
+        nan = float("nan")
+        honest = scaling_status(0.8, 4, nan)
+        original = latency_mod.achieved_fraction
+        try:
+            latency_mod.achieved_fraction = (
+                lambda served, clients, efficiency=None: max(
+                    throughput_fraction(efficiency, clients),
+                    served_fraction(served, clients)))
+            assert latency_mod.achieved_fraction is not original
+            mutant = scaling_status(0.8, 4, nan)
+        finally:
+            latency_mod.achieved_fraction = original
+        assert latency_mod.achieved_fraction is original
+        assert honest == SCALING_CONCURRENCY_NOT_ACHIEVED
+        assert mutant == SCALING_OK
+        assert honest != mutant
+        # And the honest path really did take the fraction, not the NaN.
+        assert achieved_fraction(0.8, 4, nan) == pytest.approx(0.2)
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +971,7 @@ class TestAPoolThatScaledIsNotRefusedForBeingSkewed:
     """
 
     @pytest.mark.parametrize("regime", LOW_VARIANCE_SKEW)
-    @pytest.mark.parametrize("clients", [c for c in CLIENT_COUNTS if c > 1])
+    @pytest.mark.parametrize("clients", UNAMBIGUOUS_COUNTS)
     def test_the_old_rule_refused_it_and_the_new_one_does_not(
             self, table, regime, clients):
         """Honest (new rule) against mutant (the pre-change body), one window.
@@ -874,8 +1090,8 @@ class TestAnEngineCeilingIsStillPublished:
 
         Measured at four clients: efficiency 0.277, `served / clients` 0.989,
         `p50 / mean` 0.994, and the median span rose from 0.576 ms at one
-        client to 2.075 ms at four -- about the client count, which is what a
-        queue does and a stalled client does not.
+        client to 2.075 ms at four -- a factor of 3.6, about the client count,
+        which is what a queue does and a stalled client does not.
 
         Honest: `ok`. Mutant (the efficiency fed through the served slot, so
         the rule judges it alone): `concurrency_not_achieved` -- a real engine
@@ -927,15 +1143,16 @@ class TestClientsTakingTurnsAreStillRefused:
     that can still trip it, and the repair has to leave it tripping.
     """
 
-    @pytest.mark.parametrize("clients", [c for c in CLIENT_COUNTS if c > 1])
+    @pytest.mark.parametrize("clients", UNAMBIGUOUS_COUNTS)
     def test_both_estimators_are_low_so_the_refusal_stands(self, table,
                                                            clients):
         """Honest (new rule) and mutant (pre-change rule), deliberately EQUAL.
 
         Measured in the thread arm: efficiency and `served / clients` are the
-        same number to three decimals at every client count -- 0.499/0.494 at
-        two, 0.248/0.246 at four, 0.124/0.123 at eight (the eight-client
-        reading is measured but not swept here) -- because flat throughput and
+        same number at every client count -- at 2 s windows, 0.499/0.494 at
+        two clients, 0.248/0.246 at four and 0.124/0.123 at eight (two and
+        eight are measured but not asserted here; see
+        `UNAMBIGUOUS_COUNTS`) -- because flat throughput and
         a flat median make `served` a constant and `1/n` both figures. So the
         larger of the two is still under the floor and the verdict does not
         move.
@@ -999,34 +1216,118 @@ class TestClientsTakingTurnsAreStillRefused:
 # ---------------------------------------------------------------------------
 
 class TestTwoClientsIsAKnifeEdgeForBothEstimators:
-    """Both estimators are `1/n` at two clients, so both land on the floor.
+    """At one and two clients the throughput estimator is withheld, so the
+    median-span rule decides there alone.
 
-    **A property of the floor as it already stood, surfaced by this work
-    rather than created by it, and `config/profiles/main.yml` sweeps two
-    clients.** A pool that serializes completely delivers one client's
-    throughput however many clients it has, so its efficiency is `1/n` --
-    0.5 at two -- and `served / clients` is the same 0.5 for the same reason.
-    An engine ceiling at two clients is also at about a half. The two
-    populations the floor was chosen as the midpoint of therefore MEET at two
-    clients, and nothing in this change moves that.
+    **THE FIRST VERSION OF THIS FILE CALLED THIS "a property of the floor as
+    it already stood, surfaced by this work rather than created by it", AND
+    THAT WAS WRONG.** A pool that serializes completely delivers one client's
+    throughput however many clients it has, so its efficiency is exactly
+    `1 / n` -- 0.5 at two clients, ON the floor. The old rule's quantity is
+    not symmetric with it: `served / clients` is `(p50/mean) x
+    (outstanding/clients)` and that second factor is ALWAYS under 1.0, so the
+    old rule carried a systematic downward bias that put a serialized
+    two-client pool below the floor 3 times out of 3 -- measured
+    `served / clients` 0.4873 / 0.4919 / 0.4945 and 0.4949 / 0.4912 / 0.4943
+    over two sets of three builds, by margins of 0.0055 to 0.0127. Replacing
+    the deciding quantity with an unbiased one centred on 0.5 therefore turns
+    a reliable refusal into a coin flip, and a reviewer of this change
+    measured 0.5008 and published a pool whose clients were taking turns.
 
-    Reported rather than asserted into a verdict, because a verdict here would
-    be a verdict about which side of 0.5 the box's noise fell on.
+    So `throughput_fraction` withholds the term wherever `1 / clients` is not
+    itself below the floor. That is symmetric and it CUTS BOTH WAYS: the skew
+    false positive this file exists to fix is also not fixed at one or two
+    clients, because the term that fixes it is not admitted there. The repair
+    reaches `clients >= 3`. That is measured below rather than asserted in
+    prose, and it is the main thing a reader of the follow-up needs.
     """
+
+    def test_the_repair_does_not_reach_one_or_two_clients(self):
+        """The reach of the fix, stated as the verdicts at each client count.
+
+        A skewed-but-SCALING pool -- `served / clients` 0.17, efficiency
+        0.98, which is the 30%-at-20x regime's measured shape -- is published
+        from three clients up and REFUSED at one and two, because the
+        efficiency is withheld there. Honest: the four verdicts below. Mutant
+        (`CLIENT_COUNTS`-independent admission, i.e. the pre-review form that
+        returned the efficiency at every count): `ok` at all four, including
+        the two where a serialized pool is indistinguishable from this one.
+
+        Both are read back, and they differ at exactly the two counts the
+        withholding covers.
+        """
+        skewed = {}
+        unguarded = {}
+        for clients in (1, 2, 3, 4):
+            served = 0.17 * clients
+            skewed[clients] = scaling_status(served, clients, 0.98)
+            unguarded[clients] = (
+                SCALING_OK if max(0.17, 0.98) >= SERVED_CONCURRENCY_FLOOR
+                else SCALING_CONCURRENCY_NOT_ACHIEVED)
+        assert skewed == {1: SCALING_CONCURRENCY_NOT_ACHIEVED,
+                          2: SCALING_CONCURRENCY_NOT_ACHIEVED,
+                          3: SCALING_OK, 4: SCALING_OK}, skewed
+        assert unguarded == {c: SCALING_OK for c in (1, 2, 3, 4)}, unguarded
+        assert skewed != unguarded
+        # And the cost is paid in the direction of the OLD rule, never past
+        # it: where the term is withheld the verdict is exactly the old one.
+        for clients in (1, 2):
+            assert (skewed[clients]
+                    == pre_change_scaling_status(0.17 * clients, clients))
+
+    def test_a_serialized_two_client_pool_is_still_refused(self, table):
+        """The true positive the review found dropped, read off the fixture.
+
+        Honest (the term withheld at two clients): the thread arm's
+        two-client window is `concurrency_not_achieved`, which is what the
+        old rule said. Mutant (the term admitted there, which is this
+        change's pre-review form): the verdict is whichever of the two
+        estimators happened to come out larger, and the supplied reviewer
+        reading of efficiency 0.5008 against `served / clients` 0.4898
+        publishes it.
+
+        The mutant is run on the SUPPLIED pair as well as on the measured
+        one, because the measured one does not always cross -- my own three
+        builds read efficiencies of 0.4987, 0.4913 and 0.4992, all just
+        under. A probe that only used the local reading would come back
+        identical and prove nothing, so it is reported both ways.
+        """
+        point = table["held"][2]
+        share = fractions(point)
+        honest = scaling_status(point["served"], 2, share["efficiency"])
+        assert honest == SCALING_CONCURRENCY_NOT_ACHIEVED, report(table)
+        assert honest == pre_change_scaling_status(point["served"], 2)
+        # The pre-review form over the same window: `max` of the two shares
+        # against the floor, with no withholding.
+        local = max(share["served"], share["efficiency"])
+        local_mutant = (SCALING_OK if local >= SERVED_CONCURRENCY_FLOOR
+                        else SCALING_CONCURRENCY_NOT_ACHIEVED)
+        # SUPPLIED by the reviewer of this change, not measured here.
+        supplied = max(0.4898, 0.5008)
+        supplied_mutant = (SCALING_OK if supplied >= SERVED_CONCURRENCY_FLOOR
+                           else SCALING_CONCURRENCY_NOT_ACHIEVED)
+        assert supplied_mutant == SCALING_OK
+        assert honest != supplied_mutant
+        if local_mutant == honest:
+            # A dead probe on the local reading, and said so rather than
+            # left to look like a guard that held: this build's efficiency
+            # came out under the floor on its own.
+            assert local < SERVED_CONCURRENCY_FLOOR, (local, report(table))
 
     def test_the_two_regimes_are_not_separated_at_two_clients(self, table):
         """The pair, read off the fixture and asserted only as an overlap.
 
-        Measured: the lock-holding thread arm at two clients read efficiency
-        0.497 and `served / clients` 0.496; the saturated server read 0.538
-        and 0.985. So the THROUGHPUT estimator does not separate them at two
-        clients -- the two readings are within 10% of each other and straddle
-        the floor -- while the MEDIAN one still does, by a factor of two.
+        Measured at this fixture's 0.5 s windows: the lock-holding thread arm
+        at two clients read efficiency 0.4913-0.4998 and `served / clients`
+        0.4873-0.4949 over six builds; the saturated server read 0.538 and
+        0.985. So the THROUGHPUT estimator does not separate them at two
+        clients -- the readings are within 10% of each other and straddle the
+        floor -- while the MEDIAN one still does, by a factor of two.
 
         Honest: that overlap on the efficiency column. Mutant: the same two
         regimes at four clients, where the efficiency readings are 0.248 and
         0.278 -- still overlapping, which is the point the `max` exists for --
-        and the median column separates them 0.244 against 0.989. Both pairs
+        and the median column separates them 0.246 against 0.989. Both pairs
         read back, so the probe reports the structure rather than a verdict.
         """
         turns_two = fractions(table["held"][2])
@@ -1070,6 +1371,96 @@ class TestTwoClientsIsAKnifeEdgeForBothEstimators:
                 == SCALING_CONCURRENCY_NOT_ACHIEVED)
 
 
+class TestAnUnderWarmedBaselineIsTheRepairsOwnExposure:
+    """What a depressed `qps_1` does to the term, and the signal that sees it.
+
+    **A hazard this change creates and cannot fix from here.** The efficiency
+    is a ratio across TWO windows, and `harness/workloads/concurrency.py` sets
+    `warmup` PER CLIENT -- so the one-client baseline gets the fewest warmed
+    queries of any point in the sweep, reaches cache steady state slowest in
+    wall clock, and is measured FIRST, right after load. A baseline depressed
+    by a factor k inflates every efficiency in the sweep by about k, and
+    `CREDIBLE_EFFICIENCY_CEILING` is no defence because the inflated value is
+    nowhere near it.
+
+    Measured here, with the n-client window held FIXED and only the baseline's
+    per-query cost scaled, against the retired thread pool at four clients
+    whose clients genuinely take turns:
+
+        baseline     efficiency   p50_1 / p50_n   status
+        honest            0.248           0.996   concurrency_not_achieved
+        2.0x cold         0.468           1.889   concurrency_not_achieved
+        2.5x cold         0.579           2.338   ok          <- PUBLISHED
+        3.0x cold         0.690           2.782   ok
+
+    So the crossing is at about 2.1x, and past it a pool whose clients are
+    taking turns publishes a scaling efficiency. The fix belongs in the
+    workload's warm-up, not here.
+
+    **The signal that sees it is already a published column.** `p50_1 / p50_n`
+    above 1 means the median query got FASTER as clients were added, which no
+    engine can do: a queue raises the median and a stalled client leaves it
+    alone, so nothing legitimate lowers it. `latency_p50_ms` is recorded at
+    every point of the sweep, so a caller could pass it with no schema change
+    -- it is simply not an input to this module today.
+    """
+
+    @pytest.fixture(scope="class")
+    def cold_baseline(self, base, queries):
+        """A one-client window at TWICE the per-query cost.
+
+        The model of an under-warmed baseline: same driver, same arm, same
+        window length, a cold per-query cost. Two windows, best by qps, like
+        every other point in this file.
+        """
+        factory = factory_for(base, lambda: time.sleep(QUERY_S * 2.0))
+        return _best(_thread_point, factory, queries, 1)
+
+    def test_a_cold_baseline_inflates_the_efficiency_towards_the_floor(
+            self, table, cold_baseline):
+        """Honest baseline against under-warmed, over ONE n-client window.
+
+        The four-client window is the fixture's, unchanged, so the only thing
+        that differs between the two readings is the baseline -- which is what
+        makes this a measurement of the warm-up and not of two runs.
+
+        Honest (the fixture's own baseline): efficiency about a quarter, and
+        the window is refused. Mutant (the 2x cold baseline): the efficiency
+        roughly doubles. Both read back. The verdict does not necessarily move
+        at 2x -- measured 0.468 against a floor of 0.5, a 6% margin -- and
+        that near-miss is the finding, so the assertion is on the INFLATION
+        rather than on a verdict the box's noise would decide.
+        """
+        four = table["held"][4]
+        honest = four["qps"] / (4.0 * table["held"][1]["qps"])
+        mutant = four["qps"] / (4.0 * cold_baseline["qps"])
+        assert honest < SERVED_CONCURRENCY_FLOOR, (honest, report(table))
+        assert mutant > 1.6 * honest, (honest, mutant, report(table))
+        assert honest != pytest.approx(mutant, rel=0.1)
+        # And the inflation is entirely in the baseline: the n-client window
+        # is the same object, so `served / clients` cannot have moved.
+        assert four["served"] / 4.0 < SERVED_CONCURRENCY_FLOOR, report(table)
+
+    def test_the_median_that_got_faster_is_what_flags_it(self, table,
+                                                         cold_baseline):
+        """The detector, as the pair it has to separate.
+
+        Honest (the fixture's baseline): `p50_1 / p50_n` is about 1.0 --
+        measured 0.996 -- because a stalled client leaves the median alone.
+        Mutant (the 2x cold baseline): 1.889. A median that got faster as
+        clients were added, which no engine can do.
+
+        Asserted as a factor rather than a threshold, because the threshold is
+        the follow-up's to choose once the quantity is an input.
+        """
+        four = table["held"][4]
+        honest = table["held"][1]["p50"] / four["p50"]
+        mutant = cold_baseline["p50"] / four["p50"]
+        assert honest < 1.3, (honest, report(table))
+        assert mutant > 1.5, (mutant, report(table))
+        assert mutant > 1.3 * honest, (honest, mutant, report(table))
+
+
 class TestTheResidueHoldsBothCausesAndCannotSeparateThem:
     """A saturated server whose service time is also two-moded.
 
@@ -1096,7 +1487,7 @@ class TestTheResidueHoldsBothCausesAndCannotSeparateThem:
 
         Measured at four clients in this fixture: efficiency 0.260 and
         `served / clients` 0.166, against the lock-holding arm's 0.248 and
-        0.244; at 2 s windows, 0.233 and 0.155 against 0.248 and 0.246. The
+        0.246; at 2 s windows, 0.233 and 0.155 against the same pair. The
         repair
         leaves this verdict exactly where it was, which is the honest outcome
         for a case one window cannot attribute -- and it means the repair
@@ -1111,31 +1502,86 @@ class TestTheResidueHoldsBothCausesAndCannotSeparateThem:
         assert honest == SCALING_CONCURRENCY_NOT_ACHIEVED, report(table)
         assert honest == mutant
 
-    def test_it_is_inside_the_true_positives_range_on_every_quantity(
-            self, table):
-        """Why no quantity here separates them, as a measurement.
+    @pytest.mark.parametrize("regime", AMBIGUOUS)
+    def test_the_quantities_the_status_reads_do_not_separate_it(self, table,
+                                                                regime):
+        """**On every quantity the STATUS IS COMPUTED FROM**, not on every
+        quantity -- and the narrowing is the review's, correctly.
 
-        The three shares the instrument has -- efficiency, `served / clients`
-        and `outstanding / clients` -- are all within a factor of two across
-        the two regimes at four clients. Honest: that overlap. Mutant: the
-        saturated NARROW regime over the same three, where `served / clients`
-        is a factor of four away from the true positive's and the separation
-        is real. So the pair shows the overlap is a property of the skew and
-        not of the measurement.
+        The status reads two numbers: `served / clients` and the efficiency.
+        Both of them are on the same side of the floor for the two residue
+        regimes as for clients genuinely taking turns, and the efficiency
+        columns overlap within a factor of two. Measured at four clients:
+        efficiency 0.233 and 0.217 for the two residue regimes against 0.248
+        for the true positive.
+
+        `outstanding / clients` is included because it is the quantity a
+        reviewer reaches for next, and it is blind -- 0.93-1.00 everywhere.
+        `p50` growth is NOT included, because it is not blind and it does
+        separate one of these two: that is the next test's business.
+
+        Honest: the overlap. Mutant: the saturated NARROW regime, whose
+        `served / clients` is a factor of two or more from the true
+        positive's, so the overlap is a property of the skew and not of the
+        measurement.
         """
         turns = fractions(table["held"][4])
-        both = fractions(table["sat_skew30x20"][4])
+        both = fractions(table[regime][4])
         ceiling = fractions(table["saturated"][4])
-        # Measured at four clients: efficiency 0.260/0.248 = 1.048,
-        # `served / clients` 0.166/0.244 = 0.680, `outstanding / clients`
-        # 0.946/0.939 = 1.007. Over the probe runs behind this file the
-        # served ratio spanned 0.61-0.68, so the bound is set wide enough
-        # that it asserts the OVERLAP rather than a decimal.
-        for key in ("efficiency", "served", "outstanding"):
-            ratio = both[key] / turns[key]
-            assert 0.4 < ratio < 2.5, (key, ratio, report(table))
+        for key in ("served", "efficiency"):
+            assert both[key] < SERVED_CONCURRENCY_FLOOR, report(table)
+            assert turns[key] < SERVED_CONCURRENCY_FLOOR, report(table)
+        # Measured at four clients: 0.233/0.248 = 0.94 for the saturated-and-
+        # skewed regime and 0.217/0.248 = 0.88 for the miss-queue one. The
+        # bound asserts the OVERLAP rather than a decimal.
+        ratio = both["efficiency"] / turns["efficiency"]
+        assert 0.4 < ratio < 2.5, (regime, ratio, report(table))
+        # Blind, which is the claim: measured 0.949-0.996 over 7 regimes x
+        # 3 client counts x 2 builds of this very fixture, and as low as 0.84
+        # for a CPU-bound spinning thread arm at 8 clients that no test here
+        # reproduces. The bound is deliberately far wider than either, since
+        # the only thing that has to hold is that this quantity never comes
+        # near the floor and so can never be a term.
+        assert 0.8 < both["outstanding"] < 1.05, report(table)
+        assert 0.8 < turns["outstanding"] < 1.05, report(table)
         separated = ceiling["served"] / turns["served"]
         assert separated > 2.0, (separated, report(table))
+
+    def test_median_growth_sorts_one_residue_regime_and_not_the_other(
+            self, table):
+        """Why `p50` growth is reported beside the status and not inside it.
+
+        A queue moves the median and a stalled client does not, so
+        `p50@4 / p50@1` separates a saturated server from clients taking
+        turns. Measured over five builds: x3.659-x3.726 for the saturated
+        server and x3.624-x3.660 for the saturated-and-skewed one, against
+        x0.994-x1.013 for the thread arm. **So a third term on that growth
+        WOULD sort the residue regime this file used to build alone** -- the
+        first version of this file said the median "failed to grow in two of
+        the three", naming a regime it did not build, and was wrong about the
+        two it did.
+
+        It is still not promoted, and this is the measurement that says why:
+        the miss-queue regime fails to scale with a median that does NOT grow
+        -- measured x1.020, x0.998 and x1.002 -- because its median query is a
+        cache hit that never reaches the bottleneck. Honest and mutant here
+        are the two residue regimes' growth over one fixture: a differing
+        pair, which is the point.
+        """
+        def growth(name):
+            return table[name][4]["p50"] / table[name][1]["p50"]
+
+        queued = growth(RESIDUE_WITH_A_GROWING_MEDIAN)
+        flat = growth(RESIDUE_WITH_A_FLAT_MEDIAN)
+        turns = growth("held")
+        assert queued > 2.0, (queued, report(table))
+        assert flat < 1.6, (flat, report(table))
+        assert turns < 1.6, (turns, report(table))
+        # The pair that refuses the third term: one residue regime is a
+        # factor of two clear of the stalled client on this quantity and the
+        # other is indistinguishable from it.
+        assert queued / turns > 2.0, (queued, turns, report(table))
+        assert 0.5 < flat / turns < 2.0, (flat, turns, report(table))
 
     def test_the_repair_never_refuses_what_the_old_rule_published(self,
                                                                   table):
