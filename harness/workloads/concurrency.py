@@ -369,10 +369,11 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 # meaningless without. `outstanding_concurrency` is the exact
                 # time-average number outstanding and `served_concurrency`
                 # the median-span estimate of how many were in service; they
-                # diverge by the time a span spends waiting for the
-                # interpreter lock rather than for the engine, and
-                # `scaling_status` is keyed to the second because the first
-                # was measured blind to that -- see
+                # diverge by the time a span spends WAITING rather than being
+                # served, whatever it waits on -- until version 6 that was
+                # the interpreter lock, and since then it is a queue in the
+                # engine or its socket. `scaling_status` is keyed to the
+                # second because the first was measured blind to it -- see
                 # `clients.SERVED_CONCURRENCY_FLOOR` for the five-driver
                 # table. Both are recorded, never the status alone: the
                 # status is a comparison against a floor, and a reader has to

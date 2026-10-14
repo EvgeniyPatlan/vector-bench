@@ -84,7 +84,13 @@ def is_during_writes(record: Dict[str, Any]) -> bool:
     **The magnitude depends on whether the reader's query releases the
     interpreter lock, and an earlier revision of this docstring quoted a
     single number that was its own test fixture's arithmetic.** Measured over
-    9 real churn runs each, on `tests/fake_driver.py`:
+    9 real churn runs each, on `tests/fake_driver.py`, **both arms on the
+    RETIRED THREAD POOL** -- these are the figures that established the size
+    of the hazard and they are not a current reading of this harness. Since
+    `OPS_MEASUREMENT_VERSION` 6 each reader is a forked OS process, so the
+    two rows below no longer differ by what a lock does; what survives is the
+    hazard itself, because an aggregate reader QPS over a single-client
+    baseline is a spurious retention whatever produced the readers:
 
       * readers whose query releases the GIL (a `latency_s` sleep, which is
         what a real driver blocked on a socket does): spurious retention

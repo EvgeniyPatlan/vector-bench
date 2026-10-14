@@ -472,11 +472,14 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                 len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
             **_reader_shape(driver_factory, readers, reader_count),
             # And the status of that read load, because a reader count alone
-            # does not say the readers RAN concurrently. The readers are
-            # threads in this writer's own interpreter: if they serialized on
-            # the interpreter lock they starved the writer in the client, and
-            # the rate above stops being a measurement of the engine's ingest
-            # under reads. `{}` when there was no during-writes window, which
+            # does not say the readers RAN concurrently: the rate above was
+            # measured against whatever they actually did, so a pool serving
+            # one read at a time leaves it describing an unknown load. Until
+            # version 6 the readers were threads in this writer's own
+            # interpreter and serializing readers starved the writer in the
+            # client as well; they are forked processes now, so the
+            # dependency is what is left and that attribution is not.
+            # `{}` when there was no during-writes window, which
             # keeps the key set of a readers-off record exactly what it was.
             **reader_contention_shape(reader_during),
             "index_sync_s": round(synced_s, 3),

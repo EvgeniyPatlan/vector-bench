@@ -1002,15 +1002,24 @@ class TestReadersStopWithoutHanging:
 
     Taken literally, "readers stop cleanly when the writer exhausts its
     budget" is satisfied by a workload that returns -- which it would even if
-    it left four reader threads querying the engine for the rest of the run.
-    So the assertion here is on the THREADS, identified by class, plus a wall
-    clock bound: a hang is the failure mode, and a test that can only fail by
-    timing out tells whoever reads the log nothing about what hung.
+    it left four reader PROCESSES querying the engine for the rest of the run.
+    So the assertion here is on the live client processes, via
+    `pool_clients()`, plus a wall clock bound: a hang is the failure mode, and
+    a test that can only fail by timing out tells whoever reads the log
+    nothing about what hung.
+
+    **This docstring said THREADS, identified by class, and the code below has
+    asserted on processes since G3.** That is the dead-probe wording
+    `pool_clients()`'s own docstring records retiring -- the thread form "can
+    only ever be empty" and "reads as coverage" -- so describing a process
+    assertion in it was the same mistake one level up. A leaked process
+    matters more than a leaked thread did: a thread died with the interpreter
+    and a client goes on querying the server the next configuration measures.
     """
 
     def test_the_budget_ending_the_write_also_ends_the_readers(
             self, ctx, dataset, short_window):
-        """Honest: the writer stops on its budget, no reader thread survives
+        """Honest: the writer stops on its budget, no reader PROCESS survives
         the call, and no during-writes record is written -- the corpus is
         missing rows, so `writer_rows_per_s_with_readers` would describe a
         write that never finished. The stall record states `readers: 4`, so

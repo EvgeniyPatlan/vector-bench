@@ -41,10 +41,14 @@ measuring 7.5 to 9.9 busy cores of 20 while it was taken):
     half released, half held     0.518 / 0.980  0.979/0.980  0.997/0.991
 
 `outstanding/n` is 0.84-1.00 on every row of both arms, across efficiencies
-from 0.249 to 1.009. It is blind, exactly as §7 says, and for the same
-mechanical reason -- a client waiting for the lock is still inside its own
-timed region, so the stretched spans tile the window. `served/n` is the row
-that separates the regimes, and it separates them by a factor of four.
+from 0.249 to 1.009. It is blind, exactly as §7 says, and **the mechanism
+holds in both arms because it is not about the lock**: a span brackets
+`driver.query`, so it covers whatever the query spent waiting as well as
+whatever it spent being served, and the stretched spans tile the window
+either way. Under threads the wait was the interpreter lock; under processes
+it is a queue in the engine or its socket. An earlier revision of this
+paragraph gave the lock as the reason for a figure it claimed of both arms.
+`served/n` is the row that separates the regimes, by a factor of four.
 
 Three further readings off it. The two lock-holding rows move from a quarter
 of their client count in service to all of it, which is the change. The

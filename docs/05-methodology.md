@@ -1142,19 +1142,29 @@ below.
 Four things to read off it. **Only the two lock-holding rows moved**, which is
 the whole claim of the change below: the clients no longer share an
 interpreter, so a driver that holds the lock no longer makes them take turns.
-**A genuinely saturated server is not flagged in either arm**, which is the
-case the threshold exists to protect: a real queue raises the whole latency
-distribution, median included, so that row's `served` stays at the client count
-while its efficiency falls to 0.27. A change that had started refusing real
-engine ceilings would be worse than the defect it fixes. **The lock-releasing
-row did not move either**, so the pipes, the barrier and the span transport
-cost the pool nothing. And **the exact figure is the blind one** — `outstanding`
-is 0.84–1.00 of the client count on all ten readings, across efficiencies from
-0.249 to 1.009, because a query waiting for the lock is still inside the
-client's timed region and the stretched spans tile the window. It is recorded
-anyway, because the pair is the diagnostic: outstanding at the client count
-while in service sits near one is the signature of time spent waiting for a
-lock rather than for the engine.
+**A saturated server with *deterministic* service time is not flagged in
+either arm**, which is the case the threshold was chosen to protect: a real
+queue raises the whole latency distribution, median included, so that row's
+`served` stays at the client count while its efficiency falls to 0.27.
+**That is the whole of what this table measures, and the claim is narrowed to
+it on purpose.** Every driver in it has a fixed per-query cost, so a server
+whose service time is skewed far enough to put its median well below its mean
+can still be refused — a known false positive, handled separately, and this
+section does not claim the rule is sound. What the table does establish is
+that the rule does not refuse the *deterministic* ceiling, which is the case
+a reader of a seven-engine study meets most often. **The lock-releasing row
+did not move either**, so the pipes, the barrier and the span transport cost
+the pool nothing. And **the exact figure is the blind one** — `outstanding`
+is 0.84–1.00 of the client count on all ten readings, across efficiencies
+from 0.249 to 1.009. The mechanism holds in both arms and is not about the
+lock: a span brackets `driver.query`, so it covers whatever the query spent
+waiting as well as whatever it spent being served, and the stretched spans
+tile the window either way. Under threads the wait was the interpreter lock;
+under processes it is a queue in the engine or in its socket. It is recorded
+anyway, because the pair is the diagnostic — outstanding at the client count
+while in service sits near one is the signature of waiting rather than of
+serving. It says the clients were not being served and not what they were
+waiting for; see §2.3 and the report's own footnote for the limits of that.
 
 **The lock-holding row is a C call that WAITS with the lock held, and the
 earlier version of this table burned CPU with it held instead.** That matters
