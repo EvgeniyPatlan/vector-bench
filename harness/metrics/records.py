@@ -241,9 +241,9 @@ SCHEMA_VERSION = 1
 # reads (`SMOKE_RESULTS/`, the tree `tests/test_config.py:1499` points at)
 # holds 239 ops record files and 2,134 ops records, and
 # `extra.ops_measurement_version` is ABSENT from every one of them -- so all
-# 2,134 are implicit version 1 and not one record anywhere carries a 5. There
-# is no version 5 `reinsert_rows_per_s` for a readers-contended one to be
-# incomparable with.
+# 2,134 are implicit version 1. THE LAST CLAUSE EXPIRED ON 2026-10-14: that
+# day's `smoke` run stamps 158 records at version 5, so version 5 figures now
+# exist and the version 6 block below is written against them, not around them.
 #
 # WHAT DOES KEEP THE TWO RATES APART, since the version cannot once a version
 # 5 run exists: `extra.readers`, which every churn step record from a caller
@@ -258,7 +258,64 @@ SCHEMA_VERSION = 1
 # `ops.churn_readers` within one run, that gap becomes a real chart and the
 # fix is a key the report groups on, not a bump that would invalidate every
 # recall curve beside it.
-OPS_MEASUREMENT_VERSION = 5
+#
+# VERSION 6 -- THE CLIENTS ARE OS PROCESSES, AND THAT CHANGES WHAT EVERY
+# MULTI-CLIENT NUMBER MEASURES. Until this version the concurrency sweep's
+# clients and the churn workload's readers were Python THREADS in one
+# interpreter, each with its own connection; from it they are separate
+# processes. `docs/05-methodology.md` §7 set out the change and its cost and
+# ended "none of that is attempted here"; `harness/workloads/clients.py` now
+# does it and carries the mechanism.
+#
+# WHAT MOVES, by record field: `qps` and all four latency columns on every
+# concurrency record with `clients > 1`; `extra.scaling_efficiency`,
+# `extra.outstanding_concurrency`, `extra.served_concurrency` and
+# `extra.scaling_status` with them; the churn during-writes record's
+# aggregate reader throughput and percentiles, its p99 ratio, and
+# `extra.reinsert_rows_per_s` -- which moves AGAIN, having already moved in
+# version 5 for being measured against readers at all. A one-client
+# concurrency point is the only multi-client-pool figure that does not move,
+# and it moves in meaning anyway because it is the denominator of every
+# efficiency beside it.
+#
+# WHY A BUMP RATHER THAN A FOOTNOTE, which is the test every version here has
+# to pass. It is version 3's query-pool precedent exactly: the same workload
+# against a different amount of load is not two samples of one quantity. And
+# unlike version 5, THERE ARE NOW RECORDS TO BE INCOMPARABLE WITH. The
+# 2026-10-14 `smoke` run (`SMOKE/results/smoke-20261014-075119/`, six
+# engines on fashion-mnist-784 at M=16, a Xeon Gold 6230) wrote 158 ops
+# records and every one of them is stamped 5. Those are the first version 5
+# records that have ever existed, and they are exactly the ones a reader
+# would most want to compare against the first version 6 run.
+#
+# THE EVIDENCE, because this bump is not a tidy-up. In that run
+# `served = qps x p50` -- Little's law, the quantity `served_concurrency`
+# computes -- per client, going from 1 client to 4:
+#
+#     mariadb      0.95 -> 0.238      pgvector   0.98 -> 0.974
+#     mariadb123   0.95 -> 0.237      valkey     0.97 -> 0.969
+#     alisql       0.97 -> 0.242      mongodb    0.99 -> 0.984
+#
+# The three engines pinned near one query in service are precisely the three
+# that share MariaDB Connector/Python, and the three at their client count
+# are the three that do not. The same run's churn writer managed 11.991
+# rows/s against four readers where the same run's single-threaded load of
+# the same corpus recorded `ingest_rows_per_s` 769.9 -- a factor of 64 inside
+# one run, with nothing changed but whether four readers ran. So a version 5
+# multi-client figure for mariadb, mariadb123 or alisql is a measurement of a
+# client library's lock and a version 6 one is not, and putting them on one
+# axis would read as those engines having become four times faster.
+#
+# AND THE INSTRUMENT STILL REFUSES WHAT IT REFUSED, which is the half a bump
+# could quietly break. Five synthetic drivers of identical per-query cost
+# through the real pool at 1 and 4 clients, `served / clients` at 4, threads
+# then processes: lock-releasing 0.985 -> 0.985; **saturated server 0.976 ->
+# 0.977 at efficiency 0.275, still not flagged**; atomic C call holding the
+# lock 0.219 -> 0.950; Python spin holding the lock 0.263 -> 0.996. Only the
+# lock-holding rows moved, which is the whole claim; the saturated-server row
+# is the one `SERVED_CONCURRENCY_FLOOR` exists to protect and a version that
+# had started flagging real engine ceilings would be worse than the defect.
+OPS_MEASUREMENT_VERSION = 6
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.
