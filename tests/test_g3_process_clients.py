@@ -117,6 +117,7 @@ whether the pool can achieve its concurrency, not how fast this box is.
 
 from __future__ import annotations
 
+import ast
 import ctypes
 import ctypes.util
 import multiprocessing
@@ -142,7 +143,10 @@ from harness.metrics.latency import (LatencyCollector,                # noqa: E4
 from harness.workloads import client_process as cp                    # noqa: E402
 from harness.workloads import clients as cl                           # noqa: E402
 from harness.workloads import pool_window as pw                       # noqa: E402
-from harness.workloads import transfer_deadline as td                 # noqa: E402
+# `transfer_deadline` is deliberately NOT imported here. The ceiling guard
+# DISCOVERS the pool's modules from the import graph and reads them off disk,
+# so an alias for it would be an unused import -- and the last thing this
+# file needs is a name that exists only to look like coverage.
 from tests.fake_driver import (FakeDriver, K, N_QUERIES, N_ROWS,      # noqa: E402
                                index_spec, tiny_dataset)
 from tests.retired_thread_pool import thread_window                   # noqa: E402
@@ -375,6 +379,45 @@ def factory_for(base: FakeDriver, spend: Callable[[], None]):
         client.query = query
         return client
     return clone
+
+
+def pool_modules(transitive: bool = True) -> Dict[str, str]:
+    """The modules the client pool is split across, `{name: path}`.
+
+    DISCOVERED and not listed, for the reason
+    `test_the_modules_are_each_inside_the_line_ceiling` gives: a hand-written
+    tuple is a guard that stops covering the next split until somebody
+    remembers it, and this repository has now split this pool twice.
+
+    The shared property is the import graph: every module the split produced
+    is reachable from `clients.py` through SAME-PACKAGE imports, because that
+    is what a split does -- the pool keeps importing the pieces it handed
+    out. `ast` rather than `importlib`, so nothing is executed and a module
+    that fails to import is a failure here rather than a silent omission.
+
+    `transitive=False` is the mutant: `clients`' direct imports alone, which
+    misses anything a split module itself split out. It exists so the probe
+    beside this can show the discovery finding a module the shallow form
+    does not.
+    """
+    root = os.path.join(VB_ROOT, "harness", "workloads")
+
+    def same_package(name: str) -> List[str]:
+        tree = ast.parse(open(os.path.join(root, name + ".py")).read())
+        return sorted({node.module for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom)
+                       and node.level == 1 and node.module})
+
+    found, frontier = {"clients"}, ["clients"]
+    while frontier:
+        for imported in same_package(frontier.pop()):
+            path = os.path.join(root, imported + ".py")
+            if imported in found or not os.path.isfile(path):
+                continue
+            found.add(imported)
+            if transitive:
+                frontier.append(imported)
+    return {name: os.path.join(root, name + ".py") for name in sorted(found)}
 
 
 def spec_for(queries) -> IndexSpec:
@@ -2116,21 +2159,54 @@ class TestTheSplitDidNotMovePatchTargets:
         and whoever notices should be this test rather than a reviewer -- the
         argument `tests/test_t4b_readers.py` makes for the churn split.
 
-        **FOUR modules now, not three.** `client_process.py` reached 799 of
-        800 and the next change to it was a three-line correctness fix that
-        did not fit, so `transfer_deadline.py` took the span-transfer
-        deadline. A new module absent from this tuple is a module with no
-        ceiling, which is how the guard would stop covering the thing it is
-        named for.
+        **The modules are DISCOVERED and not listed, and that is the fix for
+        what an earlier revision admitted in its own docstring.** It
+        enumerated `(cl, cp, pw)` by hand and said "a new module absent from
+        this tuple is a module with no ceiling" -- which is a statement of
+        the hazard, not a guard against it, and the hazard duly arrived:
+        `transfer_deadline.py` was split out and the tuple had to be
+        remembered. The same move that closed this for the citation tables
+        closes it here: `pool_modules()` walks the pool's own same-package
+        import graph, so the next split is covered by being imported rather
+        than by anyone updating a list.
         """
-        sizes = {}
-        for mod in (cl, cp, pw, td):
-            lines = len(open(mod.__file__).read().splitlines())
-            sizes[mod.__name__.rsplit(".", 1)[1]] = lines
+        sizes = {name: len(open(path).read().splitlines())
+                 for name, path in pool_modules().items()}
         assert all(n <= 800 for n in sizes.values()), sizes
-        # Non-vacuity: splicing them back together is over the ceiling, so the
-        # split is justified by the reason all three files give for it.
+        # Non-vacuity: splicing them back together is over the ceiling, so
+        # the split is justified by the reason all four files give for it.
         assert sum(sizes.values()) > 800, sizes
+        # And the discovery found something to measure at all. A walk that
+        # returned {} would satisfy both assertions above vacuously.
+        assert len(sizes) >= 4, sizes
+
+    def test_the_discovery_finds_the_module_a_hand_written_list_forgot(self):
+        """Honest and mutant, as the set of modules the guard covers.
+
+        The failure mode of a discovery is returning FEWER modules than
+        exist, silently -- a guard that covers three of four reads exactly
+        like one that covers four. So the probe is the module a hand-written
+        list did forget.
+
+        HONEST (transitive walk): **4** modules --
+        `client_process`, `clients`, `pool_window`, `transfer_deadline`.
+        MUTANT (`clients`' DIRECT imports only, which is the plausible
+        shallow implementation): **3** -- `transfer_deadline` is absent,
+        because `clients` does not import it; `client_process` does. That is
+        exactly the module the enumerated tuple had to be told about, so the
+        shallow walk reproduces the defect this discovery exists to remove.
+        """
+        honest = set(pool_modules())
+        assert "transfer_deadline" in honest, honest
+        assert honest >= {"clients", "client_process", "pool_window",
+                          "transfer_deadline"}, honest
+
+        mutant = set(pool_modules(transitive=False))
+        assert "transfer_deadline" not in mutant, (
+            "the shallow walk already reaches `transfer_deadline`, so it is "
+            "not the mutant this probe needs and the pair proves nothing")
+        assert honest - mutant == {"transfer_deadline"}, (honest, mutant)
+        assert len(honest) == len(mutant) + 1
 
     def test_patching_a_timeout_on_clients_still_reaches_the_client(self):
         """Honest and mutant, with the two values read back off a client.
