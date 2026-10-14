@@ -1944,11 +1944,24 @@ def _consistency_section(summary: Dict[str, Any]) -> str:
 
     The empty case is the one this function is really for. §5.2 item 3 says
     "An empty match list is itself reported, not hidden", and an empty list
-    has two causes that must not be printed the same way: `main` configures
-    `ann.m_values: [8, 32]` against `ops.m_values: [16]`, so on that profile
-    nothing can match and nothing is wrong, while a profile whose grids DO
-    overlap and still matches nothing has a fault. The coverage table names
-    which of the two happened, per engine and dataset.
+    has two causes that must not be printed the same way: a profile whose
+    `ann.m_values` and `ops.m_values` do not overlap cannot match anything and
+    nothing is wrong, while a profile whose grids DO overlap and still matches
+    nothing has a fault. The coverage table names which of the two happened,
+    per engine and dataset.
+
+    **On `main` the grids meet, so an empty section there is the fault case.**
+    That profile sweeps `ann.m_values: [8, 16, 32]` against
+    `ops.m_values: [16]`; the 16 is in the ann grid precisely so this check
+    has something to compare, and every engine should produce matched rows.
+
+    An earlier revision of this docstring said the opposite -- it described
+    the `[8, 32]` grid `main` carried before PR 5 §5.2 added the 16, and
+    called an empty section there "nothing is wrong". The same pull request
+    changed the profile, so that sentence shipped already false. An operator
+    who met it after an empty section on a `main` run would have filed a
+    fault as expected behaviour, which is the one reading this function's
+    coverage table exists to prevent.
     """
     consistency = summary.get("consistency") or {}
     matches = consistency.get("matches") or []

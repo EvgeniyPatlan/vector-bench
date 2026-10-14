@@ -164,6 +164,47 @@ contiguous block, so no two clients hold adjacent queries and part of the window
 is not one client warming a cache for another. The shards are disjoint and
 together cover the pool exactly.
 
+**Whose ceiling a point shows, and the flag that tries to say.** The clients are
+Python threads in one container pinned to a few CPUs, so a concurrency figure
+can be limited by the client rather than by the engine — and a chart that does
+not distinguish those publishes the harness as a database. Every concurrency
+record therefore carries the three numbers the judgement rests on rather than
+only the quotient: `extra.client_cpu_seconds` from the client container's own
+cgroup counter, `extra.client_cpus` for the CPUs it was given, and
+`extra.client_cpu_util` for the share those imply. All three, because each can
+be wrong while the quotient stays plausibly between 0 and 1.
+`extra.client_bound` is set when the utilisation exceeds
+`clients.CLIENT_BOUND_UTIL`, which is **0.80**, and the report draws those
+points hollow and names them in a footnote. That threshold is not a measured
+constant and is not offered as one: it is the level at which this harness stops
+being able to say whose ceiling a figure shows.
+
+**The flag is blind to the case that matters most, and that is measured rather
+than suspected.** A client can limit throughput *without* burning CPU — a
+driver that holds the interpreter lock while it waits serialises its threads,
+so the pool delivers one query at a time while every thread sits idle. On a
+`smoke` run MariaDB measured 2,920.7 QPS at one client and 2,927.5 at four with
+every latency percentile unchanged, `scaling_efficiency` 0.25, and
+`qps × p50` ≈ 0.95 — about one query in flight with four clients running. Run
+through the real `ClientPool` with two synthetic drivers of identical per-query
+cost differing only in whether they release the lock, the releasing one scaled
+1.02 (2,487 → 10,186 QPS at four clients) and the holding one 0.26, and the
+holding one's `client_cpu_util` was **0.177** against the 0.80 threshold. The
+pool delivered a quarter of its throughput and `client_bound` stayed `False`.
+(Those run figures are measurements of a live `smoke` run and of that
+reproduction, not of this document.)
+
+So `client_bound` is **sufficient and not necessary**: a point it marks was
+client-limited, and a point it does not mark is not thereby evidence that the
+engine was the limit. The signature of the case it misses is **flat QPS with
+flat latency** — throughput that stops rising while the percentiles do not
+move, which no saturating engine produces, because an engine at its limit
+makes queries wait and that shows in p95 and p99. `scaling_efficiency` beside
+it is the other half of the reading. An instrument that measures achieved
+concurrency directly from the query spans is being added; until it lands, read
+those two together and treat an unmarked flat point as unexplained rather than
+as an engine result.
+
 ### 2.4 Filtered / hybrid search (ops harness)
 
 Vector search with a scalar `WHERE` predicate, at three selectivities (~1%, ~10%,
@@ -497,6 +538,24 @@ how many. `ops.churn_readers: 0` measures the write-only rate, which is the
 quantity this report showed before PR 4 and is not the same quantity;
 `config/profiles/dev.yml` runs that pass.
 
+**The reader pool writes a third kind of churn record, and nothing may pool it
+with the other two.** It carries `phase: "churn"` and a `churn_fraction` like
+the rest, so every existing churn artifact selects it by default — but its
+`qps` is aggregate throughput over `ops.churn_readers` clients against a corpus
+that is mid-change, and it carries no recall at all, because no ground truth
+describes a corpus being rewritten (`recall_at_k` is null there rather than
+zero, for the same reason a budget-stopped filtered point is). It is marked
+`extra.during_writes: true`, and `report/churn_state.py:is_during_writes`
+is the one place that reads the mark, and `churn_measurements` beside it is
+the filter every other surface goes through: the single-client churn table and
+all three churn charts — degradation, retention and impact — select their
+records with it rather than on `phase` alone. Handed one of
+these records, the retention chart would divide an aggregate multi-client
+figure by a single-client pre-churn baseline and publish the quotient on an
+axis labelled "QPS as a fraction of pre-churn" — a new wrong result of exactly
+the kind PR 4 exists to remove, and one that the change which fixed the others
+would have introduced.
+
 ### 2.6 Uncertainty intervals, and when two engines are not ordered
 
 Every figure here is one sample of a noisy process. Without an interval beside
@@ -593,12 +652,20 @@ differently or does not name at all.
 **An empty list has two causes and the report distinguishes them.** "No `M` is
 measured by both paths" is a profile choice: the recall sweep varies `M`
 because it is the only build knob MHNSW and VIDX expose, while the ops phase
-pins one `M` because every extra value reloads the whole corpus. In `main`
-these grids do not intersect — `ann.m_values: [8, 32]` against
-`ops.m_values: [16]` — so the check is empty by design there. "`M` overlaps but
-no point matched" is a **fault**: both paths measured a shared `M` and no pair
-formed anyway. The coverage table under section 10 says which case each engine
-and dataset is in.
+pins one `M` because every extra value reloads the whole corpus. "`M` overlaps
+but no point matched" is a **fault**: both paths measured a shared `M` and no
+pair formed anyway. The coverage table under section 10 says which case each
+engine and dataset is in.
+
+**On `main` the grids meet, so an empty section there is the fault case.** That
+profile runs `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]`, and the
+16 is in the ann grid for no other reason than to give this check something to
+compare — so every engine should produce matched rows and an empty
+consistency section on a `main` run is a reason to investigate rather than a
+reassurance. An earlier revision of this paragraph described the `[8, 32]` grid
+`main` carried before that change and called the check "empty by design"
+there; the profile and the sentence moved in the same pull request, and only
+one of them was updated.
 
 **Throughput order is flagged, never failed.** At matched recall the engine
 order should agree between the two paths; where it does not, the report lists

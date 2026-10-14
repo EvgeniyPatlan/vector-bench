@@ -49,8 +49,15 @@ an absence of runs. The claim that no profile was run is **supplied** by the
 orchestrator that drove this work, not established from the tree.
 
 The repository's PR numbers are not the spec's. The spec has PR 0 to PR 5; the
-repository has merged its own up to #16, and #4 does not appear in this history
-at all. The mapping, from the merge commits:
+repository numbers its own independently, and #4 does not appear in this
+history at all. The mapping, from the merge commits:
+
+This paragraph deliberately does **not** name the highest pull request merged
+so far. It used to, and that figure went stale within the hour of being
+written — the next merge was this document's own. A monotonically increasing
+fact about the repository cannot be stated in prose and stay true; the gap at
+#4 can, because history does not acquire new gaps. The table below carries the
+numbers that matter, and each row is checked against the merge commits.
 
 | Spec PR | Tasks | Landed as | State |
 |---|---|---|---|
@@ -202,7 +209,7 @@ below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:2315`), computed by
+report** (`report/render.py:2328`), computed by
 `report/crosscheck.py:308`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
@@ -301,7 +308,7 @@ and is what the run settles.
 
 Note what changed underneath this item: the selectivity label used to be the
 share *requested*, and is now the share *delivered*
-(`docs/05-methodology.md:192-199`). If you compare against an older chart, the
+(`docs/05-methodology.md:233-240`). If you compare against an older chart, the
 axis means a different thing.
 
 **The overshoot is not a single number**, and the draft of this page quoted one
@@ -341,7 +348,7 @@ is still true.
 
 **This section now exists.** `report/crosscheck.py:308`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:2315`). It is the check that cross-references
+as section 10 (`report/render.py:2328`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -362,14 +369,19 @@ What to read, in the order it matters:
   a TCP round trip per query that the in-process path does not, so two engines
   close together in-process can legitimately swap places.
 
-**Two places still say this check is empty by design on `main`, and they are
-now wrong.** `report/render.py:1948` and `docs/05-methodology.md:596-598` both
-state that `main` configures `ann.m_values: [8, 32]` against `ops.m_values:
-[16]` so nothing can match there. The same change that added the section also
-set `config/profiles/main.yml:107` to `[8, 16, 32]` — see §5 item 3 — so on
-`main` the grids **do** meet and an empty section is a fault rather than a
-design. Neither file is this document's to edit; read the profile, not those two
-sentences, and expect them to be corrected.
+**On `main` an empty section is a fault, not a design.** That profile sweeps
+`ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
+the grids meet, and every engine with a calibration record should produce
+matched rows. `report/render.py:1953` and `docs/05-methodology.md:660` both say
+so.
+
+Until #16 was corrected they said the opposite: each described the `[8, 32]`
+grid `main` carried before the pull request that added this section, and
+called an empty section there "empty by design". The profile and those two
+sentences moved in the same change and only the profile was updated, so an
+operator reading either one would have filed a real fault as expected
+behaviour. This page flagged them until they were fixed; they are fixed, and
+the guard that held the flag now asserts the correction instead.
 
 ### 6. "`05-methodology.md` updated for all five PRs"
 
@@ -382,29 +394,34 @@ sentences, and expect them to be corrected.
   is referred to once, in passing, as "the calibrated `ef_search`" inside the
   churn section. A reader asked by item 2 to review an operating-point table
   has nothing in the methodology describing it.
-* **PR 1's client-bound flag is absent.** Neither `client_bound` nor
-  `client_cpu_util` appears. The closest is a generic sentence in §6 saying the
-  harness records client CPU utilisation — which is true but does not describe
-  the flag, its threshold, or the blindness §4 item 1 above turns on.
-* **PR 4's third record shape is absent.** `during_writes` does not appear,
-  though `maintenance_state` and `churn_readers` do.
+* **PR 1's client-bound flag is now covered**, at the end of §2.3: the three
+  numbers the judgement rests on, the 0.80 threshold and what it is and is not,
+  and the blindness §4 item 1 above turns on — including the signature of the
+  case the flag misses, which is flat QPS with flat latency.
+* **PR 4's third record shape is now covered**, in §2.5: `during_writes`, why
+  it carries no recall, and the one function every surface excludes it through.
 * PR 3 and the version scheme are well covered.
 * **PR 5 is now covered**, in §2.6 (uncertainty intervals, and when two engines
-  are not ordered) and §2.7 (cross-checking the two measurement paths) — with
-  the caveat in §4 item 5 above: §2.7's account of the empty case names a
-  profile configuration that no longer holds.
+  are not ordered) and §2.7 (cross-checking the two measurement paths).
+  §2.7's account of the empty case named a profile configuration that no longer
+  held when it was written; that is corrected, and §4 item 5 above records what
+  it said.
 
-So the item has gone from four gaps to three, and the two that matter are the
-oldest: a reader sent by item 2 to review an operating-point table still has
-nothing in the methodology describing one, and the flag item 1 turns on is
-still unnamed there. The guards derive this list from the document at test time
-rather than restating it, so the item closes itself as the gaps are filled.
+So the item has gone from four gaps to one, and the one left is the oldest and
+the largest: a reader sent by item 2 to review an operating-point table still
+has nothing in the methodology describing one. That is a section rather than a
+paragraph — calibration is not a seventh measurement dimension but the premise
+of three of them, which is why the report puts the operating-point table before
+concurrency, filtered search and churn rather than among them — so it is left
+for a task of its own rather than bolted onto §2.1. The guards derive this list
+from the document at test time rather than restating it, so the item closes
+itself as the gap is filled.
 
 ### 7. "Run manifest records `ops_measurement_version`, seeds and the resolved profile"
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:661-662` documents it.
+prints it above the numbers, and `docs/05-methodology.md:728-729` documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 
@@ -514,8 +531,10 @@ asserts, against the repository rather than against prose:
   section 10 — so if either were removed this page would have to say so again;
 * that §5 item 3's cost table is recomputed from the estimator for both grids
   and both engine sets, and that `main`'s two M grids really do meet;
-* that the two statements §4 item 5 calls stale still say what it quotes them
-  as saying, so this page stops flagging them the moment they are fixed;
+* that the two statements §4 item 5 used to call stale now say that `main`'s
+  grids **do** meet, pinned by polarity rather than by sentence so that a
+  differently wrong rewrite fails too, and that neither still carries the
+  `[8, 32]` claim;
 * that §1's PR mapping names merges that really happened, including the gap in
   the numbering, read from `git log --merges` rather than from this table;
 * that none of `docs/09` §3's figures has been copied into this page, with the
