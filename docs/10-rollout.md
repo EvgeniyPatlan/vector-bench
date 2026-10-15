@@ -176,7 +176,7 @@ re-insert pass and is deliberate, not an omission.
 
 **What step A cannot confirm, and the draft of this page had it wrong.** With
 readers off there is no reader pool, so the `during_writes` churn record is
-never written: `harness/workloads/churn_readers.py:150-151` returns a count of
+never written: `harness/workloads/churn_readers.py:156-157` returns a count of
 zero for `readers <= 0`, and `harness/workloads/churn.py:279-280` says
 `reader_baseline` being None is *"the one state in which the whole
 during-writes record is absent"*. Step A therefore exercises two of the three
@@ -209,7 +209,7 @@ below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:2592`), computed by
+report** (`report/render.py:2633`), computed by
 `report/crosscheck.py:327`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
@@ -284,7 +284,12 @@ reports the concurrency workload's own CPU flat at 2.06 cores across 4, 8, 16
 and 32 clients — 0.515 of a four-CPU container, comfortably under the 0.80
 threshold — while aggregate throughput peaks at two clients and falls by better
 than half by thirty-two, with the flag firing on none of those points. That is
-a measurement of `tests/fake_driver.py` on a twenty-CPU box. The next paragraph,
+a measurement of `tests/fake_driver.py` on a twenty-CPU box, and it was taken
+on the **retired thread pool**: the clients are OS processes from
+`OPS_MEASUREMENT_VERSION` 6, so no interpreter-lock ceiling is reachable any
+more and what the flag is now about is the cpuset alone. The shape is still
+the one to recognise, which is why both the module and this page keep it.
+The next paragraph,
 `harness/workloads/clients.py:47-55`, says the fake's queries are numpy-bound
 in-process whereas a real driver spends most of a query blocked on a socket with
 the lock released, so **"the synthetic SHAPE may not reproduce"**. The earlier
@@ -329,7 +334,7 @@ and is what the run settles.
 
 Note what changed underneath this item: the selectivity label used to be the
 share *requested*, and is now the share *delivered*
-(`docs/05-methodology.md:486-493`). If you compare against an older chart, the
+(`docs/05-methodology.md:490-497`). If you compare against an older chart, the
 axis means a different thing.
 
 **The overshoot is not a single number**, and the draft of this page quoted one
@@ -383,7 +388,7 @@ is still true.
 
 **This section now exists.** `report/crosscheck.py:327`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:2592`). It is the check that cross-references
+as section 10 (`report/render.py:2633`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -407,7 +412,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2217` and `docs/05-methodology.md:935` both say
+matched rows. `report/render.py:2258` and `docs/05-methodology.md:939` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -465,7 +470,8 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:1003-1004` documents it.
+prints it above the numbers, and `docs/05-methodology.md:1007-1008`
+documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 

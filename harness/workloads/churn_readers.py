@@ -30,33 +30,39 @@ downstream has to pair two records, so nothing downstream can pair the wrong
 two.
 
 What the numbers here are NOT evidence about: `clients.CLIENT_BOUND_UTIL` is
-sufficient and not necessary -- a CPU-utilisation threshold cannot see a GIL
-ceiling, because the lock prevents the CPU consumption the threshold looks for.
-Measured against `tests/fake_driver.py`, the concurrency workload's own CPU
-flattens at 2.06 cores while its throughput peaks at two clients and halves by
-thirty-two, and the flag fired on none of those points. A reader pool's QPS is
-a measurement of this harness against this engine under writes, and it is not
-evidence about where either one saturates.
+sufficient and not necessary -- a CPU-utilisation threshold cannot see a
+ceiling that costs no CPU, and the interpreter lock that used to be one is out
+of the path now that the readers are processes. Measured on the RETIRED thread
+pool against `tests/fake_driver.py`: its own CPU flattened at 2.06 cores while
+throughput peaked at two clients and halved by thirty-two, with the flag
+firing on none of it. A reader pool's QPS is this harness against this engine
+under writes and is not evidence about where either one saturates.
 
 **AND THE WRITE RATE DEPENDS ON THE READERS HAVING ACTUALLY RUN.**
 `extra.reinsert_rows_per_s` is a version-5 quantity precisely because it is
-now measured against `ops.churn_readers` concurrent reads, and those reads are
-THREADS IN THE WRITER'S OWN INTERPRETER. Readers that serialize on the
-interpreter lock therefore starve the writer in the CLIENT, and the rate stops
-being a measurement of the engine's ingest under read load at all. The live
-`smoke` run that exposed this recorded a writer at 12.0 rows/s -- 2,000 rows
-in 166.8 s -- with four readers at 2,819 q/s, against a modelled MariaDB
-ingest of about 150 rows/s.
+now measured against `ops.churn_readers` concurrent reads. Until version 6
+those reads were THREADS IN THE WRITER'S OWN INTERPRETER, so readers that
+serialized on the interpreter lock starved the writer in the CLIENT and the
+rate stopped being about the engine's ingest at all. The live `smoke` run
+that exposed it recorded a writer at 12.0 rows/s -- 2,000 rows in 166.8 s --
+with four readers at 2,819 q/s, against a modelled MariaDB ingest of about
+150 rows/s.
 
-**Measured here, on `tests/fake_driver.py` with a 4 ms write slice and four
-readers whose query cost is IDENTICAL in both arms**, driving the real
-`churn.run`: readers that release the lock put the
-published `reinsert_rows_per_s` at 948.2, and readers that hold it put the
-same figure at 41.1 -- a factor of 23 in a number the report prints as a
-property of the engine, from nothing but what the reader's client library
-does with a lock. Their `served_concurrency` was 3.91 and 1.07 of four. The
-exact `outstanding_concurrency` was 3.96 and 3.95: blind to the whole
-difference, which is why the status is keyed to the other one.
+**Each reader is a forked OS process now and the writer is the harness's
+own, so that mechanism is out of the measurement path.** What is NOT out of
+it is the dependency: the rate is still taken against whatever those readers
+actually did, so a reader pool that served one read at a time still leaves
+the published figure describing an unknown amount of read load. The two-arm
+measurement below is kept because it is what established the size of the
+effect, and both arms were taken on the retired THREAD pool -- it is
+history, not a current reading of this pool. Measured on
+`tests/fake_driver.py` with a 4 ms write slice and four readers whose query
+cost is IDENTICAL in both arms, driving the real `churn.run`: readers that
+release the lock put the published `reinsert_rows_per_s` at 948.2, and
+readers that hold it put the same figure at 41.1 -- a factor of 23. Their
+`served_concurrency` was 3.91 and 1.07 of four, while the exact
+`outstanding_concurrency` was 3.96 and 3.95: blind to the whole difference,
+which is why the status is keyed to the other one.
 
 So every reader window here records `outstanding_concurrency`,
 `served_concurrency` and `scaling_status` (`clients.PoolWindow`), the
@@ -348,8 +354,8 @@ def _during_writes_extra(baseline: PoolWindow, during: PoolWindow,
                                            if rows_per_s is not None
                                            else None),
         "writer_rows": rows_written,
-        # Whose ceiling the reader figures show. The clients are Python
-        # threads in a container pinned to a few CPUs, and
+        # Whose ceiling the reader figures show. The readers are forked OS
+        # processes sharing one container's cpuset, and
         # `clients.CLIENT_BOUND_UTIL` is sufficient and not necessary: an
         # unmarked point is not evidence that the engine was the limit.
         "client_cpu_seconds": (round(during.client_cpu_seconds, 3)
@@ -367,14 +373,17 @@ def _during_writes_extra(baseline: PoolWindow, during: PoolWindow,
         #
         # **This decides whether `writer_rows_per_s_with_readers` means
         # anything**, and it is the version-5 quantity PR 4 §4.3 item 7
-        # introduced. The writer runs in the harness's MAIN thread while the
-        # readers run as threads in the SAME interpreter, so readers that
-        # serialize on the interpreter lock starve the writer inside the
-        # client -- and the rate becomes a measurement of Python rather than
-        # of the engine's ingest under read load. The live `smoke` run that
-        # exposed this recorded 12.0 rows/s (2,000 rows in 166.8 s) with four
-        # readers at 2,819 q/s, against a modelled MariaDB ingest of about
-        # 150 rows/s.
+        # introduced. The rate is measured against whatever these readers
+        # actually did, so a pool that served one read at a time leaves the
+        # figure describing an unknown amount of read load. Until version 6
+        # there was a second and larger mechanism: the writer ran in the
+        # harness's MAIN thread while the readers ran as threads in the SAME
+        # interpreter, so readers serializing on the interpreter lock starved
+        # the writer inside the client and the rate became a measurement of
+        # Python. The live `smoke` run that exposed that recorded 12.0 rows/s
+        # (2,000 rows in 166.8 s) with four readers at 2,819 q/s, against a
+        # modelled MariaDB ingest of about 150 rows/s. Each reader is a
+        # forked OS process now, so only the first mechanism is left.
         "outstanding_concurrency": (
             round(during.outstanding_concurrency, 3)
             if during.outstanding_concurrency is not None else None),
@@ -447,12 +456,16 @@ def _warn_readers_serialized(name: str, fraction: float,
     what this repository asks of one.
 
     The write rate is named as well as the read figures, and that is the point
-    of this warning rather than an extra. The readers are threads in the SAME
-    interpreter as the writer, so readers serializing on the interpreter lock
-    starve the writer in the client: the 12.0 rows/s the live `smoke` run
-    recorded against four readers, where the modelled ingest is about 150
-    rows/s, is the shape. `extra.reinsert_rows_per_s` on this fraction's step
-    record is the figure the report publishes, and it carries this status too
+    of this warning rather than an extra: it was measured against these reads,
+    so a pool that served one read at a time leaves it describing an unknown
+    amount of read load. The shape it is named for was measured when the
+    readers were threads in the SAME interpreter as the writer and serializing
+    readers starved the writer in the client -- the 12.0 rows/s the live
+    `smoke` run recorded against four readers, where the modelled ingest is
+    about 150 rows/s. Each reader is a forked OS process now, so the
+    attribution is weaker than that run's was and the dependency is not.
+    `extra.reinsert_rows_per_s` on this fraction's step record is the figure
+    the report publishes, and it carries this status too
     (`extra.reader_scaling_status`) so it cannot be read without it.
     """
     served = extra.get("served_concurrency")
@@ -467,10 +480,13 @@ def _warn_readers_serialized(name: str, fraction: float,
         f"evidence about what the writes cost the engine, because the reads "
         f"were not running concurrently. The writer rate beside them "
         f"({extra.get('writer_rows_per_s_with_readers') or 0:,.1f} rows/s) "
-        f"is affected in the same direction and for the same reason: the "
-        f"readers are threads in the writer's own interpreter, so reads that "
-        f"serialize on the interpreter lock starve the writer inside the "
-        f"client rather than inside the engine.",
+        f"was measured against those same reads, so it is not a figure about "
+        f"this engine under a known read load either. Until "
+        f"`OPS_MEASUREMENT_VERSION` 6 the readers were threads in the "
+        f"writer's own interpreter and reads that serialized on the "
+        f"interpreter lock would starve the writer inside the client rather "
+        f"than inside the engine; each reader is a separate OS process now, "
+        f"so that mechanism is gone and the dependency is not.",
         file=sys.stderr, flush=True)
 
 

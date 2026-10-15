@@ -646,7 +646,7 @@ Two consequences, and they pull in opposite directions:
   nothing to test. It does not, so a reader can be mid-scan while the graph is
   replaced under it, which is exactly the state that assertion marked.
 - **The churn phase's writers stop for the whole rebuild.** On a 1M-row corpus
-  that is on the order of a bulk build (§2.5), and `churn.py:522-523` times the
+  that is on the order of a bulk build (§2.5), and `churn.py:525-526` times the
   call, so the cost is recorded — but any concurrent write workload is paused,
   not slowed, and that belongs in `docs/07-planning-a-run.md` before anyone
   schedules it.
@@ -674,7 +674,7 @@ not a tidy-up:
   recall. Read the options back out of `SHOW CREATE TABLE` (§2.3) and re-send
   them rather than re-deriving them from the profile.
 - It rebuilds the whole graph, so on a 1M-row corpus it costs on the order of a
-  whole bulk build. `churn.py:522-523` times the call, so the cost is recorded
+  whole bulk build. `churn.py:525-526` times the call, so the cost is recorded
   rather than hidden, but a churn phase that previously ran in minutes for the
   MySQL family will not for Percona. That belongs in `docs/07-planning-a-run.md`
   before anyone schedules it.

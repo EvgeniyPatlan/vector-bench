@@ -402,7 +402,7 @@ is not one client warming a cache for another. The shards are disjoint and
 together cover the pool exactly.
 
 **Whose ceiling a point shows, and the flag that tries to say.** The clients are
-Python threads in one container pinned to a few CPUs, so a concurrency figure
+forked OS processes sharing one container's cpuset, so a concurrency figure
 can be limited by the client rather than by the engine — and a chart that does
 not distinguish those publishes the harness as a database. Every concurrency
 record therefore carries the three numbers the judgement rests on rather than
@@ -416,20 +416,24 @@ points hollow and names them in a footnote. That threshold is not a measured
 constant and is not offered as one: it is the level at which this harness stops
 being able to say whose ceiling a figure shows.
 
-**The flag is blind to the case that matters most, and that is measured rather
-than suspected.** A client can limit throughput *without* burning CPU — a
-driver that holds the interpreter lock while it waits serialises its threads,
-so the pool delivers one query at a time while every thread sits idle. On a
-`smoke` run MariaDB measured 2,920.7 QPS at one client and 2,927.5 at four with
-every latency percentile unchanged, `scaling_efficiency` 0.25, and
+**The flag is blind to a ceiling that costs no CPU, and that is measured rather
+than suspected. The case below is the one it was measured on, and §7 has since
+removed that case from the harness — read the two together.** A client can
+limit throughput *without* burning CPU. When the clients were threads in one
+interpreter, a driver that held the interpreter lock while it waited serialised
+them, so the pool delivered one query at a time while every thread sat idle. On
+a `smoke` run MariaDB measured 2,920.7 QPS at one client and 2,927.5 at four
+with every latency percentile unchanged, `scaling_efficiency` 0.25, and
 `qps × p50` ≈ 0.95 — about one query in flight with four clients running. Run
-through the real `ClientPool` with two synthetic drivers of identical per-query
-cost differing only in whether they release the lock, the releasing one scaled
-1.02 (2,487 → 10,186 QPS at four clients) and the holding one 0.26, and the
-holding one's `client_cpu_util` was **0.177** against the 0.80 threshold. The
-pool delivered a quarter of its throughput and `client_bound` stayed `False`.
-(Those run figures are measurements of a live `smoke` run and of that
-reproduction, not of this document.)
+through the then-current `ClientPool` with two synthetic drivers of identical
+per-query cost differing only in whether they release the lock, the releasing
+one scaled 1.02 (2,487 → 10,186 QPS at four clients) and the holding one 0.26,
+and the holding one's `client_cpu_util` was **0.177** against the 0.80
+threshold. The pool delivered a quarter of its throughput and `client_bound`
+stayed `False`. (Those run figures are measurements of a live `smoke` run and
+of that reproduction, not of this document.) The clients are processes now and
+Python's own lock can no longer do this; the flag's blindness is structural and
+is kept for the cases that remain, which §7 lists.
 
 **What that 0.177 is a measurement OF, which this section stated too
 loosely.** `read_own_cpu_usec` opens `/sys/fs/cgroup/cpu.stat`. In a real run
@@ -1079,12 +1083,17 @@ Stated up front so readers can judge relevance:
 ## 7. Multi-client throughput and whether the clients achieved it
 
 The ops harness runs its concurrency clients, and the churn workload's readers,
-as **Python threads in one interpreter**, each with its own connection. That
-makes every multi-client figure conditional on something the figure itself does
-not state: that the pool really had *N* queries in flight. `Scaling efficiency`
-divides an *N*-client throughput by *N* times a one-client throughput, so if
-the clients took turns it reports a property of the harness in a column a
-reader will take for a property of the database.
+as **forked OS processes**, each with its own interpreter and its own
+connection. It ran them as Python threads in one interpreter until
+`OPS_MEASUREMENT_VERSION` 6, and most of this section is about why that
+changed — read it as the history it is, because the figures in it were taken in
+both regimes and each says which.
+
+Either way, every multi-client figure is conditional on something the figure
+itself does not state: that the pool really had *N* queries in flight.
+`Scaling efficiency` divides an *N*-client throughput by *N* times a
+one-client throughput, so if the clients took turns it reports a property of
+the harness in a column a reader will take for a property of the database.
 
 **This was found by a live run, not by reading the code.** §2.3 has that run
 and what it shows — flat QPS with flat latency at four clients, about one query
@@ -1133,19 +1142,29 @@ below.
 Four things to read off it. **Only the two lock-holding rows moved**, which is
 the whole claim of the change below: the clients no longer share an
 interpreter, so a driver that holds the lock no longer makes them take turns.
-**A genuinely saturated server is not flagged in either arm**, which is the
-case the threshold exists to protect: a real queue raises the whole latency
-distribution, median included, so that row's `served` stays at the client count
-while its efficiency falls to 0.27. A change that had started refusing real
-engine ceilings would be worse than the defect it fixes. **The lock-releasing
-row did not move either**, so the pipes, the barrier and the span transport
-cost the pool nothing. And **the exact figure is the blind one** — `outstanding`
-is 0.84–1.00 of the client count on all ten readings, across efficiencies from
-0.249 to 1.009, because a query waiting for the lock is still inside the
-client's timed region and the stretched spans tile the window. It is recorded
-anyway, because the pair is the diagnostic: outstanding at the client count
-while in service sits near one is the signature of time spent waiting for a
-lock rather than for the engine.
+**A saturated server with *deterministic* service time is not flagged in
+either arm**, which is the case the threshold was chosen to protect: a real
+queue raises the whole latency distribution, median included, so that row's
+`served` stays at the client count while its efficiency falls to 0.27.
+**That is the whole of what this table measures, and the claim is narrowed to
+it on purpose.** Every driver in it has a fixed per-query cost, so a server
+whose service time is skewed far enough to put its median well below its mean
+can still be refused — a known false positive, handled separately, and this
+section does not claim the rule is sound. What the table does establish is
+that the rule does not refuse the *deterministic* ceiling, which is the case
+a reader of a seven-engine study meets most often. **The lock-releasing row
+did not move either**, so the pipes, the barrier and the span transport cost
+the pool nothing. And **the exact figure is the blind one** — `outstanding`
+is 0.84–1.00 of the client count on all ten readings, across efficiencies
+from 0.249 to 1.009. The mechanism holds in both arms and is not about the
+lock: a span brackets `driver.query`, so it covers whatever the query spent
+waiting as well as whatever it spent being served, and the stretched spans
+tile the window either way. Under threads the wait was the interpreter lock;
+under processes it is a queue in the engine or in its socket. It is recorded
+anyway, because the pair is the diagnostic — outstanding at the client count
+while in service sits near one is the signature of waiting rather than of
+serving. It says the clients were not being served and not what they were
+waiting for; see §2.3 and the report's own footnote for the limits of that.
 
 **The lock-holding row is a C call that WAITS with the lock held, and the
 earlier version of this table burned CPU with it held instead.** That matters
@@ -1179,17 +1198,23 @@ through this repository as a figure from such a run and not as something a
 test on a developer box can reproduce. `PoolWindow.client_bound`'s docstring
 says so beside the number.
 
-**The churn workload's write rate depends on this too, and by more than the
-read figures do.** `extra.reinsert_rows_per_s` is measured against
-`ops.churn_readers` concurrent readers, and those readers are threads in the
-*writer's own interpreter* — so readers that take turns starve the writer
-inside the client rather than inside the engine. Measured against the synthetic
-driver with a 4 ms write slice and four readers whose per-query cost is
-identical in both arms: readers that release the lock put that published rate
-at 948.2 rows/s, and readers that hold it put the same figure at 41.1 — a
-factor of 23, from nothing but what the client library does with a lock. The
-reader pool's status therefore travels onto the step record that publishes the
-rate, as `extra.reader_scaling_status`, and the during-writes table marks the
+**The churn workload's write rate depends on this too, and the dependency
+outlived the mechanism.** `extra.reinsert_rows_per_s` is measured against
+`ops.churn_readers` concurrent readers, so a reader pool that served one read
+at a time leaves the published rate describing an unknown amount of read load
+— whatever produced it. Until version 6 there was a second and much larger
+mechanism: those readers were threads in the *writer's own interpreter*, so
+readers that took turns starved the writer inside the client rather than inside
+the engine. Measured on the retired thread pool against the synthetic driver,
+with a 4 ms write slice and four readers whose per-query cost is identical in
+both arms: readers that release the lock put that published rate at
+948.2 rows/s, and readers that hold it put the same figure at 41.1 — a factor
+of 23, from nothing but what the client library does with a lock. **Each reader
+is a forked OS process now, so that factor is history rather than a current
+property of this harness**, and the figures above are kept because they are
+what established the size of the effect. The reader pool's status still travels
+onto the step record that publishes the rate, as
+`extra.reader_scaling_status`, and the during-writes table still marks the
 writer cell as well as the latency ratio.
 
 **What was read rather than measured, and the run that measured it.** Whether a
@@ -1257,23 +1282,44 @@ measured item by item rather than estimated:
   CPython's default on Linux is `fork` today and becomes `forkserver` in 3.14:
   an inherited default would turn a working pool into `Can't pickle local
   object` at the start of a measured window on a release upgrade.
-- **The memory cost this section used to state was wrong** (MEASURED). It said
-  each client gets its own copy of the query set, so the harness container's
-  memory grows with the client count. It does not. `shard_queries` hands out
-  strided *views* of one array, a client never writes to one, and fork's
-  copy-on-write never copies a page nobody writes: eight children over a
-  104.9 MB float32 array dirtied **13.8 MB — 0.13×** the array, against 838.9 MB
-  if each had copied it. The control arm is what makes that a measurement
-  rather than a blind probe: eight children that *write* the array measure
-  **851.7 MB, 8.12×**. What a client does cost is its own interpreter's private
-  pages, about 1.7 MB.
-- **The clock needed no replacing** (MEASURED). `time.perf_counter()` is
+- **The memory cost this section used to state was wrong** (MEASURED for the
+  direction, SUPPLIED for the figures). It said each client gets its own copy
+  of the query set, so the harness container's memory grows with the client
+  count. It does not. `shard_queries` hands out strided *views* of one array,
+  a client never *writes* to one, and fork's copy-on-write never copies a page
+  nobody writes. It does not follow that a reader child leaves the pages
+  alone: a shard is `queries[c::clients]`, strided across the whole array, so
+  every child *reads* pages spread over the entire query set — what is absent
+  is the write that would make the kernel copy one.
+  The figures below are **SUPPLIED**: no test here reproduces them, because
+  `tests/test_g3_process_clients.py` runs the same probe at four children over
+  a 33.6 MB array and asserts the ratio between its two arms rather than any
+  absolute. They are a **sum over eight children against one 104.9 MB float32
+  array**, not a per-client figure and not a figure against a baseline: summed
+  `Private_Dirty` **13.8 MB — 0.13×** the array, against 838.9 MB if each
+  child had copied it. The control arm is what makes the direction a
+  measurement rather than a blind probe: eight children that *write* the array
+  sum to **851.7 MB, 8.12×**, so the probe can see a copy when there is one.
+  What a client does cost is its own interpreter's private pages, about
+  1.7 MB.
+- **The clock needed no replacing** (MEASURED, and the asserted bound is
+  looser than the observation — deliberately). `time.perf_counter()` is
   `clock_gettime(CLOCK_MONOTONIC)`, which is the machine's clock rather than
   the process's — unlike `time.process_time`, which is the control. Over 200
   forks the child's offset from `CLOCK_MONOTONIC` matched the parent's to
-  within **4.2 µs**, which is the cost of reading two clocks back to back
-  rather than an offset, and the child's reading fell inside the parent's
-  bracketing pair **200 times out of 200**. A platform where that is false
+  within a few microseconds — **4.2 µs** on the box this change was made on
+  and **8.05 µs** re-measured on a box at 20 busy cores of 20 — which is the
+  cost of reading two clocks back to back rather than an offset, and the
+  child's reading fell inside the parent's bracketing pair **200 times out of
+  200** in both. `tests/test_g3_process_clients.py` runs both of those at 200
+  forks, and asserts **10 ms** rather than the observed microseconds: the
+  quantity is the difference of two offsets, each taken across two consecutive
+  clock reads, so a thread descheduled between them on a shared box widens it
+  by milliseconds for a reason that is not the clock. 10 ms is still four
+  orders of magnitude below what a per-process clock would give — the
+  control's child reads near zero against a parent's whole process age — so
+  the loose bound is what distinguishes the two clocks, and the microsecond
+  figures are reported rather than asserted. A platform where this is false
   fails loudly rather than producing spans that cannot be compared with the
   window they are inside.
 - **Client CPU accounting still covers the clients** (VERIFIED STRUCTURALLY).

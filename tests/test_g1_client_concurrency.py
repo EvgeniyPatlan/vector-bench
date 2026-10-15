@@ -24,14 +24,18 @@ by measurement.** Two candidates come out of the same spans:
 * `served_concurrency` -- counted queries times their median span, over the
   wall. Robust: Little's law with a median.
 
-Measured through the real `ClientPool` against five synthetic drivers of
-identical per-query cost, the exact one reads 0.98-1.00 of the client count on
-all of them -- including the ones delivering a quarter of their throughput --
-because a query waiting for the interpreter lock is still inside the client's
-timed region, so the stretched spans tile the window. The robust one separates
+Measured against five synthetic drivers of identical per-query cost, the
+exact one reads **0.84-1.00** of the client count on all ten readings of both
+pools, across efficiencies from 0.249 to 1.009 -- including the ones
+delivering a quarter of their throughput. The reason is not the lock: a span
+brackets `driver.query`, so it covers whatever the query spent WAITING as
+well as whatever it spent being served, and the stretched spans tile the
+window either way. Under threads the wait was the interpreter lock; under
+processes it is a queue in the engine or its socket. The robust one separates
 the two regimes by a factor of four. Both are recorded; only the second
 carries the guard. `TestTheExactFigureIsBlindAndTheRobustOneIsNot` is that
-measurement, run here rather than quoted.
+measurement, run here rather than quoted; an earlier revision of this
+paragraph quoted the thread arm's 0.98-1.00 as if it were both.
 
 **Mutation discipline.** Every guard below names the regression it catches and
 was checked by injecting that regression AT RUN TIME -- monkeypatch, a
@@ -247,7 +251,9 @@ DRIVERS = {"releasing": releasing, "holding": holding,
            "saturated": saturated, "half": half_and_half}
 
 #: Which families the LIVE pool must be able to run at the client count.
-#: Named here so a family added above has to be classified.
+#: Every key of `DRIVERS` appears here, which is what makes a family added
+#: above a test failure rather than a row nothing runs -- asserted by
+#: `tests/test_g4_pool_teardown.py::TestEveryDriverFamilyIsStillClassified`.
 #:
 #: **ALL FOUR, SINCE G3, AND THAT IS THE CHANGE RATHER THAN A LOOSENING.**
 #: `holding` was in `SERIALIZES` until the clients became OS processes: it
@@ -266,7 +272,16 @@ SCALES = ("releasing", "saturated", "half", "holding")
 #: rather than an expected finding -- `tests/retired_thread_pool.py`'s
 #: docstring has the argument.
 SERIALIZES_UNDER_THREADS = ("holding",)
-SERIALIZES = ()
+
+#: **`SERIALIZES = ()` is GONE rather than kept empty.** It used to name the
+#: families that serialize the live pool and it carried the comment "Named
+#: here so a family added above has to be classified" -- which stopped being
+#: true twice over: no `parametrize` referenced it any more, so an added
+#: family was classified by `SCALES` alone, and an empty tuple parametrizes
+#: nothing, so even a reference would have run no test. An empty collection
+#: that reads as a classification is the dead-probe shape this file records
+#: elsewhere, so the classification duty it claimed is now discharged by an
+#: assertion that every `DRIVERS` key is in `SCALES`.
 
 
 #: What every synthetic query returns. Fixed ids rather than the fake's real
@@ -594,11 +609,14 @@ class TestTheExactFigureIsBlindAndTheRobustOneIsNot:
     `outstanding_concurrency` is the exact time-average number of queries
     outstanding -- the integral of the occupancy function over the window,
     with no estimator in it. It is also blind to the defect this file exists
-    for, and that is a measurement rather than an argument: a query waiting
-    for the interpreter lock is still inside the client's timed region,
-    because the span's start instant is read in Python and the lock can be
-    dropped at any bytecode boundary after it. The stretched spans tile the
-    wall and the sum approaches the client count however little was served.
+    for, and that is a measurement rather than an argument: a span brackets
+    `driver.query`, so it covers whatever the query spent WAITING as well as
+    whatever it spent being served, and the stretched spans tile the wall
+    until the sum approaches the client count however little was served.
+    On the retired arm below the wait is the interpreter lock, which the
+    span's start instant cannot exclude because it is read in Python and the
+    lock can be dropped at any bytecode boundary after it; under processes
+    the blindness is the same and the wait is a queue in the engine.
 
     Both figures are read off the same window here, so the pair is one
     measurement and not two runs that might differ for another reason.
@@ -1332,9 +1350,12 @@ class TestTheClientBoundFlagIsKeptAndDocumentsItsBlindness:
 class TestTheChurnReadersCarryItToo:
     """§4. `churn_readers` builds the same pool, and
     `extra.reinsert_rows_per_s` is a version-5 quantity measured against
-    concurrent readers. The readers are threads in the WRITER's own
-    interpreter, so readers that serialize starve the writer in the client and
-    that rate becomes a measurement of Python.
+    concurrent readers -- so a reader pool that served one read at a time
+    leaves that rate describing an unknown amount of read load. Until version
+    6 the readers were threads in the WRITER's own interpreter, which made it
+    worse: readers that serialized starved the writer in the client and the
+    rate became a measurement of Python. Each reader is a forked OS process
+    now, so the dependency is what is left and the attribution is not.
     """
 
     @staticmethod
@@ -1511,21 +1532,57 @@ class TestTheDuringWritesTableSaysIt:
 #: pattern tight enough to demand one sentence gets deleted by the next
 #: author, and then it is also absent on the edit it existed to catch.
 PROSE_CLAIMS = {
+    # **The claim this pins was NARROWED, and the pattern REQUIRES the
+    # narrowing.** What was measured is a saturated server whose service time
+    # is DETERMINISTIC -- every calibration driver has a fixed per-query cost
+    # -- so "a genuinely saturated server is not flagged" claimed more than
+    # the calibration supports, and a server skewed enough to put its median
+    # below its mean can still be refused.
+    #
+    # **An earlier revision of this row made the qualifier OPTIONAL while its
+    # comment claimed the pattern had been narrowed with the claim.** It had
+    # not: `(?: with [a-z ]{0,40})?` matched the unnarrowed sentence, the bare
+    # "A saturated server is not flagged.", and `docs/05-methodology.md`'s own
+    # unnarrowed copy -- so a revert to the general claim would have passed
+    # the guard that exists to catch it, and `accepts` listed the unnarrowed
+    # form as legitimate. `deterministic` is now mandatory and the unnarrowed
+    # forms are reject rows, which is what makes this a guard rather than a
+    # sentence about one.
     "a saturated server is not flagged": dict(
-        pattern=r"(?:genuinely )?saturated server is (?:deliberately )?not "
-                r"flagged",
+        # `[^.\n]` and not `[^.]`: a negated class matches a newline, and
+        # `test_a_reflow_does_not_defeat_the_guard` below is the thing that
+        # has to stay demonstrable -- that `_plain` normalisation is what
+        # makes a WRAPPED sentence match. The real input is always normalised
+        # first, so excluding the newline costs nothing and keeps that
+        # demonstration honest.
+        pattern=r"saturated server\b[^.\n]{0,60}?\bdeterministic\b"
+                r"[^.\n]{0,60}?\bis (?:deliberately )?not flagged",
         accepts=[
+            "A saturated server with deterministic service time is not "
+            "flagged, and that is the case the threshold protects.",
+            "A saturated server whose service time is deterministic is not "
+            "flagged.",
+            "A saturated server with a deterministic per-query cost is "
+            "deliberately not flagged here.",
+        ],
+        rejects=[
+            # The claim reversed.
+            "A saturated server is flagged the same way.",
+            "A saturated server is also refused, because its efficiency "
+            "falls.",
+            # The form a lazy wildcard between the noun and the verb would
+            # have accepted: it reverses the claim and keeps the words.
+            "A saturated server is flagged, and only a lock-bound client is "
+            "not flagged.",
+            # And the three the OLD pattern accepted: the claim widened back
+            # to the general property the calibration does not support. These
+            # are the mutants that make requiring `deterministic` a guard.
             "A genuinely saturated server is not flagged, and that is the "
             "case the threshold was chosen to protect.",
             "A saturated server is not flagged: a real queue raises the "
             "median too.",
             "Note that a genuinely saturated server is deliberately not "
             "flagged here.",
-        ],
-        rejects=[
-            "A saturated server is flagged the same way.",
-            "A saturated server is also refused, because its efficiency "
-            "falls.",
         ],
     ),
     "the efficiency needs the concurrency to have happened": dict(
@@ -1591,8 +1648,11 @@ class TestTheFootnoteKeepsSayingIt:
         against `_plain`-normalised text; this shows the normalisation is what
         makes a wrapped sentence match.
         """
-        wrapped = ("A genuinely\nsaturated server is\n   not flagged, and "
-                   "that\nis the point.")
+        # The NARROWED sentence, wrapped: the example has to be a form the
+        # pattern accepts once normalised, and the pattern now requires
+        # `deterministic`.
+        wrapped = ("A saturated server with\ndeterministic service time\n"
+                   "   is not flagged, and that\nis the point.")
         pattern = PROSE_CLAIMS["a saturated server is not flagged"]["pattern"]
         assert not re.search(pattern, wrapped, re.I)
         assert re.search(pattern, _plain(wrapped), re.I)

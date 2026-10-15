@@ -1400,12 +1400,13 @@ USEC_PER_QUERY = 1000
 
 
 class TestTheClientsOwnCpuIsRecorded:
-    """§1.4. The clients are Python threads in a container pinned to a few
-    CPUs; for a fast engine at 16-32 clients they can run out of CPU before
+    """§1.4. The clients are forked OS processes sharing one container's
+    cpuset; for a fast engine at 16-32 clients they can run out of CPU before
     the server does, and a curve that flattens for that reason is
     indistinguishable from one that flattens because the engine stopped
     scaling -- except that the first is a property of this harness rather than
-    a finding about the database.
+    a finding about the database. `fork` never changes cgroup membership, so
+    the one cgroup counter this class calibrates still covers all of them.
     """
 
     def _run(self, ctx, dataset, factory, **kw):

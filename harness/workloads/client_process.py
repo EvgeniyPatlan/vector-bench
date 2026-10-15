@@ -4,7 +4,13 @@ Split out of `harness/workloads/clients.py`, which owns the pool, the window
 and the measurement policy. The reason is this repository's 800-line ceiling
 and the reason the ceiling exists: `clients.py` stood at 791 lines before G3,
 so there was no substantive change to it that would have fitted. The same
-argument produced `metrics/latency.py` and `churn_readers.py`.
+argument produced `metrics/latency.py` and `churn_readers.py`. **It produced
+`transfer_deadline.py` too, and the cut was forced the same way**: this file
+reached 799 lines of 800 and the next change to it was a three-line
+correctness fix that did not fit, so the span-transfer deadline -- the
+watchdog, its two flags and the accessor `ClientPool.stop` reads -- went
+there. `TransferDeadline` is mixed into `Client` precisely so none of the
+patch targets moved; that module's docstring has the argument.
 
 **WHAT THE SPLIT HAD TO BE CAREFUL ABOUT, because this repository has been
 caught by it twice.** A module that re-exports a name does not SHARE it:
@@ -74,28 +80,31 @@ rather than accepted (the §7 list this answers is in `docs/05-methodology.md`):
   IS the parent's address space. `CLIENT_START_METHOD` pins it rather than
   inheriting the interpreter default, which is `fork` on Linux today and
   becomes `forkserver` in 3.14.
-* **Memory: the cost §7 states is NOT REAL, and that is a measurement.** §7
-  says "each client becomes an OS process with its own copy of the query set,
-  so the harness container's memory grows with the client count". Under fork
-  it does not: the query set is read-only in a client, `shard_queries` hands
-  it out as a strided VIEW rather than a copy, and copy-on-write never
-  copies a page nobody writes. Measured, eight children over a 104.9 MB
-  float32 array: summed `Private_Dirty` 13.8 MB, 0.13x the array, against
-  838.9 MB if each had copied it. The control arm is what makes that a
-  measurement and not a blind probe -- eight children that WRITE the array
-  measure 851.7 MB, 8.12x, so the probe can see a copy when there is one.
-  What a client does cost is its own interpreter's private pages, ~1.7 MB.
+* **Memory: the cost §7 states is NOT REAL, and the DIRECTION is a
+  measurement.** §7 says "each client becomes an OS process with its own copy
+  of the query set, so the harness container's memory grows with the client
+  count". Under fork it does not: the query set is read-only in a client,
+  `shard_queries` hands it out as a strided VIEW rather than a copy, and
+  copy-on-write never copies a page nobody writes. Which is not the same as
+  a child leaving the pages alone -- a shard is strided across the whole
+  array, so every child READS pages spread over the entire query set and
+  only the write is absent. §7 carries the figures and their label: SUPPLIED,
+  and a sum over eight children against one 104.9 MB array rather than a
+  per-client one. They are not restated here, because two copies of a number
+  is how the last set drifted.
 * **The clock the processes agree on is still `time.perf_counter()`, and this
   was verified rather than assumed.** It is `clock_gettime(CLOCK_MONOTONIC)`
   on this platform, which is system-wide rather than per-process, so the
   reference point is shared across a fork -- unlike `time.process_time`.
-  Measured over 200 forks: the child's `perf_counter - CLOCK_MONOTONIC`
-  offset matches the parent's to within **4.2 us**, which is the cost of
-  reading two clocks back to back rather than an offset, and the child's
-  reading fell inside the parent's bracketing pair **200 times out of 200**.
-  `tests/test_g3_process_clients.py` asserts both, so a platform where
-  `perf_counter` is process-local fails loudly instead of producing spans
-  that cannot be compared with the window they are inside.
+  Measured over 200 forks, the child's `perf_counter - CLOCK_MONOTONIC`
+  offset matches the parent's to a few microseconds and its reading fell
+  inside the parent's bracketing pair 200 times out of 200; §7 has the
+  readings. `tests/test_g3_process_clients.py` runs both probes at that same
+  200 forks and asserts **10 ms, not those microseconds**: the quantity is a
+  difference of two offsets each taken across two consecutive clock reads,
+  so a descheduled thread widens it for a reason that is not the clock, and
+  10 ms still separates the two clocks by four orders of magnitude --
+  `time.process_time` is the control and a child reads near zero.
 * **Client CPU accounting keeps working, for a structural reason.** `fork`
   never changes cgroup membership -- only an explicit write to
   `cgroup.procs` does -- so every client process is in the harness
@@ -146,6 +155,12 @@ import numpy
 
 from ..drivers.base import EngineDriver, IndexSpec
 from ..metrics.latency import LatencyCollector
+# The span-transfer deadline, lifted out when this file reached the ceiling.
+# `TRANSFER_GRACE_S` is imported so `client_process.TRANSFER_GRACE_S` still
+# READS -- which is all anything does with it -- but `_recv_by` reads it out
+# of `transfer_deadline`'s globals, so rebinding it here reaches nothing.
+from .transfer_deadline import TRANSFER_GRACE_S  # noqa: F401
+from .transfer_deadline import TransferDeadline
 
 DriverFactory = Callable[[], EngineDriver]
 
@@ -159,6 +174,7 @@ DriverFactory = Callable[[], EngineDriver]
 #: turn a working pool into `AttributeError: Can't pickle local object` at the
 #: start of a measured window.
 CLIENT_START_METHOD = "fork"
+
 
 #: The context the clients, the pipes and the two window flags come from.
 #: One context object for the module, so nothing can half-fork: mixing
@@ -297,7 +313,7 @@ def _exit_description(exitcode: Optional[int]) -> str:
     return f"it exited with status {exitcode}"
 
 
-class Client(_MP.Process):
+class Client(TransferDeadline, _MP.Process):
     """One benchmark client: own connection, own query slice, own latencies.
 
     A process and no longer a thread, which is the whole of G3: MariaDB
@@ -386,6 +402,13 @@ class Client(_MP.Process):
         #: Whether this client's window payload has been read off the pipe.
         #: Parent-side; `absorb` is idempotent so a second `stop` cannot hang.
         self._absorbed = False
+        #: The span-transfer deadline's two flags, set here because this is
+        #: where every other parent-side field is. INTENT: the deadline
+        #: fired. FACT: this pool killed a LIVE client. They are two because
+        #: only the fact may suppress `ClientPool.stop`'s exit-status report
+        #: -- `transfer_deadline.py` has why, and what one flag silenced.
+        self._transfer_cut = False
+        self._killed_here = False
 
     # -- starting it -------------------------------------------------------
 
@@ -620,6 +643,26 @@ class Client(_MP.Process):
         `deadline` is a `time.monotonic` instant and is shared across the
         whole pool, so a slow first client cannot buy the last one a fresh
         `clients.JOIN_TIMEOUT_S`.
+
+        **THE DEADLINE BOUNDS THE TRANSFER AND NOT ONLY THE WAIT FOR THE
+        FIRST BYTE, and an earlier revision bounded only the wait.** `poll`
+        respects `deadline`; `recv` takes no timeout, so a client that
+        started sending and then stalled while STILL ALIVE blocked the parent
+        inside `recv` for as long as it lived, taking `stop` past
+        `JOIN_TIMEOUT_S` without limit on the one call an operator cannot
+        interrupt. One that DIES mid-send always raised. `_recv_by` closes it.
+
+        **NO PUBLISHED NUMBER CHANGES AND AN OUTCOME CAN**, and the
+        distinction is the point: "neither fix changes a measurement" is
+        exactly true of published NUMBERS -- every figure is fixed before
+        this runs -- and not of OUTCOMES, because a bound can FAIL a window
+        the unbounded wait would have published late. Measured: a
+        1,000,000-span / 100,000-result payload takes **0.606 s** to `recv`
+        against `TRANSFER_GRACE_S`'s 1.0 s floor, 61% of it, where a
+        realistic ~100,000-span one takes **0.057 s** and leaves ~17x margin.
+        Remote rather than absent, and the right way round -- a `stop` that
+        never returns is not a result either.
+        `tests/test_g4_pool_teardown.py` has the pairs.
         """
         if self._absorbed:
             return
@@ -636,11 +679,20 @@ class Client(_MP.Process):
                     f"client {self.name} did not return its spans within "
                     f"{self._timeouts.join_s:.0f}s of the window closing")
                 return
-            phase, text, spans, results = self._from_client.recv()
+            phase, text, spans, results = self._recv_by(deadline)
         except (EOFError, OSError):
-            self.error = ClientDied(
-                f"client {self.name} died during the measured window: "
-                f"{_exit_description(self.exitcode)}")
+            if self._transfer_cut:
+                # The deadline ended it, so say that rather than reporting
+                # the SIGKILL this method sent as the client's own failure.
+                self.error = ClientDied(
+                    f"client {self.name} stopped partway through sending its "
+                    f"spans and was ended at the pool's "
+                    f"{self._timeouts.join_s:.0f}s deadline; a partial "
+                    f"payload is not a measurement of the window")
+            else:
+                self.error = ClientDied(
+                    f"client {self.name} died during the measured window: "
+                    f"{_exit_description(self.exitcode)}")
             return
         if phase != "window":  # pragma: no cover - protocol desync
             self.error = ClientDied(
@@ -689,5 +741,5 @@ class Client(_MP.Process):
 
 __all__ = [
     "Answer", "CLIENT_START_METHOD", "Client", "ClientDied", "ClientFailed",
-    "DriverFactory", "PoolError", "Timeouts",
+    "DriverFactory", "PoolError", "TRANSFER_GRACE_S", "Timeouts",
 ]

@@ -1002,15 +1002,24 @@ class TestReadersStopWithoutHanging:
 
     Taken literally, "readers stop cleanly when the writer exhausts its
     budget" is satisfied by a workload that returns -- which it would even if
-    it left four reader threads querying the engine for the rest of the run.
-    So the assertion here is on the THREADS, identified by class, plus a wall
-    clock bound: a hang is the failure mode, and a test that can only fail by
-    timing out tells whoever reads the log nothing about what hung.
+    it left four reader PROCESSES querying the engine for the rest of the run.
+    So the assertion here is on the live client processes, via
+    `pool_clients()`, plus a wall clock bound: a hang is the failure mode, and
+    a test that can only fail by timing out tells whoever reads the log
+    nothing about what hung.
+
+    **This docstring said THREADS, identified by class, and the code below has
+    asserted on processes since G3.** That is the dead-probe wording
+    `pool_clients()`'s own docstring records retiring -- the thread form "can
+    only ever be empty" and "reads as coverage" -- so describing a process
+    assertion in it was the same mistake one level up. A leaked process
+    matters more than a leaked thread did: a thread died with the interpreter
+    and a client goes on querying the server the next configuration measures.
     """
 
     def test_the_budget_ending_the_write_also_ends_the_readers(
             self, ctx, dataset, short_window):
-        """Honest: the writer stops on its budget, no reader thread survives
+        """Honest: the writer stops on its budget, no reader PROCESS survives
         the call, and no during-writes record is written -- the corpus is
         missing rows, so `writer_rows_per_s_with_readers` would describe a
         write that never finished. The stall record states `readers: 4`, so
@@ -1745,13 +1754,33 @@ class TestTheProseSaysWhatTheCodeDoes:
         return open(os.path.join(root, *parts)).read()
 
     def test_the_measurement_version_block_names_pr_4(self):
-        """`OPS_MEASUREMENT_VERSION` is still 5, and the block that
-        enumerates what each version changed now says why PR 4 sits inside it.
-        The claim it makes is checkable: no archived record carries a version
-        at all."""
+        """The version-5 block says why PR 4 sits inside version 5, and the
+        claim it makes is checkable: no archived record carries a version at
+        all.
+
+        **The constant is 6, and this docstring said 5 two lines above the
+        assertion that it is 6.** G3 bumped it; what this test is about is
+        unchanged, because the question is whether the VERSION 5 BLOCK still
+        states PR 4's three facts, not what the harness stamps today.
+
+        **And the end of the block was being found by a string that no longer
+        occurs.** It split on `"OPS_MEASUREMENT_VERSION = 5"`, which the bump
+        left at zero occurrences, so `split(...)[0]` returned the whole rest
+        of the file and the three substring assertions below scanned every
+        later version block too. Measured against that widened scan, one of
+        the three was defeated by it: `reinsert_rows_per_s` also occurs after
+        the version-6 heading, so deleting it from the version-5 block would
+        have passed, while `during_writes` and `2,134 ops records` occur
+        nowhere later and would still have failed. One guard in three is
+        enough to fix. The block now ends where the version-6 heading begins,
+        and that heading's absence raises here rather than widening the scan.
+        """
         source = self._read("harness", "metrics", "records.py")
-        block = source.split("VERSION 5 ALSO COVERS PR 4")[1].split(
-            "OPS_MEASUREMENT_VERSION = 5")[0]
+        after_5 = source.split("VERSION 5 ALSO COVERS PR 4")[1]
+        assert "VERSION 6 --" in after_5, (
+            "the version-6 heading is gone, so the version-5 block has no "
+            "end and this test would scan the rest of the file")
+        block = after_5.split("VERSION 6 --")[0]
         assert "during_writes" in block
         assert "reinsert_rows_per_s" in block
         assert "2,134 ops records" in block

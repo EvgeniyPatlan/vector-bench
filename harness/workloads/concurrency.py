@@ -35,20 +35,23 @@ made the chart above misleading until they were added:
    comparison sees a hot set small enough to hold entirely. `ops.
    concurrency_queries` separates the two, defaulting to the whole test set.
 
-3. **How busy the clients themselves were.** The clients are Python threads
-   in a container pinned to a few CPUs, and they serialize vectors and hold
-   the GIL between socket calls. For a fast engine at 16-32 clients the
-   client container can run out of CPU before the server does, and a
-   throughput curve that flattens for that reason is indistinguishable from
-   one that flattens because the engine stopped scaling -- except that the
-   first is a property of this harness and the second is the finding the
-   chart exists to report. Every window therefore records the client
-   container's own cgroup CPU over the window, as `extra.client_cpu_seconds`,
-   `extra.client_cpus`, `extra.client_cpu_util` and the derived
-   `extra.client_bound`. The report draws a bound point hollow and the run
-   says so on stderr while it happens. See `clients.CLIENT_BOUND_UTIL` for
-   what that flag can and cannot see -- it catches a saturated cpuset and not
-   a saturated interpreter lock, and the difference has been measured.
+3. **How busy the clients themselves were.** Each client is a forked OS
+   process, and they share one container's cpuset and serialize vectors into
+   it. For a fast engine at 16-32 clients the client container can run out of
+   CPU before the server does, and a throughput curve that flattens for that
+   reason is indistinguishable from one that flattens because the engine
+   stopped scaling -- except that the first is a property of this harness and
+   the second is the finding the chart exists to report. Every window
+   therefore records the client container's own cgroup CPU over the window,
+   as `extra.client_cpu_seconds`, `extra.client_cpus`,
+   `extra.client_cpu_util` and the derived `extra.client_bound`; `fork` never
+   changes cgroup membership, so that one counter still covers every client.
+   The report draws a bound point hollow and the run says so on stderr while
+   it happens. See `clients.CLIENT_BOUND_UTIL` for what that flag can and
+   cannot see -- it catches a saturated cpuset and not a ceiling that costs
+   no CPU, and the difference has been measured. Since
+   `OPS_MEASUREMENT_VERSION` 6 a shared interpreter lock is no longer one of
+   those ceilings: the clients hold one interpreter each.
 
 4. **Whether the pool ran the queries its client count implies.** The
    `scaling_efficiency` this workload publishes divides an N-client
@@ -346,8 +349,8 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 # began.
                 INFLIGHT_DISCARDED: window.inflight_discarded,
                 PREWINDOW_DISCARDED: window.prewindow_discarded,
-                # Whose ceiling this point shows. The clients are Python
-                # threads in a container pinned to a few CPUs; for a fast
+                # Whose ceiling this point shows. The clients are forked OS
+                # processes sharing one container's cpuset; for a fast
                 # engine at 16-32 clients they can run out of CPU first, and
                 # a curve that flattens for that reason looks exactly like
                 # one that flattens because the engine stopped scaling. The
@@ -366,10 +369,11 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 # meaningless without. `outstanding_concurrency` is the exact
                 # time-average number outstanding and `served_concurrency`
                 # the median-span estimate of how many were in service; they
-                # diverge by the time a span spends waiting for the
-                # interpreter lock rather than for the engine, and
-                # `scaling_status` is keyed to the second because the first
-                # was measured blind to that -- see
+                # diverge by the time a span spends WAITING rather than being
+                # served, whatever it waits on -- until version 6 that was
+                # the interpreter lock, and since then it is a queue in the
+                # engine or its socket. `scaling_status` is keyed to the
+                # second because the first was measured blind to it -- see
                 # `clients.SERVED_CONCURRENCY_FLOOR` for the five-driver
                 # table. Both are recorded, never the status alone: the
                 # status is a comparison against a floor, and a reader has to
@@ -488,13 +492,25 @@ def _warn_concurrency_not_achieved(clients: int, served: Optional[float],
     unpublishable, and the operator reading the log is the only person who can
     still do something about it before the run ends.
 
-    Both causes are named. A client's own clock cannot separate them -- see
-    `clients.PoolWindow.scaling_status` -- and the client-CPU figure beside
-    them is the evidence that can, so it is printed here rather than left to
-    be looked up in the record: roughly one core of client CPU points at the
-    clients, roughly none points at the server. Printed even when it is
-    absent, as `n/a`, because "no counter" and "no CPU" are not the same
-    reading and this is the line that would otherwise conflate them.
+    **THE CAUSE THIS WARNING WAS WRITTEN FOR IS GONE AND THE LINE SAYS SO.**
+    Until `OPS_MEASUREMENT_VERSION` 6 the clients were threads in one
+    interpreter and the expected cause was a client library holding the
+    interpreter lock across its socket wait; a `smoke` run produced exactly
+    that on three engines. Each client is a forked OS process now, so that
+    cause cannot reach this pool, and an operator who reads the old wording
+    goes looking for a client library that is not the problem.
+
+    **The one-core heuristic is DROPPED rather than restated, because it was
+    calibrated for threads.** It read "roughly one core of client CPU points
+    at the clients, roughly none points at the engine" -- which held only
+    because one interpreter lock capped every client's CPU at about one core
+    between them. N client processes that are genuinely busy burn about N
+    cores, so the same reading means the opposite of what it used to, and no
+    replacement threshold has been measured here. What is printed instead is
+    the raw pair: the CPU-seconds and the utilisation, so an operator can
+    compare them against the client count themselves. Printed even when the
+    counter is absent, as `n/a`, because "no counter" and "no CPU" are not
+    the same reading and this is the line that would otherwise conflate them.
     """
     served_text = f"{served:.2f}" if served is not None else "n/a"
     outstanding_text = (f"{outstanding:.2f}" if outstanding is not None
@@ -507,15 +523,18 @@ def _warn_concurrency_not_achieved(clients: int, served: Optional[float],
         f"pool had {served_text} quer(ies) in service on average, below the "
         f"{SERVED_CONCURRENCY_FLOOR:.0%} of {clients} this figure needs. "
         f"The scaling efficiency at this point is NOT a property of the "
-        f"engine and the report refuses to render it. Two readings produce "
-        f"this and the clients cannot tell them apart: the clients serialized "
-        f"on Python's interpreter lock, or the engine itself answers one "
-        f"query at a time. The client container spent {cores_text} "
-        f"({util_text} of its CPUs) over this window -- about one core points "
-        f"at the clients, about none points at the engine. "
-        f"{outstanding_text} quer(ies) were OUTSTANDING on average, and that "
-        f"figure counts lock waiting as flight, which is why it is not the "
-        f"one compared here.",
+        f"engine and the report refuses to render it. The clients are "
+        f"separate OS processes, so the cause this check was written for -- "
+        f"clients serialized on Python's interpreter lock -- is no longer "
+        f"reachable; what is left is the engine itself answering one query at "
+        f"a time, a fault in this pool, or a service time skewed far enough "
+        f"that the median under-reads the mean. The client container spent "
+        f"{cores_text} ({util_text} of its CPUs) over this window; compare "
+        f"that against {clients} client(s) rather than against a threshold, "
+        f"because the one-core rule this line used to quote was a property of "
+        f"the shared lock. {outstanding_text} quer(ies) were OUTSTANDING on "
+        f"average, and that figure counts any wait as flight, which is why it "
+        f"is not the one compared here.",
         file=sys.stderr, flush=True)
 
 

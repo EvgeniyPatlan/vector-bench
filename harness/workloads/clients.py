@@ -27,8 +27,8 @@ implementation that would start out agreeing and then drift:
   count, so the recall beside a throughput figure is over the queries that
   figure counted.
 
-* **PR 1's CPU accounting.** The clients are Python threads in a container
-  pinned to a few CPUs. `client_cpu` divides a cgroup counter by a wall clock
+* **PR 1's CPU accounting.** The clients are forked OS processes sharing one
+  container's cpuset. `client_cpu` divides a cgroup counter by a wall clock
   and a CPU count, and the record keeps all three, because each of the three
   can be wrong while the quotient stays plausibly between 0 and 1.
 
@@ -36,14 +36,14 @@ implementation that would start out agreeing and then drift:
 a second workload inherits it.** `CLIENT_BOUND_UTIL` is sufficient and not
 necessary, and the gap is structural rather than a question of where the limit
 was set: a CPU-utilisation threshold cannot see a GIL ceiling, because the lock
-prevents the CPU consumption the threshold looks for. Measured against
-`tests/fake_driver.py` on a twenty-CPU box, the concurrency workload's own CPU
+prevents the CPU consumption the threshold looks for. Measured on the RETIRED
+thread pool against `tests/fake_driver.py`, on a twenty-CPU box: its own CPU
 flattens at 2.06 cores -- 0.51 of a four-CPU client container at 4, 8, 16 and
 32 clients alike -- while aggregate throughput peaks at two clients
 (16,614 q/s) and falls to 8,127 by thirty-two. That is the exact shape a reader
-would call an engine ceiling and the flag fired on none of those points. So a
-churn reader pool's QPS is a measurement of this harness against this engine
-under writes, and it is not evidence about where either one saturates.
+would call an engine ceiling and the flag fired on none of those points. **No
+GIL ceiling is reachable now that the clients are processes**; what is left is
+a cpuset, and a reader pool's QPS is still this harness against this engine.
 
 **And the synthetic figure above overstates a real client's cost, so the
 synthetic SHAPE may not reproduce.** The fake's queries are numpy-bound
@@ -212,10 +212,6 @@ CLIENT_BARRIER_TIMEOUT_S = 120.0
 #: them. Joining first is a deadlock rather than a slow path.
 JOIN_TIMEOUT_S = 120.0
 
-#: The `multiprocessing` start method the pool forks its clients with, pinned
-#: rather than inherited. See this module's docstring: spawn and forkserver
-#: both pickle the target and its arguments, and every `driver_factory` a real
-
 
 class Instruments(NamedTuple):
     """The clocks, counters and primitives a pool measures itself with.
@@ -311,10 +307,14 @@ def shard_queries(queries: numpy.ndarray,
     A VIEW and not a copy, which is now load-bearing for a second reason.
     `docs/05-methodology.md` §7 states as a cost of client processes that
     "each client becomes an OS process with its own copy of the query set".
-    It does not: these are strided views of one array, a client never writes
-    to one, and fork's copy-on-write therefore copies no page of it. Measured
-    at 0.13x the array across eight children, against 8.12x for children that
-    write to it -- the module docstring has both arms.
+    It does not: these are strided views of one array, a client never WRITES
+    to one, and fork's copy-on-write therefore copies no page of it. Which is
+    not the same as a child leaving the pages alone -- `queries[c::clients]`
+    is strided across the whole array, so every child READS pages spread over
+    the entire query set and only the write is absent. SUPPLIED: 0.13x the
+    array summed over eight children against a 104.9 MB array, with a control
+    arm of 8.12x for eight children that write to it. No test here reproduces
+    those; `client_process.py`'s docstring has both arms and says so.
     """
     n = len(queries)
     return [(queries[c::clients], numpy.arange(c, n, clients))
@@ -546,6 +546,18 @@ class ClientPool:
             # concurrency figure on top of the previous one's leftovers.
             for worker in self._workers:
                 worker.reap()
+            # And the attendants, for the reason `_join_attendants` gives.
+            # **This path did not join them and that was the same defect the
+            # 54 -> 0 fork-warning repair fixed in `stop`, reached from the
+            # other side.** An attendant blocked in `_await_warmup`'s
+            # `poll(client_barrier_s)` can outlive this method, and
+            # `churn.py`'s three `except PoolError` sites go on to the next
+            # churn fraction -- so the next pool's `launch` forks beside the
+            # previous pool's live threads, which is exactly the
+            # multi-threaded fork CPython 3.12 warns about. Joining here
+            # rather than only in `stop` is what makes the warning count 0 on
+            # the FAILURE path too; `stop` is never reached on it.
+            self._join_attendants()
             raise PoolError(
                 f"a client failed during warm-up: "
                 f"{first or 'barrier timed out'}")
@@ -610,8 +622,19 @@ class ClientPool:
         # client at the end of a long window: without this check the pool
         # would publish the partial window as a measurement of the engine.
         # Checked after the two above so the more specific message wins.
+        #
+        # EXCEPT a client THIS POOL killed at the span-transfer deadline,
+        # which is not something that happened to the window. Two states, and
+        # neither belongs here: if the transfer really was cut short, `absorb`
+        # recorded a `ClientDied` and the `failures` branch above already
+        # raised with the right message; if the payload landed complete while
+        # the watchdog was firing, the spans are ENTIRE and the only thing
+        # wrong is the signal this pool sent. Counting that as "ended
+        # abnormally after reporting ... the spans it sent cover only part of
+        # the window" would fail a sound window and blame the harness's own
+        # SIGKILL on the engine. `Client.ended_by_this_pool` has the race.
         killed = [(w, w.exitcode) for w in self._workers
-                  if w.exitcode not in (0, None)]
+                  if w.exitcode not in (0, None) and not w.ended_by_this_pool]
         if killed:
             worker, code = killed[0]
             for each in self._workers:
@@ -655,18 +678,7 @@ class ClientPool:
 
         for worker in self._workers:
             worker.reap()
-        # The attendants, joined before this pool is finished with. They have
-        # been idle since the barrier released, so this costs nothing -- and
-        # NOT joining them cost something real: a sweep builds one pool per
-        # window, so the next pool's `launch` forked while the previous
-        # pool's attendants were still being collected, which is a fork from
-        # a multi-threaded parent. CPython 3.12 warns about exactly that, and
-        # the warning is right to: a child forked beside a live thread can
-        # inherit a lock that thread was holding, with nothing left to unlock
-        # it. Measured, a full suite run: 54 of those warnings before this
-        # join and 0 after. `start`'s docstring has the rest of the argument.
-        for attendant in self._attendants:
-            attendant.join(timeout=JOIN_TIMEOUT_S)
+        self._join_attendants()
 
         return PoolWindow(
             qps=merged.pop("qps"),
@@ -712,6 +724,41 @@ class ClientPool:
                 return worker.error
         return None
 
+    def _join_attendants(self) -> None:
+        """Collect the parent threads that stood in at the barrier.
+
+        **One method rather than two copies, because the two call sites are
+        the same repair and a copy is how one of them came to be missing.**
+        `stop` has always joined them. `start`'s `BrokenBarrierError` path
+        did not, and it raises `PoolError` instead of reaching `stop` -- so a
+        pool that failed during warm-up left its attendants running, and
+        `churn.py`'s three `except PoolError` sites go on to the next churn
+        fraction and fork the next pool beside them.
+
+        NOT joining them cost something real on the success path and the
+        failure path is the same cost: a sweep builds one pool per window, so
+        the next pool's `launch` forked while the previous pool's attendants
+        were still being collected, which is a fork from a multi-threaded
+        parent. CPython 3.12 warns about exactly that, and the warning is
+        right to -- a child forked beside a live thread can inherit a lock
+        that thread was holding, with nothing left to unlock it. Measured, a
+        full suite run: 54 of those warnings before the `stop` join and 0
+        after. `start`'s docstring has the rest of the argument.
+
+        **Both callers call this AFTER reaping the clients, and the order is
+        the whole reason this does not hang.** `_first_error`'s docstring has
+        the measurement: an attendant that has not reported is blocked on its
+        client's PIPE and not on the barrier, so aborting the barrier does not
+        wake it and a wait placed before the reap runs to its full length --
+        it made the pool fail after 2.51 s against a 1.5 s timeout. `reap`
+        ends the client process, which closes the write end of that pipe, so
+        the attendant's `poll` returns at once and this join is the
+        milliseconds it takes the thread to finish. The timeout is kept
+        anyway, and bounds it at `JOIN_TIMEOUT_S` like every other wait here:
+        a join with no timeout is how a reader exception becomes a hang.
+        """
+        for attendant in self._attendants:
+            attendant.join(timeout=JOIN_TIMEOUT_S)
 
 
 __all__ = [
