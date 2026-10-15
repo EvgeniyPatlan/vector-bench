@@ -276,13 +276,25 @@ WRONG_VALUES_QUOTED_IN_PROSE = (
 # whole file cannot establish what cmake is told. Only the bounded parse can.
 RIGHT_VALUE_ALSO_QUOTED_IN_PROSE = "-DWITH_CURL=bundled"
 
-# The Dockerfile legitimately passes five flags the YAML does not, and this is
+# The Dockerfile legitimately passes seven flags the YAML does not, and this is
 # the allowlist that says which. They are not policy: four name where this
-# particular image puts things and one names the build it is, so none of them
-# is a decision the YAML could sensibly express or a resource pass could vary.
+# particular image puts things, one names the build it is, and two hand cmake
+# the builder stage's own exported CFLAGS -- so none of them is a decision the
+# YAML could sensibly express or a resource pass could vary.
+#
+# The last two are the ones with a trap behind them. `-DCMAKE_C_FLAGS=` and
+# `-DCMAKE_CXX_FLAGS=` are half of the fix for the DEB package-flags overwrite
+# (docker/percona/Dockerfile's note above its cmake line, and
+# tests/test_e8_package_flags_overwrite.py): their value is `"$CFLAGS"`, a
+# shell expansion of a variable exported two lines earlier in the same RUN. A
+# YAML copy could only hold a literal, and because `${CMAKE_FLAGS}` is appended
+# LAST that literal would WIN -- quietly replacing the flags the builder
+# exported with whatever this file happened to say. So they belong here and the
+# YAML must stay silent about them. `-DWITH_PACKAGE_FLAGS=OFF`, the other half,
+# IS mirrored in the YAML, because a duplicate of it can only confirm.
 #
 # This set is asserted to be EXACTLY the Dockerfile-only symbols, not merely to
-# contain them. A sixth Dockerfile-only flag added later therefore fails here
+# contain them. An eighth Dockerfile-only flag added later therefore fails here
 # rather than slipping in, which is the drift this file exists to stop; and an
 # entry that goes stale because the Dockerfile stopped passing it fails too.
 DOCKERFILE_ONLY_SYMBOLS = frozenset({
@@ -291,6 +303,8 @@ DOCKERFILE_ONLY_SYMBOLS = frozenset({
     "-DMYSQL_DATADIR",
     "-DSYSCONFDIR",
     "-DMYSQL_SERVER_SUFFIX",
+    "-DCMAKE_C_FLAGS",
+    "-DCMAKE_CXX_FLAGS",
 })
 
 

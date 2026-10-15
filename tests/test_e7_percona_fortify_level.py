@@ -10,30 +10,57 @@ file. The serial retry added in the previous commit put the real error last:
     <command-line>: error: "_FORTIFY_SOURCE" redefined
     <command-line>: note: this is the location of the previous definition
 
-Two definitions with different values were reaching the preprocessor: the
+Two definitions with different values were reaching the preprocessor. The
 tree asks for 2 (`CMakeLists.txt:1586` at the pin prepends
-`-DNDEBUG -D_FORTIFY_SOURCE=2` for the non-debug build types) and gcc on
-noble supplies 3 of its own. Ubuntu's default stands down the moment it sees
-a plain `-D` for the macro, so the builder now passes one, and every
-definition that remains says 2.
+`-DNDEBUG -D_FORTIFY_SOURCE=2` for the non-debug build types), and the 3 came
+from `dpkg-buildflags --get CPPFLAGS` by way of
+`cmake/compile_flags.cmake:130`'s `ADD_LINUX_DEB_FLAGS()` -- a function that
+also OVERWRITES CMAKE_C_FLAGS, discarding every flag the builder exported.
+`tests/test_e8_package_flags_overwrite.py` owns that chain and the two cmake
+flags that close it; the corrected account is in docker/percona/Dockerfile
+above its cmake line.
+
+That matters for how this file should be read. WHEN THIS FILE WAS WRITTEN THE
+EMITTING SITE HAD NOT BEEN FOUND and the mechanism recorded here was the wrong
+one: it supposed the tree's own 2 arrived as a `-Wp,-D...` the gcc driver's
+scan could not see, so that the driver added its own default 3 beside it. No
+such `-Wp,` define exists in this tree and the driver's default is not
+involved -- both defines were ordinary `-D`s and the disagreeing one was
+dpkg's. The flag this file guards therefore did NOT fix the build on its own,
+because the export carrying it was thrown away too.
 
 WHAT THIS FILE IS FOR
 ---------------------
-The flag looks like decoration. It is load-bearing, it has an exact value,
-and the only symptom of getting it wrong is a build that fails two thirds of
-the way in with a diagnostic the log's tail does not show. A reader tidying
-"redundant hardening flags" out of CFLAGS would reintroduce the failure, and
-a reader "modernising" 2 to 3 would reintroduce it in the same breath --
-because 3 against the tree's 2 is the conflict, not a stronger version of
-the fix.
+The flag has an exact value and is not free to drift, but what it buys is much
+narrower than this file first claimed, and the difference is worth stating
+precisely.
 
-It also holds the level itself. `_FORTIFY_SOURCE=3` adds dynamic
-object-size checks that 2 does not, so the level is a codegen setting. Both
-MariaDB pins ask for 2 plainly and get it
+What it buys is AGREEMENT. The level it names has to match the level the tree
+prepends for its non-debug build types. A reader "modernising" 2 to 3 would
+recreate the redefinition against the tree's 2; a reader dropping the value
+entirely would get 1, which conflicts the same way.
+
+What it does NOT buy is the level the project compiles at. With
+`-DWITH_PACKAGE_FLAGS=OFF` now on the cmake line, deleting this token would
+leave the tree's own `-D_FORTIFY_SOURCE=2` at `CMakeLists.txt:1586` stating the
+level for every object in the cmake project; only sub-builds that read
+`$CFLAGS` out of the ENVIRONMENT rather than from cmake would fall back to a
+toolchain or distro default. So the token is belt-and-braces plus coverage of
+those sub-builds -- not the thing that decides the project's hardening level.
+
+AND THIS IMAGE WAS NOT COMPILING AT 3. An earlier version of this paragraph
+said it was, and built an engine-to-engine codegen argument on top of that;
+both are removed rather than softened. Pre-fix the compile line ended with the
+tree's `-D_FORTIFY_SOURCE=2` from `CMAKE_C_FLAGS_RELWITHDEBINFO`, AFTER dpkg's
+`=3` in `CMAKE_C_FLAGS`, and the last `-D` of a macro wins -- measured:
+`gcc -O2 -D_FORTIFY_SOURCE=3 -D_FORTIFY_SOURCE=2 -dM -E -` prints
+`#define _FORTIFY_SOURCE 2`, and the reverse order prints 3. The effective
+level was 2, which AGREES with both MariaDB pins
 (`mariadb-11.8.8:CMakeLists.txt:290`, `mariadb-12.3.2:CMakeLists.txt:303`,
-read at both pins) while this image was compiling at 3 -- an engine-to-engine
-difference in generated code, which is the class of defect
-`tests/test_config.py` exists for. The value here is not free to drift.
+read at both pins), while a redefinition warning was printed in every
+translation unit and the build died in libfido2. The real engine-to-engine
+divergence was `-march`, and
+`tests/test_e8_package_flags_overwrite.py` is where that argument lives.
 """
 
 from __future__ import annotations
@@ -53,11 +80,20 @@ PERCONA_DOCKERFILE = os.path.join(VB_ROOT, "docker", "percona", "Dockerfile")
 # instead of silently re-deciding the hardening level of a published number.
 TREE_FORTIFY_LEVEL = "2"
 
-# The form that reproduces the observed diagnostic. The driver's scan for a
-# user-supplied level does not see a `-Wp,` define, so its own default is
-# added as well and the two disagree. The site emitting this in the pinned
-# tree was never located -- this is the reproduction, not a citation.
-TREE_DEFINE_AS_SEEN = "-Wp,-D_FORTIFY_SOURCE=2"
+# A SYNTHETIC OBSERVER, NOT A CITATION, and not the mechanism of the observed
+# failure either -- that one is dpkg-buildflags' plain `-D_FORTIFY_SOURCE=3`
+# via `cmake/compile_flags.cmake:130`, which
+# tests/test_e8_package_flags_overwrite.py measures.
+#
+# What this define is for is the probe below. The gcc driver's scan for a
+# user-supplied level does not count a `-Wp,` define, so with this on the
+# command line the driver still injects its own default -- which makes that
+# injected default VISIBLE as a redefinition the moment our explicit `-D`
+# stops suppressing it. It is how the probe tells a load-bearing flag from a
+# decorative one on a host whose compiler defaults to 3. No `-Wp,` define of
+# this macro exists in the pinned tree; the value 2 is chosen to match the
+# tree's so that the honest side of the pair compiles clean.
+UNSEEN_DEFINE_PROBE = "-Wp,-D_FORTIFY_SOURCE=2"
 
 # libfido2's dialect and strictness at the pin, which is what makes the
 # warning fatal there and nowhere else:
@@ -144,9 +180,11 @@ class TestTheLevelIsNamedAndIsTheTreesLevel:
         value = cflags_value(dockerfile_text)
         assert "-D_FORTIFY_SOURCE=" in value, (
             "the builder's CFLAGS no longer names a _FORTIFY_SOURCE level. "
-            "Ubuntu's gcc then supplies its own 3, the tree's own 2 arrives "
-            "in a form the driver cannot see, and bundled libfido2 fails the "
-            "build at 69% under -pedantic-errors. CFLAGS: " + repr(value))
+            "The cmake project would still get the tree's own 2 from "
+            "CMakeLists.txt:1586, but the sub-builds that read $CFLAGS out of "
+            "the environment would fall back to a toolchain or distro "
+            "default, and this image would stop stating a level it has a "
+            "documented reason to state. CFLAGS: " + repr(value))
 
     def test_the_level_is_the_one_the_tree_asks_for(self, dockerfile_text):
         value = cflags_value(dockerfile_text)
@@ -172,9 +210,11 @@ class TestTheLevelIsNamedAndIsTheTreesLevel:
             f"-D_FORTIFY_SOURCE is passed without a value: {value!r}")
 
     def test_cplusplus_inherits_it(self, dockerfile_text):
-        """absl is C++ and shows the same redefinition, so CXXFLAGS has to
+        """absl is C++ and showed the same redefinition, so CXXFLAGS has to
         carry the level too. It does by deriving from CFLAGS; if that ever
-        becomes a separate literal, this file is not guarding C++."""
+        becomes a separate literal, this file is not guarding C++ -- and
+        `-DCMAKE_CXX_FLAGS="$CXXFLAGS"` on the cmake line would then pass the
+        wrong string on."""
         commands = "\n".join(build_commands(dockerfile_text))
         assert 'export CXXFLAGS="$CFLAGS"' in commands, (
             "CXXFLAGS no longer derives from CFLAGS, so the fortify level "
@@ -205,6 +245,12 @@ class TestTheLevelIsNamedAndIsTheTreesLevel:
 # with the flag removed. It needs a compiler whose default fortify level is
 # the hazard, which the documented host prerequisites do not include -- so it
 # skips rather than failing a correctly set up machine.
+#
+# READ IT FOR WHAT IT IS: it establishes that the explicit level in CFLAGS
+# suppresses the driver's own default, using UNSEEN_DEFINE_PROBE to make that
+# default observable. It does NOT reproduce the build failure -- that needed
+# dpkg-buildflags' `=3`, and tests/test_e8_package_flags_overwrite.py is where
+# that is measured.
 
 CC = shutil.which("cc") or shutil.which("gcc")
 
@@ -235,7 +281,7 @@ class TestTheFlagIsLoadBearingOnThisHost:
     @pytest.fixture(scope="class")
     def honest_flags(self, dockerfile_text) -> list[str]:
         return [*LIBFIDO2_FLAGS, *expanded_cflags(dockerfile_text),
-                TREE_DEFINE_AS_SEEN]
+                UNSEEN_DEFINE_PROBE]
 
     @pytest.fixture(scope="class")
     def probe(self, honest_flags, host_default_level, tmp_path_factory):
@@ -253,7 +299,7 @@ class TestTheFlagIsLoadBearingOnThisHost:
         # -march=x86-64-v3 and the rest have to be accepted here, or a
         # failure below would be about the flags and not about fortify.
         usable, _ = _compile(
-            [f for f in honest_flags if f != TREE_DEFINE_AS_SEEN], tmp_path)
+            [f for f in honest_flags if f != UNSEEN_DEFINE_PROBE], tmp_path)
         if usable != 0:
             pytest.skip("this host's compiler will not take the builder's "
                         "own CFLAGS, so the probe cannot run here")
@@ -280,9 +326,10 @@ class TestTheFlagIsLoadBearingOnThisHost:
             f"cleanly, which is the failure this flag exists to remove. "
             f"{report}")
         assert mutant[1] >= 1, (
-            f"without the flag the redefinition did not appear, so the "
-            f"mechanism recorded in the Dockerfile's note is not the one "
-            f"acting on this host. {report}")
+            f"without the flag the redefinition did not appear, so this "
+            f"host's compiler is not injecting a default level and the "
+            f"suppression this probe is about cannot be observed here. "
+            f"{report}")
         assert mutant[0] != 0, (
             f"without the flag the compile still succeeded, so "
             f"-pedantic-errors is not making the redefinition fatal here. "

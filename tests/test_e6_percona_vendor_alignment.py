@@ -10,10 +10,15 @@ dismissed, and the audit is written up as note 5 in
 `docker/percona/Dockerfile`. The conclusion was that the script cannot be
 used, for reasons that are about the measurement rather than convenience:
 
-  * it sets no `-march` on x86_64 -- its flags come from `rpm --eval
+  * it names no `-march` on x86_64 -- its own flags come from `rpm --eval
     %optflags` behind `if [ -n "$(command -v rpm)" ]`, and this image is
-    noble, so CFLAGS would end up empty while four other source-built engines
-    carry `x86-64-v3`. That is the first invariant in CLAUDE.md.
+    noble, so nothing in the script supplies one while four other
+    source-built engines carry `x86-64-v3`. That is the first invariant in
+    CLAUDE.md. (It does not ERASE a caller's, which an earlier version of
+    this paragraph and of the Dockerfile's note 5 both got wrong:
+    `build-binary.sh:233` is `export CFLAGS="$COMMON_FLAGS ${CFLAGS:-}"`, an
+    append, so an exported `-march` survives it. Supplying the flag would
+    still be our job, which is the point that stands.)
   * it enables PGO (a three-pass build) and LTO, so Percona would be the only
     engine in the study carrying either.
   * it enables Percona telemetry, which is periodic background work inside a
