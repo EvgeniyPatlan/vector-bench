@@ -1132,10 +1132,22 @@ class TestTheOpsPathDoesSupportBothBuildModes:
     profile's headline axis would have been silently inert on both paths.
     """
 
-    def test_the_profile_declares_both_modes(self):
+    def test_the_profile_declares_the_one_measurable_mode(self):
+        """It declared `[post, incremental]` until `post` was found to kill
+        the server at the pinned version -- see
+        `capabilities.bulk_vector_index_build` in
+        `config/engines/percona.yml` for the reproduction. The axis is down to
+        its measurable half, and this assertion is what stops the broken half
+        being reinstated without the capability being flipped first.
+        """
         from orchestrator.config import load_profile
+        from orchestrator.config import load_engine
         assert load_profile("percona")["ops"]["percona_build_modes"] == [
-            "post", "incremental"]
+            "incremental"]
+        # Tied to the reason rather than to the value: if someone restores
+        # `post` because the server was fixed, the capability has to say so.
+        caps = load_engine("percona").get("capabilities", {}) or {}
+        assert caps.get("bulk_vector_index_build") is False
 
     def test_the_key_lives_under_ops_where_the_ann_renderer_cannot_see_it(self):
         """**This assertion was inverted, and the inversion was a defect that
@@ -1600,9 +1612,13 @@ class TestEveryShippedProfileRenders:
             body = ann_pass.render_config("percona", profile, resources,
                                           resource_pass)
             assert sorted(body["float"]["any"][0]["run_groups"]) == ["innodb"]
-        # And the ops axis is still two units, which is what the key move had
-        # to preserve.
-        assert est_mod._ops_units(profile, "percona") == 2
+        # And the ops axis is one unit, not because the key move failed to
+        # preserve two -- it did, and `test_the_estimate_counts_both_modes_as_
+        # two_ops_units` still proves the estimator counts two when two are
+        # asked for -- but because the profile now asks for one. `post` kills
+        # the server at this pin; the capability in
+        # `config/engines/percona.yml` carries the evidence.
+        assert est_mod._ops_units(profile, "percona") == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1092,6 +1092,13 @@ build mode is a real axis — see §4.10.
   belongs in `main`, because neither has a counterpart on MariaDB or AliSQL.
   **The build-mode half runs on the ops path only**, and the ann half could not
   be delivered — see §4.10.
+  **The build-mode comparison is unmeasurable at the pinned version** and the
+  profile asks for `[incremental]` alone: `ALTER TABLE … ADD VECTOR KEY …
+  ALGORITHM=INPLACE` kills the server, so `post` cannot complete a unit. The
+  reproduction is recorded at `capabilities.bulk_vector_index_build` in
+  `config/engines/percona.yml`, which is also what the ops loop reads to keep
+  the default off that mode for every profile that names none. Restore the
+  pair when the server is fixed.
 - `docs/07-planning-a-run.md` carries the cost model (`_INGEST_ROWS_PER_S` in
   `orchestrator/estimate.py`). Percona's ingest rate is unmeasured, so it has no
   entry, and an estimate for it would be a guess presented as a plan. It stays
