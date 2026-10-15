@@ -141,4 +141,19 @@ ops:
   # AliSQL: `PerconaDriver.create_schema` leaves the vector index out of the
   # table definition in this mode and `create_index` adds it with one
   # `ALTER TABLE … ADD VECTOR KEY … ALGORITHM=INPLACE` afterwards.
-  percona_build_modes: [post, incremental]
+  #
+  # AND THAT STATEMENT KILLS THE SERVER AT THIS PIN, so the axis this
+  # profile exists for is down to one value. The evidence, the exact
+  # reproduction and the condition for restoring it are recorded once, next
+  # to `capabilities.bulk_vector_index_build` in `config/engines/percona.yml`
+  # -- not duplicated here, because a second copy is a second thing to go
+  # stale. In short: the load completes, the ALTER loses the connection, and
+  # the same corpus builds and serves correctly in `incremental`.
+  #
+  # WHAT IS LOST IS NAMED RATHER THAN QUIETLY DROPPED: this profile can no
+  # longer report the within-engine bulk-vs-incremental build comparison that
+  # docs/09 §2.5 proposed, and no other engine can stand in for it, because
+  # `post` is a no-op on MariaDB and AliSQL. Restore `[post, incremental]`
+  # when the server is fixed; the one-value list is the measurable half of a
+  # two-value axis, not a decision that the axis was uninteresting.
+  percona_build_modes: [incremental]

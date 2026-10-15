@@ -807,6 +807,97 @@ def _check_free_disk(paths: Dict[str, Any], engines: List[str],
     return True
 
 
+# **THE TWO KEYS LIVE IN DIFFERENT BLOCKS, AND THAT IS THE FIX FOR A
+# DEFECT RATHER THAN AN INCONSISTENCY.** `pgvector_build_modes` drives
+# BOTH passes -- `ann_pass.render_config` emits a run group per mode
+# and this loop runs an ops unit per mode -- so it belongs with the
+# ann configuration and is read from there by both.
+#
+# Percona's drives the OPS pass only, because the ann overlay module
+# reads no `build_mode` (see `ann_pass.render_config`'s percona
+# branch, which REFUSES the ann key rather than emitting two identical
+# curves). Putting it under `ann:` as `percona_build_modes` was tried
+# and was wrong twice over: `render_config` is handed the whole
+# profile and polices that key, so `run --profile percona` failed its
+# ann phase and `render --profile percona` raised uncaught from
+# `cmd_render` -- which loops over KNOWN_ENGINES, so the traceback
+# arrived for a profile that names one engine. Under `ops:` the ann
+# renderer structurally cannot see it, and the one profile that sets
+# it gets both an ef_construction sweep on the ann side and both build
+# modes on the ops side, which is what it exists for.
+#
+# Checked for every shipped profile by
+# `tests/test_e2_percona_wiring.py::TestEveryShippedProfileRenders`.
+#
+# **The default WAS the literal `["post"]` for every engine including
+# Percona, and for Percona that default could not complete: see
+# `_ops_build_modes` below, which now takes it from the engine's own
+# `capabilities.bulk_vector_index_build`. The asymmetry the rest of this
+# paragraph describes is real and unchanged for every engine whose bulk
+# build works.** For
+# MariaDB and AliSQL `post` is a no-op -- `create_index` does nothing
+# and `capabilities()["incremental_index"]` is True, so the measured
+# build is the incremental one either way. For Percona `post` is a
+# genuine bulk build, so a profile that names no mode measures
+# Percona's bulk build against the other two's incremental one. That
+# is the honest default (it is each engine's idiomatic build, which is
+# what `docs/05-methodology.md` says these comparisons report), but it
+# is not like-for-like, and `build_mode` is on every record so the
+# report can say which. `config/profiles/percona.yml` ran both until the
+# bulk build was found to kill the server at the pinned version; it now
+# asks for `[incremental]` alone.
+_OPS_BUILD_MODE_KEYS = {
+    "pgvector": ("ann", "pgvector_build_modes"),
+    "percona": ("ops", "percona_build_modes"),
+}
+
+
+def _ops_build_modes(engine: str, profile: Dict[str, Any],
+                     engine_cfg: Dict[str, Any]) -> List[str]:
+    """Which build modes the ops phase runs for one engine.
+
+    A function rather than a block inside `_run_unit` so the decision can be
+    exercised without starting a server: every arm below is reachable from a
+    profile dict and an engine config, and `tests/test_e9_percona_bulk_build
+    _crash.py` reports the honest and mutant value of each.
+    """
+    mode_ref = _OPS_BUILD_MODE_KEYS.get(engine)
+    caps = engine_cfg.get("capabilities", {}) or {}
+    # **THE DEFAULT COMES FROM THE ENGINE, NOT FROM A LITERAL HERE, AND THAT
+    # CHANGE FIXED A CRASH IN EVERY PROFILE THAT NAMES NO MODE.** The
+    # argument at `_OPS_BUILD_MODE_KEYS` is that `post` is the honest default
+    # because it is each engine's idiomatic build. That holds for every engine
+    # whose bulk build WORKS. Percona's does not at its pinned version:
+    # `ALTER TABLE ... ADD VECTOR KEY ... ALGORITHM=INPLACE` kills the server,
+    # so a literal `["post"]` default meant `main`, `smoke`, `dev` and every
+    # other profile that sets no `percona_build_modes` ran Percona in the one
+    # mode that cannot complete -- after paying for the whole load first. The
+    # evidence is at `capabilities.bulk_vector_index_build` in
+    # `config/engines/percona.yml`.
+    #
+    # An engine that declares nothing keeps `post`, so this widens where the
+    # default comes from rather than changing the default for anybody else.
+    default_modes = (["post"] if caps.get("bulk_vector_index_build", True)
+                     else ["incremental"])
+    if mode_ref:
+        block, key = mode_ref
+        modes = list((profile.get(block) or {}).get(key, default_modes))
+    else:
+        modes = list(default_modes)
+    # WARNED AND HONOURED, not refused. Whoever tests a newer Percona for the
+    # fix has to be able to ask for the broken mode on purpose, and a refusal
+    # would mean editing the engine config to do it. The warning names the
+    # symptom so the resulting lost connection is not read as a harness fault.
+    if "post" in modes and not caps.get("bulk_vector_index_build", True):
+        print(f"[ops] WARNING: {engine} declares "
+              f"capabilities.bulk_vector_index_build: false and this profile "
+              f"asks for build_mode 'post' anyway. At the pinned version that "
+              f"ALTER kills the server after the load has already been paid "
+              f"for, and the unit will fail with a lost connection. "
+              f"Honouring the explicit request.", file=sys.stderr)
+    return modes
+
+
 def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
               engine_cfg: Dict[str, Any], resources: Dict[str, Any],
               resolved: Any, resource_pass: str, paths: Dict[str, str],
@@ -845,53 +936,26 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
         # declared, and an engine that cannot would silently produce a
         # duplicate curve.
         #
-        # **THE TWO KEYS LIVE IN DIFFERENT BLOCKS, AND THAT IS THE FIX FOR A
-        # DEFECT RATHER THAN AN INCONSISTENCY.** `pgvector_build_modes` drives
-        # BOTH passes -- `ann_pass.render_config` emits a run group per mode
-        # and this loop runs an ops unit per mode -- so it belongs with the
-        # ann configuration and is read from there by both.
-        #
-        # Percona's drives the OPS pass only, because the ann overlay module
-        # reads no `build_mode` (see `ann_pass.render_config`'s percona
-        # branch, which REFUSES the ann key rather than emitting two identical
-        # curves). Putting it under `ann:` as `percona_build_modes` was tried
-        # and was wrong twice over: `render_config` is handed the whole
-        # profile and polices that key, so `run --profile percona` failed its
-        # ann phase and `render --profile percona` raised uncaught from
-        # `cmd_render` -- which loops over KNOWN_ENGINES, so the traceback
-        # arrived for a profile that names one engine. Under `ops:` the ann
-        # renderer structurally cannot see it, and the one profile that sets
-        # it gets both an ef_construction sweep on the ann side and both build
-        # modes on the ops side, which is what it exists for.
-        #
-        # Checked for every shipped profile by
-        # `tests/test_e2_percona_wiring.py::TestEveryShippedProfileRenders`.
-        #
-        # **The default is `["post"]` for Percona as it is for everyone else,
-        # and that is a real asymmetry rather than a neutral choice.** For
-        # MariaDB and AliSQL `post` is a no-op -- `create_index` does nothing
-        # and `capabilities()["incremental_index"]` is True, so the measured
-        # build is the incremental one either way. For Percona `post` is a
-        # genuine bulk build, so a profile that names no mode measures
-        # Percona's bulk build against the other two's incremental one. That
-        # is the honest default (it is each engine's idiomatic build, which is
-        # what `docs/05-methodology.md` says these comparisons report), but it
-        # is not like-for-like, and `build_mode` is on every record so the
-        # report can say which. `config/profiles/percona.yml` runs both.
-        _OPS_BUILD_MODE_KEYS = {
-            "pgvector": ("ann", "pgvector_build_modes"),
-            "percona": ("ops", "percona_build_modes"),
-        }
-        _mode_ref = _OPS_BUILD_MODE_KEYS.get(engine)
-        if _mode_ref:
-            _block, _key = _mode_ref
-            build_modes = list(
-                (profile.get(_block) or {}).get(_key, ["post"]))
-        else:
-            build_modes = ["post"]
+        build_modes = _ops_build_modes(engine, profile, engine_cfg)
         storage_engines = _ops_storage_engines(engine, profile, resources,
                                                resource_pass)
         worst_rc = 0
+        # **A FAILED UNIT USED TO BE SILENT, AND THE PHASE'S EXIT CODE WAS THE
+        # ONLY TRACE OF IT.** One ops phase is M values x build modes x
+        # storage engines, each an independent measurement, and `worst_rc`
+        # folds all of them into one number -- so a phase in which one unit
+        # crashed and another completed perfectly printed a bare
+        # `[FAIL] ... (exit 1)` with nothing saying which half was which. It
+        # cost a real diagnosis: a crashed `post` unit was read as a failure
+        # of the `incremental` unit that had just succeeded.
+        #
+        # `--fail-fast` deliberately stays PHASE-level and is not applied
+        # here. The units are independent, and stopping the loop on the first
+        # one would have thrown away the successful measurement that proved
+        # which half was broken. Visibility is the fix; aborting is not.
+        unit_count = (len(m_values) * len(build_modes)
+                      * len(storage_engines))
+        failed_units: List[str] = []
         for m in m_values:
             for build_mode in build_modes:
                 for storage in storage_engines:
@@ -935,10 +999,18 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                                          dataset, tag) as run:
                         rc = run.run_harness(harness_args, output,
                                              memory_timeseries=memory_ts)
-                    if rc == 0 and checkpoints is not None:
-                        _save_checkpoint(paths["checkpoints"], sub_key)
-                        checkpoints.add(sub_key)
+                    if rc == 0:
+                        if checkpoints is not None:
+                            _save_checkpoint(paths["checkpoints"], sub_key)
+                            checkpoints.add(sub_key)
+                    else:
+                        failed_units.append(tag)
+                        print(f"[ops] UNIT FAILED: {tag} (exit {rc})",
+                              file=sys.stderr)
                     worst_rc = worst_rc or rc
+        if failed_units:
+            print(f"[ops] {len(failed_units)} of {unit_count} units failed: "
+                  f"{', '.join(failed_units)}", file=sys.stderr)
         return worst_rc
 
     raise ValueError(f"unknown phase: {phase}")
