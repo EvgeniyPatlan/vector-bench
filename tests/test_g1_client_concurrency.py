@@ -72,6 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.drivers.base import IndexSpec                            # noqa: E402
 from harness.metrics import records                                   # noqa: E402
 from harness.metrics import latency as latency_mod                    # noqa: E402
+from harness.metrics import scaling as scaling_mod                    # noqa: E402
 from harness.metrics.latency import (LatencyCollector,                # noqa: E402
                                      merge_collectors, window_concurrency)
 from harness.workloads import churn as cw                             # noqa: E402
@@ -555,24 +556,29 @@ class TestTheStatusIsTheComparisonItClaims:
 
         Honest (`SERVED_CONCURRENCY_FLOOR` = 0.5): a window serving 0.95 of
         four clients is `concurrency_not_achieved`. Mutant (floor rebound to
-        0.0 **on `harness.metrics.latency`**): the SAME window reads `ok`.
-        `latency.scaling_status` looks the constant up in its own module
+        0.0 **on `harness.metrics.scaling`**): the SAME window reads `ok`.
+        `scaling.scaling_status` looks the constant up in its own module
         globals on every call, so the rebinding reaches it -- a floor captured
         at import time, or copied into a default argument, would make the
         mutant pass unchanged.
+
+        **The target moved from `latency` to `scaling` when the policy did.**
+        `latency.py` re-exports the floor and a re-export does not share the
+        name, so the old spelling of this probe is now DEAD -- which is what
+        `test_rebinding_the_re_export_reaches_nothing` below records.
         """
         window = self._window(0.95)
         honest = window.scaling_status
-        original = latency_mod.SERVED_CONCURRENCY_FLOOR
+        original = scaling_mod.SERVED_CONCURRENCY_FLOOR
         try:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = 0.0
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = 0.0
             mutant = window.scaling_status
         finally:
-            latency_mod.SERVED_CONCURRENCY_FLOOR = original
+            scaling_mod.SERVED_CONCURRENCY_FLOOR = original
         assert honest == cl.SCALING_CONCURRENCY_NOT_ACHIEVED
         assert mutant == cl.SCALING_OK
         assert honest != mutant
-        assert latency_mod.SERVED_CONCURRENCY_FLOOR == original
+        assert scaling_mod.SERVED_CONCURRENCY_FLOOR == original
 
     def test_rebinding_the_re_export_reaches_nothing(self):
         """The dead probe this layout creates, asserted rather than left to
@@ -580,23 +586,33 @@ class TestTheStatusIsTheComparisonItClaims:
 
         `clients.py` re-exports `SERVED_CONCURRENCY_FLOOR`, and a re-export
         does not SHARE the name: the rule reads it out of
-        `harness.metrics.latency`. Honest and mutant are the SAME status here,
+        `harness.metrics.scaling`. Honest and mutant are the SAME status here,
         which is the signature of a mutation that measured nothing -- so it is
         recorded as such instead of being mistaken for a guard that holds.
+
+        **THERE ARE TWO DEAD SPELLINGS NOW AND BOTH ARE READ BACK.** The
+        policy moved to `scaling.py`, so `harness.metrics.latency` re-exports
+        it too and a mutation aimed there is equally dead -- it was a LIVE
+        target before the split, which is exactly the kind of probe a move
+        can silently neuter.
         """
         window = self._window(0.95)
         honest = window.scaling_status
-        original = cl.SERVED_CONCURRENCY_FLOOR
-        try:
-            cl.SERVED_CONCURRENCY_FLOOR = 0.0
-            dead = window.scaling_status
-        finally:
-            cl.SERVED_CONCURRENCY_FLOOR = original
-        assert honest == dead == cl.SCALING_CONCURRENCY_NOT_ACHIEVED
-        # And the values agree, so the re-export is not a second constant that
-        # could drift from the one the rule reads.
-        assert cl.SERVED_CONCURRENCY_FLOOR == (
-            latency_mod.SERVED_CONCURRENCY_FLOOR)
+        for module in (cl, latency_mod):
+            original = module.SERVED_CONCURRENCY_FLOOR
+            try:
+                module.SERVED_CONCURRENCY_FLOOR = 0.0
+                dead = window.scaling_status
+            finally:
+                module.SERVED_CONCURRENCY_FLOOR = original
+            assert honest == dead == cl.SCALING_CONCURRENCY_NOT_ACHIEVED, \
+                module.__name__
+            assert module.SERVED_CONCURRENCY_FLOOR == original
+        # And every spelling agrees in VALUE, so the re-exports are not second
+        # constants that could drift from the one the rule reads.
+        assert (cl.SERVED_CONCURRENCY_FLOOR
+                == latency_mod.SERVED_CONCURRENCY_FLOOR
+                == scaling_mod.SERVED_CONCURRENCY_FLOOR)
 
 
 # ---------------------------------------------------------------------------
@@ -1332,9 +1348,13 @@ class TestTheClientBoundFlagIsKeptAndDocumentsItsBlindness:
         the constant's own comment has to name the alternative."""
         # In `pool_window.py` since G3 split `clients.py`: the constant went
         # beside `PoolWindow.client_bound`, its only reader, which is the
-        # placement `metrics/latency.py` argues for `SERVED_CONCURRENCY_FLOOR`.
-        # `clients.py` re-exports it and that re-export does NOT share the
-        # name -- `tests/test_g3_process_clients.py` pins the asymmetry.
+        # placement `metrics/scaling.py` argues for `SERVED_CONCURRENCY_FLOOR`
+        # -- that policy left `metrics/latency.py` when `latency.py` hit the
+        # same 800-line ceiling that split `clients.py`. `clients.py`
+        # re-exports it and that re-export does NOT share the name --
+        # `tests/test_g3_process_clients.py` pins the asymmetry, and
+        # `TestTheStatusIsTheComparisonItClaims` above pins the matching one
+        # for the floor, where `latency.py` is now a dead patch target too.
         source = open(os.path.join(
             VB_ROOT, "harness", "workloads", "pool_window.py")).read()
         block = source.split("CLIENT_BOUND_UTIL = 0.80")[0]

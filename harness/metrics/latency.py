@@ -13,8 +13,14 @@ rather than in `harness/workloads/clients.py`, where the pool that reports them
 lives, for two reasons -- `span_disposition`'s definition of "inside the
 window" has to be the SAME one the percentiles and the throughput use, and
 `clients.py` was 846 lines against this repository's 800-line ceiling with the
-policy inlined. `SERVED_CONCURRENCY_FLOOR` and `scaling_status` follow the
-quantity they judge for the same reason `churn_readers.py` exists.
+policy inlined.
+
+`SERVED_CONCURRENCY_FLOOR` and `scaling_status` followed the quantity they
+judge INTO this file for that same reason, and have now followed the ceiling
+back OUT of it: three rounds of measured rationale took this file to 844
+lines, so the policy is in `scaling.py` and re-exported here. The argument did
+not change -- the ceiling did. This file keeps the quantity; that one judges
+it.
 """
 
 from __future__ import annotations
@@ -251,107 +257,23 @@ def window_concurrency(collectors: Sequence["LatencyCollector"],
     )
 
 
-#: Share of the client count that must have been IN SERVICE before a scaling
-#: efficiency is reportable as a property of the engine. Below it the harness
-#: records a status instead and the report refuses to render the figure.
-#: `scaling_status` below says what the statuses mean; `WindowConcurrency`
-#: above says why `served` and not the exact `outstanding` is compared.
-#:
-#: 0.5 IS MEASURED, and the measurement is the GAP it sits in. Five synthetic
-#: drivers of identical 0.325 ms query cost through the real `ClientPool` at 1
-#: and 4 clients, three 2 s windows each, median window
-#: (CPython 3.12.3; `docs/05-methodology.md` §7 has the full table and
-#: `tests/test_g1_client_concurrency.py` the reproducible form):
-#:
-#:     driver                     efficiency   served/clients   flagged?
-#:     releases the lock                1.00             0.96   no
-#:     saturated server                 0.28             0.98   no
-#:     holds the lock (two forms)  0.25-0.27        0.22-0.25   YES
-#:     half released, half held         0.52             0.96   no
-#:     any driver at 1 client           1.00        0.94-1.00   no
-#:
-#: Two populations, 0.22-0.25 and 0.94-1.00, with nothing measured between:
-#: 0.5 is a factor of two from each side and no plausible move of it changes
-#: a verdict. The midpoint of a measured gap is the whole justification.
-#:
-#: **The saturated-server row is the one this has to get right.** That driver
-#: IS the bottleneck -- latency rises with the client count, throughput is
-#: flat and efficiency falls to 0.28, the shape a reader would call an engine
-#: ceiling, and it is one. Its median span rose with it, 0.389 ms to
-#: 1.377 ms, so its `served` stayed at the client count and it is NOT
-#: flagged. A real queue raises the whole distribution; a lock stall raises
-#: only the tail.
-SERVED_CONCURRENCY_FLOOR = 0.5
-
-#: The pool served about as many queries as it had clients, so a scaling
-#: efficiency measured over it describes the engine.
-SCALING_OK = "ok"
-
-#: The pool served materially fewer queries at once than it had clients, so
-#: whatever `scaling_efficiency` came out of it is not n-client scaling of
-#: this engine. Named for the OBSERVATION and not for a cause, deliberately:
-#: see `scaling_status` for the two causes a client's own clock cannot
-#: separate.
-SCALING_CONCURRENCY_NOT_ACHIEVED = "concurrency_not_achieved"
-
-#: Both statuses, for a report or a test that wants to assert it has handled
-#: every one. A tuple rather than a set so the order is the order they are
-#: documented in.
-SCALING_STATUSES = (SCALING_OK, SCALING_CONCURRENCY_NOT_ACHIEVED)
-
-
-def served_fraction(served: Optional[float],
-                    clients: int) -> Optional[float]:
-    """`served` as a share of the client count.
-
-    The quantity the floor is compared against, as one expression in one
-    place, so `scaling_status` and anything printing the evidence cannot
-    divide by two different denominators. `None` propagates: a window that
-    counted no query has no fraction, and a 0.0 here reads as total
-    serialization to every consumer.
-    """
-    if served is None or clients <= 0:
-        return None
-    return served / clients
-
-
-def scaling_status(served: Optional[float],
-                   clients: int) -> Optional[str]:
-    """Whether a scaling efficiency over this window is reportable.
-
-    Here rather than in `harness/workloads/clients.py`, where it was written
-    and where `PoolWindow.scaling_status` still exposes it: this module owns
-    the quantity, the floor belongs beside the quantity it judges, and
-    `clients.py` was 846 lines against this repository's 800-line ceiling
-    with the policy inlined. `churn_readers.py` exists for the same reason.
-
-    `None` -- not `SCALING_OK` -- when there is nothing to judge: a window
-    that counted no query has no spans to sum, and "the pool achieved its
-    concurrency" and "nobody could look" are different statements, exactly as
-    `PoolWindow.client_bound` distinguishes them for an unreadable CPU
-    counter. The report must render the two differently or the absence reads
-    as a pass.
-
-    `SCALING_CONCURRENCY_NOT_ACHIEVED` NAMES THE OBSERVATION, NOT A CAUSE,
-    deliberately. Two things produce it and a client's own clock cannot tell
-    them apart: the CLIENTS serialized on Python's interpreter lock, the case
-    the live smoke run exposed, which makes the efficiency a property of the
-    harness; or the SERVER serialized, in which case there is a real finding
-    -- but it is "this engine serializes queries", not "this engine scales at
-    0.25", which is a different claim needing a different presentation. Both
-    make the published number wrong, so both are refused and the report
-    states both readings. `client_cpu_seconds` separates them in practice,
-    roughly one core against roughly none, and travels beside the status in
-    the record. Putting the CPU figure INSIDE the condition was rejected for
-    the reason `clients.CLIENT_BOUND_UTIL` is a cautionary tale: a CPU term
-    reintroduces the blindness this quantity was added to fix.
-    """
-    fraction = served_fraction(served, clients)
-    if fraction is None:
-        return None
-    if fraction < SERVED_CONCURRENCY_FLOOR:
-        return SCALING_CONCURRENCY_NOT_ACHIEVED
-    return SCALING_OK
+# The scaling POLICY lives in `scaling.py`: the floor, the statuses, the two
+# estimators of the share of clients in service, and the rule over them. It
+# was here, beside the quantity it judges, until three rounds of measured
+# rationale took this file to 844 lines against the repository's 800-line
+# ceiling -- the same ceiling that moved the policy out of `clients.py` and
+# into this file in the first place. `scaling.py`'s docstring has the history.
+#
+# RE-EXPORTED AND NOT SHARED, which is the trap. `harness/workloads/` and
+# `report/` reach these names through this module and keep working; a
+# MUTATION aimed at this module does not, because `scaling_status` reads
+# `scaling.py`'s globals. Patch `harness.metrics.scaling`.
+from .scaling import (CREDIBLE_BASELINE_MEDIAN_RATIO,  # noqa: F401
+                      CREDIBLE_EFFICIENCY_CEILING,
+                      SCALING_CONCURRENCY_NOT_ACHIEVED, SCALING_OK,
+                      SCALING_STATUSES, SERVED_CONCURRENCY_FLOOR,
+                      achieved_fraction, baseline_is_credible,
+                      scaling_status, served_fraction, throughput_fraction)
 
 
 class LatencyCollector:
