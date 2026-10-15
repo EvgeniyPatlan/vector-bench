@@ -315,7 +315,102 @@ SCHEMA_VERSION = 1
 # efficiency 0.272, still not flagged**; a `ctypes.PyDLL` `usleep` holding the
 # lock 0.243 -> 0.982; Python spin holding the lock 0.264 -> 0.995. Only the
 # lock-holding rows moved, which is this version's whole claim.
-OPS_MEASUREMENT_VERSION = 6
+#
+# VERSION 7 -- THE SCALING STATUS AT ONE CLIENT WAS A STATEMENT ABOUT SKEW.
+# `metrics/scaling.scaling_status` refuses when `max(served_fraction,
+# throughput_fraction)` falls below `SERVED_CONCURRENCY_FLOOR` -- which at ONE
+# client is `served_concurrency` below a half on its own, because
+# `throughput_fraction` withholds the efficiency wherever `1 / clients` is not
+# itself under the floor. So at one client the condition is `p50 < mean / 2`
+# and nothing else: a one-client pool has NO CONCURRENCY TO FAIL TO ACHIEVE.
+# One client cannot take turns with itself, so "the clients serialized on the
+# interpreter lock" is impossible, and "the engine answers one query at a
+# time" is not a defect at n=1 but the definition of n=1. From this version
+# `clients == 1` is `ok` whenever the window measured anything, and `None`
+# when it measured nothing.
+#
+# WHAT MOVES, by record field. FIVE status fields, measured by rebinding
+# `pool_window.scaling_status` to a verbatim copy of the version-6 rule over a
+# window at `served / clients` 0.18 -- every one `ok` after, every one
+# `concurrency_not_achieved` before:
+#
+#     concurrency record     extra.scaling_status
+#     during-writes record   extra.scaling_status
+#     during-writes record   extra.reader_baseline_scaling_status
+#     during-writes record   extra.reader_under_writes_scaling_status
+#     churn STEP record      extra.reader_scaling_status
+#
+# all of them at ONE client or one reader, and none of them at four (the
+# control moved nothing). The two `reader_baseline`/`reader_under_writes` keys
+# are `PoolWindow.scaling_status` read at the same reader count
+# (`churn_readers.py:_reader_extra`, written under both prefixes), and an
+# earlier draft of this note omitted them. `extra.reader_scaling_status` is
+# NOT a key of the during-writes record: `reader_contention_shape` is merged
+# into the churn STEP record's extra by `churn.py`, which
+# `churn_readers.py`'s own docstring already says is the one key of the four
+# that reaches a record it does not write.
+#
+# NOTHING ELSE. No `qps`, no percentile, no efficiency, no multi-client
+# status.
+#
+# WHY A BUMP RATHER THAN A FOOTNOTE. The value of a published field changes
+# for records that already exist, with no change in any engine, so a reader
+# putting a version-6 Validity section beside a version-7 one would see
+# one-client points move from refused to published and have nothing to
+# attribute it to.
+#
+# AND WHY IT IS LATE, which is the part a reader needs most. The predicate
+# landed on master WITHOUT this bump, so version 6 has already labelled two
+# different behaviours: a one-client concurrency record written before that
+# merge and one written after it disagree about the verdict, and nothing in
+# the data distinguishes them. Records stamped 6 are therefore ambiguous at
+# `clients == 1` and only at `clients == 1`; everything else a 6 stamps is
+# unaffected. There is no repair for the records already written -- the
+# recomputation below is what a reader has instead.
+#
+# NO NEW FIELD IS NEEDED, which is unusual for a bump here and worth saying.
+# On a VERSION 6 record -- the genuinely ambiguous ones, written by the code
+# that has the one-client predicate -- `extra.served_concurrency` and
+# `extra.scaling_efficiency` are both published unconditionally, so either
+# verdict is recomputable and a reader can tell which one a 6 meant.
+#
+# NOT ON THE VERSION 5 RUN, and an earlier draft of this note said otherwise.
+# Measured on `SMOKE/results/smoke-20261014-075119/`: 14 ops files, 158
+# records, every one stamped 5, 28 of them concurrency records -- and
+# `extra.served_concurrency`, `extra.outstanding_concurrency` and
+# `extra.scaling_status` are absent from all 28. `extra.scaling_efficiency` is
+# present on all 28 but cannot stand in at one client, where it is 1.0 by
+# construction and `throughput_fraction` withholds it anyway:
+# `achieved_fraction(None, 1, 1.0)` is None, so neither verdict is derivable
+# that way. The route that DOES work there is Little's law off the published
+# columns, `qps x latency_p50_ms / 1000`, which the version-6 block above and
+# `tests/test_g3_process_clients.py` already use. Measured over that run's 14
+# one-client points it gives 0.941-0.995, so on that run both rules say `ok`
+# and no one-client verdict moves.
+#
+# THE EVIDENCE. A synthetic driver with a 30% cache-miss rate at 20x penalty,
+# through the real `ClientPool` at a SINGLE client, measured
+# `served / clients` of 0.1428, 0.1716, 0.1764, 0.1850 and 0.2050 over five
+# builds, and version 6 returned `concurrency_not_achieved` for all five. So
+# every run of a skewed workload printed "the clients serialized" about one
+# client while withholding an efficiency that is 1.0 by definition, and
+# `clients == 1` is in every profile -- `smoke`, `percona` and `dev` among
+# them. AND NOTHING IN THE TREE EVER ASSERTED THAT REFUSAL AT ONE CLIENT.
+# One-client call sites, in the keyword and the positional spelling -- the
+# `\b` matters, or the first branch also matches `clients=16` --
+#     grep -rnE 'scaling_status\([^)]*,[[:space:]]*1[,)]|clients=1\b' tests/
+# -- assert `ok`, or `None` for a window that counted nothing. A site can
+# also assert the verdict with neither spelling, by sweeping the client count
+# (`test_skewed_latency_is_not_serialization.py` loops `(1, 2, 3, 4)` and
+# asserts `{1: SCALING_OK, ...}`), so that grep is a starting point and not
+# an enumeration; it too says `ok`. The only one-client refusals anywhere are
+# the MUTANT arms, where a verbatim copy of the pre-change rule is run to
+# show the two disagree. No count is given
+# here on purpose: an earlier draft said "68 places", which does not
+# reproduce under any counting, and a figure nobody can re-derive is worse
+# than no figure. The old behaviour at n=1 was never intended by anything
+# that wrote a test.
+OPS_MEASUREMENT_VERSION = 7
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.

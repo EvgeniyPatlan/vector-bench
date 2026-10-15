@@ -100,10 +100,10 @@ being wrong.
 There is no previous smoke run to compare against **through the report**, and
 the obstacle is a deliberate one.
 
-`OPS_MEASUREMENT_VERSION` is 6 (`harness/metrics/records.py:318`). Records
+`OPS_MEASUREMENT_VERSION` is 7 (`harness/metrics/records.py:413`). Records
 written before the constant existed carry no version key at all and are
 version 1 by definition, not "unknown"
-(`harness/metrics/records.py:325`). The archived corpus is entirely version 1:
+(`harness/metrics/records.py:420`). The archived corpus is entirely version 1:
 `harness/metrics/records.py:240-246` records a count of it, and that count was
 re-taken independently for this document — 239 ops record files, 2,134 ops
 records, `extra.ops_measurement_version` absent from every one, every record in
@@ -119,7 +119,7 @@ versions are present, so a version 1 record and a version 5 record in one
 report raise `MixedMeasurementVersions`, and so do a version 1 and a version 2
 — which `report/measurement_versions.py:187-191` says **denote the same
 measurement**. The equivalence set
-(`harness/metrics/records.py:356`) changes the *wording* of the refusal,
+(`harness/metrics/records.py:451`) changes the *wording* of the refusal,
 dropping the advice to re-measure; it does not change the decision. And the
 refusal is not a caveat on a chart: `report/generate.py:858-859` prints the
 message and returns 2, so there is no report.

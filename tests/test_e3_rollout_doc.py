@@ -436,9 +436,9 @@ CITED_IN_REPO = {
     # something different from a version 5 record in the 2026-10-14 run.
     # There was no edit that bumped the constant and left this row green, and
     # that is the row doing its job rather than a row in the way.
-    "harness/metrics/records.py:318":
-        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 6"),
-    "harness/metrics/records.py:325":
+    "harness/metrics/records.py:413":
+        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 7"),
+    "harness/metrics/records.py:420":
         ("harness/metrics/records.py", "IMPLICIT_OPS_MEASUREMENT_VERSION = 1"),
     "harness/metrics/records.py:240-246":
         ("harness/metrics/records.py",
@@ -447,7 +447,7 @@ CITED_IN_REPO = {
         ("harness/metrics/records.py", "CHANGES WHAT IT MEASURES"),
     "harness/metrics/records.py:253-260":
         ("harness/metrics/records.py", "is a diagnostic, not a guard"),
-    "harness/metrics/records.py:356":
+    "harness/metrics/records.py:451":
         ("harness/metrics/records.py",
          "OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({"),
     "harness/metrics/stats.py:49":
