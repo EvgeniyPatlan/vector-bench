@@ -1137,7 +1137,7 @@ its `case` ends at `:141` with `*) die "engine '$engine' has no known
 build-arg (alias_of=$base)"`, so a missing entry is an immediate, clear failure
 rather than a silent one. The entry follows the convention at `:129-131` —
 `percona) bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;` — and
-`docker/percona/Dockerfile:330` declares `ARG PERCONA_TAG` to receive it.
+`docker/percona/Dockerfile:424` declares `ARG PERCONA_TAG` to receive it.
 `prepare-sources.sh` must ship a `git archive` of the pinned SHA (`:98` is the
 pattern) and must *not* try to carry submodules.
 

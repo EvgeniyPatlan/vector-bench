@@ -101,7 +101,8 @@ build:
     - -DWITH_MYSQLX=OFF
     - -DWITH_UNIT_TESTS=OFF
     - -DWITH_SSL=system
-    - -DWITH_ZLIB=system
+    - -DWITH_ZLIB=bundled
+    - -DWITH_ZSTD=bundled
   extra_cxxflags: ""
 
 # There is deliberately no `sql:` block, and this file is the first engine

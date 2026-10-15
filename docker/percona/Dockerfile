@@ -95,6 +95,65 @@
 #   4. NO mysql_native_password ANYWHERE. See init.sql — the plugin is gone from
 #      the server in this base and requesting it is a hard error.
 #
+#   5. WE DO NOT USE build-ps/build-binary.sh, AND THE REASON IS THE BENCHMARK
+#      AND NOT CONVENIENCE. It is the obvious thing to reach for -- it is the
+#      vendor's own build, so it must work -- and it was audited against the
+#      pinned tree on 2026-10-14 rather than dismissed. Six of its choices
+#      disqualify it here, and all six are read from the script at the pin:
+#
+#        :17, :55   TARGET_CFLAGS='' and the only -march it ever sets is
+#                   `-m32 -march=i686`, for 32-bit. On x86_64 the flags come
+#                   from `rpm --eval %optflags` (:217-218) inside
+#                   `if [ -n "$(command -v rpm)" ]`, so on this noble image
+#                   there is no rpm, COMMON_FLAGS stays empty, and CFLAGS
+#                   (:233) carries nothing. Percona would compile with no
+#                   -march while the other four source-built engines carry
+#                   x86-64-v3 -- the first invariant in CLAUDE.md, and the one
+#                   that turns the study into a comparison of compiler flags.
+#        :270       WITH_PGO defaults to 1: a three-pass profile-guided build.
+#                   Percona would be the only engine in the study with PGO.
+#        :312       -DWITH_LTO=ON, against a tree default of OFF
+#                   (CMakeLists.txt:1017, OPTION at :1020). Same objection.
+#        :311       -DWITH_PERCONA_TELEMETRY=ON, against a tree default of OFF
+#                   (CMakeLists.txt:2392). Periodic background work inside a
+#                   server whose CPU and wall time this benchmark attributes to
+#                   query execution. ON is Percona's PACKAGING choice.
+#        :299, :313 -DWITH_ROCKSDB=ON and -DWITH_JS_LANG=ON with
+#                   -DV8_LIB_DIR=${WITH_V8}/... — the rocksdb submodule note 2
+#                   explains we do not ship, and a prebuilt V8 tree.
+#        :308       -DFORCE_INSOURCE_BUILD=1, which note 1 exists to avoid.
+#
+#      Two of its flags are also simply dead on this tree, which is the other
+#      half of why the list cannot be copied: `-DWITH_LIBEVENT=bundled` (:309)
+#      and `-DWITH_INNODB_MEMCACHED=ON` (:302). Measured, not inferred --
+#      `extra/libevent` and `plugin/innodb_memcached` are both 404 at this
+#      commit, and neither symbol appears in the top-level CMakeLists.txt or
+#      in any file under cmake/. cmake warns about unused -D variables instead
+#      of failing, so copying them would be silent noise. Anyone re-deriving
+#      this flag list from the vendor script will reach for them;
+#      tests/test_e6_percona_vendor_alignment.py fails if they land.
+#
+#      What IS taken from the vendor is everything that is about making it
+#      compile rather than about how fast it runs: the builder apt list (note
+#      on it below), and `bundled` for the three third-party libraries where
+#      this tree offers the choice -- curl (:304), zlib (:303) and zstd
+#      (:310). zstd was already the default (cmake/zstd.cmake:25); zlib was
+#      `system` here until this commit and is `bundled` in cmake/zlib.cmake's
+#      own default too (:117). Bundled is the path Percona's CI exercises, and
+#      every one of the five configure failures on 2026-10-14 was a missing
+#      system library.
+#
+#      Vendor packages deliberately NOT taken, with the reason, so the audit
+#      does not have to be redone: valgrind, gdb, doxygen, doxygen-gui,
+#      graphviz, devscripts, debhelper, fakeroot, ccache, patchelf,
+#      python3-mysqldb, libeatmydata, dh-apparmor and copyright-update are
+#      their packaging and test pipeline, not compile inputs; libsystemd-dev
+#      and libjemalloc-dev govern options this tree defaults OFF
+#      (CMakeLists.txt:1655 and :874); libmecab-dev likewise, since
+#      build-binary.sh passes -DWITH_MECAB only when asked (:84); and
+#      `libpam-dev` is the virtual name whose provider we install directly --
+#      see the test that exists for exactly that mistake.
+#
 
 ARG BASE_IMAGE=ubuntu:24.04
 
@@ -244,7 +303,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 file \
       libldap2-dev libsasl2-dev libkrb5-dev libcurl4-openssl-dev libtirpc-dev \
       libpam0g-dev liblz4-dev libzstd-dev libevent-dev libre2-dev libwrap0-dev \
-      libsasl2-modules libsasl2-modules-gssapi-mit
+      libsasl2-modules libsasl2-modules-gssapi-mit \
+      perl gawk unzip curl
 
 WORKDIR /src
 COPY source.tar /tmp/source.tar
@@ -278,6 +338,39 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # for the whole build, so `=recurse` would buffer every line until the build
 # ended -- no progress at all for the hours this takes. `=line` keeps progress
 # live but still splits a multi-line diagnostic from its own target.
+#
+# `|| make -j1` is the other half, and it is about where the error lands
+# rather than whether it is adjacent to its file. `--output-sync` puts
+# the compiler diagnostic next to the `[ 26%] Building CXX object ...` line
+# that names the file; it does NOT move either of them to the end of the log.
+# When a target fails at -j80 make stops launching new work but lets the ~79
+# already-running targets finish, and their blocks print AFTER the failing
+# one -- so the last twenty lines of the log are the stragglers draining out,
+# and three builds of this image were reported from that tail with the error
+# never read. The serial retry resumes from wherever the parallel build got
+# to, recompiles only what is missing, stops at the first error and prints it
+# as the last thing in the log. It costs minutes rather than hours because
+# everything before the failure is already built.
+#
+# Two consequences to know rather than discover:
+#
+#   * a failure that was a parallel-build RACE will not recur serially, so
+#     the retry succeeds and the image builds. That is a better outcome than
+#     failing, and it produces the same binary -- but it means a green build
+#     here does not prove the parallel build is sound.
+#   * `set -e` does not fire between the two, because `||` suppresses errexit
+#     for its left side. If the serial retry also fails the chain still exits
+#     non-zero, which is what fails the Docker build.
+#
+# The retry is spelled `--jobs=1` and not `-j1`, which is not a style choice.
+# `make -j` is the region anchor two other suites split this file on, and it
+# has to stay UNIQUE: with a second `make -j` token in the same command, the
+# guard in tests/test_e5_percona_make_output_sync.py stops failing loudly
+# when the flag is misplaced and starts silently falling through to the
+# retry, widening the region past the invocation it is meant to bound.
+# Measured: with `-j1` the "wrong side of the anchor" probe went from
+# reporting an empty region to reporting a populated one, which is the
+# failure the probe exists to detect. `--jobs=1` is identical to make.
 #
 # The flag goes AFTER -j"$JOBS" deliberately. `make -j` is the literal string
 # tests/test_e1_percona_design.py and tests/test_e4_percona_build_flags.py
@@ -314,9 +407,10 @@ RUN set -eux; \
       -DWITH_MYSQLX=OFF \
       -DWITH_UNIT_TESTS=OFF \
       -DWITH_SSL=system \
-      -DWITH_ZLIB=system \
+      -DWITH_ZLIB=bundled \
+      -DWITH_ZSTD=bundled \
       ${CMAKE_FLAGS} ; \
-    make -j"$JOBS" --output-sync=target; \
+    make -j"$JOBS" --output-sync=target || make --jobs=1; \
     make install; \
     echo "${MARCH}" > /opt/percona/.march
 
