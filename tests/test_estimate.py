@@ -250,7 +250,7 @@ class TestTotalHoursStillMeansIngest:
         still be the wrong thing to print."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.91
-        assert e["worst_case_total_hours"] == 7.58
+        assert e["worst_case_total_hours"] == 7.48
         assert e["long_run"] is False
 
 
@@ -259,28 +259,36 @@ class TestTotalHoursStillMeansIngest:
 # ---------------------------------------------------------------------------
 
 class TestTheConcurrencyTermIsTimeNotQueries:
-    """`main` runs client_counts [1, 2, 4, 8, 16, 32] for 30 s each, three
+    """`main` runs client_counts [1, 4, 8, 16, 32] for 30 s each, three
     times per point. Each point runs for a fixed span whatever the engine
     manages, so this term is exact.
 
+    The grid lost its 2-client point on 2026-10-14, which is why the figure
+    below is 450 s and not 540 s: at two clients BOTH estimators of the
+    achieved concurrency equal exactly 1/n = 0.5 for a perfectly serialized
+    pool, the floor is a strict `<`, and the verdict therefore lands on
+    whichever side of it the box's noise puts it -- measured 0.499 (refused)
+    in one synthetic driver and 0.537 (published) in another. See
+    tests/test_two_client_points_are_not_measured.py.
+
     By hand, for `main`, one pass, SEVEN engines, two datasets:
-        6 points x 30 s x 3 repeats               =   540 s per ops unit
+        5 points x 30 s x 3 repeats               =   450 s per ops unit
         ops units per (engine, dataset): 1 each,
             except pgvector, which runs both
             pgvector_build_modes               -> 8 units per dataset
         8 units x 2 datasets x 1 pass             =    16 unit-instances
-        16 x 540 s = 8,640 s                      =  2.40 h
+        16 x 450 s = 7,200 s                      =  2.00 h
 
     Over the six engines that preceded Percona the same arithmetic gave 7
-    units per dataset, 14 unit-instances and 2.10 h. Percona contributes one
+    units per dataset, 14 unit-instances and 1.75 h. Percona contributes one
     ops unit per dataset like every engine except pgvector: `percona.yml` is
     the only profile that sets `percona_build_modes`, and `main` does not.
     """
 
     def test_main(self):
         t = term(est("main"), "concurrency windows")
-        assert t["typical_hours"] == 2.40
-        assert t["worst_hours"] == 2.40
+        assert t["typical_hours"] == 2.00
+        assert t["worst_hours"] == 2.00
         assert t["bounded"] is True
 
     def test_the_client_count_list_is_counted_not_summed(self):
@@ -872,7 +880,7 @@ class TestACapIsPrintedAsACapNotADuration:
 
 class TestTheWholeQueryEstimateForMain:
     """The aggregate, so a reader can see the number the convention now refers
-    to and check it against the parts: 2.10 h of concurrency windows, 4.77 h
+    to and check it against the parts: 1.75 h of concurrency windows, 4.77 h
     of modelled churn re-insert and 0.23 h of churn reader baseline, against a
     14.00 h churn ceiling and a 7.00 h filtered one.
 
@@ -920,15 +928,15 @@ class TestTheWholeQueryEstimateForMain:
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 7.44
-        assert e["query_hours_worst"] == 26.67
+        assert e["query_hours"] == 7.04
+        assert e["query_hours_worst"] == 26.27
         # The totals move with the ENGINE LIST as well as with the ann M
         # grid. Over six engines these were 100.16 and 116.39; the INGEST
         # half of both is unchanged at 93.06, because Percona is named in
         # `engines_without_ingest_rate` and contributes nothing to it -- so
         # every hour of the difference is query time.
-        assert e["typical_total_hours"] == 100.50
-        assert e["worst_case_total_hours"] == 119.73
+        assert e["typical_total_hours"] == 100.10
+        assert e["worst_case_total_hours"] == 119.33
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -944,9 +952,9 @@ class TestTheWholeQueryEstimateForMain:
         # terms are spans the profile puts a clock on and need no engine
         # rate; the ingest figure is rows divided by a rate, and needs one.
         assert e["query_per_engine_hours"] == {
-            "mariadb": 1.43, "alisql": 2.33, "pgvector": 0.78,
-            "mariadb123": 1.89, "mongodb": 0.34, "valkey": 0.34,
-            "percona": 0.33,
+            "mariadb": 1.38, "alisql": 2.28, "pgvector": 0.68,
+            "mariadb123": 1.84, "mongodb": 0.29, "valkey": 0.29,
+            "percona": 0.28,
         }
         assert "percona" not in e["per_engine_hours"]
         assert e["engines_without_ingest_rate"] == ["percona"]
@@ -1100,9 +1108,9 @@ class TestTheExtensionPoint:
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
                             tuple(est_mod._QUERY_TERMS) + (lambda plan: None,))
         # Unchanged by a term that declines: `main`'s query subtotal over all
-        # seven engines. It was 7.10 over six; Percona adds one ops unit per
-        # dataset and 0.33 h of it.
-        assert est("main")["query_hours"] == 7.44
+        # seven engines. It was 6.76 over six; Percona adds one ops unit per
+        # dataset and 0.28 h of it.
+        assert est("main")["query_hours"] == 7.04
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 8 ops units per dataset x 2 datasets = 16 per pass.
@@ -1236,8 +1244,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~119.7 h worst case" in out
-        assert "~100.5 h typical" in out
+        assert "~119.3 h worst case" in out
+        assert "~100.1 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run

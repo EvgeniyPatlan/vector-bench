@@ -326,7 +326,7 @@ not a record, and the report does not reclassify on it.)
 
 ### 2.3 Concurrency scaling (ops harness)
 
-QPS and latency percentiles (p50/p95/p99) at 1, 2, 4, 8, 16, 32 concurrent
+QPS and latency percentiles (p50/p95/p99) at 1, 4, 8, 16, 32 concurrent
 clients, at a fixed `ef_search` chosen to put all engines at comparable recall.
 
 This is the dimension that separates a database from an ANN library: it exercises

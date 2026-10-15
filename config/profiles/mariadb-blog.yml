@@ -127,6 +127,11 @@ ops:
   # steps straight over the knee and reports a flat line with no explanation.
   # Each extra point is one more `concurrency_duration_s`, so resolution here
   # is nearly free.
+  # Keeps the 2-client point that the measurement profiles dropped on
+  # 2026-10-14: here it is a QPS figure compared against a published
+  # curve, not a concurrency verdict. The verdict at n=2 is undecidable
+  # either way -- see config/profiles/main.yml -- so read this point's
+  # throughput and percentiles and ignore its scaling_status.
   client_counts: [1, 2, 4, 8, 16, 32]
   # 30s at these throughputs is a few thousand queries, which is thin for a p99.
   # Six points at 60s is six minutes per engine.

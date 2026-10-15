@@ -747,7 +747,7 @@ against a server. The chain is:
 | Input | Status |
 |---|---|
 | per-row floor formula `dims × 4 + 2 × M × 8` | **measured on Percona**, in the sense that it is the floor an MTR test asserts the server stays above — `hnsw_memory_used.result:63`, `SET @floor = 1000 * (64 * 4 + 2 * 16 * 8);` with `:64-67` asserting `actual >= floor` and `actual <= 2 × floor + 2 × 65536` |
-| row counts | **supplied** — from this repo (`harness/datasets.py:492` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md:506` calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
+| row counts | **supplied** — from this repo (`harness/datasets.py:492` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md:505` calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
 | dimensionality | **supplied** — from the dataset names |
 | `M` | **supplied** — from the profiles |
 | 1 GiB default | **measured** — `innodb_hnsw_max_memory_basic.result:3-5` |

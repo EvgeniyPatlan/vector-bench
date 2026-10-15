@@ -521,9 +521,9 @@ CITED_IN_REPO = {
         ("orchestrator/estimate.py", "by 3x is worse than none"),
     "orchestrator/estimate.py:50":
         ("orchestrator/estimate.py", '"mariadb": 150'),
-    "config/profiles/main.yml:181":
+    "config/profiles/main.yml:200":
         ("config/profiles/main.yml", "churn_readers: 4"),
-    "config/profiles/dev.yml:74":
+    "config/profiles/dev.yml:77":
         ("config/profiles/dev.yml", "churn_readers: 0"),
     "docs/05-methodology.md:490-497":
         ("docs/05-methodology.md",

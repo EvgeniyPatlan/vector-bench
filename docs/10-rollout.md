@@ -171,7 +171,7 @@ MariaDB alone first would buy nothing.
 
 **Step A — `dev`, all engines.** The cheapest end-to-end exercise: images build,
 every driver connects, every phase writes records. `dev` pins
-`ops.churn_readers: 0` (`config/profiles/dev.yml:74`), which is the write-only
+`ops.churn_readers: 0` (`config/profiles/dev.yml:77`), which is the write-only
 re-insert pass and is deliberate, not an omission.
 
 **What step A cannot confirm, and the draft of this page had it wrong.** With
@@ -219,8 +219,8 @@ that exercises it against published numbers.
 
 ### Do not pool one run's churn records with another's
 
-`main.yml` pins `ops.churn_readers: 4` (`config/profiles/main.yml:181`) and
-`dev.yml` pins `0` (`config/profiles/dev.yml:74`). Both stamp version 5, so the
+`main.yml` pins `ops.churn_readers: 4` (`config/profiles/main.yml:200`) and
+`dev.yml` pins `0` (`config/profiles/dev.yml:77`). Both stamp version 5, so the
 cross-version refusal in §1 will **not** catch a reader-contended re-insert rate
 pooled with a write-only one. The code names the gap itself:
 `harness/metrics/records.py:253-260` says *"`extra.readers` is a diagnostic,

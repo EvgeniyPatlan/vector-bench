@@ -125,7 +125,26 @@ ops:
   subset_rows: null
   load_threads: 1
   max_queries: 500
-  client_counts: [1, 2, 4, 8, 16, 32]
+  # The 2-client point was dropped on 2026-10-14 and the reason is structural,
+  # not a matter of taste. The concurrency status is refused when the achieved
+  # fraction of the client count falls below SERVED_CONCURRENCY_FLOOR = 0.5
+  # (harness/metrics/latency.py), and BOTH estimators of that fraction --
+  # served_concurrency/clients and the scaling efficiency -- equal exactly
+  # 1/n for a perfectly serialized pool. At n=2 that is 0.5 exactly, against
+  # a strict `<`, so a two-client pool that genuinely took turns lands on
+  # whichever side of the floor the box's noise puts it: measured 0.499
+  # (refused) under one synthetic driver and 0.537 (published as ok) under
+  # another, for the same defect. Every other point in the grid decides
+  # cleanly -- at n=4 serialization reads 0.25 against 0.98 for a pool that
+  # scaled. The point cost 30s x 3 repeats per ops unit and could not answer
+  # the question it was there to answer.
+  #
+  # It is kept in mariadb-blog.yml and mariadb-blog-repro.yml, where the
+  # 2-client QPS is a figure being compared against a published curve rather
+  # than a concurrency verdict. See
+  # tests/test_two_client_points_are_not_measured.py, which encodes exactly
+  # that split.
+  client_counts: [1, 4, 8, 16, 32]
   concurrency_duration_s: 30
   # Three windows per point, and the median reported with the spread beside
   # it. Every figure in this framework was a single sample until a Valkey

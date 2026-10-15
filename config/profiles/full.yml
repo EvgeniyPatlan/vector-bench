@@ -46,7 +46,10 @@ ops:
   subset_rows: null
   load_threads: 1
   max_queries: 2000
-  client_counts: [1, 2, 4, 8, 16, 32]
+  # No 2-client point: at n=2 both estimators of the achieved
+  # concurrency equal exactly the floor, so the verdict is noise.
+  # config/profiles/main.yml carries the measurement.
+  client_counts: [1, 4, 8, 16, 32]
   concurrency_duration_s: 30
   # See main.yml for why: a single window has no error bar, and two engines
   # differing by less than the window-to-window spread were being presented

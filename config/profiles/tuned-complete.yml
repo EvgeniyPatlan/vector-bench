@@ -79,7 +79,10 @@ ops:
   # The same grid the equal-budget run used, so the two are directly
   # comparable. The knee is between 1 and 4, which is why those points are all
   # present.
-  client_counts: [1, 2, 4, 8, 16, 32]
+  # No 2-client point: at n=2 both estimators of the achieved
+  # concurrency equal exactly the floor, so the verdict is noise.
+  # config/profiles/main.yml carries the measurement.
+  client_counts: [1, 4, 8, 16, 32]
   concurrency_duration_s: 60
   # Three windows per client count, median reported with the spread beside it.
   # Every figure in the 2026-08 run was a single sample, and the one point that
