@@ -495,23 +495,77 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 #     the error standing (MEASURED).
 #
 # (b) `-march=x86-64-v3` IS SILENTLY DROPPED. Step 4 replaces CMAKE_C_FLAGS
-#     wholesale, so the entire exported string goes. The delta is exactly two
-#     things: `-march=x86-64-v3` is LOST, and dpkg's `-flto=auto
-#     -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection
-#     -fcf-protection` are GAINED. The LTO is real LTO and not just a compile
-#     flag, because compile_flags.cmake:132-134 sets all three of cmake's
-#     LINKER_FLAGS variables from dpkg's LDFLAGS as well -- so link-time
-#     optimization, which tests/test_e6_percona_vendor_alignment.py forbids
-#     this image from taking off the vendor script, arrives through the back
-#     door instead.
+#     wholesale, so the entire exported string goes and dpkg's arrives in its
+#     place. THE WHOLE DELTA, because a partial list here would be the same
+#     kind of mistake this note is about -- MEASURED by tokenising
+#     `dpkg-buildflags --get CFLAGS` plus `--get CPPFLAGS` on the build host
+#     against the exported string READ from the `export CFLAGS=` line below.
+#     THE LOST COUNT IS THIS ENGINE'S: AliSQL loses FOUR, not five, because
+#     its export line carries no `-D_FORTIFY_SOURCE=2` to lose. The gained
+#     twelve and the kept two are the same for both.
+#
+#       LOST (5 here, 4 for AliSQL)
+#         -march=x86-64-v3        the one that matters; see below
+#         -fexceptions
+#         -fno-strict-aliasing    see below
+#         -O3                     replaced by dpkg's -O2, and of NO
+#                                 consequence either way: the per-config
+#                                 `-O2 -g -DNDEBUG` ends the command line
+#                                 whatever CMAKE_C_FLAGS holds
+#         -D_FORTIFY_SOURCE=2     replaced by dpkg's =3. The effective LEVEL
+#                                 is still 2, because the tree's own =2 from
+#                                 CMAKE_C_FLAGS_<BUILDTYPE> comes last -- but
+#                                 the disagreement between the two is exactly
+#                                 what emits consequence (a)'s diagnostic
+#       GAINED (12)
+#         -flto=auto -ffat-lto-objects -fstack-protector-strong
+#         -fstack-clash-protection -fcf-protection
+#         -mno-omit-leaf-frame-pointer -Wformat -Werror=format-security
+#         -Wdate-time -ffile-prefix-map=<cwd>=.
+#         -O2                     see -O3 above
+#         -D_FORTIFY_SOURCE=3     see -D_FORTIFY_SOURCE=2 above
+#       KEPT (2)
+#         -g
+#         -fno-omit-frame-pointer for two independent reasons: Ubuntu 24.04's
+#                                 dpkg emits it too, AND
+#                                 cmake/build_configurations/compiler_options
+#                                 .cmake:41 and :51 set COMMON_C_FLAGS and
+#                                 COMMON_CXX_FLAGS to it under
+#                                 `IF(MY_COMPILER_IS_GNU)` (:40) and :78/:83
+#                                 prepend them. READ at the pin.
+#
+#     `-fno-strict-aliasing` DESERVES ITS OWN SENTENCE. A MySQL-family C/C++
+#     build silently losing it while compiling at -O2 is a codegen change and
+#     arguably a correctness one, and it is precisely the class of thing this
+#     note exists to catch. NOTHING IN THE THREE FILES WE HOLD AT THE PIN
+#     re-adds it: `CMakeLists.txt`, `cmake/compile_flags.cmake` and
+#     `cmake/build_configurations/compiler_options.cmake` contain zero
+#     occurrences of either `-fno-strict-aliasing` or `-fexceptions`
+#     (MEASURED). That is deliberately NOT a claim about the whole tree --
+#     there is no Percona source tarball on this box and the rest of the tree
+#     was never read, so a sub-directory may well re-add either one. What
+#     those three files DO add, for contrast, is `-fno-omit-frame-pointer`
+#     above and `SECTIONS_FLAG` = `-ffunction-sections -fdata-sections` at
+#     compiler_options.cmake:34.
+#
+#     The LTO is real LTO and not just a compile flag, because
+#     compile_flags.cmake:132-134 sets all three of cmake's LINKER_FLAGS
+#     variables from dpkg's LDFLAGS as well -- MEASURED, `dpkg-buildflags
+#     --get LDFLAGS` here is `-Wl,-Bsymbolic-functions -flto=auto
+#     -ffat-lto-objects -Wl,-z,relro`. So link-time optimization, which
+#     tests/test_e6_percona_vendor_alignment.py forbids this image from taking
+#     off the vendor script, arrives through the back door instead.
 #     THE BREACH HAS NO SYMPTOM. `echo "${MARCH}" > /opt/percona/.march` below
 #     writes the build ARG, not what cmake honoured, so that file and every
 #     `march` reader in this repo report x86-64-v3 whichever way the configure
 #     went. CLAUDE.md's "Never mix -march between engines" is what this
-#     violates, and a Percona number produced without the SIMD baseline the
-#     other source-built engines carry, and with LTO none of them have, is
-#     exactly the comparison-of-compiler-flags outcome those guards exist to
-#     prevent.
+#     violates, and a Percona number produced without the SIMD baseline is not
+#     comparable with the three engines that demonstrably carry it -- mariadb,
+#     mariadb123 and pgvector, which pass `-march` on the cmake command line
+#     or through a Makefile and so never lost it. AliSQL is NOT in that list:
+#     before this commit it had the identical defect and was almost certainly
+#     built without `-march` too, which is why its published numbers have to
+#     be re-measured rather than used as the comparison.
 #
 #     THE OPTIMISATION LEVEL IS NOT PART OF THIS, in either direction, and no
 #     sentence here should imply otherwise. `-O3` in the exported CFLAGS has

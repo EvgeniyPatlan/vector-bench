@@ -1671,7 +1671,7 @@ CITED_IN_REPO = {
     # Found only once `_CITE_RE` learned to see extensionless filenames --
     # see the note on that pattern. It is the citation that sat at `:113`,
     # 51 lines wrong, for this document's whole life.
-    "docker/percona/Dockerfile:671":
+    "docker/percona/Dockerfile:725":
         ("docker/percona/Dockerfile", "ARG PERCONA_TAG=unknown"),
     "docker/alisql/entrypoint-alisql.sh:94":
         ("docker/alisql/entrypoint-alisql.sh", 'local u; u="$(user_args)"'),
