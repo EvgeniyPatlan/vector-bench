@@ -80,7 +80,7 @@ cmake honoured, so every `march` reader in this repo reports `x86-64-v3`
 either way. That is the kind of breach that publishes a number rather than
 failing a build.
 
-THE OPTIMISATION LEVEL IS NOT ONE OF THE TWO, and no assertion here should be
+THE OPTIMISATION LEVEL IS NOT PART OF THIS, and no assertion here should be
 read as touching it. `-O3` in the exported CFLAGS has never reached the
 compiler for either engine: the compile line is `CMAKE_C_FLAGS
 CMAKE_C_FLAGS_<configuration>` and RelWithDebInfo's own value ends it with
@@ -685,11 +685,21 @@ class TestThisHostsDistroDisagreesWithTheTree:
 # `CMakeLists.txt:313-322`, reproduced in shape below -- under three inputs and
 # reports what cmake says in each.
 #
-# `PROJECT(vb_probe NONE)` AFTER THE CAPTURE IS LOAD-BEARING, and an earlier
-# version of this file got it wrong in a way worth recording, because the
-# mistake inverted the result rather than merely weakening it. That version
-# omitted `PROJECT()` entirely and claimed that therefore no compiler was
-# needed and no toolchain detection ran. MEASURED on cmake 3.28.3: with no
+# CALLING `PROJECT(vb_probe NONE)` AT ALL IS LOAD-BEARING. Its PLACEMENT is
+# not, and the distinction is worth stating because an earlier version of this
+# comment credited the placement. MEASURED: moving the call to BEFORE the
+# capture gives byte-identical readings on all three arms and still zero
+# compiler-identification lines, because `NONE` enables no languages, so
+# nothing ever reads `$CFLAGS` whichever side of the capture it sits on. It is
+# kept AFTER the capture for FIDELITY TO THE TREE -- the tree asks its question
+# before its own `PROJECT()` (:326 says why it has to) and this snippet should
+# read the same way -- not because the reading depends on it.
+#
+# What the call being PRESENT buys is the whole regime, and an earlier version
+# of this file got that wrong in a way worth recording, because the mistake
+# inverted the result rather than merely weakening it. That version omitted
+# `PROJECT()` entirely and claimed that therefore no compiler was needed and
+# no toolchain detection ran. MEASURED on cmake 3.28.3: with no
 # `project()` anywhere, cmake warns `No project() command is present`, INJECTS
 # AN IMPLICIT PROJECT, and prints `The C compiler identification is GNU
 # 13.3.0` plus the CXX twin and two ABI probes -- so every clause of that claim
@@ -699,10 +709,9 @@ class TestThisHostsDistroDisagreesWithTheTree:
 # this whole change rests on.
 #
 # Naming a project explicitly suppresses the implicit one, and `NONE` enables
-# no languages, so no compiler is identified and `$CFLAGS` is never read.
-# Placing it AFTER the capture leaves the capture looking at the genuine
-# pre-`PROJECT()` state, which is where the tree asks the question (:326 says
-# why it has to). MEASURED in that shape: zero compiler-identification lines,
+# no languages, so no compiler is identified and `$CFLAGS` is never read --
+# which is what leaves the capture looking at a genuine un-initialised
+# CMAKE_C_FLAGS. MEASURED in that shape: zero compiler-identification lines,
 # zero ABI probes, no implicit-project warning, and an exported `CFLAGS` gives
 # `INITIAL_DEFINED=0, HATCH_OPEN=1`. So the claim is now true as written: no
 # compiler is needed, no toolchain detection runs, and no network is touched.
@@ -713,7 +722,16 @@ CMAKE = shutil.which("cmake")
 
 #: The capture from the pinned trees, in shape: Percona `CMakeLists.txt:313-322`
 #: and AliSQL `:303-306`, with `PROJECT(... NONE)` appended for the reason in
-#: the note above.
+#: the note above and one addition of our own.
+#:
+#: THE `ENV_SEEN` LINE IS NOT DECORATION: it is how the environment arm
+#: certifies its own input. Without it, dropping the `CFLAGS` injection from
+#: that arm passed every test in this class -- and silently disarmed the
+#: `PROJECT(... NONE)` guard too, because with no `CFLAGS` in the environment
+#: the broken implicit-project shape leaves CMAKE_C_FLAGS defined-empty, the
+#: unquoted expansion unsets it again, and the arm reads exactly like the
+#: correct regime. A guard whose own input is invisible to it is the same
+#: hazard as the one this class exists to measure, one level up.
 #:
 #: The expansion of `${CMAKE_C_FLAGS}` is left UNQUOTED because the trees leave
 #: it unquoted, and it does change one of the two readings: under an empty
@@ -725,6 +743,11 @@ CMAKE = shutil.which("cmake")
 #: contradicted docker/alisql/Dockerfile's own correct sentence.
 _CAPTURE_SNIPPET = """\
 CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
+IF("$ENV{CFLAGS}" STREQUAL "")
+  MESSAGE(STATUS "VB_PROBE ENV_SEEN=0")
+ELSE()
+  MESSAGE(STATUS "VB_PROBE ENV_SEEN=1")
+ENDIF()
 SET(INITIAL_CMAKE_C_FLAGS)
 IF(DEFINED CMAKE_C_FLAGS)
   SET(INITIAL_CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
@@ -747,6 +770,16 @@ PROJECT(vb_probe NONE)
 #: `IF(NOT INITIAL_CMAKE_C_FLAGS)`. `INITIAL_DEFINED` is reported beside it as
 #: mechanism, and is deliberately NOT what any conclusion here rests on.
 _VERDICT_KEY = "HATCH_OPEN"
+
+#: The two readings that describe the GUARD, as opposed to the input. Compared
+#: on their own by the dead-probe checks: `ENV_SEEN` differs between the arms
+#: by construction, so including it would let a pair satisfy "these arms
+#: answered differently" while every guard reading matched.
+_GUARD_KEYS = ("INITIAL_DEFINED", "HATCH_OPEN")
+
+#: What the environment arm must put in `CFLAGS`, and what the other two must
+#: NOT have there. Named once so the arm and its certification cannot drift.
+_ENV_CFLAGS = "-O3 -g -march=x86-64-v3"
 
 
 @pytest.mark.skipif(
@@ -778,12 +811,23 @@ class TestCmakeReallyTreatsAnEmptyValueAsUnset:
         src.mkdir()
         (src / "CMakeLists.txt").write_text(_CAPTURE_SNIPPET)
 
-        def configure(name: str, args: list[str], env: dict | None) -> dict:
+        def configure(name: str, args: list[str], cflags: str | None) -> dict:
+            """One arm. `cflags=None` means CFLAGS is REMOVED, not emptied.
+
+            Every arm starts from a copy of the environment with CFLAGS and
+            CXXFLAGS deleted, so the two command-line arms read `ENV_SEEN=0`
+            on any host -- including one that happens to export CFLAGS
+            itself, which would otherwise make their certification wrong for
+            a reason that has nothing to do with this repo.
+            """
             build = root / name
             build.mkdir()
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CFLAGS", "CXXFLAGS")}
+            if cflags is not None:
+                env["CFLAGS"] = cflags
             done = subprocess.run(
-                [CMAKE, str(src), *args], cwd=str(build),
-                env={**os.environ, **(env or {})},
+                [CMAKE, str(src), *args], cwd=str(build), env=env,
                 capture_output=True, text=True, timeout=120)
             found = dict(re.findall(r"VB_PROBE (\w+)=(\d)", done.stdout))
             if not found:
@@ -807,22 +851,22 @@ class TestCmakeReallyTreatsAnEmptyValueAsUnset:
 
         return (
             configure("cmdline_nonempty",
-                      ["-DCMAKE_C_FLAGS=-O3 -g -march=x86-64-v3"], None),
+                      ["-DCMAKE_C_FLAGS=" + _ENV_CFLAGS], None),
             configure("cmdline_empty", ["-DCMAKE_C_FLAGS="], None),
-            configure("env_only", [],
-                      {"CFLAGS": "-O3 -g -march=x86-64-v3"}),
+            configure("env_only", [], _ENV_CFLAGS),
         )
 
     @staticmethod
     def _readings(arm: dict) -> dict:
-        """The probe's answers, without `rc`.
+        """The guard's answers only -- not `rc`, and not `ENV_SEEN`.
 
-        Compared without it on purpose: the dead-probe check below says the
-        two arms answered identically, and two arms differing only in exit
-        status would satisfy a whole-dict comparison while every reading
-        matched.
+        Narrowed on purpose. The dead-probe checks below say that two arms
+        answered the GUARD differently; `rc` is not an answer at all, and
+        `ENV_SEEN` differs between the arms by construction, so including
+        either would let a pair satisfy the check while every reading that
+        matters matched.
         """
-        return {k: v for k, v in arm.items() if k != "rc"}
+        return {k: arm[k] for k in _GUARD_KEYS if k in arm}
 
     def test_an_empty_value_does_not_close_the_hatch(self, probe):
         """All three arms reported; an identical pair is a dead probe."""
@@ -856,6 +900,12 @@ class TestCmakeReallyTreatsAnEmptyValueAsUnset:
         nonempty, _empty, env_only = probe
         report = f"env CFLAGS only = {env_only}; cmdline non-empty = {nonempty}"
 
+        assert env_only["ENV_SEEN"] == "1", (
+            f"THIS ARM NEVER SAW ITS OWN INPUT: cmake reported CFLAGS empty "
+            f"in the environment, so whatever the hatch reading says, it is "
+            f"not a statement about an exported CFLAGS. Dropping the "
+            f"injection used to pass this class silently -- which is why the "
+            f"snippet reports ENV_SEEN at all. {report}")
         assert env_only[_VERDICT_KEY] == "1", (
             f"an exported CFLAGS CLOSED the tree's hatch. Either cmake reads "
             f"the environment before PROJECT() now, or this snippet lost its "
@@ -866,6 +916,31 @@ class TestCmakeReallyTreatsAnEmptyValueAsUnset:
             f"DEAD PROBE -- an exported CFLAGS and a command-line value gave "
             f"identical readings, so this arm cannot tell the environment "
             f"from the command line. {report}")
+
+    def test_the_probe_certifies_its_own_input(self, probe):
+        """Each arm saw the environment it was given, as cmake reports it.
+
+        This is the reading that makes the arm above mean what its name says.
+        It is asserted for all three arms, not just the environment one: if
+        the two command-line arms ALSO saw a CFLAGS, then their `ENV_SEEN=0`
+        premise is false and the three arms are not the three regimes this
+        class claims to compare.
+        """
+        nonempty, empty, env_only = probe
+        report = (f"ENV_SEEN: cmdline non-empty = {nonempty.get('ENV_SEEN')}, "
+                  f"cmdline empty = {empty.get('ENV_SEEN')}, "
+                  f"env only = {env_only.get('ENV_SEEN')} "
+                  f"(injected CFLAGS = {_ENV_CFLAGS!r})")
+        print(f"\nMEASURED probe input certification: {report}")
+
+        assert env_only["ENV_SEEN"] == "1", (
+            f"the environment arm did not see its own injected CFLAGS. {report}")
+        for name, arm in (("cmdline_nonempty", nonempty),
+                          ("cmdline_empty", empty)):
+            assert arm["ENV_SEEN"] == "0", (
+                f"{name} saw a CFLAGS in the environment, so it is not a "
+                f"command-line-only arm and the comparison below is not "
+                f"between the regimes this class names. {report}")
 
     def test_the_mechanism_reading_is_reported_but_not_relied_on(self, probe):
         """`INITIAL_DEFINED` is mechanism, `HATCH_OPEN` is the verdict.
