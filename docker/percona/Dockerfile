@@ -102,14 +102,14 @@
 #      disqualify it here, and all six are read from the script at the pin:
 #
 #        :17, :55   TARGET_CFLAGS='' and the only -march it ever sets is
-#                   `-m32 -march=i686`, for 32-bit. On x86_64 the flags come
-#                   from `rpm --eval %optflags` (:217-218) inside
-#                   `if [ -n "$(command -v rpm)" ]`, so on this noble image
-#                   there is no rpm, COMMON_FLAGS stays empty, and CFLAGS
-#                   (:233) carries nothing. Percona would compile with no
-#                   -march while the other four source-built engines carry
-#                   x86-64-v3 -- the first invariant in CLAUDE.md, and the one
-#                   that turns the study into a comparison of compiler flags.
+#                   `-m32 -march=i686`, for 32-bit. On x86_64 the script's own
+#                   flags come from `rpm --eval %optflags` (:217-218) inside
+#                   `if [ -n "$(command -v rpm)" ]` and this noble image has
+#                   no rpm, so COMMON_FLAGS holds only :232's
+#                   -DPERCONA_INNODB_VERSION and the SCRIPT names no -march.
+#                   It does NOT erase a caller's: :233 is `export
+#                   CFLAGS="$COMMON_FLAGS ${CFLAGS:-}"`, an APPEND. Naming one
+#                   stays our job -- CLAUDE.md, "Never mix -march".
 #        :270       WITH_PGO defaults to 1: a three-pass profile-guided build.
 #                   Percona would be the only engine in the study with PGO.
 #        :312       -DWITH_LTO=ON, against a tree default of OFF
@@ -385,58 +385,250 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # as far down as `ARG PERCONA_TAG`. That asymmetry is why
 # tests/test_e5_percona_make_output_sync.py pins the flag's side of the
 # anchor rather than trusting either suite to notice.
-# CFLAGS carries an explicit -D_FORTIFY_SOURCE=2. That is a build FIX, not a
-# hardening preference: without it this image does not compile at all.
 #
-# The symptom was three builds ending in `make: *** [Makefile:166: all] Error
-# 2` with nothing in the tail naming a file. The serial retry above is what
-# finally put the real error last:
+# CFLAGS CANNOT BE HANDED TO THIS TREE BY `export` ALONE ON A DEBIAN HOST, AND
+# THE cmake LINE BELOW CARRIES THREE FLAGS THAT EXIST ONLY FOR THAT. Every step
+# of the chain is READ from the pinned tree
+# (02a8b80c70b0ccf6c9035d8a2307e7fa988cc304) unless it says MEASURED, which
+# means measured on the build host rather than inside this image:
 #
-#     extra/libfido2/libfido2-1.15.0/src/.../aes256.c.o
-#     <command-line>: error: "_FORTIFY_SOURCE" redefined
-#     <command-line>: note: this is the location of the previous definition
+#   1. source CMakeLists.txt:747-764 -- for `LINUX_STANDALONE AND
+#      (LINUX_DEB_PLATFORM OR LINUX_RPM_PLATFORM)` (:750) the tree offers a
+#      WITH_PACKAGE_FLAGS option (:762-763), and :758 defaults it **ON** when
+#      the build type is RELWITHDEBINFO. Every other branch defaults it OFF:
+#      any sanitizer at :753-754, DEBUG/WITH_DEBUG at :755-756, everything
+#      else at :759-760. This image is RelWithDebInfo (`ARG BUILD_TYPE` above,
+#      and `build.type` in config/engines/percona.yml), so it is ON unless we
+#      say otherwise. READ.
+#      Both of that condition's terms hold here, and these two files were
+#      fetched from the pin itself rather than inferred from AliSQL's copies:
+#      `cmake/os/Linux.cmake:56-58` is
+#      `IF(LINUX_DEBIAN OR LINUX_UBUNTU) SET(LINUX_DEB_PLATFORM 1)` and
+#      CMakeLists.txt:286 is where `LINUX_UBUNTU` is set; the base image is
+#      ubuntu:24.04. `cmake/install_layout.cmake:114-116` is
+#      `IF(LINUX AND INSTALL_LAYOUT MATCHES "STANDALONE")
+#      SET(LINUX_STANDALONE 1)`, and :80/:83 default INSTALL_LAYOUT to
+#      STANDALONE, which nothing in this image overrides. READ.
+#   2. source CMakeLists.txt:769-770 -- the escape hatch is
+#      `IF(MY_COMPILER_IS_GNU AND WITH_PACKAGE_FLAGS AND NOT
+#      INITIAL_CMAKE_C_FLAGS AND NOT INITIAL_CMAKE_CXX_FLAGS)`. READ.
+#   3. source CMakeLists.txt:313-322 -- INITIAL_CMAKE_C_FLAGS is captured from
+#      `IF(DEFINED CMAKE_C_FLAGS)`, and that block runs BEFORE `PROJECT()`;
+#      :326 is where the tree says it has to ("Cannot
+#      INCLUDE(CMakeDetermineSystem) prior to PROJECT initialization below").
+#      The tree's own comment at :313-314 says the capture is for values picked
+#      up "form the CACHE or from the command line" -- THE ENVIRONMENT IS NOT
+#      IN THAT LIST, and cmake does not read $CFLAGS until the C language is
+#      enabled, which happens inside PROJECT().
+#      MEASURED, with that snippet alone on cmake 3.28.3 (noble's cmake): with
+#      `CFLAGS` exported, `DEFINED CMAKE_C_FLAGS` is FALSE before PROJECT() and
+#      the value appears only after it, so `NOT INITIAL_CMAKE_C_FLAGS` reads
+#      TRUE and the hatch stays OPEN. With `-DCMAKE_C_FLAGS=` on the command
+#      line it is DEFINED before PROJECT() and the hatch CLOSES. So exporting
+#      CFLAGS does not arm the guard; only the command line does.
+#      ALSO MEASURED, and the sharp edge on this flag: the command-line value
+#      has to be NON-EMPTY. With `-DCMAKE_C_FLAGS=` and nothing after it,
+#      CMAKE_C_FLAGS is DEFINED with an empty value, but the capture is
+#      `SET(INITIAL_CMAKE_C_FLAGS ${CMAKE_C_FLAGS})` with the expansion
+#      UNQUOTED -- an empty expansion supplies zero arguments, so that is
+#      `SET(INITIAL_CMAKE_C_FLAGS)`, which UNSETS the variable rather than
+#      setting it to "". MEASURED: `IF(DEFINED INITIAL_CMAKE_C_FLAGS)` is
+#      false in that case. Either way `IF(NOT ...)` reads TRUE, so the hatch
+#      stays open and the overwrite happens anyway. That is why this image
+#      passes the real
+#      CFLAGS rather than a placeholder, and the second reason
+#      `-DWITH_PACKAGE_FLAGS=OFF` is passed as well. (The vendor's own value
+#      is non-empty too: build-binary.sh:282 sets TARBALL_WARN_SUPPRESS to
+#      five `-Wno-` flags before :290-291 pass it. READ.)
+#   4. source cmake/compile_flags.cmake:119-136 -- ADD_LINUX_DEB_FLAGS() then
+#      runs. Its four `SET(... PARENT_SCOPE)` calls sit INSIDE the
+#      `FOREACH(flag CPPFLAGS CFLAGS CXXFLAGS LDFLAGS)` at :120-135, not after
+#      it, so they execute once per iteration and only the last pass has every
+#      `GET_*` variable populated -- which is why the net effect is simply the
+#      final values. The one that matters is
+#      `SET(CMAKE_C_FLAGS "${GET_CFLAGS}   ${GET_CPPFLAGS}" PARENT_SCOPE)`
+#      (:130), with the CXX equivalent at :131: an OVERWRITE and not an
+#      append, so everything exported above is DISCARDED. :132-134 set
+#      CMAKE_EXE_LINKER_FLAGS, CMAKE_MODULE_LINKER_FLAGS and
+#      CMAKE_SHARED_LINKER_FLAGS from dpkg's LDFLAGS the same way. READ.
+#   5. dpkg-buildflags is present in the builder because it installs
+#      build-essential (the apt list above), so MY_DPKG_BUILDFLAGS is found and
+#      step 4 fires. MEASURED on the build host (Ubuntu 24.04.5, dpkg 1.22.6 --
+#      the same series as this image's ubuntu:24.04 base): `apt-cache depends
+#      build-essential` lists `Depends: dpkg-dev`, and
+#      `dpkg -S $(command -v dpkg-buildflags)` answers
+#      `dpkg-dev: /usr/bin/dpkg-buildflags`. Its output there, also MEASURED:
+#        --get CPPFLAGS -> `-Wdate-time -D_FORTIFY_SOURCE=3`
+#        --get CFLAGS   -> `-g -O2 -fno-omit-frame-pointer
+#            -mno-omit-leaf-frame-pointer -ffile-prefix-map=<cwd>=. -flto=auto
+#            -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection
+#            -Wformat -Werror=format-security -fcf-protection`
 #
-# Two definitions with different values reach the preprocessor. The tree asks
-# for 2 -- source CMakeLists.txt:1586 prepends `-DNDEBUG -D_FORTIFY_SOURCE=2`
-# for RELEASE/RELWITHDEBINFO/MINSIZEREL -- and gcc on noble supplies 3 of its
-# own. Measured on ubuntu:24.04's gcc 13.3: `echo | gcc -O3 -dM -E -` prints
-# `#define _FORTIFY_SOURCE 3`.
+# TWO CONSEQUENCES, AND THE SECOND IS THE SERIOUS ONE.
 #
-# Ubuntu's default stands down as soon as it sees a -D for the macro on the
-# command line: measured, `gcc -O3 -D_FORTIFY_SOURCE=2` warns nothing and the
-# effective value is 2. So the tree's own definition is arriving in a form the
-# driver's scan cannot see. `-Wp,-D...` is the only form reproduced that
-# behaves this way -- plain -D, a @response-file, C++ and -std=c99 all let the
-# default stand down. The emitting site was NOT found in the pinned tree and
-# this comment does not pretend to know it: the fix does not depend on which
-# site it is. A plain -D here makes the driver stand down, and every
-# definition that then remains says 2. Identical redefinition is silent.
+# (a) THE BUILD FAILURE. Three builds ended in `make: *** [Makefile:166: all]
+#     Error 2` with nothing in the tail naming a file. The serial retry above
+#     is what finally put the real error last:
 #
-# Only libfido2 FAILS on it. The rest of the build prints the same
-# redefinition as a warning and carries on -- bundled absl does, at 69% --
-# which is why three builds reached 20-69% before dying. libfido2 adds
-# `-pedantic-errors` (source extra/libfido2/libfido2-1.15.0/CMakeLists.txt
-# :329-330), and that turns this one diagnostic into a hard error.
-# -pedantic-errors is also the only flag tried that reproduces the log's exact
-# form: a bare `error:` with a `note:` and no `cc1: all warnings being treated
-# as errors` line. It is NOT -Werror, which prints a `[-Werror]` tag and that
-# summary. Nor can it be demoted -- -Wno-error=cpp, -Wno-pedantic and
-# -Wno-builtin-macro-redefined all leave the error standing (measured).
-# Removing the conflict is the only route, which is why this is a -D and not
-# a -Wno-.
+#         extra/libfido2/libfido2-1.15.0/src/.../aes256.c.o
+#         <command-line>: error: "_FORTIFY_SOURCE" redefined
+#         <command-line>: note: this is the location of the previous definition
 #
-# The value is 2 and must not be 3: it has to AGREE with what the tree asks
-# for, and 3 against the tree's 2 would reinstate the conflict it removes. It
-# also lines this image up with the two MariaDB builds, which ask for 2
-# plainly and get it (mariadb-11.8.8:CMakeLists.txt:290 and
-# mariadb-12.3.2:CMakeLists.txt:303, read at both pins) while this one was
-# compiling at 3. _FORTIFY_SOURCE=3 adds dynamic object-size checks that 2
-# does not, so that was a codegen difference between engines in the same
-# study -- the same class of problem as -march. The pinned AliSQL sets no
-# level of its own and is still on the compiler default; that is a separate
-# question and this file does not answer it.
+#     Both definitions are ordinary `-D`s on one command line and they
+#     disagree. Step 5's `-D_FORTIFY_SOURCE=3` arrives in CMAKE_C_FLAGS through
+#     CPPFLAGS, while the tree prepends its own `-DNDEBUG -D_FORTIFY_SOURCE=2`
+#     into CMAKE_C_FLAGS_<BUILDTYPE> for the three non-debug types at source
+#     CMakeLists.txt:1583-1588 (READ). gcc's own Ubuntu default never enters
+#     it: the driver stands that default down as soon as a -D for the macro is
+#     on the command line, and here there are two.
 #
-# tests/test_e7_percona_fortify_level.py holds the value and the reasoning.
+#     Only libfido2 FAILS on it. Everywhere else the same redefinition is a
+#     warning and the build carries on -- bundled absl does, at 69% -- which is
+#     why three builds reached 20-69% before dying. libfido2 adds
+#     `-pedantic-errors` (source extra/libfido2/libfido2-1.15.0/CMakeLists.txt
+#     :329-330, READ), and that turns this one diagnostic into a hard error.
+#     -pedantic-errors is also the only flag tried that reproduces the log's
+#     exact form: a bare `error:` with a `note:` and no `cc1: all warnings
+#     being treated as errors` line. It is NOT -Werror, which prints a
+#     `[-Werror]` tag and that summary. Nor can it be demoted --
+#     -Wno-error=cpp, -Wno-pedantic and -Wno-builtin-macro-redefined all leave
+#     the error standing (MEASURED).
+#
+# (b) `-march=x86-64-v3` IS SILENTLY DROPPED. Step 4 replaces CMAKE_C_FLAGS
+#     wholesale, so the entire exported string goes. The delta is exactly two
+#     things: `-march=x86-64-v3` is LOST, and dpkg's `-flto=auto
+#     -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection
+#     -fcf-protection` are GAINED. The LTO is real LTO and not just a compile
+#     flag, because compile_flags.cmake:132-134 sets all three of cmake's
+#     LINKER_FLAGS variables from dpkg's LDFLAGS as well -- so link-time
+#     optimization, which tests/test_e6_percona_vendor_alignment.py forbids
+#     this image from taking off the vendor script, arrives through the back
+#     door instead.
+#     THE BREACH HAS NO SYMPTOM. `echo "${MARCH}" > /opt/percona/.march` below
+#     writes the build ARG, not what cmake honoured, so that file and every
+#     `march` reader in this repo report x86-64-v3 whichever way the configure
+#     went. CLAUDE.md's "Never mix -march between engines" is what this
+#     violates, and a Percona number produced without the SIMD baseline the
+#     other source-built engines carry, and with LTO none of them have, is
+#     exactly the comparison-of-compiler-flags outcome those guards exist to
+#     prevent.
+#
+#     THE OPTIMISATION LEVEL IS NOT PART OF THIS, in either direction, and no
+#     sentence here should imply otherwise. `-O3` in the exported CFLAGS has
+#     NEVER reached the compiler for this engine, before this fix or after it.
+#     Both trees say why in their own words -- source CMakeLists.txt:2959-2969
+#     (AliSQL's copy at :2709-2719) records that the command line is
+#     `g++ DEFINITIONS CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_<configuration>` and
+#     that RELWITHDEBINFO's own value is `-O2 -g -DNDEBUG`, and names the only
+#     remedy: `cmake -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O3 -g -DNDEBUG"`,
+#     which this image does not pass. MEASURED, on cmake 3.28.3 and gcc 13:
+#     a RelWithDebInfo project configured with `-DCMAKE_C_FLAGS="-O3 -g
+#     -march=x86-64-v3"` compiles with
+#     `cc -O3 -g -march=x86-64-v3 -O2 -g -DNDEBUG`, and
+#     `gcc -O3 -O2 -Q --help=optimizers` is byte-identical to `gcc -O2` and
+#     differs from `gcc -O3` -- the LAST -O wins, so the effective level is 2.
+#     (-march has no such competitor in the per-config flags, which is why it
+#     DOES reach the compiler once step 4 stops discarding it.) That this
+#     study mixes -O2 and -O3 across engines is a real and separate defect; it
+#     is not this fix's to make or to claim.
+#
+# THE PREVIOUS FIX AIMED AT THE RIGHT SYMPTOM THROUGH THE WRONG MECHANISM AND
+# DID NOT WORK, and this paragraph replaces its account rather than softening
+# it. It added `-D_FORTIFY_SOURCE=2` to the exported CFLAGS on the theory that
+# the tree's own 2 was reaching the preprocessor as a `-Wp,-D...` that the gcc
+# driver's scan could not see, letting the driver add its own 3 beside it.
+# There is no such `-Wp,` define in this tree. The emitting site is step 5, the
+# conflicting value is 3 and it is a plain `-D`, the driver's own default is
+# not involved at all, and -- decisively -- the export that fix added was
+# itself discarded by step 4 along with everything else, so it could not have
+# taken effect either way.
+#
+# THE FIX IS THE PAIR OF DEFENCES PERCONA'S OWN PACKAGING USES, and both are on
+# the cmake line below: build-ps/build-binary.sh:307 passes
+# `-DWITH_PACKAGE_FLAGS=OFF`, which closes step 1, and :290-291 pass
+# `-DCMAKE_C_FLAGS=` and `-DCMAKE_CXX_FLAGS=` on the cmake COMMAND LINE, which
+# closes step 3 (both READ at the pin). Either alone would be enough today;
+# both are passed because they fail in different directions. A future tree that
+# renames or re-defaults the option leaves the command line standing, and a
+# future tree that learns to capture the environment leaves the option
+# standing.
+#
+# THE `export CFLAGS=`/`export CXXFLAGS=` LINES STAY. Sub-builds that are not
+# this cmake project read them from the environment -- extra/libfido2 and the
+# bundled ExternalProjects -- and the exported string is literally what the new
+# `-D` flags pass on, so the command line and the environment cannot drift
+# apart.
+#
+# THE `-D_FORTIFY_SOURCE=2` TOKEN IN CFLAGS ALSO STAYS, AND ITS LEVEL IS NOT
+# FREE TO DRIFT, but its job has changed and the change is worth being plain
+# about. It must AGREE with the 2 the tree prepends at CMakeLists.txt:1583-1588
+# -- 3 against that 2 is the redefinition conflict again rather than a stronger
+# fix, and a bare `-D_FORTIFY_SOURCE` means 1, which conflicts the same way.
+# WHAT IT DOES NOT BUY, AND AN EARLIER VERSION OF THIS NOTE CLAIMED IT DID:
+# this image was NOT compiling at 3. Pre-fix the compile line ended with the
+# tree's own `-D_FORTIFY_SOURCE=2` from CMAKE_C_FLAGS_RELWITHDEBINFO (:1586),
+# AFTER dpkg's `=3` in CMAKE_C_FLAGS, and the last -D of a macro wins.
+# MEASURED: `gcc -O2 -D_FORTIFY_SOURCE=3 -D_FORTIFY_SOURCE=2 -dM -E -` prints
+# `#define _FORTIFY_SOURCE 2`, and the reverse order prints 3. So the image was
+# compiling at 2 -- AGREEING with both MariaDB pins, which ask for 2 plainly
+# (mariadb-11.8.8:CMakeLists.txt:290 and mariadb-12.3.2:CMakeLists.txt:303,
+# both `MY_CHECK_AND_SET_COMPILER_FLAG("-D_FORTIFY_SOURCE=2" RELEASE
+# RELWITHDEBINFO)`, READ at both pins) -- while printing a redefinition warning
+# in every translation unit and dying in libfido2. There was no engine-to-engine
+# codegen difference in the hardening level, and the argument that there was has
+# been removed rather than softened. The divergence that WAS real is -march, and
+# consequence (b) above is where that argument belongs.
+# What this token is NOT, any more, is the thing that fixes the build: with
+# WITH_PACKAGE_FLAGS=OFF there is no second, disagreeing definition left for it
+# to agree with.
+#
+# THE PINNED AliSQL HAS THE IDENTICAL DEFECT. Its CMakeLists.txt:782-799 is
+# this same option block (WITH_PACKAGE_FLAGS_DEFAULT ON for RELWITHDEBINFO at
+# :793, sanitizer and DEBUG branches at :788-791), :801-820 is this same guard
+# (the condition at :804-805), :303-306 is the same INITIAL_CMAKE_C_FLAGS
+# capture, and its cmake/compile_flags.cmake:120-137 is this same function with
+# the overwrite at :131 -- all READ at its own pin.
+# docker/alisql/Dockerfile now carries the same three flags and a note of its
+# own.
+#
+# WHY ALISQL NEVER HIT CONSEQUENCE (a), re-derived, because an earlier version
+# of this note gave the wrong reason ("the string appears only in two
+# comments"). MEASURED over sources/alisql-AliSQL-8.0.44-2.tar: `_FORTIFY_SOURCE`
+# occurs 11 times on 10 lines in 9 files. Eight of those files are comments or
+# inert -- source/CMakeLists.txt:783, gperftools' CMakeLists.txt:278 and
+# configure.ac:349, libfido2's commented-out set() at :349, a
+# `#ifndef`/`#define _FORTIFY_SOURCE 3` pair in libevent's evdns.c:56-57, and
+# three rpm `%optflags` seds in packaging/rpm-* (4 hits: fedora names twice).
+# Exactly ONE is live code:
+# extra/libevent/libevent-2.1.11-stable/CMakeLists.txt:365,
+# `add_definitions(-D_FORTIFY_SOURCE=2)`. But it is inside
+# `if (EVENT__ENABLE_GCC_HARDENING)` (:357), an option declared with default
+# **OFF** at :321 and set nowhere else in the tree (grepped: those two lines are
+# its only occurrences) -- so it is not emitted. libevent itself IS compiled
+# (cmake/libevent.cmake:164-166 default WITH_LIBEVENT to `bundled`, :148 and
+# :153 set the path and ADD_SUBDIRECTORY it, and source/CMakeLists.txt:1965
+# calls MYSQL_CHECK_LIBEVENT() unconditionally); it is the define that is
+# switched off. So no second, disagreeing definition reached any AliSQL object:
+# dpkg's `=3` simply replaced gcc's own default of 3 and nothing was redefined.
+#
+# AND INDEPENDENTLY, the escalation that killed this image cannot occur there at
+# all. AliSQL vendors the same libfido2 1.15.0, with the same
+# `-pedantic-errors` at extra/libfido2/libfido2-1.15.0/CMakeLists.txt:329-330 --
+# but source/CMakeLists.txt:2110-2118 adds `extra/libfido2` only
+# `IF((WITH_AUTHENTICATION_FIDO OR WITH_AUTHENTICATION_CLIENT_PLUGINS) AND NOT
+# UDEV_WARN_MISSING)`, and config/engines/alisql.yml:96-97 pass BOTH of those
+# OFF. So AliSQL compiles no libfido2 object and that flag is applied to
+# nothing. (config/engines/percona.yml passes neither flag, which is why THIS
+# image does compile it -- and why its log names
+# extra/libfido2/libfido2-1.15.0/src/.../aes256.c.o.)
+#
+# INFERRED, NOT OBSERVED: no AliSQL build log was available. The two paragraphs
+# above are read from the cmake sources at the pin, not from a recorded build.
+# What is not in doubt is consequence (b), which applied to AliSQL in full and
+# in silence.
+#
+# tests/test_e7_percona_fortify_level.py holds the fortify level and its
+# reasoning; tests/test_e8_package_flags_overwrite.py holds this chain.
 RUN set -eux; \
     JOBS="${JOBS:-0}"; [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS="$(nproc)"; \
     mkdir -p /build; \
@@ -445,6 +637,9 @@ RUN set -eux; \
     export CXXFLAGS="$CFLAGS"; \
     cmake /src/source \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+      -DWITH_PACKAGE_FLAGS=OFF \
+      -DCMAKE_C_FLAGS="$CFLAGS" \
+      -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
       -DCMAKE_INSTALL_PREFIX=/opt/percona \
       -DMYSQL_DATADIR=/var/lib/vbench/data \
       -DSYSCONFDIR=/opt/percona \

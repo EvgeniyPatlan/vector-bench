@@ -43,6 +43,24 @@ build:
   # build appears to stall for a long stretch with no output. That is expected.
   # Budget 1.5-3 hours for a cold AliSQL build and several GB of scratch space.
   cmake_flags:
+    # NOT one of AliSQL's own release flags: it stops the TREE discarding the
+    # CFLAGS the builder exports. Source `CMakeLists.txt:793` defaults
+    # WITH_PACKAGE_FLAGS ON for a RELWITHDEBINFO standalone build on a DEB
+    # platform -- `build.type` above -- and `cmake/compile_flags.cmake:131`
+    # then OVERWRITES CMAKE_C_FLAGS with `dpkg-buildflags` output, so
+    # `-march: x86-64-v3` above and `-O3` are silently dropped and nothing
+    # reports it (`/opt/alisql/.march` is written from the build ARG). Both
+    # READ at the pin; docker/alisql/Dockerfile carries the chain and the
+    # consequence for AliSQL's already-published numbers, and
+    # tests/test_e8_package_flags_overwrite.py pins both copies.
+    #
+    # Duplicated with the Dockerfile's copy on purpose:
+    # `scripts/build-images.sh:119` appends this list as ${CMAKE_FLAGS} AFTER
+    # the Dockerfile's own flags, so a value here can only confirm, never
+    # remove. `-DCMAKE_C_FLAGS=`, the other half of the fix, is deliberately
+    # NOT here -- appended last it would win, carrying whatever literal this
+    # file held instead of the `$CFLAGS` the builder actually exported.
+    - -DWITH_PACKAGE_FLAGS=OFF
     - -DFORCE_INSOURCE_BUILD=ON
     - -DWITH_UNIT_TESTS=0
     - -DWITH_DEBUG=0

@@ -91,6 +91,28 @@ build:
   # upstream flag governs. The fix for all of them is the builder stage's apt
   # list in docker/percona/Dockerfile, not a flag.
   cmake_flags:
+    # NOT a vector-search option, and the only entry in this list that exists
+    # to stop the TREE discarding our flags rather than to switch a component
+    # off. Percona's source `CMakeLists.txt:758` defaults WITH_PACKAGE_FLAGS ON
+    # for a RELWITHDEBINFO standalone build on a DEB platform -- which is
+    # exactly `build.type` above -- and `cmake/compile_flags.cmake:130` then
+    # OVERWRITES CMAKE_C_FLAGS with `dpkg-buildflags` output, taking `-march`
+    # and `-O3` with it. Both READ at the pin. The full chain, with its
+    # measurements, is written out in docker/percona/Dockerfile above that
+    # file's own copy of this flag, and
+    # tests/test_e8_package_flags_overwrite.py pins both copies.
+    #
+    # This IS the deliberate duplicate the note above describes, not drift:
+    # `scripts/build-images.sh:119` appends this list as ${CMAKE_FLAGS} AFTER
+    # the Dockerfile's own flags, so a value here can only confirm or override
+    # one of them, never remove it.
+    #
+    # `-DCMAKE_C_FLAGS=`, the other half of the fix, is deliberately NOT here
+    # and must not be added. Being appended LAST it would WIN, and the value it
+    # would carry is whatever literal this file happened to hold -- not the
+    # `$CFLAGS` the builder stage exported two lines above its cmake call,
+    # which is what the Dockerfile's copy passes on.
+    - -DWITH_PACKAGE_FLAGS=OFF
     - -DWITH_COREDUMPER=OFF
     - -DWITH_AUTH_OPENID_CONNECT=OFF
     - -DWITH_CURL=bundled

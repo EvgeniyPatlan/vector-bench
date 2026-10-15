@@ -1671,7 +1671,7 @@ CITED_IN_REPO = {
     # Found only once `_CITE_RE` learned to see extensionless filenames --
     # see the note on that pattern. It is the citation that sat at `:113`,
     # 51 lines wrong, for this document's whole life.
-    "docker/percona/Dockerfile:476":
+    "docker/percona/Dockerfile:671":
         ("docker/percona/Dockerfile", "ARG PERCONA_TAG=unknown"),
     "docker/alisql/entrypoint-alisql.sh:94":
         ("docker/alisql/entrypoint-alisql.sh", 'local u; u="$(user_args)"'),
@@ -1764,9 +1764,13 @@ FOREIGN_MARKERS = (
 #: **IT WAS ADDED BECAUSE THE OMISSION HID A LIVE ERROR.** The parser saw 60 of
 #: this document's 72 citations; eleven of the misses were foreign `.result` and
 #: `.test` paths that `_is_foreign` would have skipped anyway, and exactly one
-#: was in-repo: `docker/percona/Dockerfile:164`, which sat in §4.7 reading
-#: `:113` -- wrong by 51 lines, pointing at `ENV DEBIAN_FRONTEND`, with nothing
-#: in this file able to see it. A completeness guard that cannot see a whole
+#: was in-repo: the `docker/percona/Dockerfile` citation, which sat in §4.7
+#: reading `:113` -- wrong by 51 lines, pointing at `ENV DEBIAN_FRONTEND`, with
+#: nothing in this file able to see it. (No line number is given for it here on
+#: purpose: this is a narrative about a citation that has since been corrected
+#: and has since moved, and a number in prose that nothing checks is exactly
+#: the rot the row below exists to stop. The live, checked number is in
+#: CITED_IN_REPO.) A completeness guard that cannot see a whole
 #: CLASS of citation reports coverage it does not have, which is the same shape
 #: as the vacuity it exists to catch.
 #:

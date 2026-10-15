@@ -40,6 +40,99 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 
 # AliSQL's own build.sh forces an in-source build, so cmake runs in the tree.
 # Flags mirror its release configuration; see config/engines/alisql.yml.
+#
+# THE THREE FLAGS AT THE TOP OF THE cmake LINE BELOW ARE NOT DECORATION, AND
+# `export CFLAGS=` ALONE DOES NOT REACH THIS TREE ON A DEBIAN HOST. AliSQL is
+# MySQL-family and carries the same package-flags machinery Percona does; the
+# full chain, with its measurements, is written out in
+# docker/percona/Dockerfile beside the identical flags there. In short, all
+# READ from the pinned AliSQL tree unless marked MEASURED:
+#
+#   * source CMakeLists.txt:782-799 offers WITH_PACKAGE_FLAGS for a
+#     `LINUX_STANDALONE` DEB/RPM platform (the condition is :785) and :793
+#     defaults it **ON** for RELWITHDEBINFO, which is this image's build type
+#     (`ARG BUILD_TYPE` above and `build.type` in config/engines/alisql.yml).
+#     Every other branch defaults it OFF: any sanitizer at :788-789,
+#     DEBUG/WITH_DEBUG at :790-791, everything else at :794-795.
+#   * the guard at source CMakeLists.txt:801-820 only stands down if
+#     INITIAL_CMAKE_C_FLAGS is set (the condition is :804-805), and :303-306
+#     captures that from `IF(DEFINED CMAKE_C_FLAGS)`
+#     BEFORE `PROJECT()` -- which cmake satisfies from the command line or the
+#     cache, never from the environment. MEASURED on cmake 3.28.3 with that
+#     snippet alone: an exported `CFLAGS` leaves `CMAKE_C_FLAGS` undefined at
+#     that point, a command-line `-DCMAKE_C_FLAGS=` defines it.
+#   * source cmake/compile_flags.cmake:120-137 then runs
+#     ADD_LINUX_DEB_FLAGS(). Its four `SET(... PARENT_SCOPE)` calls sit INSIDE
+#     the `FOREACH(flag CPPFLAGS CFLAGS CXXFLAGS LDFLAGS)` at :121-136, so they
+#     run once per iteration and only the last pass has every `GET_*`
+#     populated; the one that matters is
+#     `SET(CMAKE_C_FLAGS "${GET_CFLAGS}   ${GET_CPPFLAGS}" PARENT_SCOPE)`
+#     (:131) -- an OVERWRITE -- and :133-135 replace the three LINKER_FLAGS
+#     from dpkg's LDFLAGS too. dpkg-buildflags is present because this builder
+#     installs build-essential above, which depends on dpkg-dev (MEASURED on
+#     the build host).
+#
+# The consequence here is the quiet one, and it is exactly two things.
+# `-march=${MARCH}` -- x86-64-v3, which config/engines/alisql.yml and
+# CLAUDE.md's "Never mix -march between engines" both require to equal every
+# other source-built engine's -- IS DISCARDED along with the whole exported
+# string; and dpkg's `-flto=auto -ffat-lto-objects -fstack-protector-strong
+# -fstack-clash-protection -fcf-protection` arrive in its place, the LTO being
+# real LTO because compile_flags.cmake:133-135 replaces the LINKER_FLAGS too.
+# `echo "${MARCH}" > /opt/alisql/.march` below writes the build ARG and not
+# what cmake honoured, so the file and every `march` reader in this repo say
+# x86-64-v3 whichever way the configure went: THE BREACH HAS NO SYMPTOM.
+#
+# THE OPTIMISATION LEVEL IS NOT PART OF THIS. `-O3` in the exported CFLAGS has
+# never reached the compiler for this engine, before this fix or after it: the
+# compile line is `CMAKE_C_FLAGS CMAKE_C_FLAGS_<configuration>` and
+# RelWithDebInfo's own value ends it with `-O2 -g -DNDEBUG`, which this tree
+# spells out itself at source CMakeLists.txt:2709-2719 along with the remedy
+# this image does not pass (`-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=...`). MEASURED
+# on cmake 3.28.3 and gcc 13: the emitted command is
+# `cc -O3 -g -march=x86-64-v3 -O2 -g -DNDEBUG` and the last -O wins. That the
+# study mixes -O2 and -O3 across engines is a separate defect; this fix neither
+# causes nor repairs it.
+#
+# ALISQL'S ALREADY-PUBLISHED SMOKE NUMBERS PREDATE THIS FIX and were therefore
+# almost certainly produced by a binary compiled WITHOUT -march=x86-64-v3 and
+# WITH LTO. They are not comparable with numbers from an image built after this
+# commit and must be re-measured rather than reused. That conclusion rests on
+# -march and LTO alone.
+#
+# WHY THE PERCONA BUILD FAILURE NEVER HAPPENED HERE, which is not for the
+# reason an earlier version of this note gave. MEASURED over
+# sources/alisql-AliSQL-8.0.44-2.tar: `_FORTIFY_SOURCE` occurs 11 times on 10
+# lines in 9 files, and exactly ONE of them is live code --
+# extra/libevent/libevent-2.1.11-stable/CMakeLists.txt:365,
+# `add_definitions(-D_FORTIFY_SOURCE=2)`. That line sits inside
+# `if (EVENT__ENABLE_GCC_HARDENING)` (:357), an option declared default **OFF**
+# at :321 and set nowhere else in the tree, so it is never emitted -- libevent
+# is compiled (cmake/libevent.cmake:164-166, :148, :153 and
+# source/CMakeLists.txt:1965) but that define is not. With no second,
+# disagreeing definition, dpkg's `=3` merely replaced gcc's own default of 3
+# and nothing was redefined at all. Independently, the `-pedantic-errors` that
+# made the diagnostic FATAL for Percona is applied to nothing here:
+# source/CMakeLists.txt:2110-2118 adds `extra/libfido2` only
+# `IF((WITH_AUTHENTICATION_FIDO OR WITH_AUTHENTICATION_CLIENT_PLUGINS) AND NOT
+# UDEV_WARN_MISSING)`, and config/engines/alisql.yml:96-97 pass both OFF.
+# INFERRED FROM THE SOURCES, NOT OBSERVED: no AliSQL build log was available.
+#
+# The fix is the pair of defences Percona's own packaging uses, and both are
+# on the cmake line below: `-DWITH_PACKAGE_FLAGS=OFF` closes the option, and
+# `-DCMAKE_C_FLAGS="$CFLAGS"`/`-DCMAKE_CXX_FLAGS="$CXXFLAGS"` on the COMMAND
+# LINE close the guard. Both are READ off build-ps/build-binary.sh (:307 and
+# :290-291) at the Percona pin. The `export CFLAGS=`/`export CXXFLAGS=` lines
+# STAY: the bundled DuckDB ExternalProject is built by its own Makefile and
+# reads them from the environment, and the exported string is literally what
+# the new `-D` flags pass on, so the two cannot drift. The command-line value
+# must be NON-EMPTY to arm the guard: `SET(INITIAL_CMAKE_C_FLAGS
+# ${CMAKE_C_FLAGS})` expands UNQUOTED, so `-DCMAKE_C_FLAGS=` with nothing after
+# it supplies zero arguments and UNSETS the variable rather than setting it to
+# "" -- MEASURED on cmake 3.28.3, `IF(DEFINED INITIAL_CMAKE_C_FLAGS)` is false
+# there. `IF(NOT ...)` reads true either way, so the hatch stays open.
+#
+# tests/test_e8_package_flags_overwrite.py holds this for both engines.
 RUN set -eux; \
     JOBS="${JOBS:-0}"; [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS="$(nproc)"; \
     cd /src/source; \
@@ -47,6 +140,9 @@ RUN set -eux; \
     export CXXFLAGS="$CFLAGS"; \
     cmake . \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+      -DWITH_PACKAGE_FLAGS=OFF \
+      -DCMAKE_C_FLAGS="$CFLAGS" \
+      -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
       -DCMAKE_INSTALL_PREFIX=/opt/alisql \
       -DMYSQL_DATADIR=/var/lib/vbench/data \
       -DSYSCONFDIR=/opt/alisql \
