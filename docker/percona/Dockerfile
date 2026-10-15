@@ -385,11 +385,63 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # as far down as `ARG PERCONA_TAG`. That asymmetry is why
 # tests/test_e5_percona_make_output_sync.py pins the flag's side of the
 # anchor rather than trusting either suite to notice.
+# CFLAGS carries an explicit -D_FORTIFY_SOURCE=2. That is a build FIX, not a
+# hardening preference: without it this image does not compile at all.
+#
+# The symptom was three builds ending in `make: *** [Makefile:166: all] Error
+# 2` with nothing in the tail naming a file. The serial retry above is what
+# finally put the real error last:
+#
+#     extra/libfido2/libfido2-1.15.0/src/.../aes256.c.o
+#     <command-line>: error: "_FORTIFY_SOURCE" redefined
+#     <command-line>: note: this is the location of the previous definition
+#
+# Two definitions with different values reach the preprocessor. The tree asks
+# for 2 -- source CMakeLists.txt:1586 prepends `-DNDEBUG -D_FORTIFY_SOURCE=2`
+# for RELEASE/RELWITHDEBINFO/MINSIZEREL -- and gcc on noble supplies 3 of its
+# own. Measured on ubuntu:24.04's gcc 13.3: `echo | gcc -O3 -dM -E -` prints
+# `#define _FORTIFY_SOURCE 3`.
+#
+# Ubuntu's default stands down as soon as it sees a -D for the macro on the
+# command line: measured, `gcc -O3 -D_FORTIFY_SOURCE=2` warns nothing and the
+# effective value is 2. So the tree's own definition is arriving in a form the
+# driver's scan cannot see. `-Wp,-D...` is the only form reproduced that
+# behaves this way -- plain -D, a @response-file, C++ and -std=c99 all let the
+# default stand down. The emitting site was NOT found in the pinned tree and
+# this comment does not pretend to know it: the fix does not depend on which
+# site it is. A plain -D here makes the driver stand down, and every
+# definition that then remains says 2. Identical redefinition is silent.
+#
+# Only libfido2 FAILS on it. The rest of the build prints the same
+# redefinition as a warning and carries on -- bundled absl does, at 69% --
+# which is why three builds reached 20-69% before dying. libfido2 adds
+# `-pedantic-errors` (source extra/libfido2/libfido2-1.15.0/CMakeLists.txt
+# :329-330), and that turns this one diagnostic into a hard error.
+# -pedantic-errors is also the only flag tried that reproduces the log's exact
+# form: a bare `error:` with a `note:` and no `cc1: all warnings being treated
+# as errors` line. It is NOT -Werror, which prints a `[-Werror]` tag and that
+# summary. Nor can it be demoted -- -Wno-error=cpp, -Wno-pedantic and
+# -Wno-builtin-macro-redefined all leave the error standing (measured).
+# Removing the conflict is the only route, which is why this is a -D and not
+# a -Wno-.
+#
+# The value is 2 and must not be 3: it has to AGREE with what the tree asks
+# for, and 3 against the tree's 2 would reinstate the conflict it removes. It
+# also lines this image up with the two MariaDB builds, which ask for 2
+# plainly and get it (mariadb-11.8.8:CMakeLists.txt:290 and
+# mariadb-12.3.2:CMakeLists.txt:303, read at both pins) while this one was
+# compiling at 3. _FORTIFY_SOURCE=3 adds dynamic object-size checks that 2
+# does not, so that was a codegen difference between engines in the same
+# study -- the same class of problem as -march. The pinned AliSQL sets no
+# level of its own and is still on the compiler default; that is a separate
+# question and this file does not answer it.
+#
+# tests/test_e7_percona_fortify_level.py holds the value and the reasoning.
 RUN set -eux; \
     JOBS="${JOBS:-0}"; [ "$JOBS" -gt 0 ] 2>/dev/null || JOBS="$(nproc)"; \
     mkdir -p /build; \
     cd /build; \
-    export CFLAGS="-O3 -g -fexceptions -fno-strict-aliasing -fno-omit-frame-pointer -march=${MARCH} ${EXTRA_CXXFLAGS}"; \
+    export CFLAGS="-O3 -g -fexceptions -fno-strict-aliasing -fno-omit-frame-pointer -march=${MARCH} -D_FORTIFY_SOURCE=2 ${EXTRA_CXXFLAGS}"; \
     export CXXFLAGS="$CFLAGS"; \
     cmake /src/source \
       -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
