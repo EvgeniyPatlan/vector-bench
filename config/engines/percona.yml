@@ -97,10 +97,22 @@ build:
     # for a RELWITHDEBINFO standalone build on a DEB platform -- which is
     # exactly `build.type` above -- and `cmake/compile_flags.cmake:130` then
     # OVERWRITES CMAKE_C_FLAGS with `dpkg-buildflags` output, taking `-march`
-    # and `-O3` with it. Both READ at the pin. The full chain, with its
-    # measurements, is written out in docker/percona/Dockerfile above that
-    # file's own copy of this flag, and
-    # tests/test_e8_package_flags_overwrite.py pins both copies.
+    # with it. Both READ at the pin.
+    #
+    # THE LEVEL, NOT THE TOKEN. The `-O3` TOKEN is lost with everything else,
+    # and docker/percona/Dockerfile's delta table lists it under LOST. What is
+    # NOT affected is the optimisation the compiler actually applies: the
+    # compile line ends with CMAKE_C_FLAGS_RELWITHDEBINFO's own
+    # `-O2 -g -DNDEBUG` whether the overwrite happens or not, so the effective
+    # level is 2 either way. `CMakeLists.txt:2959-2969` is where the pin says
+    # so (READ). An earlier version of THIS comment said the overwrite takes
+    # "`-march` and `-O3` with it" as though the second mattered to the
+    # generated code; it does not, and that is the half that was wrong.
+    #
+    # The full chain, with its measurements and the complete flag-by-flag
+    # delta, is written out in docker/percona/Dockerfile above that file's own
+    # copy of this flag, and tests/test_e8_package_flags_overwrite.py pins
+    # both copies.
     #
     # This IS the deliberate duplicate the note above describes, not drift:
     # `scripts/build-images.sh:119` appends this list as ${CMAKE_FLAGS} AFTER

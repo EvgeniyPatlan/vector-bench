@@ -61,13 +61,24 @@ sufficient and neither of which is "its tree states no level": the single live
 compiles no libfido2 at all. `docker/alisql/Dockerfile` carries that derivation
 with the grep behind it.
 
-The second consequence applied to BOTH, in silence, and is exactly two things:
-`-march=x86-64-v3` is dropped, and dpkg's `-flto=auto -ffat-lto-objects
--fstack-protector-strong -fstack-clash-protection -fcf-protection` are gained.
+The second consequence applied to BOTH, in silence. The flag this file guards
+is `-march=x86-64-v3`, but it is not the only token the overwrite moves, and
+`docker/percona/Dockerfile` carries the full catalogue rather than a sample
+(AliSQL's note defers to it). THE COUNT DIFFERS BETWEEN THE TWO ENGINES, and
+saying "five" for both would re-open exactly the defect this file was written
+after. Measured on the build host against each engine's own `export CFLAGS=`
+line: twelve tokens are gained and two are kept (`-g`,
+`-fno-omit-frame-pointer`) for both, but PERCONA loses FIVE and ALISQL FOUR.
+The difference is `-D_FORTIFY_SOURCE=2`, which Percona exports
+(`docker/percona/Dockerfile`'s export line) and AliSQL does not
+(`docker/alisql/Dockerfile`'s). The four they share are `-march=x86-64-v3`,
+`-fexceptions`, `-fno-strict-aliasing`, and `-O3` replaced by dpkg's `-O2`.
+`-march` is what this file asserts about, because it is the one CLAUDE.md
+makes an invariant and the one with no symptom:
 `/opt/<engine>/.march` is written from the `MARCH` build ARG, not from what
-cmake honoured, so every `march` reader in this repo reports `x86-64-v3` either
-way. CLAUDE.md's "Never mix -march between engines" is what that violates, and
-it is the kind of breach that publishes a number rather than failing a build.
+cmake honoured, so every `march` reader in this repo reports `x86-64-v3`
+either way. That is the kind of breach that publishes a number rather than
+failing a build.
 
 THE OPTIMISATION LEVEL IS NOT ONE OF THE TWO, and no assertion here should be
 read as touching it. `-O3` in the exported CFLAGS has never reached the
@@ -660,6 +671,225 @@ class TestThisHostsDistroDisagreesWithTheTree:
               f"{found.group(1) if found else '<none>'} "
               f"(the trees ask for {TREE_FORTIFY_LEVEL})")
         assert cppflags
+
+
+# ---------------------------------------------------------------------------
+# The other measurement: what cmake does with the tree's own capture
+# ---------------------------------------------------------------------------
+#
+# `test_the_command_line_value_is_not_empty` exists because an empty
+# `-DCMAKE_C_FLAGS=` does not arm the tree's guard, and the whole fix rests on
+# a second claim: that an exported `CFLAGS` does not arm it either. Both are
+# claims about CMAKE's behaviour, not about our files, and until now they were
+# only asserted in prose. This runs the tree's own capture -- Percona
+# `CMakeLists.txt:313-322`, reproduced in shape below -- under three inputs and
+# reports what cmake says in each.
+#
+# `PROJECT(vb_probe NONE)` AFTER THE CAPTURE IS LOAD-BEARING, and an earlier
+# version of this file got it wrong in a way worth recording, because the
+# mistake inverted the result rather than merely weakening it. That version
+# omitted `PROJECT()` entirely and claimed that therefore no compiler was
+# needed and no toolchain detection ran. MEASURED on cmake 3.28.3: with no
+# `project()` anywhere, cmake warns `No project() command is present`, INJECTS
+# AN IMPLICIT PROJECT, and prints `The C compiler identification is GNU
+# 13.3.0` plus the CXX twin and two ABI probes -- so every clause of that claim
+# was false. Worse, the implicit project initialises CMAKE_C_FLAGS FROM THE
+# ENVIRONMENT before the capture runs, so in that shape an exported `CFLAGS`
+# gave `INITIAL_DEFINED=1, HATCH_OPEN=0` -- the exact opposite of the premise
+# this whole change rests on.
+#
+# Naming a project explicitly suppresses the implicit one, and `NONE` enables
+# no languages, so no compiler is identified and `$CFLAGS` is never read.
+# Placing it AFTER the capture leaves the capture looking at the genuine
+# pre-`PROJECT()` state, which is where the tree asks the question (:326 says
+# why it has to). MEASURED in that shape: zero compiler-identification lines,
+# zero ABI probes, no implicit-project warning, and an exported `CFLAGS` gives
+# `INITIAL_DEFINED=0, HATCH_OPEN=1`. So the claim is now true as written: no
+# compiler is needed, no toolchain detection runs, and no network is touched.
+# All three arms configure in well under a second into pytest's own tmp_path,
+# never into the repo.
+
+CMAKE = shutil.which("cmake")
+
+#: The capture from the pinned trees, in shape: Percona `CMakeLists.txt:313-322`
+#: and AliSQL `:303-306`, with `PROJECT(... NONE)` appended for the reason in
+#: the note above.
+#:
+#: The expansion of `${CMAKE_C_FLAGS}` is left UNQUOTED because the trees leave
+#: it unquoted, and it does change one of the two readings: under an empty
+#: `-DCMAKE_C_FLAGS=`, unquoted gives `INITIAL_DEFINED=0` and quoted gives
+#: `INITIAL_DEFINED=1` (MEASURED). It does NOT change the guard's outcome --
+#: `HATCH_OPEN=1` either way, because `IF(NOT ...)` is a truthiness test and
+#: `IF(NOT "")` is as true as `IF(NOT <unset>)`. An earlier version of this
+#: comment said the guard "would then behave differently", which is wrong and
+#: contradicted docker/alisql/Dockerfile's own correct sentence.
+_CAPTURE_SNIPPET = """\
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
+SET(INITIAL_CMAKE_C_FLAGS)
+IF(DEFINED CMAKE_C_FLAGS)
+  SET(INITIAL_CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
+ENDIF()
+IF(DEFINED INITIAL_CMAKE_C_FLAGS)
+  MESSAGE(STATUS "VB_PROBE INITIAL_DEFINED=1")
+ELSE()
+  MESSAGE(STATUS "VB_PROBE INITIAL_DEFINED=0")
+ENDIF()
+IF(NOT INITIAL_CMAKE_C_FLAGS)
+  MESSAGE(STATUS "VB_PROBE HATCH_OPEN=1")
+ELSE()
+  MESSAGE(STATUS "VB_PROBE HATCH_OPEN=0")
+ENDIF()
+PROJECT(vb_probe NONE)
+"""
+
+#: The readings that carry a conclusion. `HATCH_OPEN` is the one that decides
+#: whether `ADD_LINUX_DEB_FLAGS()` runs, because the tree's condition is
+#: `IF(NOT INITIAL_CMAKE_C_FLAGS)`. `INITIAL_DEFINED` is reported beside it as
+#: mechanism, and is deliberately NOT what any conclusion here rests on.
+_VERDICT_KEY = "HATCH_OPEN"
+
+
+@pytest.mark.skipif(
+    CMAKE is None,
+    reason="cmake is not on PATH, so the tree's own capture cannot be run "
+           "here. It is not among the documented host prerequisites "
+           "(docker/python3/pyyaml/git/curl); the IMAGES have it.")
+class TestCmakeReallyTreatsAnEmptyValueAsUnset:
+    """The two preconditions the fix's second flag rests on.
+
+    1. A non-empty `-DCMAKE_C_FLAGS=` CLOSES the tree's hatch, and an empty
+       one does NOT. If cmake ever started reading an empty value as
+       sufficient -- that is, if `HATCH_OPEN` came back `0` for it -- then
+       `test_the_command_line_value_is_not_empty` would be guarding a hazard
+       that no longer exists. Note the failure mode is about `HATCH_OPEN`, not
+       about `INITIAL_DEFINED`: a cmake that DEFINED the variable as an empty
+       string would still leave the hatch open, because `IF(NOT "")` is true.
+    2. An exported `CFLAGS` does NOT close it. That is the premise the whole
+       change rests on, and the arm that pins it is the one that would catch a
+       regression to the shape described in the note above, where omitting
+       `PROJECT()` silently inverted this answer.
+    """
+
+    @pytest.fixture(scope="class")
+    def probe(self, tmp_path_factory):
+        """Three arms: non-empty `-D`, empty `-D`, and exported CFLAGS only."""
+        root = tmp_path_factory.mktemp("capture")
+        src = root / "src"
+        src.mkdir()
+        (src / "CMakeLists.txt").write_text(_CAPTURE_SNIPPET)
+
+        def configure(name: str, args: list[str], env: dict | None) -> dict:
+            build = root / name
+            build.mkdir()
+            done = subprocess.run(
+                [CMAKE, str(src), *args], cwd=str(build),
+                env={**os.environ, **(env or {})},
+                capture_output=True, text=True, timeout=120)
+            found = dict(re.findall(r"VB_PROBE (\w+)=(\d)", done.stdout))
+            if not found:
+                # The return code is checked HERE and not left to the test
+                # below, because a skip would take that test with it: a cmake
+                # that died before the MESSAGE() calls would otherwise become
+                # a skip on a green suite rather than a failure. Only a cmake
+                # that ran cleanly and still said nothing may skip.
+                assert done.returncode == 0, (
+                    f"{name}: cmake exited {done.returncode} and printed no "
+                    f"probe output, so the configure FAILED rather than being "
+                    f"unable to answer. stderr: {done.stderr[-600:]}")
+                pytest.skip(
+                    f"{name}: this cmake configured cleanly but printed no "
+                    f"probe output, so it cannot answer the question. A "
+                    f"likely cause is the snippet's "
+                    f"CMAKE_MINIMUM_REQUIRED(VERSION 3.10) floor -- cmake 4.0 "
+                    f"already errors below 3.5 and deprecates below 3.10. "
+                    f"stdout: {done.stdout[-400:]}")
+            return {"rc": done.returncode, **found}
+
+        return (
+            configure("cmdline_nonempty",
+                      ["-DCMAKE_C_FLAGS=-O3 -g -march=x86-64-v3"], None),
+            configure("cmdline_empty", ["-DCMAKE_C_FLAGS="], None),
+            configure("env_only", [],
+                      {"CFLAGS": "-O3 -g -march=x86-64-v3"}),
+        )
+
+    @staticmethod
+    def _readings(arm: dict) -> dict:
+        """The probe's answers, without `rc`.
+
+        Compared without it on purpose: the dead-probe check below says the
+        two arms answered identically, and two arms differing only in exit
+        status would satisfy a whole-dict comparison while every reading
+        matched.
+        """
+        return {k: v for k, v in arm.items() if k != "rc"}
+
+    def test_an_empty_value_does_not_close_the_hatch(self, probe):
+        """All three arms reported; an identical pair is a dead probe."""
+        nonempty, empty, env_only = probe
+        report = (f"cmdline non-empty = {nonempty}; cmdline empty = {empty}; "
+                  f"env CFLAGS only = {env_only}")
+        print(f"\nMEASURED cmake capture semantics ({CMAKE}): {report}")
+
+        assert self._readings(nonempty) != self._readings(empty), (
+            f"DEAD PROBE -- cmake gave identical READINGS for an empty and a "
+            f"non-empty command-line value, so this probe is measuring "
+            f"nothing. {report}")
+        assert nonempty[_VERDICT_KEY] == "0", (
+            f"a non-empty -DCMAKE_C_FLAGS= left the tree's hatch OPEN, which "
+            f"would mean `-DCMAKE_C_FLAGS=\"$CFLAGS\"` does not block the "
+            f"package-flags overwrite at all. {report}")
+        assert empty[_VERDICT_KEY] == "1", (
+            f"an empty -DCMAKE_C_FLAGS= CLOSED the hatch, so "
+            f"test_the_command_line_value_is_not_empty is guarding against a "
+            f"hazard that does not exist on this cmake. {report}")
+
+    def test_an_exported_cflags_does_not_close_the_hatch(self, probe):
+        """The premise the whole change rests on, measured rather than argued.
+
+        With no `-D` at all and `CFLAGS` in the environment, the tree's
+        capture must still come back with the hatch OPEN. If this ever fails,
+        either cmake has started reading the environment before `PROJECT()` or
+        this snippet has drifted back into the implicit-project shape -- and
+        in the second case the whole file is measuring the wrong regime.
+        """
+        nonempty, _empty, env_only = probe
+        report = f"env CFLAGS only = {env_only}; cmdline non-empty = {nonempty}"
+
+        assert env_only[_VERDICT_KEY] == "1", (
+            f"an exported CFLAGS CLOSED the tree's hatch. Either cmake reads "
+            f"the environment before PROJECT() now, or this snippet lost its "
+            f"explicit PROJECT(... NONE) and cmake injected an implicit "
+            f"project that initialised CMAKE_C_FLAGS from the environment -- "
+            f"see the note above this class. {report}")
+        assert self._readings(env_only) != self._readings(nonempty), (
+            f"DEAD PROBE -- an exported CFLAGS and a command-line value gave "
+            f"identical readings, so this arm cannot tell the environment "
+            f"from the command line. {report}")
+
+    def test_the_mechanism_reading_is_reported_but_not_relied_on(self, probe):
+        """`INITIAL_DEFINED` is mechanism, `HATCH_OPEN` is the verdict.
+
+        Asserted so the distinction is visible rather than merely intended:
+        the empty-value arm is the case where the two readings can disagree
+        with each other, and it is the verdict that decides the build.
+        """
+        _nonempty, empty, _env = probe
+        assert _VERDICT_KEY in empty and "INITIAL_DEFINED" in empty, empty
+        assert empty[_VERDICT_KEY] == "1", empty
+        # Unquoted in the snippet, as in the trees, so this is 0 here; quoted
+        # it would be 1 and the hatch would STILL be open. Either value is
+        # consistent with the conclusion, which is why nothing asserts it.
+        assert empty["INITIAL_DEFINED"] in ("0", "1"), empty
+
+    def test_all_three_configures_succeeded(self, probe):
+        """Non-vacuity. A configure that failed after printing its messages
+        would leave the readings above describing a broken run; one that failed
+        BEFORE printing them is caught in the fixture instead, so that it
+        cannot turn into a skip."""
+        for name, arm in zip(("cmdline_nonempty", "cmdline_empty", "env_only"),
+                             probe):
+            assert arm["rc"] == 0, f"{name} configure exited {arm['rc']}: {arm}"
 
 
 # ---------------------------------------------------------------------------

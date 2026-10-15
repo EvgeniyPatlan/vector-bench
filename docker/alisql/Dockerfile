@@ -72,13 +72,29 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 #     installs build-essential above, which depends on dpkg-dev (MEASURED on
 #     the build host).
 #
-# The consequence here is the quiet one, and it is exactly two things.
-# `-march=${MARCH}` -- x86-64-v3, which config/engines/alisql.yml and
-# CLAUDE.md's "Never mix -march between engines" both require to equal every
-# other source-built engine's -- IS DISCARDED along with the whole exported
-# string; and dpkg's `-flto=auto -ffat-lto-objects -fstack-protector-strong
-# -fstack-clash-protection -fcf-protection` arrive in its place, the LTO being
-# real LTO because compile_flags.cmake:133-135 replaces the LINKER_FLAGS too.
+# The consequence here is the quiet one. `-march=${MARCH}` -- x86-64-v3, which
+# config/engines/alisql.yml and CLAUDE.md's "Never mix -march between engines"
+# both require to equal every other source-built engine's -- IS DISCARDED
+# along with the whole exported string, and dpkg's arrives in its place.
+#
+# THE FULL DELTA is catalogued in docker/percona/Dockerfile. ITS LOST COUNT IS
+# FIVE AND THIS ENGINE'S IS FOUR, and the difference is not a rounding of the
+# same fact: Percona's `export CFLAGS=` carries `-D_FORTIFY_SOURCE=2` and the
+# one below does not, so that token is Percona's to lose and not ours.
+# MEASURED against this file's own export line, the four lost here are
+# `-march=x86-64-v3`, `-fexceptions`, `-fno-strict-aliasing`, and `-O3`
+# replaced by dpkg's `-O2` to no effect. The gained twelve and the kept two
+# are the same for both engines: twelve gained (`-flto=auto
+# -ffat-lto-objects -fstack-protector-strong -fstack-clash-protection
+# -fcf-protection -mno-omit-leaf-frame-pointer -Wformat -Werror=format-security
+# -Wdate-time -ffile-prefix-map=<cwd>=. -O2 -D_FORTIFY_SOURCE=3`) and two kept
+# (`-g`, `-fno-omit-frame-pointer`). MEASURED on the build host by tokenising
+# `dpkg-buildflags --get CFLAGS` plus `--get CPPFLAGS` against the exported
+# string. `-fno-strict-aliasing` is the one besides `-march` worth naming on
+# its own: a MySQL-family build losing it at -O2 is a codegen change. The LTO
+# is real LTO because compile_flags.cmake:133-135 replaces the LINKER_FLAGS
+# too, and `dpkg-buildflags --get LDFLAGS` carries `-flto=auto
+# -ffat-lto-objects` (MEASURED).
 # `echo "${MARCH}" > /opt/alisql/.march` below writes the build ARG and not
 # what cmake honoured, so the file and every `march` reader in this repo say
 # x86-64-v3 whichever way the configure went: THE BREACH HAS NO SYMPTOM.

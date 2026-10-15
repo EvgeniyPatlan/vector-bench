@@ -48,10 +48,23 @@ build:
     # WITH_PACKAGE_FLAGS ON for a RELWITHDEBINFO standalone build on a DEB
     # platform -- `build.type` above -- and `cmake/compile_flags.cmake:131`
     # then OVERWRITES CMAKE_C_FLAGS with `dpkg-buildflags` output, so
-    # `-march: x86-64-v3` above and `-O3` are silently dropped and nothing
-    # reports it (`/opt/alisql/.march` is written from the build ARG). Both
-    # READ at the pin; docker/alisql/Dockerfile carries the chain and the
-    # consequence for AliSQL's already-published numbers, and
+    # `-march: x86-64-v3` above is silently dropped and nothing reports it
+    # (`/opt/alisql/.march` is written from the build ARG). Both READ at the
+    # pin.
+    #
+    # THE LEVEL, NOT THE TOKEN. The `-O3` TOKEN is dropped with everything
+    # else, and docker/alisql/Dockerfile's delta lists it among the four lost
+    # here. What is NOT affected is the optimisation the compiler applies: the
+    # compile line ends with CMAKE_C_FLAGS_RELWITHDEBINFO's own
+    # `-O2 -g -DNDEBUG` whether the overwrite happens or not, so the effective
+    # level is 2 either way -- this tree says so itself at
+    # `CMakeLists.txt:2709-2719` (READ). An earlier version of THIS comment
+    # said `-march: x86-64-v3` "and `-O3`" were both silently dropped as
+    # though the second changed the generated code; it does not, and that is
+    # the half that was wrong.
+    #
+    # docker/alisql/Dockerfile carries the chain, the complete flag-by-flag
+    # delta and the consequence for AliSQL's already-published numbers, and
     # tests/test_e8_package_flags_overwrite.py pins both copies.
     #
     # Duplicated with the Dockerfile's copy on purpose:
