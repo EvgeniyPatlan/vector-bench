@@ -1986,8 +1986,8 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
     def test_the_constant_moved_and_the_record_carries_it(self, tmp_path):
         """Honest and mutant, both read back out of a written record.
 
-        Honest: `OPS_MEASUREMENT_VERSION` is 6 and a record written by
-        `Recorder` carries `extra.ops_measurement_version` 6. Mutant (the
+        Honest: `OPS_MEASUREMENT_VERSION` is 7 and a record written by
+        `Recorder` carries `extra.ops_measurement_version` 7. Mutant (the
         constant rebound to 5 at run time): the same `Recorder` call stamps a
         5 onto a record measured by the process pool, which is the state that
         would put this pool's numbers on one axis with the thread pool's.
@@ -2009,7 +2009,7 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
             return list(records.read_records(str(path)))[0]["extra"][
                 records.OPS_MEASUREMENT_VERSION_KEY]
 
-        assert records.OPS_MEASUREMENT_VERSION == 6
+        assert records.OPS_MEASUREMENT_VERSION == 7
         honest = stamp(tmp_path / "honest.jsonl")
         original = records.OPS_MEASUREMENT_VERSION
         try:
@@ -2017,7 +2017,7 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
             mutant = stamp(tmp_path / "mutant.jsonl")
         finally:
             records.OPS_MEASUREMENT_VERSION = original
-        assert honest == 6
+        assert honest == 7
         assert mutant == 5
         assert honest != mutant
         assert records.OPS_MEASUREMENT_VERSION == original
@@ -2045,9 +2045,42 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
 
         Checked as a vocabulary rather than a sentence, so a reword passes and
         a deletion does not.
+
+        **THE BLOCK IS BOUNDED BY THE NEXT HEADING AND NOT BY THE CONSTANT'S
+        ASSIGNMENT, because the assignment is what a bump deletes.** This
+        split on `"OPS_MEASUREMENT_VERSION = 6"` until the version-7 bump left
+        that literal at zero occurrences; `str.split` on a missing separator
+        returns the whole string, so `block` became everything from the
+        version-6 heading to EOF and the six assertions below scanned every
+        later block too. Measured on that widened scan, two of the six were
+        defeated by it -- `smoke-20261014-075119` and `scaling_efficiency`
+        also occur after the version-6 block, so deleting either from the
+        block would have passed -- while `processes`, `reinsert_rows_per_s`,
+        `version 3` and `not flagged` occur nowhere later and would still have
+        failed. `tests/test_t4b_readers.py` records the identical defect from
+        the 5->6 bump.
+
+        **THE PROPERTY THAT DECIDES IT IS WHETHER THE LITERAL EMBEDS A VALUE
+        THE CHANGE EDITS**, which is narrower than "a heading is safe and a
+        value is not". A HEADING is safe because a bump adds a new one and
+        never edits an old one. `"NAME = "` is safe too, with the literal
+        stopping before the value -- `tests/test_t2b_report.py:2021` and
+        `tests/test_config.py:6988`/`:7003` all split on
+        `"OPS_MEASUREMENT_EQUIVALENT_VERSIONS = "` and survive any bump, so
+        nobody should "fix" them. Only `"NAME = <value>"` breaks, because the
+        bump edits exactly what the literal embeds. The sweep in the commit
+        message agrees -- it requires a digit after `VERSION`/`version`, so
+        those three do not match it -- and it is only a loose one-line
+        restatement that would condemn them.
+
+        The heading's presence is asserted, so the next bump fails LOUDLY
+        here instead of silently widening again.
         """
         source = open(records.__file__).read()
-        block = source.split("OPS_MEASUREMENT_VERSION = 6")[0]
+        assert "VERSION 7 --" in source, (
+            "the version-7 heading is gone, so the version-6 block has no "
+            "end and this test would scan the rest of the file")
+        block = source.split("VERSION 7 --")[0]
         block = block[block.index("VERSION 6"):]
         for token in ("processes", "reinsert_rows_per_s", "scaling_efficiency",
                       "smoke-20261014-075119", "version 3"):
