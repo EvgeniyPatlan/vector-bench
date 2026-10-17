@@ -750,6 +750,101 @@ class PerconaDriver(MySQLFamilyDriver):
     #: MySQL-family engine here that has a repair path at all.
     repair_path = "index-replace"
 
+    #: Whether the server's BULK vector index build works at the pinned
+    #: version. Host-supplied with a class-level default, because this file
+    #: cannot know it: the fact lives in
+    #: `capabilities.bulk_vector_index_build` in `config/engines/percona.yml`,
+    #: and `harness/` must not import `orchestrator` -- each runs in a
+    #: container that mounts only itself. `harness/main.py` passes it in on
+    #: the command line, the way it passes `--driver`, and
+    #: `declare_bulk_vector_index_build` below applies it.
+    #:
+    #: **True, because the absence of a declaration has to mean today's
+    #: behaviour exactly.** It is the same reading
+    #: `orchestrator/cli.py:_bulk_vector_index_build` gives the capability --
+    #: one fact with one default on both sides of the container boundary -- so
+    #: the six engines that declare nothing are untouched, and a hand-run
+    #: harness or a `run-benchmark.sh lab` script still gets the repair with
+    #: no flags.
+    bulk_vector_index_build: bool = True
+
+    def declare_bulk_vector_index_build(self, supported: bool) -> None:
+        """Withdraw the repair path when the server cannot execute it.
+
+        **`maintain()`'s `ALTER TABLE … DROP KEY vi, ADD VECTOR KEY …,
+        ALGORITHM=INPLACE` is the same statement `create_index` issues for
+        `build_mode: post`**, which `capabilities.bulk_vector_index_build:
+        false` records as killing the server at the pinned `source.tag`. PR
+        #36 stopped the build-mode default from reaching that path and did not
+        touch this one, and the difference between the two failures is why
+        this hook exists rather than a second warning:
+
+        * the bulk BUILD fails loudly -- `Lost connection to server during
+          query`, the ops unit dies, nothing is published;
+        * the REPAIR failed silently. On `full-20261015-215006`
+          (`ops-percona-*.jsonl`, phase `churn`) the ALTER returned in
+          **1-4 ms** -- `maintenance_s` was 0.001 seventeen times, 0.002
+          twice and 0.004 twice -- and changed nothing: `index_bytes`
+          identical TO THE BYTE either side of it (281,018,368 at churn 0.10,
+          318,767,104 at 0.25) and recall identical to five decimals in
+          **all 20 pairs**, which is 10 ops units x 2 churn fractions, across
+          three datasets.
+          **The sizes above are fashion-mnist-784 at 60,000 rows** -- 268 MiB
+          is that graph, not sift's. sift-128 at 1,000,000 rows is in the same
+          20, where the graph is 808-1,428 MiB and a genuine rebuild costs on
+          the order of the 26-80 minute incremental load. The report published
+          every one of those rows as
+          `after ALTER TABLE (index replace) (0.0 s)`: the degraded index,
+          measured twice, presented as a repair result.
+
+        A 1-4 ms DDL has not rebuilt the graph, so there is nothing here to
+        time. Declaring **no repair path** is the honest answer, and it is
+        already the shape five of seven engines use: `churn.py`'s
+        `_record_maintenance` returns early on a non-`str`, so only the
+        "before" record is written and no `maintenance_state: "after"` record
+        exists to be read as a repair.
+
+        **NO EXPLICIT OPT-IN TO ATTEMPT IT ANYWAY, and that is a decision
+        rather than an omission.** PR #36 gave the build mode one -- a profile
+        that writes `percona_build_modes: [post]` is honoured with a warning
+        -- so that whoever tests a newer Percona for the fix is not blocked by
+        the engine config. Three things make the repair path different:
+
+        1. `build_mode` is an EXISTING profile axis. Honouring it is honouring
+           a request a profile can already make, and refusing it would leave
+           the run's records disagreeing with the profile that asked. Nothing
+           selects a repair path, so an opt-in here would mean INVENTING a
+           profile key whose only purpose is to turn on a measurement already
+           known to be false.
+        2. The two failures are not the same kind. The bulk build fails
+           loudly and publishes nothing; this one publishes a credible number
+           that is wrong. An escape hatch whose misuse produces a crash is a
+           tool. An escape hatch whose misuse produces a plausible figure in
+           a report is a trap, and CLAUDE.md's first paragraph is about
+           exactly that distinction.
+        3. **Two escape hatches already exist and neither needs a new key.**
+           The capability itself is one: a tester moving to a newer server is
+           editing `source.tag` in `config/engines/percona.yml` anyway, and
+           flipping `bulk_vector_index_build: true` is one line in the file
+           they already have open -- whereas a per-run override could leave
+           the run's `repair_path: index-replace` contradicting the config's
+           own declaration. The other is `run-benchmark.sh lab`, whose
+           documented job is "diagnose, don't measure": the class default
+           above is True, so a lab script that constructs this driver and
+           calls `maintain()` gets the ALTER with no flag at all.
+
+        An INSTANCE attribute shadowing the class one, which is the shape
+        `tests/fake_driver.py` already uses for this key. The class keeps
+        declaring `"index-replace"` on purpose: that IS this engine's repair
+        mechanism, `docs/10-rollout.md` names it as one of the two, and what
+        the pinned server cannot do is EXECUTE it. The record has to carry
+        what this run could actually measure, so the instance says "none" --
+        the base class's default, `harness/drivers/base.py:258`.
+        """
+        self.bulk_vector_index_build = bool(supported)
+        self.repair_path = (type(self).repair_path
+                            if self.bulk_vector_index_build else "none")
+
     def effective_ef(self, ef: int, k: int) -> int:
         """`max(ef, k)` -- the clamp is the variable's own contract.
 
@@ -875,7 +970,32 @@ class PerconaDriver(MySQLFamilyDriver):
         graph, so on a 1M-row corpus this costs on the order of a bulk build,
         and the ALTER takes a SHARED metadata lock -- readers continue, every
         writer stops for the duration.
+
+        **None of that happens when the host says the bulk build is broken.**
+        The statement below IS the bulk build, so an engine whose
+        `capabilities.bulk_vector_index_build` is false has no repair path to
+        run, and returning `None` before the cursor is touched is what keeps
+        the degraded index from being measured twice and published as
+        repaired. See `declare_bulk_vector_index_build`, which carries the
+        measured evidence.
         """
+        if not self.bulk_vector_index_build:
+            # THIS PRINT IS THE ARTEFACT. It reaches the run's phase log,
+            # which is the only place a reader can learn that the repair was
+            # withdrawn and why -- nothing writes the harness argv anywhere,
+            # so the flag itself leaves no trace a reader will ever see. See
+            # `declare_bulk_vector_index_build` for the full evidence.
+            print(f"[{self.name}] no repair path at this version: the index "
+                  f"replace is the same ALTER TABLE ... ADD VECTOR KEY ... "
+                  f"ALGORITHM=INPLACE that capabilities."
+                  f"bulk_vector_index_build: false records as killing the "
+                  f"server, and on full-20261015-215006 it returned in "
+                  f"1-4 ms with the index byte-identical either side of it "
+                  f"in all 20 before/after pairs. Measuring the degraded "
+                  f"index again and labelling it repaired is worse than "
+                  f"publishing no repair, so nothing runs and no "
+                  f"post-maintenance record is written.")
+            return None
         clause = self._index_clause_from_server()
         sql = (f"ALTER TABLE {TABLE} DROP KEY {self.dialect.index_name}, "
                f"ADD {clause}, ALGORITHM=INPLACE")

@@ -70,7 +70,7 @@ rather than accepted (the §7 list this answers is in `docs/05-methodology.md`):
 
 * **fork, not spawn, and it is not a preference.** `driver_factory` is a
   callable the caller supplies, and every real one is unpicklable:
-  `harness/main.py:270` is a `def` nested inside `main()`, whose
+  `harness/main.py:298` is a `def` nested inside `main()`, whose
   `__qualname__` is `main.<locals>.driver_factory`, and pickle resolves a
   function by qualified name -- measured, `AttributeError: Can't pickle local
   object`. The test suite's factories are a `lambda` and a bound

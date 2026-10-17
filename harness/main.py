@@ -111,6 +111,34 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--storage-engine", default="InnoDB")
     p.add_argument("--build-mode", default="post", choices=("post", "incremental"))
+    # The engine's BULK vector index build, as its own config declares it.
+    # Decided on the host and passed in, the way `--driver` above is, and for
+    # the same reason: `harness/` must not import `orchestrator`, so it cannot
+    # read `capabilities.bulk_vector_index_build` out of
+    # `config/engines/<e>.yml` itself. `orchestrator/cli.py` reads the
+    # capability and `ops_pass.harness_args` emits this flag for the engines
+    # that declare it broken.
+    #
+    # NEGATIVE POLARITY, and `store_true`, so the absence of the flag is
+    # today's behaviour exactly -- which is also how the capability reads when
+    # an engine config omits it (`cli.py:_bulk_vector_index_build`). One fact,
+    # one default, on both sides of the container boundary. A positive flag
+    # that had to be spelled out for all seven engines would be a second
+    # place for that default to live, and the two would drift.
+    #
+    # **It gates the churn REPAIR and not `--build-mode post`.** Both issue
+    # the same `ALTER TABLE ... ADD VECTOR KEY ... ALGORITHM=INPLACE`, but an
+    # explicit `post` is deliberately honoured with a warning so a newer
+    # server can be tested for the fix without editing the engine config
+    # (`cli.py:_ops_build_modes`) -- it fails loudly, killing the server, and
+    # publishes nothing. The repair failed silently: a 1 ms no-op whose
+    # "after" record the report published as a repair. See
+    # `PerconaDriver.declare_bulk_vector_index_build`.
+    p.add_argument("--no-bulk-vector-index-build", action="store_true",
+                   help="the engine's bulk vector index build is unusable at "
+                        "its pinned version; a driver whose repair path "
+                        "rebuilds the index declares no repair path instead "
+                        "of timing a statement that cannot work")
     # Percona Search is the only engine that compresses indexed vectors. Without
     # this the ops path always built unquantized while the recall path built
     # whatever the profile asked for, so one run measured two different indexes.
@@ -268,7 +296,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     def driver_factory():
-        return get_driver(args.engine, spec, args.driver)
+        driver = get_driver(args.engine, spec, args.driver)
+        # The one host-side capability applied AFTER construction rather than
+        # handed to `get_driver`: that function takes the connection spec and
+        # the driver class name, and widening its signature is a change to
+        # `harness/drivers/postgres.py`, which every engine's driver is built
+        # through. Read through `getattr`, the way the churn workload reads
+        # Valkey's optional sync hooks -- a driver with no repair path to
+        # withdraw has no such method, and most do not.
+        #
+        # No runtime warning for the "flag given, nobody listened" case, on
+        # purpose: that would fire once per client connection (up to 32 in the
+        # concurrency pool) and it is a WIRING fault, which belongs in the
+        # suite rather than in a run's log.
+        # `tests/test_e13_percona_churn_repair_is_a_noop.py` pins that every
+        # engine whose config declares the capability false has a driver that
+        # can act on it, so a declaration cannot silently reach a driver that
+        # would ignore it.
+        declare = getattr(driver, "declare_bulk_vector_index_build", None)
+        if declare is not None:
+            declare(not args.no_bulk_vector_index_build)
+        return driver
 
     # The mode is known now and is true of every record this run writes; the
     # target and the status are not known until the sweep has run, and are

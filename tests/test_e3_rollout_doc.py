@@ -528,7 +528,7 @@ CITED_IN_REPO = {
     "docs/05-methodology.md:490-497":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:1007-1008":
+    "docs/05-methodology.md:1021-1022":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
     "config/profiles/main.yml:110":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
@@ -548,16 +548,16 @@ CITED_IN_REPO = {
     "report/render.py:2258":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:939":
+    "docs/05-methodology.md:953":
         ("docs/05-methodology.md",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/09-adding-percona-server.md:682":
+    "docs/09-adding-percona-server.md:700":
         ("docs/09-adding-percona-server.md",
          "is not a cache, and that is a fairness problem"),
-    "docs/09-adding-percona-server.md:736-775":
+    "docs/09-adding-percona-server.md:754-793":
         ("docs/09-adding-percona-server.md",
          "These figures are projections, not measurements."),
-    "docs/09-adding-percona-server.md:841-844":
+    "docs/09-adding-percona-server.md:859-862":
         ("docs/09-adding-percona-server.md",
          "the gate cannot surface this at all"),
 }
@@ -1279,7 +1279,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
         assert "report/render.py:2258" in section
-        assert "docs/05-methodology.md:939" in section
+        assert "docs/05-methodology.md:953" in section
 
 
 # ---------------------------------------------------------------------------
@@ -1432,9 +1432,22 @@ class TestTheChurnHooksAreReadFromTheDrivers:
         acquired a repair path without this page noticing would have been
         given one silently -- or denied one it had earned.
 
-        Percona's is the expensive one of the two: a whole graph rebuild per
-        churn fraction against pgvector's VACUUM. A value assertion, so a
-        third fails here rather than passing.
+        Percona's is the expensive one of the two BY DESIGN: a whole graph
+        rebuild per churn fraction against pgvector's VACUUM. A value
+        assertion, so a third fails here rather than passing.
+
+        **"declares a repair mechanism" and "can execute it at this pin" are
+        two different claims, and this test is about the first.** It reads the
+        CLASS attributes, which is why
+        `PerconaDriver.declare_bulk_vector_index_build` shadowing
+        `repair_path` with `"none"` per instance leaves it green and should.
+        At the pinned `source.tag` Percona's records carry
+        `repair_path: "none"` and no before/after maintenance panel, because
+        that ALTER is the same statement
+        `capabilities.bulk_vector_index_build: false` records as killing the
+        server; the engine still *has* the mechanism, and the class is where
+        that is declared. A reader who wants the per-pin answer wants
+        `docs/05-methodology.md`'s churn section, not this assertion.
         """
         from harness.drivers.base import EngineDriver
         assert EngineDriver.repair_path == "none"
@@ -1861,7 +1874,7 @@ class TestTheMemoryTableIsCitedAndNotRestated:
     def test_it_cites_the_section_and_states_the_conclusion(self):
         """The paired positive: not restating is only right if the document
         still tells the operator where to look and what it means."""
-        assert "docs/09-adding-percona-server.md:736-775" in _doc()
+        assert "docs/09-adding-percona-server.md:754-793" in _doc()
         _claim("a green smoke is not evidence about the memory policy")
 
 

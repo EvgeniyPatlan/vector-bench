@@ -852,6 +852,30 @@ _OPS_BUILD_MODE_KEYS = {
 }
 
 
+def _bulk_vector_index_build(engine_cfg: Dict[str, Any]) -> bool:
+    """Whether this engine's bulk vector index build works at its pinned source.
+
+    ONE reading of one fact, because there are now two consumers of it and
+    they must not drift: `_ops_build_modes` below picks the ops phase's
+    default build mode from it, and `ops_pass.harness_args` tells the ops
+    harness about it so a driver whose repair path REBUILDS the index does not
+    time a statement that cannot work. `maintain()`'s `ALTER TABLE … DROP KEY
+    vi, ADD VECTOR KEY …, ALGORITHM=INPLACE` is the same statement
+    `create_index` issues for `build_mode: post`, which is why both answers
+    come off the same key. It was already read twice inside
+    `_ops_build_modes` alone before this existed.
+
+    **Absence reads as True**, and that default is the whole compatibility
+    story: the key is declared by exactly one engine config
+    (`config/engines/percona.yml`, false at its pin), which
+    `tests/test_e9_percona_bulk_build_crash.py` pins. mariadb, mariadb123,
+    alisql, pgvector, mongodb and valkey declare nothing and are unaffected in
+    both consumers.
+    """
+    caps = engine_cfg.get("capabilities", {}) or {}
+    return bool(caps.get("bulk_vector_index_build", True))
+
+
 def _ops_build_modes(engine: str, profile: Dict[str, Any],
                      engine_cfg: Dict[str, Any]) -> List[str]:
     """Which build modes the ops phase runs for one engine.
@@ -862,7 +886,11 @@ def _ops_build_modes(engine: str, profile: Dict[str, Any],
     _crash.py` reports the honest and mutant value of each.
     """
     mode_ref = _OPS_BUILD_MODE_KEYS.get(engine)
-    caps = engine_cfg.get("capabilities", {}) or {}
+    # Derived once and used twice below. It used to be two `caps.get` calls
+    # with the same default spelled out in both, which is the shape a drift
+    # between the two readings hides in; it is now
+    # `_bulk_vector_index_build`, shared with the ops harness's flag.
+    bulk_build = _bulk_vector_index_build(engine_cfg)
     # **THE DEFAULT COMES FROM THE ENGINE, NOT FROM A LITERAL HERE, AND THAT
     # CHANGE FIXED A CRASH IN EVERY PROFILE THAT NAMES NO MODE.** The
     # argument at `_OPS_BUILD_MODE_KEYS` is that `post` is the honest default
@@ -877,8 +905,7 @@ def _ops_build_modes(engine: str, profile: Dict[str, Any],
     #
     # An engine that declares nothing keeps `post`, so this widens where the
     # default comes from rather than changing the default for anybody else.
-    default_modes = (["post"] if caps.get("bulk_vector_index_build", True)
-                     else ["incremental"])
+    default_modes = ["post"] if bulk_build else ["incremental"]
     if mode_ref:
         block, key = mode_ref
         modes = list((profile.get(block) or {}).get(key, default_modes))
@@ -888,13 +915,18 @@ def _ops_build_modes(engine: str, profile: Dict[str, Any],
     # fix has to be able to ask for the broken mode on purpose, and a refusal
     # would mean editing the engine config to do it. The warning names the
     # symptom so the resulting lost connection is not read as a harness fault.
-    if "post" in modes and not caps.get("bulk_vector_index_build", True):
+    if "post" in modes and not bulk_build:
         print(f"[ops] WARNING: {engine} declares "
               f"capabilities.bulk_vector_index_build: false and this profile "
               f"asks for build_mode 'post' anyway. At the pinned version that "
               f"ALTER kills the server after the load has already been paid "
               f"for, and the unit will fail with a lost connection. "
-              f"Honouring the explicit request.", file=sys.stderr)
+              f"Honouring the explicit request. Note that the SAME "
+              f"declaration also withdraws the churn repair path in EVERY "
+              f"build mode -- `maintain()` issues that same ALTER, so the "
+              f"harness is told to declare repair_path 'none' and writes no "
+              f"post-maintenance record. Flipping the capability is what "
+              f"restores both.", file=sys.stderr)
     return modes
 
 
@@ -937,6 +969,11 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
         # duplicate curve.
         #
         build_modes = _ops_build_modes(engine, profile, engine_cfg)
+        # Read here, once per phase, rather than inside the unit loop: it is a
+        # property of the engine's pinned source and cannot vary with M, the
+        # build mode or the storage engine. The same value `build_modes` above
+        # was derived from, which is the point of there being one reader.
+        bulk_build = _bulk_vector_index_build(engine_cfg)
         storage_engines = _ops_storage_engines(engine, profile, resources,
                                                resource_pass)
         worst_rc = 0
@@ -993,6 +1030,7 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                         build_mode=build_mode, storage_engine=storage,
                         iterative_scan=_ops_iterative_scan(
                             engine, profile, resources, resource_pass),
+                        bulk_vector_index_build=bulk_build,
                     )
                     with ops_pass.OpsRun(engine, engine_cfg, resolved,
                                          resource_pass, paths, run_id,

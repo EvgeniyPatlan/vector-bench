@@ -363,13 +363,30 @@ presented as a measurement.
 **This page said "only pgvector" and that was true when it was written.**
 Percona Server's path is an `ALTER TABLE … DROP KEY vi, ADD VECTOR KEY vi (…)`
 which rebuilds the graph from the live rows, so the tombstones a DELETE leaves
-behind are collected — and it is the **expensive** one of the two: a whole
-graph rebuild per churn fraction, on the order of a bulk build at 1M rows,
-against pgvector's VACUUM. Neither has a measured rate at any corpus size, and
-`orchestrator/estimate.py` discloses both by name rather than charging for
-either. Budget for it before scheduling a churn phase on this engine; `docs/09
--adding-percona-server.md` §2.7 has the mechanism and the lock level (SHARED —
-readers continue, every writer stops for the duration).
+behind are collected — and **by design** it is the expensive one of the two: a
+whole graph rebuild per churn fraction, on the order of a bulk build at 1M
+rows, against pgvector's VACUUM. `orchestrator/estimate.py` discloses both by
+name rather than charging for either. `docs/09-adding-percona-server.md` §2.7
+has the mechanism and the lock level (SHARED — readers continue, every writer
+stops for the duration).
+
+> **CORRECTION: at the pinned `source.tag` that repair does not run, so there
+> is nothing to budget for and it is not the expensive one of the two — it is
+> the one that costs nothing.** Three sentences above are now wrong and are
+> left standing because the design claim they make is still right if the
+> server is fixed. `maintain()`'s `ALTER … ADD VECTOR KEY … ALGORITHM=INPLACE`
+> is the same statement `capabilities.bulk_vector_index_build: false` in
+> `config/engines/percona.yml` records as killing the server. Measured on
+> `full-20261015-215006`: **1–4 ms**, `index_bytes` identical to the byte and
+> recall identical to five decimals in all 20 before/after pairs. So:
+> "Neither has a measured rate at any corpus size" — pgvector's still has
+> none, Percona's is now measured at effectively zero *because nothing runs*;
+> and "budget for it before scheduling a churn phase on this engine" —
+> **do not**, at this pin the churn phase pays no repair at all.
+> `PerconaDriver.declare_bulk_vector_index_build` withdraws the path per
+> instance, the class keeps declaring the mechanism, and §4's heading above
+> ("before/after maintenance shown where a repair path exists") resolves for
+> Percona to the `repair_path: none` branch until the capability is flipped.
 
 What MongoDB has instead is the index-sync wait, a different hook:
 `harness/drivers/base.py:340-353` returns `0.0` by default and MongoDB and
@@ -412,7 +429,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2258` and `docs/05-methodology.md:939` both say
+matched rows. `report/render.py:2258` and `docs/05-methodology.md:953` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -470,7 +487,7 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 Satisfied for the version: `orchestrator/manifest.py:80` writes
 `config.ops_measurement_version` from the constant, `report/render.py:99-100`
-prints it above the numbers, and `docs/05-methodology.md:1007-1008`
+prints it above the numbers, and `docs/05-methodology.md:1021-1022`
 documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
@@ -481,7 +498,7 @@ everything above auditable a year from now.
 
 `innodb_hnsw_max_memory` is a hard bound and not a cache, which makes it a
 fairness problem rather than a tuning knob
-(`docs/09-adding-percona-server.md:682`). That document holds the floor
+(`docs/09-adding-percona-server.md:700`). That document holds the floor
 formula, the per-dataset table and the policy decision, and
 **the numbers are not repeated here on purpose** — `docs/09` carries its own
 guards, including a test that recomputes every row of that table from the
@@ -489,10 +506,10 @@ formula it cites, and a second copy in this file would be a second thing to go
 stale. This repository's most frequent defect is a figure restated in two
 places and corrected in one.
 
-Where to look: `docs/09-adding-percona-server.md:736-775` for the table and its
+Where to look: `docs/09-adding-percona-server.md:754-793` for the table and its
 provenance — which says in its own words that the figures are projections and
 not measurements, because row counts, dimensionality and `M` are all supplied —
-and `docs/09-adding-percona-server.md:841-844` for the conclusion that matters
+and `docs/09-adding-percona-server.md:859-862` for the conclusion that matters
 to a rollout: the smoke profile fits under the shipped default, so **a green
 smoke run is not evidence the memory policy is sound**. The `main` profile does
 not fit. The policy chosen is unlimited, which removes the hazard; the point is

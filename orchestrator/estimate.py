@@ -231,8 +231,23 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
         # repair itself -- pgvector's `VACUUM (ANALYZE)` over a table a
         # quarter of whose rows are tombstones, or Percona's index replace,
         # which rebuilds the entire HNSW graph and so costs on the order of a
-        # bulk build per fraction. This repo has no figure for either at any
-        # corpus size, because no live engine has been run. Named separately from
+        # bulk build per fraction.
+        #
+        # **"because no live engine has been run" was true when this was
+        # written and is not any more, and the correction cuts the other way
+        # than you would expect.** `full-20261015-215006` ran Percona's churn
+        # phase: the index replace returned in 1-4 ms and changed nothing --
+        # identical `index_bytes` to the byte and identical recall to five
+        # decimals in all 20 before/after pairs -- because that ALTER is the
+        # same statement `capabilities.bulk_vector_index_build: false`
+        # records as killing the server. So pgvector's VACUUM still has no
+        # measured rate, and Percona's repair now has one of zero while the
+        # capability is false, because the driver withdraws the path and runs
+        # nothing. The disclosure string below therefore qualifies Percona
+        # rather than dropping it: this module reads no engine configs, so it
+        # cannot know which pin a given run is on, and a reader planning a run
+        # on a FIXED server still needs the cost disclosed.
+        # Named separately from
         # the re-measurement line above because that line is about the two
         # measurements every engine pays and this one is about the engines
         # that repair.
@@ -243,8 +258,11 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
         # the order of a bulk build per churn fraction, so it is the larger of
         # the two unmeasured repairs disclosed here, not a footnote to
         # pgvector's VACUUM.
-        "churn repair path: on an engine that has one (pgvector's VACUUM "
-        "(ANALYZE) and Percona Server's index replace), driver.maintain() "
+        "churn repair path: on an engine that has one it can execute at its "
+        "pinned version (pgvector's VACUUM (ANALYZE); Percona Server's index "
+        "replace only while capabilities.bulk_vector_index_build is true -- "
+        "it is false at the pinned version, where the driver declares no "
+        "repair path, runs nothing and pays neither cost), driver.maintain() "
         "per churn fraction plus a third ops.max_queries measurement of the "
         "repaired index -- the repair has no measured rate at any corpus "
         "size and nothing caps either",

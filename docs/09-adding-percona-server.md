@@ -661,8 +661,26 @@ So, hook by hook (`harness/drivers/base.py:325-371`):
 |---|---|---|
 | `prepare_churn()` | **no-op — inherit** | There is no autovacuum-equivalent to pin down. This hook exists for pgvector, whose autovacuum decides on its own schedule whether tombstones are still there when recall is re-measured; Percona has no background graph maintenance at all, so there is no knob whose state could differ between the baseline and the post-churn measurement. |
 | `wait_index_synced()` | **no-op — inherit `0.0`** | The graph is maintained on the write path, inside the `INSERT`. There is nothing to wait for and the honest value is zero, which is what the inherited method returns. Returning a small positive number "to be safe" would be a fabricated measurement in a field documented as a measurement. |
-| `maintain()` | **implement** — `ALTER TABLE t1 DROP KEY vi, ADD VECTOR KEY vi (v) TYPE hnsw (…), ALGORITHM=INPLACE`, returning `"ALTER TABLE (index replace)"` | This is the one hook Percona changes relative to MariaDB and AliSQL, both of which inherit `None`. Percona has a repair path, it is the only MySQL-family engine here that does, and `maintain()`'s contract is to run it and name it. Returning `None` would make the churn workload write one record per fraction instead of a before/after pair, and would lose the measurement this engine is uniquely able to supply. |
-| `repair_path` | **`"index-replace"`** | `base.py:239-258` is explicit that this is declared and not inferred, because the churn workload stamps it onto the record *before* maintenance runs. Note that `base.py:255-256` currently says "MariaDB, AliSQL, Valkey and Percona Search inherit `"none"`" — "Percona Search" there is the MongoDB engine, not this one, and the sentence stays true. |
+| `maintain()` | **implement** — `ALTER TABLE t1 DROP KEY vi, ADD VECTOR KEY vi (v) TYPE hnsw (…), ALGORITHM=INPLACE`, returning `"ALTER TABLE (index replace)"` — **but it returns `None` at the pinned version; see the correction below** | This is the one hook Percona changes relative to MariaDB and AliSQL, both of which inherit `None`. Percona has a repair path, it is the only MySQL-family engine here that does, and `maintain()`'s contract is to run it and name it. |
+| `repair_path` | **`"index-replace"` on the class; `"none"` on the instance at the pinned version** | `base.py:239-258` is explicit that this is declared and not inferred, because the churn workload stamps it onto the record *before* maintenance runs. The class attribute still declares `"index-replace"` because that **is** this engine's repair mechanism; `PerconaDriver.declare_bulk_vector_index_build` shadows it with `"none"` per instance when the host says the bulk build is broken, which is what the records then carry. Note that `base.py:255-256` currently says "MariaDB, AliSQL, Valkey and Percona Search inherit `"none"`" — "Percona Search" there is the MongoDB engine, not this one, and the sentence stays true. |
+
+> **CORRECTION, and it reverses the argument in the `maintain()` row above.**
+> That row said returning `None` "would lose the measurement this engine is
+> uniquely able to supply". **At the pinned `source.tag` there is no such
+> measurement to lose**, and the row was written before anyone had run the
+> repair. `maintain()`'s `ALTER … ADD VECTOR KEY … ALGORITHM=INPLACE` is the
+> same statement `capabilities.bulk_vector_index_build: false` records as
+> killing the server. Measured on `full-20261015-215006`: it returned in
+> **1–4 ms** and changed nothing — `index_bytes` identical to the byte either
+> side of it and recall identical to five decimals in **all 20** before/after
+> pairs (10 ops units × 2 fractions, three datasets). What the before/after
+> pair supplied was the degraded index measured twice and published as
+> `after ALTER TABLE (index replace) (0.0 s)`. So the driver now declares no
+> repair path when the host says the bulk build is broken, and the churn
+> workload writes one record per fraction — the shape the five engines with no
+> repair path already use. Nothing is lost; a false row is removed. Flip
+> `capabilities.bulk_vector_index_build` in `config/engines/percona.yml` when
+> the server is fixed and both the bulk build and this repair come back.
 
 Two warnings about that `maintain()`, both of which make it a *measurement* and
 not a tidy-up:
@@ -1159,16 +1177,16 @@ returned `"unknown"` otherwise. `percona/module.py` overrode it to try
 `/opt/percona/.march` first and then fall back, so **the ann path was already
 correct** in the file the design task wrote.
 
-**The ops path, which the override cannot reach.** `harness/main.py:209-227` has
+**The ops path, which the override cannot reach.** `harness/main.py:237-255` has
 its own:
 
 ```python
-227      for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
-228                   "/opt/pgvector-artifacts/.march",
-229                   "/opt/percona/.march"):
+256      for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
+257                   "/opt/pgvector-artifacts/.march",
+258                   "/opt/percona/.march"):
 ```
 
-consumed at `:283` as `march=args.march or _detect_march()`. That runs in the
+consumed at `:331` as `march=args.march or _detect_march()`. That runs in the
 **harness container**, which mounts `harness/` and not `overlay/`, so no
 override in an ann-benchmarks module can affect it. `orchestrator/ops_pass.py`
 contains the string `march` zero times, so nothing passes `--march` in and the
@@ -1569,7 +1587,7 @@ unknowns look less urgent.
    just fixed `IGNORE INDEX … FOR ORDER BY (vk)` being ignored for them. If a
    future caller switches the hint on, a `FORCE INDEX` the parser rejects turns
    every plan check into an exception instead of a plan.
-8. **The ops path's `march` field.** §4.8: `harness/main.py:209-227` is a second
+8. **The ops path's `march` field.** §4.8: `harness/main.py:237-255` is a second
    `-march` reader in a different container, which no overlay override can
    reach. Both tuples now carry `/opt/percona/.march`, so this should read the
    image's real value — but *nothing in this repository can prove that*, since
