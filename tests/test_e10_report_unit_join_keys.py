@@ -142,6 +142,17 @@ def _identities(table: str, names: List[str]) -> List[tuple]:
     return [tuple(row[header.index(name)] for name in names) for row in body]
 
 
+def _CHURN_STATE_ORDER_FOR_MUTANT(record: Dict[str, Any]) -> int:
+    """`_churn_table`'s own state rank, for the mutant sort below.
+
+    Read off `render_mod` rather than re-spelled, so the mutant differs from
+    the real sort key in ONE respect -- where the unit axes sit relative to
+    this rank -- and not in how a state is ranked.
+    """
+    from report.churn_state import maintenance_state
+    return render_mod._CHURN_STATE_ORDER.get(maintenance_state(record), 99)
+
+
 # ---------------------------------------------------------------------------
 # The run's own records, for the units that produced the four wrong rows.
 # ---------------------------------------------------------------------------
@@ -363,13 +374,53 @@ class TestTheBuildTableNamesItsResourcePass:
         table = render_mod._build_table({"build": [bare], "ingest": []})
         assert _column(table, "Pass") == ["—"]
 
+    def test_the_m_cell_does_not_lean_on_the_none_string(self):
+        """`_fmt(m, 0)`, not `str(r.get("m", "—"))`.
+
+        This cell was the one ops-unit M cell in the file spelled with
+        `str()`. A record carrying `m: None` has the key present, so `.get`'s
+        default never fires and `str(None)` is the four-character string
+        "None"; it reached the page as an em dash only because `_md_table`'s
+        `_sanitise_cell` lists "None" among the three empties it maps.
+
+        Honest: an em dash from `_fmt`, with no dependency on that arm. Mutant
+        (the old `str()` spelling, computed inline): the literal "None", which
+        `_sanitise_cell` currently rescues and would print verbatim the moment
+        that arm changed. A float M is the second half: `str(16.0)` is "16.0"
+        where every other table prints "16".
+        """
+        none_m = dict(_build(FASHION, "tuned", 8, 100.265, 1))
+        none_m["m"] = None
+        table = render_mod._build_table({"build": [none_m], "ingest": []})
+        assert _column(table, "M") == ["—"]
+        assert str(none_m.get("m", "—")) == "None"
+
+        float_m = dict(_build(FASHION, "tuned", 8, 100.265, 1))
+        float_m["m"] = 16.0
+        table = render_mod._build_table({"build": [float_m], "ingest": []})
+        assert _column(table, "M") == ["16"]
+        assert str(float_m.get("m", "—")) == "16.0"
+
+    def test_every_body_cell_is_filled(self):
+        """A column added to the header and not to the row shifts every cell
+        after it, which renders as a plausible table of wrong numbers."""
+        rows = _cells(render_mod._build_table(
+            {"build": self.PAIR, "ingest": []}))
+        header, body = rows[0], rows[1:]
+        assert len(body) == 2
+        for row in body:
+            assert len(row) == len(header), list(zip(header, row))
+
 
 def _concurrency(pass_: str, m: int, qps: float, recall: float,
-                 spread: float, clients: int = 1) -> Dict[str, Any]:
+                 spread: float, clients: int = 1,
+                 engine: str = "percona", dataset: str = FASHION,
+                 build_mode: str = "incremental",
+                 storage: str = "InnoDB") -> Dict[str, Any]:
     """One concurrency record, as `full-20261015-215006` wrote it."""
-    return {"phase": "concurrency", "engine": "percona", "dataset": FASHION,
-            "resource_pass": pass_, "m": m, "build_mode": "incremental",
-            "storage_engine": "InnoDB", "clients": clients, "qps": qps,
+    return {"phase": "concurrency", "engine": engine, "dataset": dataset,
+            "resource_pass": pass_, "m": m, "build_mode": build_mode,
+            "storage_engine": storage, "clients": clients, "qps": qps,
             "recall_at_k": recall, "latency_p50_ms": 0.5,
             "latency_p95_ms": 0.6, "latency_p99_ms": 0.7,
             "extra": {"repeats": 3, "qps_spread_pct": spread,
@@ -466,7 +517,10 @@ class TestTheConcurrencyTableNamesItsOpsUnit:
 
 
 def _churn(pass_: str, m: int, fraction: float, qps: float, recall: float,
-           state: str | None, index_bytes: int) -> Dict[str, Any]:
+           state: str | None, index_bytes: int,
+           engine: str = "percona", dataset: str = FASHION,
+           build_mode: str = "incremental",
+           storage: str = "InnoDB") -> Dict[str, Any]:
     """One churn measurement, as `full-20261015-215006` wrote it."""
     extra: Dict[str, Any] = {}
     if state is not None:
@@ -474,9 +528,9 @@ def _churn(pass_: str, m: int, fraction: float, qps: float, recall: float,
         if state == "after":
             extra["maintenance"] = "ALTER TABLE (index replace)"
             extra["maintenance_s"] = 0.0
-    return {"phase": "churn", "engine": "percona", "dataset": FASHION,
-            "resource_pass": pass_, "m": m, "build_mode": "incremental",
-            "storage_engine": "InnoDB", "churn_fraction": fraction,
+    return {"phase": "churn", "engine": engine, "dataset": dataset,
+            "resource_pass": pass_, "m": m, "build_mode": build_mode,
+            "storage_engine": storage, "churn_fraction": fraction,
             "qps": qps, "recall_at_k": recall, "index_bytes": index_bytes,
             "extra": extra}
 
@@ -529,30 +583,73 @@ class TestTheChurnTableNamesItsOpsUnit:
                         ("tuned", "8"), ("tuned", "16"), ("tuned", "32")}
         assert len({tuple(row) for row in body}) == 5
 
-    def test_the_repair_pair_within_one_unit_is_still_two_rows(self):
-        """The columns added here must not cost the distinction the `Repair`
-        column exists to make.
+    #: Two units, each with its own before/after pair at 10%. Two is the
+    #: minimum that can see the defect this guards: with ONE unit the four
+    #: unit axes are constant across the pair, so their position in the sort
+    #: tuple cannot affect the order and the test is decorative.
+    TWO_PAIRS = [
+        _churn("tuned", 16, 0.10, 1_561.0, 0.9672, "before", 281_018_368),
+        _churn("tuned", 16, 0.10, 1_561.0, 0.9672, "after", 281_018_368),
+        _churn("tuned", 32, 0.10, 1_331.0, 0.9860, "before", 281_018_368),
+        _churn("tuned", 32, 0.10, 1_374.0, 0.9860, "after", 281_018_368),
+    ]
 
-        A non-regression guard rather than a probe: `Repair` predates this
-        change and the pre-change code passes this test too. It is here
-        because adding two columns ahead of `Repair` and putting both in the
-        sort key is exactly the edit that could reorder a before/after pair,
-        and `_CHURN_STATE_ORDER` exists because a plain string sort already
-        did once -- "after" sorts before "before".
+    def test_each_units_repair_pair_is_adjacent(self):
+        """The precedence claim in `_churn_table`'s sort key, as a value.
 
-        Honest: one unit's pair renders as two rows, `before` then `after
-        ALTER TABLE (index replace)`, in the order they were measured.
+        The four unit axes sort ahead of `_CHURN_STATE_ORDER`, which stays
+        last, so a unit's degraded and repaired rows are adjacent and in the
+        order they were measured.
+
+        Honest: `before, after, before, after`.
+        Mutant (the four unit axes moved BEHIND the state rank, computed
+        inline below over these same records): `before, before, after,
+        after` -- every unit's pair separated by as many rows as the grid is
+        wide, which on `full-20261015-215006` is five. Nothing about the
+        numbers changes under that mutation and the whole suite stays green,
+        which is exactly why this is pinned here.
         """
-        pair = [_churn("tuned", 16, 0.10, 1_561.0, 0.9672, "before",
-                       281_018_368),
-                _churn("tuned", 16, 0.10, 1_561.0, 0.9672, "after",
-                       281_018_368)]
-        rows = _cells(render_mod._churn_table({"churn": pair}))
+        rows = _cells(render_mod._churn_table({"churn": self.TWO_PAIRS}))
         header, body = rows[0], rows[1:]
         states = [row[header.index("Repair")] for row in body]
+        assert len(states) == 4
         assert states[0] == "before"
         assert states[1].startswith("after ALTER TABLE (index replace)")
-        assert body[0] != body[1]
+        assert states[2] == "before"
+        assert states[3].startswith("after ALTER TABLE (index replace)")
+
+        # And the pairs really are two different units, not one rendered
+        # twice: without this the sequence above could be satisfied by a
+        # fixture that collapsed.
+        units = [(row[header.index("Pass")], row[header.index("M")])
+                 for row in body]
+        assert units == [("tuned", "16"), ("tuned", "16"),
+                         ("tuned", "32"), ("tuned", "32")]
+
+        from report.churn_state import maintenance_state
+        mutant = [maintenance_state(r) or "—" for r in sorted(
+            self.TWO_PAIRS,
+            key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                           # The state rank FIRST, the unit axes behind it:
+                           # the one reordering of this tuple that keeps every
+                           # number right and makes the page unreadable.
+                           _CHURN_STATE_ORDER_FOR_MUTANT(r),
+                           r.get("resource_pass") or "",
+                           r.get("m") or 0,
+                           r.get("build_mode") or "",
+                           r.get("storage_engine") or "",
+                           r.get("churn_fraction") or 0))]
+        assert mutant == ["before", "before", "after", "after"], mutant
+        assert [s.split()[0] for s in states] != mutant
+
+    def test_every_body_cell_is_filled(self):
+        """A column added to the header and not to the row shifts every cell
+        after it, which renders as a plausible table of wrong numbers."""
+        rows = _cells(render_mod._churn_table({"churn": self.TWO_PAIRS}))
+        header, body = rows[0], rows[1:]
+        assert len(body) == 4
+        for row in body:
+            assert len(row) == len(header), list(zip(header, row))
 
     def test_the_m_column_sorts_as_a_number(self):
         rows = _cells(render_mod._churn_table(
@@ -570,7 +667,81 @@ class TestTheChurnTableNamesItsOpsUnit:
         assert _column(table, "M") == ["—"]
 
 
-class TestEveryOpsUnitTableSpellsTheTwoColumnsTheSameWay:
+class TestTheBuildModeAxisIsNamedToo:
+    """The fourth unit axis, which section 7 and section 9 still omitted.
+
+    `orchestrator/cli.py`'s ops loop is `for m in m_values: for build_mode in
+    build_modes: for storage in storage_engines:` inside each resource pass --
+    four axes, and after Pass and M landed these two tables named three of
+    them. The omission is reachable rather than theoretical: `full.yml`,
+    `main.yml`, `smoke.yml` and `quick.yml` all set `pgvector_build_modes:
+    [post, incremental]`, so a pgvector run writes two concurrency points and
+    two churn rows per (pass, M, storage) that are a bulk-built index and an
+    incrementally maintained one. It did not show in
+    `full-20261015-215006` only because `config/profiles/percona.yml` pins
+    `percona_build_modes: [incremental]`.
+
+    The figures below are the shape the reviewer measured for that case -- a
+    22% throughput spread between two different indexes -- not numbers read
+    off a bundle, because no bundle here has run that grid yet.
+    """
+
+    #: Two pgvector units differing in NOTHING but the build mode.
+    TWO_MODES = [
+        _concurrency("tuned", 16, 4_120.0, 0.9810, 0.4, engine="pgvector",
+                     build_mode="post", storage="heap"),
+        _concurrency("tuned", 16, 3_380.0, 0.9655, 0.5, engine="pgvector",
+                     build_mode="incremental", storage="heap"),
+    ]
+
+    TWO_MODES_CHURN = [
+        _churn("tuned", 16, 0.10, 4_120.0, 0.9810, "before", 281_018_368,
+               engine="pgvector", build_mode="post", storage="heap"),
+        _churn("tuned", 16, 0.10, 3_380.0, 0.9655, "before", 281_018_368,
+               engine="pgvector", build_mode="incremental", storage="heap"),
+    ]
+
+    #: Section 7's identity columns after Pass and M landed and before
+    #: `Build mode` did.
+    OLD_IDENTITY = ["Engine", "Dataset", "Pass", "M", "Storage", "Clients"]
+
+    def test_section_7_tells_the_two_build_modes_apart(self):
+        """Honest: `Build mode` reads `post` and `incremental`, so 4,120 and
+        3,380 QPS are visibly two indexes.
+
+        Old form, read back out of the rendered table: both rows carry
+        ('pgvector', 'fashion-mnist-784-euclidean', 'tuned', '16', 'heap',
+        '1') -- byte-identical across a 22% throughput spread and a recall
+        difference of 0.0155. Distinct identities: 1 of 2.
+        """
+        table = render_mod._concurrency_table({"concurrency": self.TWO_MODES})
+        old = _identities(table, self.OLD_IDENTITY)
+        assert len(old) == 2 and old[0] == old[1], old
+
+        assert _column(table, "Build mode") == ["incremental", "post"]
+        body = _cells(table)[1:]
+        assert body[0] != body[1]
+
+    def test_section_9_tells_the_two_build_modes_apart(self):
+        """The same omission in the churn table, which `churn_group` has
+        always held `build_mode` constant in."""
+        table = render_mod._churn_table({"churn": self.TWO_MODES_CHURN})
+        old = _identities(table, ["Engine", "Dataset", "Pass", "M", "Storage",
+                                  "Churn", "Repair"])
+        assert len(old) == 2 and old[0] == old[1], old
+
+        assert _column(table, "Build mode") == ["incremental", "post"]
+        body = _cells(table)[1:]
+        assert body[0] != body[1]
+
+    def test_a_record_with_no_build_mode_renders_the_em_dash(self):
+        bare = {"phase": "concurrency", "engine": "valkey", "dataset": "d",
+                "clients": 32, "qps": 5_820.0, "extra": {}}
+        table = render_mod._concurrency_table({"concurrency": [bare]})
+        assert _column(table, "Build mode") == ["—"]
+
+
+class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     """One reader convention across the five tables that render an ops unit.
 
     A column named `Pass` in one section and `Resource pass` in the next is a
@@ -578,31 +749,76 @@ class TestEveryOpsUnitTableSpellsTheTwoColumnsTheSameWay:
     down a column. The two already-correct tables are in the list as the
     reference and as the non-vacuity check: if the header text ever changes
     there, this test says so rather than silently passing on three tables.
+
+    **The assertion is the full identity set and its order, not a membership
+    test for two names.** Asserting only that `Pass` and `M` are present was
+    how `build_mode` stayed unnamed in two of these five tables while a test
+    called "one reader convention" passed: a convention check that names a
+    subset of the convention cannot see the part it left out.
     """
 
-    def test_all_five_tables_carry_pass_and_m(self):
-        build = render_mod._build_table(
-            {"build": TUNED_FASHION_BUILD, "ingest": TUNED_FASHION_INGEST})
-        concurrency = render_mod._concurrency_table(
-            {"concurrency": FIVE_UNITS})
-        churn = render_mod._churn_table({"churn": FIVE_CHURN_UNITS})
-        filtered = render_mod._filtered_table({"filtered": [
-            {"phase": "filtered", "engine": "percona", "dataset": FASHION,
-             "resource_pass": "tuned", "m": 16, "build_mode": "incremental",
-             "storage_engine": "InnoDB", "selectivity": 0.01,
-             "recall_at_k": 0.99, "qps": 100.0, "extra": {}}]})
-        during = render_mod._churn_during_writes_table(
-            {"churn_during_writes": [
-                {"engine": "percona", "dataset": FASHION,
+    #: Every ops-unit table opens with these four, in this order.
+    UNIT_PREFIX = ["Engine", "Dataset", "Pass", "M"]
+
+    #: Then these two, and **the build table alone has them the other way
+    #: round** -- `Storage | Build mode` where the other four read
+    #: `Build mode | Storage`. That predates this change: section 5's
+    #: `Storage` column carries its own MariaDB InnoDB/MyISAM rationale
+    #: anchored at that position, and reordering a column of a table whose
+    #: numbers were the actual defect here is a cosmetic edit with its own
+    #: risk. So the order of these two is asserted as a set and the
+    #: difference is recorded rather than hidden; the prefix above, which is
+    #: where the three new columns went, is asserted as a sequence.
+    UNIT_PAIR = {"Build mode", "Storage"}
+
+    def _tables(self):
+        return {
+            "build": render_mod._build_table(
+                {"build": TUNED_FASHION_BUILD,
+                 "ingest": TUNED_FASHION_INGEST}),
+            "concurrency": render_mod._concurrency_table(
+                {"concurrency": FIVE_UNITS}),
+            "churn": render_mod._churn_table({"churn": FIVE_CHURN_UNITS}),
+            "filtered": render_mod._filtered_table({"filtered": [
+                {"phase": "filtered", "engine": "percona", "dataset": FASHION,
                  "resource_pass": "tuned", "m": 16,
                  "build_mode": "incremental", "storage_engine": "InnoDB",
-                 "churn_fraction": 0.10, "readers": 4,
-                 "baseline_p99_ms": 10.0, "under_writes_p99_ms": 20.0,
-                 "p99_ratio": 2.0, "baseline_qps": 100.0,
-                 "under_writes_qps": 50.0, "writer_rows_per_s": 10.0}]})
-        for name, table in (("build", build), ("concurrency", concurrency),
-                            ("churn", churn), ("filtered", filtered),
-                            ("churn_during_writes", during)):
+                 "selectivity": 0.01, "recall_at_k": 0.99, "qps": 100.0,
+                 "extra": {}}]}),
+            "churn_during_writes": render_mod._churn_during_writes_table(
+                {"churn_during_writes": [
+                    {"engine": "percona", "dataset": FASHION,
+                     "resource_pass": "tuned", "m": 16,
+                     "build_mode": "incremental", "storage_engine": "InnoDB",
+                     "churn_fraction": 0.10, "readers": 4,
+                     "baseline_p99_ms": 10.0, "under_writes_p99_ms": 20.0,
+                     "p99_ratio": 2.0, "baseline_qps": 100.0,
+                     "under_writes_qps": 50.0,
+                     "writer_rows_per_s": 10.0}]}),
+        }
+
+    def test_all_five_tables_open_with_the_same_unit_columns(self):
+        """Honest: every one of the five opens `Engine, Dataset, Pass, M` and
+        then carries both `Build mode` and `Storage`.
+
+        Mutant (this test as it was first written -- `"Pass" in header and
+        "M" in header`): passes on all five while two of them name three of
+        the four ops-unit axes, which is the state that let `build_mode` stay
+        unnamed under a test called "one reader convention".
+        """
+        for name, table in self._tables().items():
             header = _cells(table)[0]
-            assert "Pass" in header, (name, header)
-            assert "M" in header, (name, header)
+            assert header[:len(self.UNIT_PREFIX)] == self.UNIT_PREFIX, (
+                name, header)
+            pair = header[len(self.UNIT_PREFIX):len(self.UNIT_PREFIX) + 2]
+            assert set(pair) == self.UNIT_PAIR, (name, header)
+
+    def test_every_table_is_rectangular(self):
+        """A column added to the header and not to the row shifts every cell
+        after it, which renders as a plausible table of wrong numbers."""
+        for name, table in self._tables().items():
+            rows = _cells(table)
+            header, body = rows[0], rows[1:]
+            assert body, name
+            for row in body:
+                assert len(row) == len(header), (name, list(zip(header, row)))
