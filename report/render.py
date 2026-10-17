@@ -1827,9 +1827,6 @@ def _tie_cells(records: List[Dict[str, Any]],
     return cells
 
 
-#: The footnote under every table that carries a tie column. One string, used
-#: by both, because two copies of an explanation drift and the churn table and
-#: the filtered table are explaining the same column.
 #: What the `Build mode` column in sections 7 and 9 is, and what it is not.
 #:
 #: **Those two sections print the DECLARED mode and cannot print what
@@ -1868,6 +1865,9 @@ BUILD_MODE_COLUMN_NOTE = (
     "is derived from the build record rather than from the requested mode._\n")
 
 
+#: The footnote under every table that carries a tie column. One string, used
+#: by both, because two copies of an explanation drift and the churn table and
+#: the filtered table are explaining the same column.
 TIE_COLUMN_NOTE = (
     "\n_**“Tied with”** is PR 5 §5.1 item 6: where two engines' 95% "
     "bootstrap intervals for the recall in this row overlap, the report says "
@@ -2033,8 +2033,10 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
         "qualifying vectors is less work. Anything that applies the predicate "
         "during or after the graph walk gets slower, because it has to travel "
         "further to find k survivors.\n\n"
-        "**One row per filter column per ops unit, and they can disagree.** "
-        "The ratio is taken across the two ends of ONE curve — one column, "
+        "**One row per corpus per filter column per ops unit, and they can "
+        "disagree.** "
+        "The ratio is taken across the two ends of ONE curve — one dataset, "
+        "one column, "
         "one iterative-scan mode, one resource pass, and one (M, build mode, "
         "storage engine) unit. Every one of those changes the answer, and the "
         "ops phase loops the last three: pgvector's `post` and `incremental` "

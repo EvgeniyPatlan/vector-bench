@@ -76,6 +76,7 @@ dicts carrying the figures the bundle recorded.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 from typing import Any, Dict, List
@@ -140,6 +141,38 @@ def _identities(table: str, names: List[str]) -> List[tuple]:
     for name in names:
         assert name in header, (name, header)
     return [tuple(row[header.index(name)] for name in names) for row in body]
+
+
+def _md_table_headers() -> List[tuple]:
+    """Every `_md_table` call in `report/render.py` whose header is literal.
+
+    Returns (lineno, [column names]). An AST scan rather than a regex, and
+    over the file rather than over rendered output, because the question is
+    "which tables exist" -- a table this test file forgot to render is
+    exactly the one a hand-written list omits, and that has happened twice in
+    this series. A header built at run time rather than spelled as a literal
+    list is skipped and would need its own guard; there are none today, which
+    the count pinned in `OPS_UNIT_TABLE_COUNT` is what notices.
+    """
+    source = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "report", "render.py")
+    out = []
+    for node in ast.walk(ast.parse(open(source).read())):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr",
+                                                         None)
+        if name != "_md_table" or not node.args:
+            continue
+        first = node.args[0]
+        if not isinstance(first, (ast.List, ast.Tuple)):
+            continue
+        if not all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                   for e in first.elts):
+            continue
+        out.append((first.lineno, [e.value for e in first.elts]))
+    return out
 
 
 def _strategy(dataset: str, m: int, column: str = "tag",
@@ -781,6 +814,79 @@ class TestTheBuildModeAxisIsNamedToo:
         assert _column(table, "Build mode") == ["—"]
 
 
+class TestSectionSevenAndNineSayWhatTheBuildModeCellIs:
+    """`BUILD_MODE_COLUMN_NOTE`, and that both sections actually carry it.
+
+    This is the one thing on the page stopping a reader from taking a
+    MariaDB `post` cell as a description of how its index was built --
+    `cli.py` defaults the mode to `post` for every engine that does not
+    declare `capabilities.bulk_vector_index_build: false`, and for MHNSW and
+    VIDX `post` is a no-op. It shipped with no test at all: deleting the
+    constant from `_concurrency_table` produced 0 failures in 1,636. Its own
+    stated precedent, `TIE_COLUMN_NOTE`, has a content test, so this is the
+    matching one.
+    """
+
+    #: Phrases the note cannot lose without ceasing to do its job: what the
+    #: column IS, the mechanism that makes the cell potentially misleading,
+    #: and where the honest answer lives. A substring list rather than the
+    #: whole string, so rewording the prose is allowed and gutting it is not.
+    MUST_SAY = ("ops-unit axis", "post", "no-op", "section 5",
+                "`Index build`")
+
+    def test_the_note_names_the_axis_the_mechanism_and_the_alternative(self):
+        note = render_mod.BUILD_MODE_COLUMN_NOTE
+        for phrase in self.MUST_SAY:
+            assert phrase in note, (phrase, note)
+
+    def test_section_7_carries_it(self):
+        """Honest: the note is in `_concurrency_table`'s output. Mutant (the
+        constant dropped from that return, which was the shipped state of the
+        previous commit): it is absent and nothing else notices."""
+        table = render_mod._concurrency_table({"concurrency": FIVE_UNITS})
+        assert render_mod.BUILD_MODE_COLUMN_NOTE in table
+
+    def test_section_9_carries_it(self):
+        table = render_mod._churn_table({"churn": FIVE_CHURN_UNITS})
+        assert render_mod.BUILD_MODE_COLUMN_NOTE in table
+
+    def test_both_sections_carry_the_same_string(self):
+        """One constant, two readers, for the reason `TIE_COLUMN_NOTE` is
+        one: two sections wording the same caveat separately is how one of
+        them comes to be edited into contradicting the other."""
+        concurrency = render_mod._concurrency_table(
+            {"concurrency": FIVE_UNITS})
+        churn = render_mod._churn_table({"churn": FIVE_CHURN_UNITS})
+        assert render_mod.BUILD_MODE_COLUMN_NOTE in concurrency
+        assert render_mod.BUILD_MODE_COLUMN_NOTE in churn
+
+
+class TestTheOperatingPointMCellMatchesTheOtherTables:
+    """Section 6's M cell, which shipped unguarded.
+
+    Reverting it from `_fmt(m, 0)` to `str(point.get("m") or "—")` produced
+    0 failures in 1,636 tests, so the fix had no probe. A float M is the live
+    half for the same reason it is in the build table's test: `str(16.0)` is
+    "16.0" where the other seven ops-unit tables print "16".
+    """
+
+    def test_a_float_m_renders_without_its_decimal(self):
+        """Honest: `16`. Mutant (the `str()` spelling): `16.0`."""
+        point = dict(_operating_point(FASHION, 16))
+        point["m"] = 16.0
+        table = render_mod._operating_point_table(
+            {"operating_points": [point]})
+        assert _column(table, "M") == ["16"]
+        assert str(point.get("m") or "—") == "16.0"
+
+    def test_a_point_with_no_m_renders_the_em_dash(self):
+        point = dict(_operating_point(FASHION, 16))
+        point["m"] = None
+        table = render_mod._operating_point_table(
+            {"operating_points": [point]})
+        assert _column(table, "M") == ["—"]
+
+
 class TestTheFilterStrategyTableNamesItsCorpus:
     """`_filter_strategy_table` named every ops-unit axis and not the dataset.
 
@@ -871,32 +977,62 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
         "storage_engine": "Storage",
     }
 
-    #: Every ops-unit table opens with these, in this order -- except the two
-    #: noted in `NO_DATASET_COLUMN` below.
+    #: Every table in `_rendered_tables` opens with these, in this order.
+    #: There is no exemption list and this must not acquire one by loosening:
+    #: a table that genuinely cannot carry `Dataset` belongs out of that dict
+    #: and named in `SEQUENCE_NOT_CHECKED` with its reason, not inside it
+    #: under a weakened assertion.
     UNIT_PREFIX = ["Engine", "Dataset", "Pass", "M"]
 
     #: Then these two, and **the build table alone has them the other way
     #: round** -- `Storage | Build mode` where the others read
     #: `Build mode | Storage`. Reordering it was considered and declined
-    #: twice: nothing in this repository reads these columns positionally
-    #: (every parser resolves by `header.index(name)`), so the swap is
-    #: invisible to every consumer, while section 5's `Storage` column
-    #: carries its own MariaDB InnoDB/MyISAM rationale anchored at that
-    #: position. With seven tables carrying these axes across four column
-    #: vocabularies there is no single achievable ordering for the whole
-    #: file, so the set that genuinely is a convention is pinned and the
-    #: deviation is recorded rather than hidden. A MISSING column is the
-    #: defect class that mattered, and a set still catches that.
+    #: twice.
+    #:
+    #: The narrow fact the decision rests on: **no parser anywhere reads
+    #: `Storage` or `Build mode` by index**, so swapping those two
+    #: specifically is invisible to every consumer. That is NOT the same as
+    #: "nothing reads these columns positionally", which an earlier version
+    #: of this comment claimed and which is false --
+    #: `tests/test_t3c_filtered.py:2263` reads the filtered table's cell
+    #: `[3]`, and `:1955-1958` reads the strategy table as `cells[-4]` and
+    #: `cells[-1]` behind a `len(cells) >= 12` gate that a 13-column header
+    #: would also pass if a column went missing. **An INSERTION is therefore
+    #: not safe**, and believing otherwise is what cost one commit in this
+    #: series 24 re-pointed assertion sites -- 25 integer subscripts -- in
+    #: `tests/test_t2b_report.py`.
+    #:
+    #: With eight tables carrying these axes across four column vocabularies
+    #: there is no single achievable ordering for the whole file, so the set
+    #: that genuinely is a convention is pinned and the deviation is recorded
+    #: rather than hidden. A MISSING column is the defect class that
+    #: mattered, and a set still catches that.
     UNIT_PAIR = {"Build mode", "Storage"}
 
-    def _tables(self):
-        """Every table in this file that renders one row per ops unit.
+    #: Tables the sequence assertion deliberately skips, with the reason.
+    #: Checked for the AXES by `test_every_ops_unit_header_names_every_axis`,
+    #: which reads the file rather than rendering it, so skipping the
+    #: sequence here does not drop them from the covered set.
+    SEQUENCE_NOT_CHECKED = {
+        "consistency_match": "section 10 interposes `ef_search` between M "
+                             "and Storage, and is rendered as part of "
+                             "`_consistency_section` rather than by a table "
+                             "function this test can call directly",
+    }
 
-        Seven, not five. `filter_strategy` and `operating_point` were missing
-        from the first version of this list, and that absence was measurable:
-        renaming `_filter_strategy_table`'s `Build mode` header to `Build`
-        left all 24 tests in this file passing and nothing else in the suite
-        caught it either.
+    def _rendered_tables(self):
+        """The ops-unit tables this test can call and render directly.
+
+        **Hand-written, and therefore not the covered set.** This list has
+        been wrong twice -- five when it was seven, seven when it was eight --
+        and each time the omission was measurable: renaming
+        `_filter_strategy_table`'s `Build mode` to `Build` left every test in
+        this file green, and dropping section 10's `Storage` column produced
+        no failure in 3,143 tests but a citation line-shift. So the AXIS
+        dimension is derived from the file by
+        `test_every_ops_unit_header_names_every_axis` and this dict is used
+        only for the checks that need rendered output: the column sequence
+        and rectangularity.
         """
         return {
             "build": render_mod._build_table(
@@ -941,32 +1077,62 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
         assert set(OPS_UNIT_FIELDS) == set(self.COLUMN_FOR_FIELD), (
             sorted(set(OPS_UNIT_FIELDS) ^ set(self.COLUMN_FOR_FIELD)))
 
-    def test_every_table_names_every_ops_unit_axis(self):
-        """The header side of `ops_unit`.
+    #: How many `_md_table` literal headers in `report/render.py` name both
+    #: `Pass` and `M`. Pinned so the test below cannot pass by selecting
+    #: nothing: a predicate that stops matching is a guard that stopped
+    #: working, and it would look identical to a clean run.
+    OPS_UNIT_TABLE_COUNT = 8
 
-        Honest: all seven headers carry `Pass`, `M`, `Build mode` and
-        `Storage`. Mutant (`_filter_strategy_table`'s `Build mode` renamed to
-        `Build`, which this file's previous version did not catch): this
-        fails naming `filter_strategy` and the column it is missing.
+    def test_every_ops_unit_header_names_every_axis(self):
+        """The header side of `ops_unit`, over the FILE rather than a list.
+
+        **Both dimensions are derived.** The axes come from
+        `report.generate.OPS_UNIT_FIELDS`, and the tables come from an AST
+        scan of `report/render.py` for every `_md_table` call whose header is
+        a literal list of strings. The predicate is "names both `Pass` and
+        `M`", which selects exactly the eight ops-unit tables and nothing
+        else -- the validity-section partials carry one of the two and not
+        both, so they are not selected and need no exemption.
+
+        Deriving the table dimension is the point. A hand-written list was
+        wrong twice in this series, and the second time the missing table was
+        section 10's cross-check between the two measurement paths, where
+        dropping `Storage` makes one engine's cross-check read as another's
+        and produced no test failure at all.
+
+        Honest: 8 tables selected, none missing an axis.
+        Mutant (section 10's `Storage` removed, or any axis renamed in any of
+        the eight): this fails naming the header's line number and the
+        missing column.
         """
         from report.generate import OPS_UNIT_FIELDS
         wanted = {self.COLUMN_FOR_FIELD[f] for f in OPS_UNIT_FIELDS}
-        for name, table in self._tables().items():
-            header = _cells(table)[0]
+        selected = [(lineno, h) for lineno, h in _md_table_headers()
+                    if {"Pass", "M"} <= set(h)]
+        assert len(selected) == self.OPS_UNIT_TABLE_COUNT, (
+            f"{len(selected)} headers in report/render.py name both Pass and "
+            f"M, expected {self.OPS_UNIT_TABLE_COUNT}. If a table was added "
+            f"or removed on purpose, update the count; if the predicate "
+            f"stopped matching, this guard had stopped working.",
+            [lineno for lineno, _ in selected])
+        for lineno, header in selected:
             missing = sorted(wanted - set(header))
-            assert not missing, (name, missing, header)
+            assert not missing, (f"render.py:{lineno}", missing, header)
 
-    def test_all_seven_tables_open_with_the_same_unit_columns(self):
-        """Honest: every one of the seven opens `Engine, Dataset, Pass, M` and
-        then carries both `Build mode` and `Storage`.
+    def test_the_rendered_tables_open_with_the_same_unit_columns(self):
+        """The column ORDER, on the tables this test can render.
+
+        Honest: each opens `Engine, Dataset, Pass, M` and then carries both
+        `Build mode` and `Storage`.
 
         Mutant (this test as it was first written -- `"Pass" in header and
-        "M" in header` over five tables): passes while two of the five name
-        three of the four ops-unit axes and two more tables are not checked
-        at all, which is the state that let `build_mode` stay unnamed under a
-        test called "one reader convention".
+        "M" in header`): passes while two tables name three of the four axes
+        and three more are not checked at all, which is the state that let
+        `build_mode` stay unnamed under a test called "one reader convention".
         """
-        for name, table in self._tables().items():
+        assert set(self.SEQUENCE_NOT_CHECKED) & set(self._rendered_tables()) \
+            == set(), "a skipped table must not also be in the rendered dict"
+        for name, table in self._rendered_tables().items():
             header = _cells(table)[0]
             assert header[:len(self.UNIT_PREFIX)] == self.UNIT_PREFIX, (
                 name, header)
@@ -976,7 +1142,7 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     def test_every_table_is_rectangular(self):
         """A column added to the header and not to the row shifts every cell
         after it, which renders as a plausible table of wrong numbers."""
-        for name, table in self._tables().items():
+        for name, table in self._rendered_tables().items():
             rows = _cells(table)
             header, body = rows[0], rows[1:]
             assert body, name

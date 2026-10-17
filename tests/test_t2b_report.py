@@ -243,12 +243,22 @@ def _table_rows(markdown: str, header: Sequence[str]) -> List[List[str]]:
 def _cell(cells: Sequence[str], column: str) -> str:
     """One operating-point cell, by column name rather than by position.
 
-    Every read in this file used to be an integer index, and adding a
-    `Storage` column to section 6 shifted fifteen of them at once -- each one
-    then reading a value from a position that had come to mean a different
-    column, which is the same defect class the table itself was being fixed
-    for. `OPERATING_HEADER` already pins the order, so a rename still fails
-    loudly here; what no longer fails is an insertion.
+    The operating-point cell reads in this file were integer indices -- not
+    every read in the file, but every read of this table -- and adding a
+    `Storage` column to section 6 shifted all of them at once, each then
+    taking its value from a position that had come to mean a different
+    column. That is the same defect class the table itself was being fixed
+    for, in the tests that were meant to catch it.
+
+    **24 call sites, replacing 25 integer subscripts.** The counts differ by
+    one because a single assertion message read the same cell twice
+    (`assert cells[8] == want, (target, cells[8])`) and now prints the whole
+    row instead of looking the cell up again. Both numbers are checkable: the
+    subscripts are in `845f326:tests/test_t2b_report.py` at indices
+    5x3, 6x2, 7x9, 8x2, 9x7, 10x2.
+
+    `OPERATING_HEADER` already pins the order, so a rename still fails loudly
+    here; what no longer fails is an insertion.
     """
     return cells[OPERATING_HEADER.index(column)]
 
