@@ -121,7 +121,7 @@ report raise `MixedMeasurementVersions`, and so do a version 1 and a version 2
 measurement**. The equivalence set
 (`harness/metrics/records.py:451`) changes the *wording* of the refusal,
 dropping the advice to re-measure; it does not change the decision. And the
-refusal is not a caveat on a chart: `report/generate.py:858-859` prints the
+refusal is not a caveat on a chart: `report/generate.py:1213-1214` prints the
 message and returns 2, so there is no report.
 
 So step 3's comparison has no in-report form. It can be done by hand, by
@@ -209,7 +209,7 @@ below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:2858`), computed by
+report** (`report/render.py:3201`), computed by
 `report/crosscheck.py:327`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
@@ -405,7 +405,7 @@ is still true.
 
 **This section now exists.** `report/crosscheck.py:327`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:2858`). It is the check that cross-references
+as section 10 (`report/render.py:3201`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -429,7 +429,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2483` and `docs/05-methodology.md:953` both say
+matched rows. `report/render.py:2826` and `docs/05-methodology.md:953` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -485,8 +485,8 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 ### 7. "Run manifest records `ops_measurement_version`, seeds and the resolved profile"
 
-Satisfied for the version: `orchestrator/manifest.py:80` writes
-`config.ops_measurement_version` from the constant, `report/render.py:99-100`
+Satisfied for the version: `orchestrator/manifest.py:219` writes
+`config.ops_measurement_version` from the constant, `report/render.py:326-327`
 prints it above the numbers, and `docs/05-methodology.md:1021-1022`
 documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes

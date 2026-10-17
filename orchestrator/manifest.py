@@ -12,6 +12,7 @@ import datetime as _dt
 import json
 import os
 import platform
+import socket
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,147 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
             return json.load(fh)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _pass_entry(resource_pass: str, resolved: Any,
+                fingerprint: Optional[str]) -> Dict[str, Any]:
+    """One pass's record: its name, its limits and its results-tree key.
+
+    The three keys are spelled exactly as the single-valued keys beside them
+    in the config block, so a reader who knows that block knows an entry.
+
+    Absent stays absent. A missing `ann_fingerprint` means nobody computed one
+    for this pass, and the generator's stdout warning says so -- in those
+    words, "cannot narrow to that pass's results tree". It deliberately does
+    not say the recall is missing, and §2 Validity may say nothing at all:
+    see the retraction in `_accumulate_passes` below for the branch where the
+    whole-tree fallback publishes the pass anyway. Writing `None` here would
+    make the same statement harder to tell apart from a tree keyed on the
+    string "None".
+    """
+    entry: Dict[str, Any] = {
+        "resource_pass": str(resource_pass),
+        "resolved_resources": resolved,
+    }
+    if fingerprint is not None:
+        entry["ann_fingerprint"] = fingerprint
+    return entry
+
+
+def _measured_on_this_host(recorded_host: Any) -> bool:
+    """Whether the manifest's recorded host is the one running now.
+
+    Empty counts as "yes": `cli.py` calls `set_host` before `set_config`, so a
+    fresh run always has a hostname by the time a pass is recorded, and the
+    only way to reach this with nothing recorded is a manifest written by
+    something that never called `set_host` -- where refusing to record a
+    fingerprint would block the recovery for no stated reason.
+
+    Both spellings are accepted because the writer and the existing reader
+    disagree: `harness/metrics/sysinfo.py` stores `platform.node()`, and
+    `webui/runs.py` already compares the same field against
+    `socket.gethostname()`. On Linux they are the same string; matching either
+    means a machine is never called foreign because of which API asked.
+    """
+    if not recorded_host:
+        return True
+    return str(recorded_host) in (platform.node(), socket.gethostname())
+
+
+def _accumulate_passes(prior: Dict[str, Any], resource_pass: str,
+                       resolved: Any, fingerprint: Optional[str],
+                       recorded_host: Any = None) -> List[Dict[str, Any]]:
+    """`prior["passes"]` extended to cover `resource_pass`, as a new list.
+
+    Why the list exists. `set_config` is called once per (pass, engine) and
+    rebuilds the whole `config` block every time, so `config.resource_pass`,
+    `config.resolved_resources` and `config.ann_fingerprint` end up describing
+    whichever pass was configured last. A run of `--resource-pass both`
+    therefore left behind a manifest that described a run of one pass, and
+    every reader believed it. `full-20261015-215006` ran `normalized` then
+    `tuned` -- 16 phases, 8 per pass, 41.9 h in total -- and its report
+    narrowed the ann results tree to `tuned/a9349676` alone. The three
+    completed normalized recall phases, 0.50 h + 4.80 h + 7.78 h = 13.1 hours
+    of measurement, were simply absent from it: of 397 records in
+    `report/records.jsonl`, none carried `phase: recall_qps` with
+    `resource_pass: normalized`. Section 1 then printed the tuned machine --
+    cpuset `0-75`, 112.5 GiB -- above tables holding rows measured with 8 CPUs
+    and 16 GB. Nothing crashed and nothing looked wrong.
+
+    `ann_fingerprint` is what makes this more than a labelling problem. It
+    keys `results/annb/<pass>/<fingerprint>/` by the pass's *declared* knobs,
+    so the normalized tree sits under a different string, and the report
+    cannot derive it: that container mounts `report/` and `harness/` only, and
+    importing the orchestrator from there once crashed generation at the end of
+    a twenty-hour run. The string has to be recorded here, on the host, by the
+    very function that keys the tree -- exactly as `presentation` is.
+
+    Two rules, and both exist because `cli.py` calls `set_config` *before* the
+    checkpoint skip, so `run --resume --run-id <old-run>` reaches it even when
+    every unit is skipped and nothing is measured:
+
+    **A pass already in the list is never rewritten.** Overwriting it on a
+    resume would write today's resolved limits and today's fingerprint over a
+    directory measured under other ones, which is the provenance bug the long
+    comment in `set_config` describes for `ops_measurement_version`. Appending
+    a pass that has no entry is additive; rewriting one is not.
+
+    **The pass the block already describes is adopted before this call's.**
+    The single-valued keys are already a complete entry for one pass, and on
+    an archived run they are the only honest record of it -- they were written
+    when it was measured. Adopting them first means a resume of
+    `full-20261015-215006` recovers `tuned/a9349676` as measured, rather than
+    re-deriving it from whatever machine the resume happens to run on, and
+    then adds `normalized` beside it. That resume records both passes and
+    measures nothing, which is how a run that has already cost 42 hours gets a
+    complete report without being repeated.
+
+    **A pass added on a machine that did not measure the run gets no
+    fingerprint.** The entry's limits and fingerprint for a newly appended
+    pass are this machine's derivation, which is right when the resume runs
+    where the run ran and wrong otherwise. Wrong-and-absent is safe: the tree
+    is not on disk, and the report names the pass and says its recall cannot
+    be located. Wrong-and-*present* is not -- if this machine has itself
+    measured that pass under its own knobs, `annb/<pass>/<its fingerprint>/`
+    exists, and the report would merge another machine's recall curve as this
+    run's under a §1 block carrying that machine's limits. The staleness check
+    does not save it: that catches a tree measured BEFORE the run, not one
+    measured after. So when the recorded host is not this one, the pass is
+    recorded without a fingerprint. Same-machine recovery, the case this is
+    for, is untouched. `webui/runs.py` compares the same field for the same
+    reason.
+
+    **That closes one of the two branches, not both.** This comment used to
+    end "and the report says it cannot be located -- which is the truth", and
+    that is only true where this host has never measured the pass: no
+    directory, nothing read, and §2 names it. Where this host HAS measured it,
+    withholding the fingerprint sends the report into its whole-tree fallback,
+    which reads that very directory; §4 labels those records with the pass
+    name taken from the directory, `summarize`'s intersection then sees recall
+    for the pass and suppresses §2's notice, and nothing in the document says
+    the tree was not this run's. §4's label is correct and no false sentence is
+    printed, so this is an omitted warning about a hazard that predates the
+    per-pass list rather than a new wrong number -- but it is not "the truth"
+    that the report says anything at all. Telling a narrowed read from a
+    fallback one is a backlog item; the records already carry the
+    discriminator in `extra.source_file`.
+    """
+    out: List[Dict[str, Any]] = [dict(e) for e in (prior.get("passes") or [])
+                                 if isinstance(e, dict) and e.get("resource_pass")]
+    named = {e["resource_pass"] for e in out}
+    carried = prior.get("resource_pass")
+    if carried and str(carried) not in named:
+        out.append(_pass_entry(str(carried), prior.get("resolved_resources"),
+                               prior.get("ann_fingerprint")))
+        named.add(str(carried))
+    if str(resource_pass) not in named:
+        # The adoption above keeps the archive's own fingerprint whatever host
+        # this is; only a NEWLY appended pass is this machine's derivation, so
+        # only it is withheld.
+        out.append(_pass_entry(
+            resource_pass, resolved,
+            fingerprint if _measured_on_this_host(recorded_host) else None))
+    return out
 
 
 class Manifest:
@@ -128,8 +270,8 @@ class Manifest:
         # A resume that *does* bump the version and then measures something new
         # is still caught, by the other half of the check: the directory ends
         # up holding records at two versions.
-        declared = (self.data.get("config") or {}).get(
-            "ops_measurement_version")
+        prior = self.data.get("config") or {}
+        declared = prior.get("ops_measurement_version")
         self._warn_if_resuming_across_a_bump(declared)
         config: Dict[str, Any] = {
             "profile": profile,
@@ -143,6 +285,17 @@ class Manifest:
         config.pop("ops_measurement_version", None)
         if declared is not None:
             config["ops_measurement_version"] = declared
+        # No pop needed above this, unlike the version one: that assignment
+        # is conditional, so a smuggled value survives when the manifest
+        # declares nothing, which is every archived run. This one is
+        # unconditional and `_accumulate_passes` reads `prior` rather than
+        # `config`, so a `passes` key in a caller's `extra` is overwritten
+        # whatever it holds. A pop here looked prudent and was dead code:
+        # deleting it changed no test.
+        config["passes"] = _accumulate_passes(
+            prior, resource_pass, config["resolved_resources"],
+            config.get("ann_fingerprint"),
+            recorded_host=(self.data.get("host") or {}).get("hostname"))
         self.data["config"] = config
         # Persisted here rather than left to the next populator's save(). Every
         # other method on this class saves, and set_config did not only because
@@ -164,9 +317,16 @@ class Manifest:
         means up to days of ingest before anything says the directory it is
         filling cannot be reported as one. This is the only moment that knows
         both numbers and still precedes the work: `cli.py` calls `set_config`
-        per (pass, engine) at :461, above the `(already complete)` checkpoint
-        skip at :484, so a resume reaches it even when every unit is skipped
-        and nothing is measured. If that call ever moves below the unit loop
+        per (pass, engine) above the `(already complete)` checkpoint skip, so
+        a resume reaches it even when every unit is skipped and nothing is
+        measured. That ordering is pinned by
+        `tests/test_config.py::TestResumingDoesNotRewriteTheVersion::test_cli_still_calls_set_config_before_the_checkpoint_skip`
+        rather than cited by line number here: the pair this comment carried,
+        :461 and :484, had drifted to :468 and :491 by the time anyone
+        checked. The class is part of the node id -- the first version of this
+        citation omitted it and collected nothing, which is the same lesson
+        again: a reference being drift-RESISTANT in form says nothing about it
+        being right, and the only way to know is to run it. If that call ever moves below the unit loop
         this notice becomes useless, and no test will say so -- "checkpoint"
         appears a dozen times either side of the call, so the obvious grep
         for the ordering passes whatever the order is.

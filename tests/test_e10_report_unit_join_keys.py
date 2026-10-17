@@ -1002,7 +1002,7 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     #: series 24 re-pointed assertion sites -- 25 integer subscripts -- in
     #: `tests/test_t2b_report.py`.
     #:
-    #: With eight tables carrying these axes across four column vocabularies
+    #: With nine tables carrying these axes across four column vocabularies
     #: there is no single achievable ordering for the whole file, so the set
     #: that genuinely is a convention is pinned and the deviation is recorded
     #: rather than hidden. A MISSING column is the defect class that
@@ -1081,7 +1081,16 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     #: `Pass` and `M`. Pinned so the test below cannot pass by selecting
     #: nothing: a predicate that stops matching is a guard that stopped
     #: working, and it would look identical to a clean run.
-    OPS_UNIT_TABLE_COUNT = 8
+    #:
+    #: 8 -> 9: §2's "same configuration was measured more than once" table
+    #: gained the unit. It lists recall configurations rather than ops units,
+    #: but it is keyed on `build_signature`, which takes the configuration
+    #: from the result filename and so carries the storage engine and the
+    #: build mode inside it -- two rows can differ on either, and a table
+    #: printing neither made two configurations' duplicates read as one
+    #: configuration listed twice. The reasoning this guard records for
+    #: section 10's `Storage` applies unchanged.
+    OPS_UNIT_TABLE_COUNT = 9
 
     def test_every_ops_unit_header_names_every_axis(self):
         """The header side of `ops_unit`, over the FILE rather than a list.
@@ -1090,9 +1099,18 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
         `report.generate.OPS_UNIT_FIELDS`, and the tables come from an AST
         scan of `report/render.py` for every `_md_table` call whose header is
         a literal list of strings. The predicate is "names both `Pass` and
-        `M`", which selects exactly the eight ops-unit tables and nothing
-        else -- the validity-section partials carry one of the two and not
-        both, so they are not selected and need no exemption.
+        `M`", which selects every table that renders a unit.
+
+        It is NOT true that the validity-section partials are excluded by
+        construction. That clause stood here until §2's "same configuration
+        was measured more than once" table gained the full unit -- it lists
+        recall configurations rather than ops units, but it is keyed on
+        `build_signature`, which takes the configuration from the result
+        filename and so carries the storage engine and the build mode inside
+        it, and a table printing neither made two configurations' duplicates
+        read as one configuration listed twice. Any validity table that names
+        a unit is selected and must spell it in full, which is the rule this
+        guard enforces and not an exemption from it.
 
         Deriving the table dimension is the point. A hand-written list was
         wrong twice in this series, and the second time the missing table was
@@ -1100,9 +1118,9 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
         dropping `Storage` makes one engine's cross-check read as another's
         and produced no test failure at all.
 
-        Honest: 8 tables selected, none missing an axis.
+        Honest: 9 tables selected, none missing an axis.
         Mutant (section 10's `Storage` removed, or any axis renamed in any of
-        the eight): this fails naming the header's line number and the
+        the nine): this fails naming the header's line number and the
         missing column.
         """
         from report.generate import OPS_UNIT_FIELDS

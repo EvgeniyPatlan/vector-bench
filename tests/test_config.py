@@ -1736,7 +1736,13 @@ class TestStorageEngineIsNeverCollapsed:
                  "storage_engine": storage, "build_mode": "post"}
                 for ef, rec, qps, storage in
                 ((20, 0.9552, 569.0, "InnoDB"), (10, 0.9817, 867.5, "MyISAM"))]
-        entry = summarize(recs, {})["per_dataset"]["d"]["mariadb"]
+        # `per_dataset` is keyed by (dataset, resource pass): a frontier is a
+        # claim about one grid on one machine, and pooling two passes summed
+        # their sample counts. These records declare no pass, so they group
+        # under the `unknown` key -- `loaders.pass_or_unknown` normalises a
+        # falsy pass name to the one word the headings, the chart stem and the
+        # legend all use, so nothing publishes a Python `None` repr.
+        entry = summarize(recs, {})["per_dataset"]["d"]["unknown"]["mariadb"]
         assert entry["qps_at_recall_95"] == 867.5
         assert entry["qps_at_recall_95_storage"] == "MyISAM"
 
@@ -4843,7 +4849,10 @@ class TestAFloorFigureSaysWhereItWasActuallyTaken:
 
     def _table(self, entry, engine="mariadb123"):
         from report.render import _headline_tables
-        return _headline_tables({"per_dataset": {"d": {engine: entry}}})
+        # One table per (dataset, pass); `None` is the pass of a record that
+        # declares none, and §4 keeps the bare `#### d` heading for a single
+        # pass.
+        return _headline_tables({"per_dataset": {"d": {None: {engine: entry}}}})
 
     def test_a_figure_above_the_floor_is_marked(self):
         table = self._table(self._entry())
@@ -5424,7 +5433,8 @@ class TestEqualFloorColumnsAreExplained:
                  "qps_at_recall_95": 415, "qps_at_recall_95_recall": 0.9563,
                  "qps_at_recall_99": 46, "qps_at_recall_99_recall": 0.9931}
         entry.update(over)
-        return _headline_tables({"per_dataset": {"d": {"mariadb": entry}}})
+        return _headline_tables(
+            {"per_dataset": {"d": {None: {"mariadb": entry}}}})
 
     def test_every_cell_carries_its_recall(self):
         table = self._table()

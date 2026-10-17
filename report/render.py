@@ -17,7 +17,7 @@ from __future__ import annotations
 import html as _html
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Defaults; the manifest's per-engine `presentation.label` overrides them, so an
 # engine added after this file was written names itself correctly.
@@ -65,11 +65,265 @@ def _label(engine: str) -> str:
 # Shared section builders (returned as Markdown; HTML converts them)
 # ---------------------------------------------------------------------------
 
+def described_passes(summary: Dict[str, Any]) -> List[str]:
+    """Every resource pass the report describes, as `summarize` computed it.
+
+    One number, carried in the summary, so §4's headings and the floor chart's
+    stem agree about how many passes there are. They did not: §4 counted the
+    passes in `per_dataset`, which holds only those that produced recall for
+    one dataset, so a report whose §1 named two passes could print §4 under a
+    bare single-pass heading, and the stem qualified one dataset and not
+    another.
+
+    Those two are its only callers. An earlier version of this docstring said
+    §1's row and §2's notice shared it as well; they do not -- §1 derives from
+    `_pass_resources(manifest)` and the single-valued `resource_pass`, §2
+    reads `summary["passes_without_a_tree"]` -- and claiming a wider
+    agreement than exists is the same kind of false statement as the narrow
+    ones this change went back to fix.
+
+    The fallback derives it from `per_dataset` for a caller that builds a
+    summary by hand -- several tests do -- and yields 1 for a single-pass one,
+    which is what the byte-identical single-pass path requires.
+    """
+    described = summary.get("described_passes")
+    if described is not None:
+        return list(described)
+    per_dataset = summary.get("per_dataset", {}) or {}
+    return sorted({p for passes in per_dataset.values() for p in passes},
+                  key=str)
+
+
+def passes_that_ran(manifest: Dict[str, Any]) -> List[str]:
+    """Passes the phase log says this run executed, in first-seen order.
+
+    `phases[]` is appended per measured unit, so it is the one place a
+    manifest states what the run actually did rather than what its config
+    block was last told. It needs no fingerprint, which is why it can describe
+    an archived both-pass run that recorded only one.
+    """
+    out: List[str] = []
+    for phase in (manifest.get("phases") or []):
+        name = phase.get("resource_pass")
+        if name and str(name) not in out:
+            out.append(str(name))
+    return out
+
+
+def recorded_passes(manifest: Dict[str, Any]
+                    ) -> List[Tuple[str, Optional[str]]]:
+    """(pass, ann fingerprint) for every pass this run executed, in run order.
+
+    `config["passes"]` is accumulated one entry per pass by
+    `orchestrator/manifest.py`. A manifest written before that list existed
+    carries only the single-valued `resource_pass` / `ann_fingerprint`, which
+    describe one pass -- whichever `set_config` saw last.
+
+    **A pass `phases[]` names and the config block does not still appears
+    here, with `None` for its fingerprint.** That is the archived both-pass
+    run: `full-20261015-215006` ran `normalized` then `tuned`, and its config
+    block names only `tuned`. Deriving the pass list from the config block
+    alone made §1 and §11 describe a run of one pass, because the config block
+    is exactly the thing that forgot. `None` means "this pass ran and its
+    results tree cannot be located" -- the tree needs the fingerprint, but
+    naming the pass and reproducing the run do not.
+
+    **Ordered by `phases[]`.** The entry order in `config["passes"]` is the
+    order `set_config` was called in, and on a resume that is not the run
+    order: `_accumulate_passes` adopts the pass the config block carried
+    before the one it is called for, so resuming the archived manifest records
+    `['tuned', 'normalized']` for a run that measured normalized first. Any
+    pass the phase log does not mention keeps its recorded position, after the
+    ones it does.
+
+    The fingerprint is read, never derived. `report/` runs inside a bench
+    image that mounts report/ and harness/ only; importing the orchestrator to
+    compute it crashed generation at the end of a twenty-hour run once.
+
+    Lives here rather than in `generate.py` because the narrowing of the ann
+    results tree, the two sections that describe the run and §2's Validity
+    notice all have to agree about which passes ran -- a report naming one
+    pass above trees read from two is the bug this list exists to end.
+    `generate.py` imports it, for the same reason it imports `ENGINE_LABEL`:
+    one reader, not two.
+    """
+    config = manifest.get("config") or {}
+    out: List[Tuple[str, Optional[str]]] = []
+    seen = set()
+    for entry in (config.get("passes") or []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("resource_pass")
+        if name and str(name) not in seen:
+            seen.add(str(name))
+            out.append((str(name), entry.get("ann_fingerprint")))
+    # Consulted whether or not the list is populated, not only as a fallback.
+    # `_pass_resources` adopts the carried block unconditionally, so a manifest
+    # whose list omits the pass its single-valued keys name made the two
+    # readers disagree: §1 printed that pass's real limits while §2 declared
+    # its recall unlocatable, because only one of them had read its recorded
+    # fingerprint. Unreachable from the fixed orchestrator, reachable from a
+    # hand-edited manifest, and a disagreement between two sections of one
+    # report is the class of defect this whole change is about.
+    name = config.get("resource_pass")
+    if name and str(name) not in seen:
+        seen.add(str(name))
+        out.append((str(name), config.get("ann_fingerprint")))
+    for name in passes_that_ran(manifest):
+        if name not in seen:
+            seen.add(name)
+            out.append((name, None))
+    order = passes_that_ran(manifest)
+    ranked = [pair for pair in out if pair[0] in order]
+    ranked.sort(key=lambda pair: order.index(pair[0]))
+    return ranked + [pair for pair in out if pair[0] not in order]
+
+
+def passes_without_a_tree(manifest: Dict[str, Any]) -> List[str]:
+    """Passes this run executed whose ann results tree cannot be located.
+
+    A pass with no recorded `ann_fingerprint` -- an archived manifest's other
+    pass, or one a resume declined to fingerprint because it was measured on
+    another machine. The tree is keyed by that string and nothing in `report/`
+    can recompute it.
+
+    **That is the whole of what a name in this list means: the tree could not
+    be narrowed to.** Whether the pass's recall is actually missing from the
+    report is a second question with a different answer, because both
+    whole-tree fallbacks in `generate._narrow_to_this_run` hand the loader the
+    un-narrowed root and `_pass_from_path` then recovers the pass from the
+    directory layout. On a host that has itself measured the pass -- the case
+    `orchestrator/manifest.py`'s `_accumulate_passes` documents -- this
+    function returns the pass, §4 publishes its recall, and §2 correctly says
+    nothing.
+
+    So §2 does NOT render this list. It renders the intersected one that
+    `generate.summarize` builds, which drops any pass whose recall the
+    fallback picked up anyway; an earlier version of this docstring claimed
+    both that a name here means the measurements are absent and that §2
+    renders it, and both halves are false of the un-intersected return. The
+    reason that matters is not tidiness: read as a guarantee, it invites
+    dropping the intersection as redundant, which is exactly the hole the
+    retraction in `_accumulate_passes` exists to record.
+
+    This list is what the generator's stdout warning reads, and that warning
+    is worded to match -- it claims only that the tree cannot be narrowed to.
+    stdout is not bundled by `./run-benchmark.sh export`, which is why §2
+    exists as well.
+    """
+    return [name for name, fingerprint in recorded_passes(manifest)
+            if not fingerprint]
+
+
+def _pass_resources(manifest: Dict[str, Any]
+                    ) -> List[Tuple[str, Dict[str, Any]]]:
+    """(pass, its own resolved resources) for each pass, in run order.
+
+    A pass with no limits of its own gets `{}`, which §1 renders as `?` and
+    `—`. It must NOT fall back to the single-valued `resolved_resources`:
+    those describe one named pass, and lending them to another is the
+    misattribution this change exists to end -- `full-20261015-215006` would
+    print `normalized — server cpuset | 0-75` for a pass that ran on 8 CPUs.
+    """
+    config = manifest.get("config") or {}
+    by_name = {str(e.get("resource_pass")): (e.get("resolved_resources") or {})
+               for e in (config.get("passes") or [])
+               if isinstance(e, dict) and e.get("resource_pass")}
+    # The single-valued block is a complete record of exactly one pass: the
+    # one it names, and no other.
+    carried = config.get("resource_pass")
+    if carried and str(carried) not in by_name:
+        by_name[str(carried)] = config.get("resolved_resources") or {}
+    return [(name, by_name.get(name, {}))
+            for name, _fingerprint in recorded_passes(manifest)]
+
+
+def reproduction_pass_flag(manifest: Dict[str, Any]) -> str:
+    """The `--resource-pass` value that would perform this run again.
+
+    §11 printed the single-valued `config.resource_pass`, so a run of both
+    passes was reproduced as `--resource-pass tuned` -- a command that does
+    neither of the two things the run did. `both` is the flag `cli.py` expands
+    into the pass list, so it is the only correct answer for a multi-pass run;
+    a comma-separated list is not accepted there and would send the reader to
+    an error.
+
+    Taken from `recorded_passes`, which unions the config block with
+    `phases[]`, so an archived manifest that recorded one pass and ran two
+    still reproduces as `both`. No fingerprint is involved.
+    """
+    names = [name for name, _fingerprint in recorded_passes(manifest)]
+    if len(names) > 1:
+        return "both"
+    if names:
+        return names[0]
+    return "normalized"
+
+
+def _or_unknown(value: Any) -> str:
+    """`?` for a limit the manifest does not state, matching the single-pass
+    rows, which reach the same answer through `dict.get(key, "?")`."""
+    return "?" if value is None else str(value)
+
+
+#: The five limits §1 prints, and the label each carries, in its order.
+#:
+#: `server_cpuset`, `server_memory_bytes` and `build_threads` are pass-level
+#: and engine-invariant by construction, so one row per pass states them
+#: exactly. The buffer and graph-cache figures are NOT: `resolve_resources`
+#: lets pgvector's buffer absorb the graph cache's share, and an in-memory
+#: engine allocates neither, so on the tuned pass the same row differs by
+#: engine. Measured on `full-20261015-215006`, whose host is 80 logical CPUs
+#: (40 physical) and 187.54 GiB, and whose TUNED PASS is granted cpuset `0-75`
+#: -- 76 CPUs -- and 112.52 GiB, that being `host_fraction: 0.6` of host RAM.
+#: The buffer row is then 39.38 GiB for the MySQL family, 67.51 GiB for
+#: pgvector and 0 for Valkey, being 0.35, 0.60 and 0 of that pass limit per
+#: `config/resources/tuned.yml`.
+#:
+#: **Every figure here is binary.** They read 42.29 / 72.49 in decimal GB,
+#: and an earlier version of this comment gave the limit in GiB and the
+#: buffers in GB while asserting the ratio between them -- arithmetic that
+#: only closes if the reader switches base mid-sentence. What §1 actually
+#: prints is neither written form: `_fmt_bytes` renders that cell as
+#: `39.4 GiB`.
+#:
+#: The pass limits are deliberately not called the host's capacity. An
+#: earlier version labelled 76 CPUs and 112.5 GiB as "the host", in the one
+#: sentence whose purpose is naming the machine; they are
+#: `resolved_resources.server_cpu_count` and `server_memory_bytes`, which are
+#: what the pass was given, and they scale with the host -- which is why the
+#: run is named beside them.
+#:
+#: So those two rows are ONE engine's split, and -- the part that is new and
+#: was glossed here before -- not necessarily the same engine's as before.
+#: `config.resolved_resources` is whichever (pass, engine) `set_config` saw
+#: last; a `config["passes"]` entry holds the FIRST engine of its pass,
+#: because the accumulation is first-writer-wins so that a resume cannot
+#: re-stamp it. A single-pass report and a two-pass one can therefore print
+#: different buffer figures for the same pass. Both are a real resolved value
+#: for that pass; neither is the pass's only one, and §1 is not the place that
+#: claims otherwise -- the per-engine table below is.
+_PASS_LIMIT_ROWS = (
+    ("server_cpuset", "server cpuset", _or_unknown),
+    ("server_memory_bytes", "server memory limit", _fmt_bytes),
+    ("buffer_bytes", "buffer pool / shared_buffers", _fmt_bytes),
+    ("graph_cache_bytes", "graph cache", _fmt_bytes),
+    ("build_threads", "build threads", _or_unknown),
+)
+
+
 def _environment_rows(manifest: Dict[str, Any]) -> List[List[str]]:
     host = manifest.get("host", {}) or {}
     cpu = host.get("cpu", {}) or {}
     config = manifest.get("config", {}) or {}
     resolved = config.get("resolved_resources", {}) or {}
+    # One block of limit rows per pass once a run measured more than one.
+    # Printing a single pass's cpuset and memory limit above tables holding
+    # another pass's rows is how `full-20261015-215006` published 8-core
+    # normalized numbers under "cpuset 0-75, 112.5 GiB": the reader attributes
+    # them to a 76-core machine, and nothing in the report contradicts that.
+    per_pass = _pass_resources(manifest)
+    multi = len(per_pass) > 1
 
     simd = ", ".join(cpu.get("simd_flags", []) or []) or "none detected"
     rows = [
@@ -83,7 +337,9 @@ def _environment_rows(manifest: Dict[str, Any]) -> List[List[str]]:
         ["Kernel", host.get("kernel", "?")],
         ["Docker", host.get("docker_version", "?") or "?"],
         ["cgroup", host.get("cgroup_version", "?")],
-        ["Resource pass", str(config.get("resource_pass", "?"))],
+        ["Resource pass",
+         ", ".join(name for name, _r in per_pass) if multi
+         else str(config.get("resource_pass", "?"))],
         # Which version of the ops measurement path produced these numbers.
         # The reason `OPS_MEASUREMENT_VERSION` exists at all is that a change
         # to `harness/` can alter what an ops number means without altering
@@ -98,12 +354,26 @@ def _environment_rows(manifest: Dict[str, Any]) -> List[List[str]]:
         # what say version 1 -- see `ops_measurement_version`.
         ["Ops measurement version",
          str(config.get("ops_measurement_version", "not recorded"))],
-        ["Server cpuset", str(resolved.get("server_cpuset", "?"))],
-        ["Server memory limit", _fmt_bytes(resolved.get("server_memory_bytes"))],
-        ["Buffer pool / shared_buffers", _fmt_bytes(resolved.get("buffer_bytes"))],
-        ["Graph cache", _fmt_bytes(resolved.get("graph_cache_bytes"))],
-        ["Build threads", str(resolved.get("build_threads", "?"))],
     ]
+    if not multi:
+        # Byte-for-byte what this table has always emitted for a run of one
+        # pass. A single-pass report is not what was wrong, and changing its
+        # wording would invalidate every published one for nothing.
+        rows += [
+            ["Server cpuset", str(resolved.get("server_cpuset", "?"))],
+            ["Server memory limit", _fmt_bytes(resolved.get("server_memory_bytes"))],
+            ["Buffer pool / shared_buffers", _fmt_bytes(resolved.get("buffer_bytes"))],
+            ["Graph cache", _fmt_bytes(resolved.get("graph_cache_bytes"))],
+            ["Build threads", str(resolved.get("build_threads", "?"))],
+        ]
+        return rows
+    # One labelled block per pass, in the order the passes ran. The property
+    # column carries the pass name because this table is two columns wide and
+    # every row in it is a property of the run: a third column would have to
+    # be added to, and left blank by, every row above.
+    for name, limits in per_pass:
+        for key, label, fmt in _PASS_LIMIT_ROWS:
+            rows.append([f"{name} — {label}", fmt(limits.get(key))])
     return rows
 
 
@@ -412,20 +682,44 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     if summary.get("duplicate_ann"):
         parts.append(
             "\n### The same configuration was measured more than once\n\n"
-            "Every row below appeared twice or more in the results this report "
-            "read, which means it is reading **more than one measurement tree** "
-            "— typically results from an older resource budget sitting alongside "
-            "the current ones. The charts pick the best value at each point, so "
-            "they are a blend of two configurations rather than a measurement of "
-            "either. Point the report at a single tree with `--annb-results`, or "
-            "delete the stale one.\n"
+            "Every row below appeared twice or more **within one resource "
+            "pass**, which means this report is reading more than one "
+            "measurement tree for that pass — typically results from an older "
+            "resource budget left in the tree beside the current ones. The "
+            "charts pick the best value at each point, so those rows are a "
+            "blend of two configurations rather than a measurement of either. "
+            "Remove the stale directory under `results/annb/<pass>/` and "
+            "regenerate. `--force` is not the remedy here: it recomputes "
+            "within a tree, and what this section describes is a second tree "
+            "being read alongside the current one.\n"
+            # The remedy used to read "point the report at a single tree with
+            # `--annb-results`, or delete the stale one", and both halves are
+            # now wrong. The first is inert: the generator climbs back out of
+            # a narrowed path on purpose, because a run of both passes writes
+            # two trees and narrowing to one of them silently dropped 13.1
+            # hours of measurement. The second invited deleting real results —
+            # the rows this section used to list on a legitimate two-pass run
+            # were that run's own two passes, 123 of them, and a reader who
+            # followed the advice would have deleted a pass.
+            "\n_Two resource passes are **not** a duplicate: they are two "
+            "budgets, and they are keyed separately here and in every chart. "
+            "A row appearing in this table names one pass measured twice._\n"
         )
         rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
-                 str(c.get("m", "—")), str(c.get("ef_search", "—")),
+                 c.get("resource_pass") or "—",
+                 str(c.get("m", "—")), c.get("build_mode") or "—",
+                 c.get("storage_engine") or "—",
+                 str(c.get("ef_search", "—")),
                  str(c.get("count")), ", ".join(str(q) for q in c.get("qps", []))]
                 for c in summary["duplicate_ann"][:30]]
+        # The full unit, in the column order every other unit table in this
+        # file uses. `build_signature` keys on the result filename, which
+        # carries the storage engine and the build mode, so two rows here can
+        # differ on either -- and printing neither made two configurations'
+        # duplicates read as one configuration listed twice.
         parts.append(_md_table(
-            ["Engine", "Dataset", "M", "ef_search", "Copies", "QPS seen"], rows))
+            ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage",
+             "ef_search", "Copies", "QPS seen"], rows))
         if len(summary["duplicate_ann"]) > 30:
             parts.append(f"\n_…and {len(summary['duplicate_ann']) - 30} more._\n")
 
@@ -448,6 +742,45 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             rows.append([_label(c.get("engine", "?")), c.get("dataset", "?"),
                          _fmt_age(c.get("run_started"), c.get("measured_at"))])
         parts.append(_md_table(["Engine", "Dataset", "Measured before this run by"], rows))
+
+    if summary.get("passes_without_a_tree"):
+        # The notice that has to be IN the document. `full-20261015-215006`
+        # ran both passes, recorded one pass's `ann_fingerprint`, and
+        # published a report whose §1 stated one machine above 52 table rows
+        # measured on another -- with nothing in the document to contradict
+        # them. The generator said so on stdout; stdout is not what anybody
+        # reads, and `export` does not bundle it.
+        # Not escaped here: this function emits Markdown, and the HTML page
+        # runs every line through `_inline_md`, which escapes first and then
+        # applies the backtick and bold markup. Escaping twice prints
+        # `&amp;#x27;` on the page and a literal entity in the Markdown.
+        orphans = summary["passes_without_a_tree"]
+        named = ", ".join(f"`{p}`" for p in orphans)
+        many = len(orphans) > 1
+        # Spelled out rather than glued together from a suffix: "pass" + "es"
+        # + "'s" produced "those passes's recall measurements" in the first
+        # version of this notice.
+        subject = f"the {named} resource passes" if many \
+            else f"the {named} resource pass"
+        them, their = ("them", "those passes'") if many \
+            else ("it", "that pass's")
+        parts.append(
+            f"\n### Recall measurements this report could not locate\n\n"
+            f"This run executed {subject}, and the manifest records no "
+            f"`ann_fingerprint` for {them}. Recall results live in a tree "
+            f"shared across runs at `results/annb/<pass>/<fingerprint>/`, "
+            f"keyed by that string, so **{their} recall and throughput "
+            f"measurements are absent from every chart and table below**. "
+            f"The ops measurements for {them} are unaffected and are "
+            f"present. Nothing here guesses at the tree: it is shared across "
+            f"runs, so a directory under that pass may belong to a different "
+            f"resource configuration entirely.\n\n"
+            f"A manifest predating per-pass recording can be completed "
+            f"without re-measuring anything — "
+            f"`./run-benchmark.sh run --profile <p> --resume --run-id "
+            f"{manifest.get('run_id', '<run-id>')}` "
+            f"records every pass's fingerprint and skips every finished "
+            f"unit — after which this report regenerates complete.\n")
 
     if summary.get("memory_pressure"):
         parts.append(
@@ -746,84 +1079,123 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _headline_tables(summary: Dict[str, Any]) -> str:
+    """§4's tables: one per (dataset, resource pass).
+
+    The pass is in the heading rather than in a column, and that is a
+    deliberate difference from §7-§10, which do carry a Pass cell. Their rows
+    are individual measurement windows, so the pass identifies which machine
+    one window ran on. A row here is a derived frontier: the floor columns,
+    `Recall range` and `Points measured` are all claims taken across the whole
+    point set, so the pass scopes the entire table. A scope that belongs to the
+    table belongs in its heading, where the eye cannot drop it -- as a cell, an
+    engine measured in both passes becomes two rows with the same label and the
+    qualifier has to be carried by hand. The prose under the table is written
+    in the singular about "the swept grid" and closes "this run pins M=16 for
+    every engine", which stays true per table and becomes a per-row read under
+    a column.
+
+    The cross-pass comparison this does not give is `charts.pass_comparison`'s,
+    which exists because that question "had to be reconstructed by hand from
+    two tables" and whose first dimension is recall throughput.
+    """
     parts: List[str] = []
-    for dataset, per_engine in sorted(summary.get("per_dataset", {}).items()):
-        parts.append(f"\n#### {dataset}\n\n")
-        rows = []
-        for engine, entry in sorted(per_engine.items()):
-            # The frontier spans every configuration the engine was swept over,
-            # so on the tuned pass MariaDB's headline figures are MyISAM ones.
-            # Naming the winner keeps the number from being read as the result
-            # of the default build.
-            multi = len(entry.get("storage_engines") or []) > 1
+    per_dataset = summary.get("per_dataset", {}) or {}
+    # Named only when the RUN has more than one, so a single-pass report keeps
+    # the heading `#### <dataset>` it has always had, byte for byte.
+    #
+    # Off `described_passes`, not off `per_dataset`: the latter holds only the
+    # passes that produced recall for a dataset, so when one pass's tree was
+    # missing or unnarrowable §1 said "normalized, tuned" and §4 printed a bare
+    # heading over one of them -- and a reader took that table for the other
+    # pass's. One number, computed once in `summarize`.
+    #
+    # NOT called `multi`: the engine loop below already binds that name for
+    # "this engine was swept over more than one storage engine", so an outer
+    # `multi` is shadowed from the first engine onward. It rendered the first
+    # pass's heading correctly and every later one bare, which the §4 heading
+    # test caught and inspection did not.
+    many_passes = len(described_passes(summary)) > 1
+    for dataset, by_pass in sorted(per_dataset.items()):
+        for resource_pass, per_engine in sorted(
+                by_pass.items(), key=lambda kv: str(kv[0])):
+            heading = (f"{dataset} — {resource_pass}" if many_passes
+                       else dataset)
+            parts.append(f"\n#### {heading}\n\n")
+            rows = []
+            for engine, entry in sorted(per_engine.items()):
+                # The frontier spans every configuration the engine was swept over,
+                # so on the tuned pass MariaDB's headline figures are MyISAM ones.
+                # Naming the winner keeps the number from being read as the result
+                # of the default build.
+                multi = len(entry.get("storage_engines") or []) > 1
 
-            def cell(floor: int) -> str:
-                value = _fmt(entry.get(f"qps_at_recall_{floor}"), 0)
-                storage = entry.get(f"qps_at_recall_{floor}_storage")
-                if multi and storage and value != "—":
-                    value = f"{value} ({storage})"
-                # The recall the figure was actually taken at, on every cell.
-                # A frontier reports the fastest configuration at or above the
-                # floor, and that configuration is often well above it -- so
-                # two floors can be served by one measurement and the columns
-                # come out identical. MariaDB reads 415 at both 0.90 and 0.95
-                # because its fastest setting already returns 0.9563, and it
-                # has three slower measurements in between. Without the recall
-                # beside it, equal columns read as a missing measurement.
-                at = entry.get(f"qps_at_recall_{floor}_recall")
-                if value != "—" and at is not None:
-                    value += f" @{at:.3f}"
-                # An engine with no configuration below the floor has no
-                # measurement AT the floor either -- the best it can offer is
-                # the one above it. MariaDB 12.3's lowest setting returns
-                # recall 0.9784, so its "QPS at recall 0.90" is really its QPS
-                # at 0.9888, and printing a bare number invites a comparison
-                # with engines that do have a point near 0.90. The recall the
-                # figure was actually taken at travels with it.
-                # A bare marker now: the recall it was taken at is already on
-                # the cell, so repeating it beside a dagger said the same
-                # number twice.
-                lowest = entry.get("min_recall")
-                if (value != "—" and at is not None and lowest is not None
-                        and lowest > floor / 100.0):
-                    value += " †"
-                return value
+                def cell(floor: int) -> str:
+                    value = _fmt(entry.get(f"qps_at_recall_{floor}"), 0)
+                    storage = entry.get(f"qps_at_recall_{floor}_storage")
+                    if multi and storage and value != "—":
+                        value = f"{value} ({storage})"
+                    # The recall the figure was actually taken at, on every cell.
+                    # A frontier reports the fastest configuration at or above the
+                    # floor, and that configuration is often well above it -- so
+                    # two floors can be served by one measurement and the columns
+                    # come out identical. MariaDB reads 415 at both 0.90 and 0.95
+                    # because its fastest setting already returns 0.9563, and it
+                    # has three slower measurements in between. Without the recall
+                    # beside it, equal columns read as a missing measurement.
+                    at = entry.get(f"qps_at_recall_{floor}_recall")
+                    if value != "—" and at is not None:
+                        value += f" @{at:.3f}"
+                    # An engine with no configuration below the floor has no
+                    # measurement AT the floor either -- the best it can offer is
+                    # the one above it. MariaDB 12.3's lowest setting returns
+                    # recall 0.9784, so its "QPS at recall 0.90" is really its QPS
+                    # at 0.9888, and printing a bare number invites a comparison
+                    # with engines that do have a point near 0.90. The recall the
+                    # figure was actually taken at travels with it.
+                    # A bare marker now: the recall it was taken at is already on
+                    # the cell, so repeating it beside a dagger said the same
+                    # number twice.
+                    lowest = entry.get("min_recall")
+                    if (value != "—" and at is not None and lowest is not None
+                            and lowest > floor / 100.0):
+                        value += " †"
+                    return value
 
-            # The range, not only the best. Two identical floor columns mean
-            # the engine has no measurement between them, and the lowest recall
-            # it reached is the number that says so.
-            low, high = entry.get("min_recall"), entry.get("max_recall", 0)
-            span = f"{low:.4f} to {high:.4f}" if low is not None else f"{high:.4f}"
-            rows.append([
-                _label(engine),
-                cell(90), cell(95), cell(99),
-                span,
-                str(entry.get("points", 0)),
-            ])
-        parts.append(_md_table(
-            ["Engine", "QPS @ recall≥0.90", "QPS @ recall≥0.95",
-             "QPS @ recall≥0.99", "Recall range", "Points measured"],
-            rows,
-        ))
-        parts.append(
-            "\n_QPS at a recall floor is the comparison an operator makes: how fast "
-            "is the engine at an accuracy I can accept. A dash means the engine did "
-            "not reach that recall anywhere in the swept grid._\n"
-            "\n_Each cell also carries the recall the figure was measured at. "
-            "A frontier reports the fastest configuration at or above the "
-            "floor, and that configuration is frequently well above it, so two "
-            "columns showing the same number are one measurement winning both "
-            "— not a missing one. MariaDB reads the same at 0.90 and 0.95 "
-            "because its fastest setting already returns 0.956, with three "
-            "slower measurements in between._\n"
-            "\n_A **†** marks a figure the engine has no measurement for at that "
-            "floor: every configuration swept returned recall above it, so the "
-            "number shown is its throughput at the higher recall printed beside "
-            "the dagger. Those cells are not comparable with engines that do have "
-            "a point near the floor — they are taken at a materially harder task. "
-            "Lowering the graph degree M is what would produce points there; this "
-            "run pins M=16 for every engine._\n"
-        )
+                # The range, not only the best. Two identical floor columns mean
+                # the engine has no measurement between them, and the lowest recall
+                # it reached is the number that says so.
+                low, high = entry.get("min_recall"), entry.get("max_recall", 0)
+                span = f"{low:.4f} to {high:.4f}" if low is not None else f"{high:.4f}"
+                rows.append([
+                    _label(engine),
+                    cell(90), cell(95), cell(99),
+                    span,
+                    str(entry.get("points", 0)),
+                ])
+            parts.append(_md_table(
+                ["Engine", "QPS @ recall≥0.90", "QPS @ recall≥0.95",
+                 "QPS @ recall≥0.99", "Recall range", "Points measured"],
+                rows,
+            ))
+            parts.append(
+                "\n_QPS at a recall floor is the comparison an operator makes: how fast "
+                "is the engine at an accuracy I can accept. A dash means the engine did "
+                "not reach that recall anywhere in the swept grid._\n"
+                "\n_Each cell also carries the recall the figure was measured at. "
+                "A frontier reports the fastest configuration at or above the "
+                "floor, and that configuration is frequently well above it, so two "
+                "columns showing the same number are one measurement winning both "
+                "— not a missing one. MariaDB reads the same at 0.90 and 0.95 "
+                "because its fastest setting already returns 0.956, with three "
+                "slower measurements in between._\n"
+                "\n_A **†** marks a figure the engine has no measurement for at that "
+                "floor: every configuration swept returned recall above it, so the "
+                "number shown is its throughput at the higher recall printed beside "
+                "the dagger. Those cells are not comparable with engines that do have "
+                "a point near the floor — they are taken at a materially harder task. "
+                "Lowering the graph degree M is what would produce points there; this "
+                "run pins M=16 for every engine._\n"
+            )
     return "".join(parts) or "_No recall/QPS data in this run._\n"
 
 
@@ -2872,7 +3244,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         f"./run-benchmark.sh build --march {(config.get('resolved_resources') or {}).get('march', 'x86-64-v3')}\n"
         f"./run-benchmark.sh fetch --datasets {','.join(summary.get('datasets', []) or ['glove-100-angular'])}\n"
         f"./run-benchmark.sh run --profile {profile.get('name', 'quick')} "
-        f"--resource-pass {config.get('resource_pass', 'normalized')}\n"
+        f"--resource-pass {reproduction_pass_flag(manifest)}\n"
         "```\n\n",
         "The raw merged records are in `records.jsonl` next to this file, and the "
         "full provenance — image ids, source commits, resolved limits — is in "
@@ -3160,14 +3532,32 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
                                f"</figcaption></figure>")
         return "\n".join(out)
 
+    # The headline cards are the first thing a reader of the page sees, and
+    # they carried the same single-pass claim §1's table did: one cpuset and
+    # one memory limit, taken from whichever pass `set_config` saw last. On
+    # `full-20261015-215006` that put `0-75` and 112.5 GiB at the top of a
+    # page whose tables held 8-CPU, 16 GB rows. With two passes each card
+    # names both, qualified, rather than picking one.
+    per_pass = _pass_resources(manifest)
+    if len(per_pass) > 1:
+        pass_card = ", ".join(name for name, _limits in per_pass)
+        cpuset_card = ", ".join(f"{_or_unknown(limits.get('server_cpuset'))} "
+                                f"({name})" for name, limits in per_pass)
+        memory_card = ", ".join(
+            f"{_fmt_bytes(limits.get('server_memory_bytes'))} ({name})"
+            for name, limits in per_pass)
+    else:
+        pass_card = config.get("resource_pass", "?")
+        cpuset_card = resolved.get("server_cpuset", "?")
+        memory_card = _fmt_bytes(resolved.get("server_memory_bytes"))
     cards = [
         ("Run", run_id),
         ("Profile", profile.get("name", "?")),
-        ("Resource pass", config.get("resource_pass", "?")),
+        ("Resource pass", pass_card),
         ("CPU", cpu.get("model", "?")),
         ("AVX-512", "yes" if cpu.get("has_avx512") else "no"),
-        ("Server cpuset", resolved.get("server_cpuset", "?")),
-        ("Server memory", _fmt_bytes(resolved.get("server_memory_bytes"))),
+        ("Server cpuset", cpuset_card),
+        ("Server memory", memory_card),
         ("Records", f"{len(records):,}"),
     ]
     cards_html = "".join(
@@ -3275,7 +3665,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
 <h2>11. Reproducing this run</h2>
 <pre><code>./run-benchmark.sh build
 ./run-benchmark.sh fetch --datasets {_html.escape(','.join(summary.get('datasets', []) or ['glove-100-angular']))}
-./run-benchmark.sh run --profile {_html.escape(str(profile.get('name', 'quick')))} --resource-pass {_html.escape(str(config.get('resource_pass', 'normalized')))}</code></pre>
+./run-benchmark.sh run --profile {_html.escape(str(profile.get('name', 'quick')))} --resource-pass {_html.escape(reproduction_pass_flag(manifest))}</code></pre>
 <p class="note">Raw merged records are in <code>records.jsonl</code>; full provenance
 is in <code>run-manifest.json</code>. See <code>docs/05-methodology.md</code> for
 what is measured, and <code>docs/03-running-manually.md</code> to reproduce any
