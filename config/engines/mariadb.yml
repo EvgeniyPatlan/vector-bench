@@ -119,6 +119,18 @@ runtime:
   # Where the server keeps its data inside the image.
   data_mount: /var/lib/vbench
   server_data_mount: /server-data/data
+  # Where mariadbd's own diagnostics land INSIDE the container, i.e. what the
+  # entrypoint gives --log-error. Must equal LOG_FILE's default in
+  # docker/mariadb/entrypoint-mariadb.sh (which mariadb123 shares via
+  # alias_of); tests/test_e10_failures_explain_themselves.py reads both and
+  # fails if they drift.
+  #
+  # It is a file in the data volume, not a stream, so `docker logs` carries
+  # only the entrypoint banner and teardown removes the rest along with the
+  # volume. ops_pass copies it out before teardown. An engine that logs to
+  # stderr -- pgvector, mongodb, valkey -- declares no error_log and keeps the
+  # stdout-only capture it already had.
+  error_log: /var/lib/vbench/mariadb.err
   credentials:
     user: "bench"
     password: "bench"

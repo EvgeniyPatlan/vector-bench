@@ -974,7 +974,7 @@ display_name: Percona Server
 family: mysql
 source:
   # The key is `tag` even though the value is a SHA, and that is not a
-  # cosmetic choice. `orchestrator/engines.py:63-65` is
+  # cosmetic choice. `orchestrator/engines.py:79-81` is
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its

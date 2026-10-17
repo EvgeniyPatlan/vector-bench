@@ -197,8 +197,8 @@ def start(spec: ContainerSpec) -> str:
     return proc.stdout.strip()
 
 
-def save_phase_log(run_dir: str, engine: str, phase: str, resource_pass: str,
-                   lines: List[str]) -> Optional[str]:
+def save_phase_log(run_dir: str, engine: str, dataset: str, phase: str,
+                   resource_pass: str, lines: List[str]) -> Optional[str]:
     """Keep a phase's console output next to its measurements.
 
     The output of a phase is where a failure explains itself, and until now it
@@ -207,13 +207,27 @@ def save_phase_log(run_dir: str, engine: str, phase: str, resource_pass: str,
     then lost, and by the time anyone asked, the terminal was gone. The
     measurements are archived and copied between machines; their explanation
     should travel with them.
+
+    `dataset` IS IN THE NAME AND IS NOT OPTIONAL, because it was missing and
+    the name collided. One engine, one phase and one resource pass is not a
+    unit of work -- a profile runs that triple once per dataset -- and this
+    file is opened "w". `full` has four datasets, so the ann phase wrote this
+    name four times per pass and three of the four were overwritten by the
+    next dataset in the loop. Run full-20261015-215006 kept 14 log files for
+    16 phases, and the one surviving `percona-ann-normalized.log` was gist's:
+    the sift-128 ANN phase had failed in six seconds in both passes and the
+    only record of why was gone. A keyword with a default would let the next
+    caller reintroduce exactly that, silently, so it is positional and
+    required and mirrors the order of the name it builds. `mem-` and `ops-`
+    files in the same run directory already carry the dataset here.
     """
     if not lines:
         return None
     directory = os.path.join(run_dir, "logs")
     try:
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, f"{engine}-{phase}-{resource_pass}.log")
+        path = os.path.join(
+            directory, f"{engine}-{dataset}-{phase}-{resource_pass}.log")
         with open(path, "w") as fh:
             fh.write("\n".join(lines) + "\n")
         return path
@@ -317,6 +331,36 @@ def logs(name: str, tail: int = 100) -> str:
 def exec_in(name: str, args: Sequence[str], timeout: int = 60,
             check: bool = False) -> subprocess.CompletedProcess:
     return _run(["docker", "exec", name, *args], check=check, timeout=timeout)
+
+
+def read_file_tail(name: str, path: str, lines: int = 100) -> Optional[str]:
+    """Last `lines` of a file *inside* a running container, or None.
+
+    `logs` reads the container's stdout, which for an engine that was started
+    with `--log-error=<file>` is the entrypoint banner and nothing else. The
+    MySQL-family engines here are all started that way, so the stream that
+    carries the signal, the assertion or the refused statement is a file in a
+    volume that teardown deletes. This is how that file gets out while the
+    container is still alive.
+
+    `tail` rather than `cat` because an error log has no bound: mongod writes a
+    few thousand lines an hour, and the caller wants the end of it anyway.
+
+    RETURNS None FOR EVERY FAILURE and raises for none of them. The only
+    caller runs in a `finally` on the path a crashed phase takes, so a file
+    that was never created, a container that has already gone, a path the
+    engine could not open and a daemon that is not answering must all come
+    back as "no log" rather than as an exception that converts a lost
+    measurement into a lost run.
+    """
+    try:
+        proc = exec_in(name, ["tail", "-n", str(lines), path], timeout=120)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip()
+    return text or None
 
 
 def wait_healthy(name: str, probe: Sequence[str], timeout_s: int = 180,

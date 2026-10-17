@@ -244,8 +244,8 @@ class OpsRun:
             rc = docker_ctl.run_foreground(spec, timeout=timeout_s,
                                            sink=captured)
             saved = docker_ctl.save_phase_log(
-                self.paths["run_dir"], self.engine, f"ops-{self.tag}",
-                self.resource_pass, captured)
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"ops-{self.tag}", self.resource_pass, captured)
             if saved:
                 print(f"[ops] log -> "
                       f"{os.path.relpath(saved, self.paths['run_dir'])}")
@@ -360,16 +360,78 @@ class OpsRun:
         baseline, and the question of which one was wrong could not be answered
         from the run directory at all -- the half that would have said was
         discarded when the container was removed.
+
+        TWO CAPTURES, because for four of the seven engines `docker logs` is
+        not the server's voice. `mariadb`, `mariadb123`, `alisql` and `percona`
+        are all started with `--log-error=<file>`, so their stdout is the
+        entrypoint banner -- three lines -- and everything the server itself
+        has to say goes into a file in the data volume that teardown deletes.
+        That is precisely the half this method was added to keep, and for those
+        engines it was capturing the wrong one: 13 of the 24 ops units in run
+        full-20261015-215006 died inside the first INSERT with
+        `mariadb.InterfaceError: Lost connection to server during query`, and
+        all six server logs it archived are the banner. `runtime.error_log`
+        names the file; `_save_server_error_log` copies it out while the
+        container is still up.
+
+        Independent of each other, and neither can end the run: a server whose
+        stdout is empty is exactly the one whose file log matters, so an
+        exception from the first must not skip the second.
         """
         try:
             text = docker_ctl.logs(self.server_name, tail=SERVER_LOG_TAIL)
         except Exception:
-            return
-        if not text:
-            return
-        docker_ctl.save_phase_log(
-            self.paths["run_dir"], self.engine, f"server-{self.tag}",
-            self.resource_pass, text.splitlines())
+            text = ""
+        if text:
+            docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"server-{self.tag}", self.resource_pass, text.splitlines())
+        self._save_server_error_log()
+
+    def _save_server_error_log(self) -> None:
+        """Copy the engine's own `--log-error` file out before teardown.
+
+        Only for an engine whose config declares `runtime.error_log`; the
+        engines that log to stderr are already covered by `docker logs` above
+        and this is a no-op for them, so their behaviour is unchanged.
+
+        Must run BEFORE teardown and does, because every caller reaches it from
+        a `finally` inside a `with OpsRun(...)` block, and `teardown` -- which
+        stops the container and then removes the volume the file lives in -- is
+        `__exit__`. There is no second chance after that: the file is not on
+        the host, and the volume is bind-backed under state/ops, which
+        `remove_tree_as_root` then deletes as well.
+
+        NOTHING HERE MAY RAISE. This is on the path a crashed phase takes, and
+        a phase that has already lost its measurement must not also lose the
+        run because its log could not be fetched. Every failure -- no such
+        engine, no such file, an unreadable path, a container that has gone, no
+        daemon -- degrades to a printed note and no file. `read_file_tail`
+        returns None for all of them; the try is for the registry lookup and
+        the write.
+        """
+        try:
+            error_log = engines_mod.get(self.engine).error_log
+            if not error_log:
+                return
+            text = docker_ctl.read_file_tail(self.server_name, error_log,
+                                             lines=SERVER_LOG_TAIL)
+            if not text:
+                print(f"[ops] note: {self.engine} declares "
+                      f"runtime.error_log={error_log} but nothing could be "
+                      f"read from it; the server's own log is not in this run "
+                      f"directory", file=sys.stderr)
+                return
+            saved = docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"server-error-{self.tag}", self.resource_pass,
+                text.splitlines())
+            if saved:
+                print(f"[ops] server error log -> "
+                      f"{os.path.relpath(saved, self.paths['run_dir'])}")
+        except Exception as exc:                 # pragma: no cover - defensive
+            print(f"[ops] note: could not archive {self.engine}'s error log: "
+                  f"{exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
 

@@ -49,6 +49,22 @@ class EngineRuntime:
     tag: str
     #: Readiness probe argv, run in the server container until it succeeds.
     probe: Tuple[str, ...]
+    #: Absolute path, inside the container, of the file the server writes its
+    #: own diagnostics to -- i.e. what the entrypoint gives `--log-error`.
+    #:
+    #: Set only by the four engines started that way (`mariadb`, `mariadb123`,
+    #: `alisql`, `percona`). For those, the container's stdout is the
+    #: entrypoint banner and everything the server itself says goes into a
+    #: file in the data volume that teardown removes, so the ops path copies
+    #: it out first. None -- the default, and the case for the engines that
+    #: log to stderr -- keeps the `docker logs` capture that already carries
+    #: everything for them.
+    #:
+    #: LAST IN THE DATACLASS AND DEFAULTED, deliberately. A field with no
+    #: default inserted mid-list breaks every positional construction of this
+    #: type, and `tests/test_webui_setup.py` builds one by hand; defaulting it
+    #: also matches the config, where the key is genuinely optional.
+    error_log: Optional[str] = None
 
     @property
     def credentials(self) -> Tuple[str, str]:
@@ -97,6 +113,9 @@ def _build(name: str, config: Dict[str, Any], fallback_index: int) -> EngineRunt
         label=str(label),
         tag=_source_tag(config),
         probe=tuple(str(a) for a in (runtime.get("probe") or ())),
+        # Not in `missing` above: an engine that logs to stderr declares no
+        # error_log and must keep working without one.
+        error_log=str(runtime["error_log"]) if runtime.get("error_log") else None,
     )
 
 

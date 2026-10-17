@@ -1664,7 +1664,9 @@ CITED_IN_REPO = {
         ("harness/drivers/postgres.py", "def _driver_classes()"),
     "ops_pass.py:231":
         ("orchestrator/ops_pass.py", "VB_ENGINE_TAG"),
-    "orchestrator/engines.py:63-65":
+    # Moved from 63-65 by `runtime.error_log`, which added a field to
+    # `EngineRuntime` above it. Re-derived with grep, not by arithmetic.
+    "orchestrator/engines.py:79-81":
         ("orchestrator/engines.py", "def _source_tag"),
     "docs/07-planning-a-run.md:505":
         ("docs/07-planning-a-run.md", "60,000-row smoke"),
