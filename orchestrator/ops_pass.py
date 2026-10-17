@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -118,8 +119,19 @@ class OpsRun:
             # 300s" plus the three-line banner, and the assertion that
             # actually caused it was deleted. Cannot raise -- see
             # `_save_startup_log`.
-            self._save_startup_log()
-            self.teardown()
+            #
+            # TEARDOWN IS IN A `finally`, not merely sequenced after the
+            # capture. The capture can sit on 30 s + 60 s + 120 s of timeouts
+            # against a wedged daemon, and its inner handlers are
+            # `except Exception`, which by design does not catch
+            # KeyboardInterrupt -- so a second Ctrl-C aborts it at once. Merely
+            # sequenced, that interrupt escapes past `teardown()` and leaks
+            # every one of the things listed above. The `finally` is what makes
+            # the fast abort safe.
+            try:
+                self._save_startup_log()
+            finally:
+                self.teardown()
             raise
         return self
 
@@ -371,36 +383,31 @@ class OpsRun:
         discarded when the container was removed.
 
         THE ANN PATH DOES NOT GET THIS FOR FREE, and that gap is still open.
-        This docstring used to say it did, on the grounds that the engine and
-        the benchmark share one container there. They do share one, but
-        `overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py` starts the engine
-        with `Popen([ENTRYPOINT, "server"])` -- `/usr/local/bin/vb-entrypoint`,
-        the same script, because every bench image is `FROM runtime AS bench`
-        -- so mysqld is given the same `--log-error=<file>` and that one
-        stream carries the client's half plus the banner, exactly as here.
-        What the ann path has instead is that `ann_pass.run_engine`
-        bind-mounts `state_dir` at the engine's `data_mount` read-write, so
-        the file does land on the host: root-owned, keyed by (pass, engine) and
-        NOT by dataset, and wiped by the next dataset's
-        `shutil.rmtree(state_dir)`. Nothing copies it into the run directory
-        yet.
+        This docstring used to say it did, because the engine and the
+        benchmark share one container there. They do, but
+        `overlay/.../vb_mysql.py` starts the engine with
+        `Popen([ENTRYPOINT, "server"])` -- the same `vb-entrypoint`, since
+        every bench image is `FROM runtime AS bench` -- so mysqld gets the
+        same `--log-error=<file>` and that stream carries no more of the
+        server than this one did. What the ann path has instead is
+        `run_engine`'s read-write bind of `state_dir` at the engine's
+        `data_mount`, so the file lands on the host: root-owned, keyed by
+        (pass, engine) and NOT by dataset, wiped by the next dataset's
+        `rmtree`. Nothing copies it into the run directory yet.
 
         TWO CAPTURES, because for five of the seven engines `docker logs` is
         not all of the server's voice, and for four of those it is almost none
         of it. `mariadb`, `mariadb123`, `alisql` and `percona` are started
         with `--log-error=<file>`, so their stdout is the entrypoint banner --
-        three lines -- and everything the server itself has to say goes into a
-        file in the data volume that teardown deletes. That is precisely the
-        half this method was added to keep, and for those engines it was
-        capturing the wrong one: 13 of the 24 ops units in run
-        full-20261015-215006 died inside the first INSERT with
-        `mariadb.InterfaceError: Lost connection to server during query`, and
-        all six server logs it archived are the banner. `mongodb` is the fifth
-        and a partial case -- `mongod` does log to stdout, but `mongot`, which
-        is where vector search actually happens, is redirected into the data
-        volume -- so for it both captures carry something.
-        `runtime.error_log` names the file; `_save_server_error_log` copies it
-        out while the container is still up.
+        three lines -- and everything the server says goes into a file in the
+        data volume that teardown deletes. That is the half this method was
+        added to keep, and for those engines it was capturing the wrong one;
+        `config/engines/percona.yml`'s `error_log` records what that cost in
+        run full-20261015-215006. `mongodb` is the fifth and a partial case:
+        `mongod` does log to stdout, but `mongot`, where vector search
+        actually happens, is redirected into the volume -- so both captures
+        carry something. `runtime.error_log` names the file;
+        `_save_server_error_log` copies it out while the container is up.
 
         Independent of each other, and neither can end the run: a server whose
         stdout is empty is exactly the one whose file log matters, so an
@@ -419,17 +426,13 @@ class OpsRun:
     def _save_startup_log(self) -> None:
         """`_save_server_log`, but only once there is a container to ask.
 
-        Setup fails in three places and only the last one has started a
-        server: a missing image raises before `docker run`, and
-        `create_network` / `create_volume` raise before that. In those cases
-        `docker logs` answers with the daemon's "No such container ..." on
-        stderr, which `logs` folds into its return value -- and archiving that
-        as `<engine>-<dataset>-server-<tag>-<pass>.log` would put a Docker
-        error in the run directory under a name that reads as the server's own
-        account of itself.
+        Setup fails in three places and only the last has started a server: a
+        missing image raises before `docker run`, and `create_network` /
+        `create_volume` before that. `container_exists` is what rules those
+        out, and its own docstring says why asking is necessary.
 
-        Cannot raise: `container_exists` is a `check=False` inspect, and
-        `_save_server_log` already swallows everything underneath it.
+        Cannot raise: that inspect is `check=False`, and `_save_server_log`
+        swallows everything underneath it.
         """
         try:
             if not docker_ctl.container_exists(self.server_name):
@@ -437,6 +440,43 @@ class OpsRun:
         except Exception:                        # pragma: no cover - defensive
             return
         self._save_server_log()
+
+    def _read_error_log(self, error_log: str) -> Optional[str]:
+        """The tail of the engine's error log, however the container is doing.
+
+        TWO MECHANISMS, because `wait_healthy` fails two ways and only one
+        leaves a container `docker exec` can enter: the 300 s probe timeout,
+        where it is still RUNNING and never answered, and `is_running()` false
+        -- "container ... exited during startup" -- where the server DIED,
+        which is the case whose last words are worth most. `docker cp` reads
+        through the daemon rather than through the container, so it covers the
+        second; it also has no `--tail`, so the copy is bounded here instead,
+        and deleted either way.
+
+        Reading the host side of the bind-backed volume needs no docker at all
+        and is deliberately NOT the fallback: the engine writes that file as
+        root inside the container, so `<engine_state>/ops/<volume>/…` is
+        typically root:root 0640 and unreadable to a non-root orchestrator.
+        """
+        text = docker_ctl.read_file_tail(self.server_name, error_log,
+                                         lines=SERVER_LOG_TAIL)
+        if text:
+            return text
+        scratch = tempfile.mkdtemp(prefix="vb-errlog-")
+        try:
+            copied = docker_ctl.copy_file_out(self.server_name, error_log,
+                                              scratch)
+            if not copied:
+                return None
+            with open(copied, errors="replace") as fh:
+                lines = fh.read().splitlines()
+            print(f"[ops] {self.engine} is no longer running; its error log "
+                  f"was copied out rather than read in place")
+            return "\n".join(lines[-SERVER_LOG_TAIL:]).strip() or None
+        except OSError:
+            return None
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def _save_server_error_log(self) -> None:
         """Copy the engine's own `--log-error` file out before teardown.
@@ -456,7 +496,7 @@ class OpsRun:
         a phase that has already lost its measurement must not also lose the
         run because its log could not be fetched. Every failure -- no such
         engine, no such file, an unreadable path, a container that has gone, no
-        daemon -- degrades to a printed note and no file. `read_file_tail`
+        daemon -- degrades to a printed note and no file. `_read_error_log`
         returns None for all of them; the try is for the registry lookup and
         the write.
         """
@@ -464,8 +504,7 @@ class OpsRun:
             error_log = engines_mod.get(self.engine).error_log
             if not error_log:
                 return
-            text = docker_ctl.read_file_tail(self.server_name, error_log,
-                                             lines=SERVER_LOG_TAIL)
+            text = self._read_error_log(error_log)
             if not text:
                 print(f"[ops] note: {self.engine} declares "
                       f"runtime.error_log={error_log} but nothing could be "

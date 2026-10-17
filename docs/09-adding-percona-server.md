@@ -978,7 +978,7 @@ source:
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `ops_pass.py:242` reads the same key
+  # hard-coded default for that engine. `ops_pass.py:254` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
   tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
@@ -1249,10 +1249,18 @@ and the previous revision of this document never mentioned it.
 ```
 
 The branches are `:150` (`if engine in MARIADB_ENGINES + ("alisql",)`), `:167`
-(pgvector), `:186` (valkey) and `:206` (mongodb). **Percona matches none of
-them and lands on the `raise`.** Either add it to the MySQL-family condition at
+(pgvector), `:186` (valkey) and `:278` (mongodb). **Percona matched none of
+them and landed on the `raise`.** Either add it to the MySQL-family condition at
 `:150` or give it a branch of its own, and a branch of its own is what the two
 things §4.6 proposes actually need:
+
+The branch this section asked for is now `:206` (percona), and it was inserted
+at the position mongodb's branch used to occupy — which is why this list said
+`(mongodb)` against that line for two revisions, pointing at Percona's own
+branch while the sentence above it said Percona had none. Every `` `:N` ``
+below is a line of `orchestrator/ann_pass.py`; the labelled ones are checked
+against the branch they claim by
+`tests/test_e10_failures_explain_themselves.py`, which is what caught that.
 
 - **`efConstruction`.** No existing MySQL-family branch emits it. The two that
   do are `:180` (pgvector) and `:199` (valkey), and both sit inside a

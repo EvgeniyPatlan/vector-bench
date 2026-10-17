@@ -379,6 +379,41 @@ def read_file_tail(name: str, path: str, lines: int = 100) -> Optional[str]:
     return text or None
 
 
+def copy_file_out(name: str, path: str, dest_dir: str) -> Optional[str]:
+    """Copy one file out of a container that may already have STOPPED.
+
+    `read_file_tail` needs a running container, because `docker exec` does.
+    `docker cp` does not -- it reads the container's filesystem through the
+    daemon, which is why it is the documented way to retrieve a file from a
+    container that has exited. (READ, from Docker's own documentation of the
+    two commands, NOT measured here: verifying it would mean running a
+    container, which this change is not allowed to do.)
+
+    That difference is the whole point. A server that *failed its readiness
+    probe* is still running and `read_file_tail` reaches it; a server that
+    *died during startup* is not, and that is the one whose last words are
+    worth most. It also does not care who owns the file: the engine writes its
+    error log as root inside the container, so the same file on the host side
+    of a bind-backed volume is typically root:root 0640 and unreadable to the
+    orchestrator, which is why reading the bind directory directly is not the
+    fallback here.
+
+    Unbounded, unlike `read_file_tail` -- `docker cp` has no `--tail`. The
+    caller bounds it afterwards by taking the last lines of the copy. Returns
+    the local path, or None for every failure.
+    """
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path) or "copied")
+        proc = _run(["docker", "cp", f"{name}:{path}", dest],
+                    check=False, timeout=300)
+    except Exception:
+        return None
+    if proc.returncode != 0 or not os.path.isfile(dest):
+        return None
+    return dest
+
+
 def wait_healthy(name: str, probe: Sequence[str], timeout_s: int = 180,
                  interval_s: float = 1.0) -> None:
     """Wait until `probe` succeeds inside the container.

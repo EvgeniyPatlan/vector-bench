@@ -27,8 +27,28 @@ So the expansion is reproduced from the vendored upstream rather than
 approximated, and the answer is the size of the SET of file names. The
 reproduced functions name their originals; `work/ann-benchmarks` is generated
 and gitignored, so nothing here can import them and the tests cannot read
-them. What the tests pin instead is the one thing that cannot be re-derived:
-`result_stem` against file names a real ann-benchmarks run left on disk.
+them.
+
+WHAT THE TESTS PIN, precisely, because the first version of this sentence
+overclaimed. `result_stem` has two halves and they are not equally
+checkable:
+
+* `json.dumps(..., sort_keys=True)` IS pinned, and the flag is load-bearing:
+  `render_config` builds its pgvector arg dict as
+  `{M, efConstruction, build_mode}` and `_expand` preserves that order, so an
+  unsorted dump names the file
+  `euclidean_M_16_efConstruction_200_build_mode_post_10` where the one on disk
+  is `euclidean_M_16_build_mode_post_efConstruction_200_10`. One literal in
+  the tests is deliberately written in the build order so that deleting the
+  flag fails; the others happen to be alphabetical and cannot see it.
+* `re.sub(r"\\W+", "_", ...)` is unfalsifiable rather than unpinned, which is a
+  weaker claim and the honest one. `json.dumps` defaults to
+  `ensure_ascii=True`, so `\\W` never meets a non-ASCII character however odd
+  the argument values are.
+
+Six of the pinned names are ones a real ann-benchmarks run left in
+`results/annb/` on this machine, which is the only external ground truth
+available for either half.
 """
 
 from __future__ import annotations
@@ -139,14 +159,35 @@ def result_stems(body: Dict[str, Any]) -> Set[Tuple[str, str]]:
     but merging them would under-count, and under-counting is the direction
     that hides a lost curve.
 
+    TWO UPSTREAM RULES REPRODUCED HERE THAT NOTHING TODAY EXERCISES, for the
+    same reason the `arg_groups` product is: each would over-count, and an
+    over-count fails a healthy phase after hours and blames a worker that
+    never died.
+
+    * A `disabled` algorithm writes nothing. `main.filter_disabled_algorithms`
+      drops it, so it must not be counted. `render_config` always emits
+      `disabled: False`.
+    * Two entries sharing a `name` are ONE algorithm, not two.
+      `_get_algorithm_definitions` does `definitions[cc.pop("name")] = cc`, so
+      the later entry replaces the earlier one entirely rather than merging
+      with it -- hence the dict below, keyed by name, which keeps the last.
+
     `@metric`, `@count` and `@dimension` are left unsubstituted. Upstream
     replaces them from the dataset and the run, and all three are constant
     across every definition in one phase, so they cannot change the size of
-    this set.
+    this set for any body `render_config` emits. (Not in general: a grid that
+    swept the literal `"@metric"` beside the value it resolves to would see
+    upstream collapse the two and this count them separately. Nothing emits
+    that, and resolving it here would mean knowing the dataset's metric, which
+    this module is deliberately not given.)
     """
     stems: Set[Tuple[str, str]] = set()
+    by_name: Dict[str, Dict[str, Any]] = {}
     for algorithm in ((body.get("float") or {}).get("any") or []):
-        name = str(algorithm.get("name", ""))
+        by_name[str(algorithm.get("name", ""))] = algorithm
+    for name, algorithm in by_name.items():
+        if algorithm.get("disabled"):
+            continue
         base_args = list(algorithm.get("base_args") or [])
         for run_group in (algorithm.get("run_groups") or {}).values():
             if "arg_groups" not in run_group and "args" not in run_group:
