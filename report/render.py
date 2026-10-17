@@ -842,12 +842,29 @@ def _storage(record: Dict[str, Any]) -> str:
 def _build_table(summary: Dict[str, Any]) -> str:
     # Ingest rate lives on the `ingest` record, not on `index_build`; reading it
     # off the build record produced an em dash in every row.
-    # Keyed on the storage engine as well. Without it MariaDB's InnoDB and
-    # MyISAM builds collided and one rate was printed for both rows, which
-    # reported MyISAM's 210 rows/s as 80 on 11.8 and its 305 as 51 on 12.3.
+    #
+    # **This key must name every axis `_run_unit` loops, because each one it
+    # omits silently publishes one unit's rate beside another unit's build
+    # time.** `storage_engine` was added first: MariaDB's InnoDB and MyISAM
+    # builds collided and one rate was printed for both rows, which reported
+    # MyISAM's 210 rows/s as 80 on 11.8 and its 305 as 51 on 12.3.
+    #
+    # `m` is the same bug one axis over. It cannot show at all until one
+    # (engine, dataset, pass, mode, storage) holds two M values, which is why
+    # it was found by `full-20261015-215006` (percona, 4 datasets x M 8/16/32
+    # x both resource passes): that bundle published four self-refuting rows
+    # out of eleven in section 5. With `m` absent
+    # every M record for one (engine, dataset, pass, mode, storage) collapsed
+    # into a single dict entry and the last one written won: fashion-mnist
+    # printed 598 rows/s beside its own M=16 build of 167.1 s over 60,000 rows
+    # (359), 545 beside M=32's 370.3 s (162) and 598 beside the other M=32's
+    # 356.9 s (168), and sift-128 printed 206 beside M=16's 2,344.5 s over
+    # 1,000,000 rows (427). For an incremental build the build wall clock IS
+    # the load, so each of those rows carried the arithmetic that refuted it --
+    # and a reader had no way to tell which of the two numbers was the stray.
     ingest_by_key = {
         (i.get("engine"), i.get("dataset"), i.get("resource_pass"),
-         i.get("build_mode"), i.get("storage_engine")):
+         i.get("m"), i.get("build_mode"), i.get("storage_engine")):
             i.get("ingest_rows_per_s")
         for i in summary.get("ingest", [])
     }
@@ -855,12 +872,29 @@ def _build_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("build", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # The pass is in the sort as well as in the
+                                   # key: it is an axis of the grid, and with
+                                   # it absent two rows differing only by pass
+                                   # landed in whatever order the records were
+                                   # written in.
+                                   r.get("resource_pass") or "",
                                    r.get("m") or 0, r.get("storage_engine") or "")):
         ingest_rate = ingest_by_key.get(
             (r.get("engine"), r.get("dataset"), r.get("resource_pass"),
-             r.get("build_mode"), r.get("storage_engine")))
+             r.get("m"), r.get("build_mode"), r.get("storage_engine")))
         rows.append([
-            _label(r.get("engine", "?")), r.get("dataset", "?"), str(r.get("m", "—")),
+            _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # The resource pass, for the reason the key above carries it and
+            # sections 7, 8 and 9's tables all print it: the two passes hand
+            # the server different machines, so two rows differing only by
+            # pass are not two readings of one configuration. In
+            # `full-20261015-215006` fashion-mnist M=8 appeared twice --
+            # 110.1 s at 6.5 GiB peak RSS and 100.3 s at 44.4 GiB -- with
+            # nothing on the page saying which budget either row ran under,
+            # and section 1 names a single pass (`tuned` there), so the
+            # 8-core/16 GB normalized row read as a 76-core/112.5 GiB one.
+            r.get("resource_pass") or "—",
+            str(r.get("m", "—")),
             # MariaDB is measured on InnoDB and MyISAM under the tuned pass, and
             # without this column those two rows are identical on the page while
             # differing 6x in ingest rate.
@@ -881,8 +915,8 @@ def _build_table(summary: Dict[str, Any]) -> str:
             _index_build_kind(r),
         ])
     table = _md_table(
-        ["Engine", "Dataset", "M", "Storage", "Build mode", "Build time",
-         "Ingest rate", "Peak server RSS", "Index size",
+        ["Engine", "Dataset", "Pass", "M", "Storage", "Build mode",
+         "Build time", "Ingest rate", "Peak server RSS", "Index size",
          "Time to queryable index (s)", "Index build"],
         rows,
     )
@@ -1319,10 +1353,30 @@ def _engines_without_an_operating_point(summary: Dict[str, Any]
 # unexplained duplicates, and the largest result in the tuned-complete run --
 # that MariaDB loses 3-10% of its throughput to churn on MyISAM against 84-86%
 # on InnoDB -- was invisible on the page.
+#
+# `Pass` and `M` are here for the same reason and were added by the same kind
+# of evidence. The ops phase loops `m_values x build_modes x storage_engines`
+# inside each resource pass, and this table named only the storage engine, so
+# the other two axes rendered as duplicate rows. In `full-20261015-215006`
+# five fashion-mnist rows at one client read 1,677 / 2,037 / 1,952 / 1,673 /
+# 1,789 QPS -- five different (pass, M) units, in that order
+# (normalized M=32, normalized M=8, tuned M=16, tuned M=32, tuned M=8) -- and
+# the page could not tell them apart. The pass is the damaging half: the
+# normalized pass gives the server 8 cores and 16 GB
+# (`config/resources/normalized.yml`) against the tuned pass's 76 cores and
+# 112.5 GiB in that run, section 1 names one pass for the whole report, so an
+# 8-core throughput read as a 76-core one. Section 8's filtered table already
+# carried both columns, which is why the same grid is legible there.
 def _concurrency_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("concurrency", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # The ops-unit axes sort ahead of the client
+                                   # count, so each unit's scaling curve is
+                                   # contiguous. `m or 0`, not `str(m)`: as
+                                   # text, M 8/16/32 sorts 16, 32, 8.
+                                   r.get("resource_pass") or "",
+                                   r.get("m") or 0,
                                    r.get("storage_engine") or "",
                                    r.get("clients") or 0)):
         extra = r.get("extra") or {}
@@ -1342,6 +1396,11 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
         pool = extra.get("query_pool")
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # Spelled exactly as `_filtered_table` and the churn-under-writes
+            # table spell them, so one reader convention covers every table
+            # that renders an ops unit.
+            r.get("resource_pass") or "—",
+            _fmt(r.get("m"), 0),
             _storage(r),
             str(r.get("clients", "—")),
             _fmt(r.get("qps"), 0),
@@ -1371,8 +1430,8 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _client_cpu_cell(extra),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread",
-         "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
+        ["Engine", "Dataset", "Pass", "M", "Storage", "Clients", "QPS",
+         "Spread", "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
          "Scaling efficiency", "Queries in service", "Query pool", "Reuse",
          "Client CPU"],
         rows,
@@ -1934,6 +1993,20 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     writes are the same phase with a `churn_fraction` and a multi-client QPS,
     and they belong in their own table below rather than in a column of
     single-client ones.
+
+    **`Pass` and `M` are a fix of the same shape as `Repair`.** `churn_group`
+    below has always held both constant when deciding what a row is tied
+    with, so the renderer knew they were part of a row's identity while the
+    header named neither -- and the churn-under-writes table immediately
+    below this one prints both. `full-20261015-215006` swept M 8/16/32 over
+    two resource passes, so every (dataset, fraction, state) appeared five
+    times with the engine, dataset, storage, churn and repair cells
+    byte-identical: at 10% before repair, recalls 0.9865 / 0.9594 / 0.9672 /
+    0.9860 / 0.9598 and QPS 1,503 / 1,898 / 1,561 / 1,331 / 1,829, which
+    reads as one noisy measurement of one index instead of five readings of
+    five. The pass matters most: it gave the server 8 cores and 16 GB under
+    `normalized` against 76 cores and 112.5 GiB under `tuned` in that run, so
+    a QPS column with no pass beside it is not a comparison at all.
     """
     from report.churn_state import churn_measurements, maintenance_state
 
@@ -1958,6 +2031,13 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(measurements,
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # Ahead of the fraction, so one unit's
+                                   # whole churn curve is contiguous rather
+                                   # than interleaved with four others at
+                                   # every fraction. `m or 0`, not `str(m)`,
+                                   # for the reason `_filtered_table` gives.
+                                   r.get("resource_pass") or "",
+                                   r.get("m") or 0,
                                    r.get("storage_engine") or "",
                                    r.get("churn_fraction") or 0,
                                    # Ranked, not sorted as strings: "after"
@@ -1971,6 +2051,11 @@ def _churn_table(summary: Dict[str, Any]) -> str:
         state = maintenance_state(r)
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # The two axes `churn_group` above already holds constant, now
+            # named on the page as well. Same spelling as `_filtered_table`
+            # and `_churn_during_writes_table`.
+            r.get("resource_pass") or "—",
+            _fmt(r.get("m"), 0),
             _storage(r),
             f"{(r.get('churn_fraction') or 0):.0%}",
             _churn_state_cell(state, extra),
@@ -1981,8 +2066,9 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             tie_cells.get(id(r), TIE_ALONE_CELL),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Churn", "Repair", "Recall@k",
-         "Recall drop vs baseline", "QPS", "Index size", "Tied with"],
+        ["Engine", "Dataset", "Pass", "M", "Storage", "Churn", "Repair",
+         "Recall@k", "Recall drop vs baseline", "QPS", "Index size",
+         "Tied with"],
         rows,
     ) + TIE_COLUMN_NOTE + _churn_notes(summary) \
         + _churn_during_writes_table(summary)
