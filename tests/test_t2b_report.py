@@ -203,7 +203,11 @@ def _render(records: List[Dict[str, Any]], *,
 #: cell index pointed at the wrong column. Matching the whole header also pins
 #: the column ORDER, so the index-based assertions below cannot be satisfied
 #: by a table whose columns were rearranged.
-OPERATING_HEADER = ["Engine", "Dataset", "Pass", "M", "Build",
+#: `Build` became `Build mode` and `Storage` was added: that column is the
+#: `build_mode` ops-unit axis and was the only table in `render.py` naming it
+#: differently, and `operating_point_key` separates units by a signature that
+#: contains the storage engine while this table did not print it.
+OPERATING_HEADER = ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage",
                     "Chosen ef_search", "Effective ef", "Recall@k", "Target",
                     "Status", "Grid points"]
 ENVIRONMENT_HEADER = ["Property", "Value"]
@@ -234,6 +238,19 @@ def _table_rows(markdown: str, header: Sequence[str]) -> List[List[str]]:
             continue
         rows.append(cells)
     return rows
+
+
+def _cell(cells: Sequence[str], column: str) -> str:
+    """One operating-point cell, by column name rather than by position.
+
+    Every read in this file used to be an integer index, and adding a
+    `Storage` column to section 6 shifted fifteen of them at once -- each one
+    then reading a value from a position that had come to mean a different
+    column, which is the same defect class the table itself was being fixed
+    for. `OPERATING_HEADER` already pins the order, so a rename still fails
+    loudly here; what no longer fails is an insertion.
+    """
+    return cells[OPERATING_HEADER.index(column)]
 
 
 def _operating_rows(markdown: str) -> List[List[str]]:
@@ -704,13 +721,13 @@ class TestTheOperatingPointTableCells:
         maria = _row_for(rows, "MariaDB")
         pg = _row_for(rows, "pgvector")
         assert len(maria) == len(OPERATING_HEADER) == len(pg)
-        # Whole-cell equality. `maria[5] == "24"` is false for a cell of "240".
-        assert maria[5] == "24"
-        assert maria[7] == "0.9611"
-        assert maria[9] == "ok"
-        assert pg[5] == "480"
-        assert pg[7] == "0.8456"
-        assert pg[9].startswith("target_unreached")
+        # Whole-cell equality. A cell of "240" must not satisfy "24".
+        assert _cell(maria, "Chosen ef_search") == "24"
+        assert _cell(maria, "Recall@k") == "0.9611"
+        assert _cell(maria, "Status") == "ok"
+        assert _cell(pg, "Chosen ef_search") == "480"
+        assert _cell(pg, "Recall@k") == "0.8456"
+        assert _cell(pg, "Status").startswith("target_unreached")
 
     def test_the_recall_is_the_one_measured_at_the_chosen_ef(self):
         """Not the curve's first point, not its last, not the other engine's.
@@ -722,14 +739,15 @@ class TestTheOperatingPointTableCells:
         """
         rows = _operating_rows(_render(self._records()))
         pg = _row_for(rows, "pgvector")
-        assert pg[7] == "0.8456"
-        assert pg[7] != "0.8123"
-        assert pg[7] != "0.9611"
+        assert _cell(pg, "Recall@k") == "0.8456"
+        assert _cell(pg, "Recall@k") != "0.8123"
+        assert _cell(pg, "Recall@k") != "0.9611"
 
     def test_the_column_is_not_the_concurrency_windows_recall(self):
         """`_downstream` carries recall 0.5, which no curve here contains."""
         rows = _operating_rows(_render(self._records()))
-        assert all(cells[7] not in ("0.5000", "0.5") for cells in rows)
+        assert all(_cell(cells, "Recall@k") not in ("0.5000", "0.5")
+                   for cells in rows)
 
     def test_a_wrong_join_is_caught_rather_than_rendering_cleanly(self):
         """The mutant: read the recall off the record that used the ef.
@@ -740,7 +758,8 @@ class TestTheOperatingPointTableCells:
         column of a table that renders identically.
         """
         records = self._records()
-        honest = _row_for(_operating_rows(_render(records)), "pgvector")[7]
+        honest = _cell(_row_for(_operating_rows(_render(records)),
+                                "pgvector"), "Recall@k")
 
         real = loaders.operating_points
 
@@ -758,7 +777,8 @@ class TestTheOperatingPointTableCells:
 
         from unittest import mock
         with mock.patch.object(loaders, "operating_points", mutant_points):
-            mutant = _row_for(_operating_rows(_render(records)), "pgvector")[7]
+            mutant = _cell(_row_for(_operating_rows(_render(records)),
+                                    "pgvector"), "Recall@k")
         assert honest == "0.8456"
         assert mutant == "0.5000"
         assert honest != mutant
@@ -768,7 +788,7 @@ class TestTheOperatingPointTableCells:
                 + [_downstream("mariadb", 24, "ok")])
         cells = _row_for(_operating_rows(_render(rows)), "MariaDB")
         # Whole cell: "2 of 12" is not satisfied by "12 of 12".
-        assert cells[10] == "2 of 12"
+        assert _cell(cells, "Grid points") == "2 of 12"
 
     def test_the_effective_ef_is_shown_only_where_it_differs(self):
         """MongoDB cannot search fewer candidates than k, so its "ef 8" is 10.
@@ -784,8 +804,8 @@ class TestTheOperatingPointTableCells:
         rows = (same + differs + [_downstream("mariadb", 24, "ok"),
                                   _downstream("mongodb", 8, "ok")])
         table = _operating_rows(_render(rows))
-        assert _row_for(table, "MariaDB")[6] == "—"
-        assert _row_for(table, "MongoDB")[6] == "10"
+        assert _cell(_row_for(table, "MariaDB"), "Effective ef") == "—"
+        assert _cell(_row_for(table, "MongoDB"), "Effective ef") == "10"
 
 
 class TestTheOperatingPointTableIsExplicitWhenThereIsNothingToSay:
@@ -890,10 +910,13 @@ class TestTheReportSaysTheEngineCannotBeSlowedToTheTarget:
                 + [_downstream("mariadb", 8, "floor_above_target"),
                    _downstream("pgvector", 480, "target_unreached")])
         table = _operating_rows(_render(rows))
-        assert render.FLOOR_MARK in _row_for(table, "MariaDB")[9]
-        assert render.UNREACHED_MARK in _row_for(table, "pgvector")[9]
-        assert render.UNREACHED_MARK not in _row_for(table, "MariaDB")[9]
-        assert render.FLOOR_MARK not in _row_for(table, "pgvector")[9]
+        assert render.FLOOR_MARK in _cell(_row_for(table, "MariaDB"), "Status")
+        assert render.UNREACHED_MARK in _cell(_row_for(table, "pgvector"),
+                                          "Status")
+        assert render.UNREACHED_MARK not in _cell(_row_for(table, "MariaDB"),
+                                              "Status")
+        assert render.FLOOR_MARK not in _cell(_row_for(table, "pgvector"),
+                                          "Status")
 
     def test_the_floor_mark_is_the_dagger_the_spec_names(self):
         """§2.3.3 says `floor_above_target` gets "a dagger".
@@ -999,8 +1022,10 @@ class TestTheReportSaysTheEngineCannotBeSlowedToTheTarget:
         assert point["points_measured"] is None
         report = _render(rows)
         cells = _row_for(_operating_rows(report), "MariaDB")
-        assert cells[5] == "24" and cells[9] == "ok"
-        assert cells[7] == "—" and cells[10] == "—"
+        assert (_cell(cells, "Chosen ef_search") == "24"
+                and _cell(cells, "Status") == "ok")
+        assert (_cell(cells, "Recall@k") == "—"
+                and _cell(cells, "Grid points") == "—")
         assert "show an ef and a status but no curve" in report
         assert "not that the recall was zero" in report
 
@@ -1148,7 +1173,7 @@ class TestTheConcurrencyChartTitle:
             cells = _row_for(_operating_rows(_render(rows)), "MariaDB")
             # Whole cell, and the whole title: `want in title` would be
             # satisfied for 0.9 by a title naming 0.95.
-            assert cells[8] == want, (target, cells[8])
+            assert _cell(cells, "Target") == want, (target, cells)
             assert self._title(rows) == f"QPS at recall ≥ {want}"
 
     def test_a_fixed_ef_run_claims_no_recall_floor(self):

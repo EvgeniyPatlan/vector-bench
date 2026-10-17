@@ -142,6 +142,35 @@ def _identities(table: str, names: List[str]) -> List[tuple]:
     return [tuple(row[header.index(name)] for name in names) for row in body]
 
 
+def _strategy(dataset: str, m: int, column: str = "tag",
+              wide_p50: float = 10.1, narrow_p50: float = 0.7,
+              ratio: float = 0.07, engine: str = "percona",
+              pass_: str = "tuned", build_mode: str = "incremental",
+              storage: str = "InnoDB") -> Dict[str, Any]:
+    """One `filter_strategies` entry, as `generate.summarize` builds it."""
+    return {"engine": engine, "dataset": dataset, "filter_column": column,
+            "iterative_scan": None, "m": m, "build_mode": build_mode,
+            "storage_engine": storage, "resource_pass": pass_,
+            "narrow": 0.01, "wide": 0.50, "narrow_p50": narrow_p50,
+            "wide_p50": wide_p50, "narrow_recall": 0.98, "ratio": ratio,
+            "span": 49.0, "observed": "pre-filter"}
+
+
+def _operating_point(dataset: str, m: int, engine: str = "percona",
+                     pass_: str = "tuned",
+                     build_mode: str = "incremental",
+                     storage: str = "InnoDB",
+                     ef: int = 64) -> Dict[str, Any]:
+    """One `operating_points` entry, as `loaders.operating_points` builds it."""
+    return {"key": (engine, dataset, pass_, m, build_mode, storage),
+            "engine": engine, "dataset": dataset, "resource_pass": pass_,
+            "m": m, "build_mode": build_mode, "storage_engine": storage,
+            "ef_search": ef, "ef_conflict": None, "effective_ef": None,
+            "recall_at_k": 0.9712, "status": "ok", "status_conflict": None,
+            "target_recall": 0.95, "grid_size": 12, "points_measured": 12,
+            "ef_grid": [ef]}
+
+
 def _CHURN_STATE_ORDER_FOR_MUTANT(record: Dict[str, Any]) -> int:
     """`_churn_table`'s own state rank, for the mutant sort below.
 
@@ -374,20 +403,31 @@ class TestTheBuildTableNamesItsResourcePass:
         table = render_mod._build_table({"build": [bare], "ingest": []})
         assert _column(table, "Pass") == ["—"]
 
-    def test_the_m_cell_does_not_lean_on_the_none_string(self):
+    def test_the_m_cell_renders_a_float_m_the_way_every_other_table_does(self):
         """`_fmt(m, 0)`, not `str(r.get("m", "—"))`.
 
-        This cell was the one ops-unit M cell in the file spelled with
-        `str()`. A record carrying `m: None` has the key present, so `.get`'s
-        default never fires and `str(None)` is the four-character string
-        "None"; it reached the page as an em dash only because `_md_table`'s
-        `_sanitise_cell` lists "None" among the three empties it maps.
+        **Named after the live half.** This test has two arms and only one of
+        them discriminates:
 
-        Honest: an em dash from `_fmt`, with no dependency on that arm. Mutant
-        (the old `str()` spelling, computed inline): the literal "None", which
-        `_sanitise_cell` currently rescues and would print verbatim the moment
-        that arm changed. A float M is the second half: `str(16.0)` is "16.0"
-        where every other table prints "16".
+        * the FLOAT arm is the probe. `str(16.0)` is "16.0" where the other
+          six ops-unit tables print "16", so honest `16` / mutant `16.0`.
+        * the `None` arm is an identical pair under both spellings and is
+          asserted as documentation, not as a probe. `str(None)` is the
+          four-character string "None" -- `.get`'s default never fires,
+          because a record carrying `m: None` has the key present -- and it
+          reached the page as an em dash only because `_md_table`'s
+          `_sanitise_cell` lists "None" among the three empties it maps. That
+          dependency is unguarded either way: remove the arm and the old
+          spelling prints `None` on the page with the whole suite green. It
+          is recorded here so the next person to touch `_sanitise_cell` can
+          find out who was relying on it.
+
+        `_fmt(m, 0)` also rounds and comma-groups -- `16.4` renders `16` and
+        `1024.0` renders `1,024`. Neither is a measurement being altered:
+        a non-integral M is nonsense input rather than a reading, so this
+        hides a configuration error instead of publishing a wrong number, and
+        the other six ops-unit tables have behaved this way for longer. This
+        is convergence on their behaviour, not a new one.
         """
         none_m = dict(_build(FASHION, "tuned", 8, 100.265, 1))
         none_m["m"] = None
@@ -741,37 +781,123 @@ class TestTheBuildModeAxisIsNamedToo:
         assert _column(table, "Build mode") == ["—"]
 
 
+class TestTheFilterStrategyTableNamesItsCorpus:
+    """`_filter_strategy_table` named every ops-unit axis and not the dataset.
+
+    Pre-existing, and not caused or worsened by the join-key fix: it reads
+    the same way in the archived `report.md`. Closed here because it is the
+    same defect as the rest of this file in the same file -- a table that
+    collapses two measurements into repeated rows -- and because
+    `generate.summarize` has always put `dataset` in the grouping key and
+    carried it on every entry, so the renderer was the only thing dropping
+    it.
+
+    On `full-20261015-215006` the table published 21 rows carrying 12
+    distinct identities, 8 of them two or three times over.
+    """
+
+    #: Two datasets, same ops unit and same filter column, with the two
+    #: latency pairs the published table printed as repeated rows.
+    TWO_DATASETS = [
+        _strategy(FASHION, 16, wide_p50=10.1, narrow_p50=0.7),
+        _strategy(SIFT, 16, wide_p50=15.8, narrow_p50=0.9),
+    ]
+
+    #: The identity columns this table carried before `Dataset` landed.
+    OLD_IDENTITY = ["Engine", "Pass", "M", "Build mode", "Storage", "Column"]
+
+    def test_two_datasets_are_distinguishable_rows(self):
+        """Honest: the `Dataset` column separates them.
+
+        Old form, read back out of the rendered table: both rows carry
+        ('Percona Server (InnoDB HNSW)', 'tuned', '16', 'incremental',
+        'InnoDB', 'tag') -- byte-identical -- beside `0.7 → 10.1 ms` and
+        `0.9 → 15.8 ms`. Distinct identities: 1 of 2.
+        """
+        table = render_mod._filter_strategy_table(
+            {"filter_strategies": self.TWO_DATASETS})
+        old = _identities(table, self.OLD_IDENTITY)
+        assert len(old) == 2 and old[0] == old[1], old
+
+        assert _column(table, "Dataset") == [FASHION, SIFT]
+        body = _cells(table)[1:]
+        assert body[0] != body[1]
+
+    def test_the_latency_pair_stays_with_its_own_corpus(self):
+        table = render_mod._filter_strategy_table(
+            {"filter_strategies": self.TWO_DATASETS})
+        rows = _cells(table)
+        header, body = rows[0], rows[1:]
+        pairs = {row[header.index("Dataset")]:
+                 row[header.index("Median latency")] for row in body}
+        assert pairs == {FASHION: "10.1 → 0.7 ms", SIFT: "15.8 → 0.9 ms"}
+
+    def test_an_entry_with_no_dataset_renders_the_em_dash(self):
+        bare = dict(_strategy(FASHION, 16))
+        bare.pop("dataset")
+        table = render_mod._filter_strategy_table(
+            {"filter_strategies": [bare]})
+        assert _column(table, "Dataset") == ["—"]
+
+
 class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
-    """One reader convention across the five tables that render an ops unit.
+    """One reader convention across the seven tables that render an ops unit.
 
     A column named `Pass` in one section and `Resource pass` in the next is a
     second thing for a reader to notice, and this report is read by scanning
-    down a column. The two already-correct tables are in the list as the
-    reference and as the non-vacuity check: if the header text ever changes
-    there, this test says so rather than silently passing on three tables.
+    down a column.
 
-    **The assertion is the full identity set and its order, not a membership
-    test for two names.** Asserting only that `Pass` and `M` are present was
-    how `build_mode` stayed unnamed in two of these five tables while a test
-    called "one reader convention" passed: a convention check that names a
-    subset of the convention cannot see the part it left out.
+    **The axis list is read from `report.generate.OPS_UNIT_FIELDS`, not
+    restated here.** Restating it is the shape that let `build_mode` slip:
+    a guard that names a subset of the convention cannot see the part it left
+    out, and the first version of this class asserted the two literals
+    `"Pass"` and `"M"` while two of these tables named three of the four
+    axes. The key side of this is already self-guarding --
+    `tests/test_t3c_filtered.py` AST-parses `cli._run_unit` and fails if a
+    fifth looped axis appears without joining `OPS_UNIT_FIELDS` -- so reading
+    the same tuple here closes the header side against the same mutation.
+    Add `quantization` to the loop and to `OPS_UNIT_FIELDS` and
+    `test_the_column_map_covers_every_ops_unit_field` fails naming it,
+    instead of seven tables silently collapsing two quantizations.
     """
 
-    #: Every ops-unit table opens with these four, in this order.
+    #: `OPS_UNIT_FIELDS` member -> the column header that prints it. The map
+    #: is asserted to cover the tuple exactly, which is what makes a new axis
+    #: fail here rather than pass.
+    COLUMN_FOR_FIELD = {
+        "resource_pass": "Pass",
+        "m": "M",
+        "build_mode": "Build mode",
+        "storage_engine": "Storage",
+    }
+
+    #: Every ops-unit table opens with these, in this order -- except the two
+    #: noted in `NO_DATASET_COLUMN` below.
     UNIT_PREFIX = ["Engine", "Dataset", "Pass", "M"]
 
     #: Then these two, and **the build table alone has them the other way
-    #: round** -- `Storage | Build mode` where the other four read
-    #: `Build mode | Storage`. That predates this change: section 5's
-    #: `Storage` column carries its own MariaDB InnoDB/MyISAM rationale
-    #: anchored at that position, and reordering a column of a table whose
-    #: numbers were the actual defect here is a cosmetic edit with its own
-    #: risk. So the order of these two is asserted as a set and the
-    #: difference is recorded rather than hidden; the prefix above, which is
-    #: where the three new columns went, is asserted as a sequence.
+    #: round** -- `Storage | Build mode` where the others read
+    #: `Build mode | Storage`. Reordering it was considered and declined
+    #: twice: nothing in this repository reads these columns positionally
+    #: (every parser resolves by `header.index(name)`), so the swap is
+    #: invisible to every consumer, while section 5's `Storage` column
+    #: carries its own MariaDB InnoDB/MyISAM rationale anchored at that
+    #: position. With seven tables carrying these axes across four column
+    #: vocabularies there is no single achievable ordering for the whole
+    #: file, so the set that genuinely is a convention is pinned and the
+    #: deviation is recorded rather than hidden. A MISSING column is the
+    #: defect class that mattered, and a set still catches that.
     UNIT_PAIR = {"Build mode", "Storage"}
 
     def _tables(self):
+        """Every table in this file that renders one row per ops unit.
+
+        Seven, not five. `filter_strategy` and `operating_point` were missing
+        from the first version of this list, and that absence was measurable:
+        renaming `_filter_strategy_table`'s `Build mode` header to `Build`
+        left all 24 tests in this file passing and nothing else in the suite
+        caught it either.
+        """
         return {
             "build": render_mod._build_table(
                 {"build": TUNED_FASHION_BUILD,
@@ -795,16 +921,50 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
                      "p99_ratio": 2.0, "baseline_qps": 100.0,
                      "under_writes_qps": 50.0,
                      "writer_rows_per_s": 10.0}]}),
+            "filter_strategy": render_mod._filter_strategy_table(
+                {"filter_strategies": [_strategy(FASHION, 16)]}),
+            "operating_point": render_mod._operating_point_table(
+                {"operating_points": [_operating_point(FASHION, 16)]}),
         }
 
-    def test_all_five_tables_open_with_the_same_unit_columns(self):
-        """Honest: every one of the five opens `Engine, Dataset, Pass, M` and
+    def test_the_column_map_covers_every_ops_unit_field(self):
+        """Non-vacuity for the test below, and the guard against a fifth axis.
+
+        Honest: `OPS_UNIT_FIELDS` is exactly the four keys of
+        `COLUMN_FOR_FIELD`. Mutant (a `quantization` axis added to the loop
+        and to `OPS_UNIT_FIELDS`, which `tests/test_t3c_filtered.py` requires
+        of anyone adding one): this fails naming `quantization`, and the
+        author has to give it a column before the header check below can
+        pass.
+        """
+        from report.generate import OPS_UNIT_FIELDS
+        assert set(OPS_UNIT_FIELDS) == set(self.COLUMN_FOR_FIELD), (
+            sorted(set(OPS_UNIT_FIELDS) ^ set(self.COLUMN_FOR_FIELD)))
+
+    def test_every_table_names_every_ops_unit_axis(self):
+        """The header side of `ops_unit`.
+
+        Honest: all seven headers carry `Pass`, `M`, `Build mode` and
+        `Storage`. Mutant (`_filter_strategy_table`'s `Build mode` renamed to
+        `Build`, which this file's previous version did not catch): this
+        fails naming `filter_strategy` and the column it is missing.
+        """
+        from report.generate import OPS_UNIT_FIELDS
+        wanted = {self.COLUMN_FOR_FIELD[f] for f in OPS_UNIT_FIELDS}
+        for name, table in self._tables().items():
+            header = _cells(table)[0]
+            missing = sorted(wanted - set(header))
+            assert not missing, (name, missing, header)
+
+    def test_all_seven_tables_open_with_the_same_unit_columns(self):
+        """Honest: every one of the seven opens `Engine, Dataset, Pass, M` and
         then carries both `Build mode` and `Storage`.
 
         Mutant (this test as it was first written -- `"Pass" in header and
-        "M" in header`): passes on all five while two of them name three of
-        the four ops-unit axes, which is the state that let `build_mode` stay
-        unnamed under a test called "one reader convention".
+        "M" in header` over five tables): passes while two of the five name
+        three of the four ops-unit axes and two more tables are not checked
+        at all, which is the state that let `build_mode` stay unnamed under a
+        test called "one reader convention".
         """
         for name, table in self._tables().items():
             header = _cells(table)[0]
