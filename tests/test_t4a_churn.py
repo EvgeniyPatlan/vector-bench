@@ -387,9 +387,22 @@ class TestTheDeclaredRepairPathMatchesTheHook:
         only one in the MySQL family: `ALTER TABLE t1 DROP KEY vi, ADD VECTOR
         KEY vi (…)`, which rebuilds the graph from the live rows and so
         collects the tombstones a DELETE leaves behind. Returning `None` from
-        `maintain()` would have made the churn workload write one record per
-        fraction instead of a before/after pair, losing the measurement this
-        engine is uniquely able to supply.
+        `maintain()` makes the churn workload write one record per fraction
+        instead of a before/after pair.
+
+        **That last sentence used to end "losing the measurement this engine
+        is uniquely able to supply", and that is now false at the pinned
+        version** -- see `PerconaDriver.declare_bulk_vector_index_build`. The
+        ALTER is the same statement
+        `capabilities.bulk_vector_index_build: false` records as killing the
+        server; measured, it returned in 1-4 ms and changed nothing in all 20
+        before/after pairs, so the pair was the degraded index measured twice
+        and published as a repair. The driver now withdraws the repair path
+        per instance when the host says so, and **this assertion is unaffected
+        because it reads the CLASS attribute**, which still declares the
+        mechanism the engine has. Declaring a mechanism and being able to
+        execute it at a given pin are two different claims, and this test is
+        about the first.
 
         `==`, not `in`: "none" is a substring of plenty, and this repo has
         already shipped seven assertions where a substring was satisfied by a

@@ -743,7 +743,21 @@ has a repair path, runs it, times it, and writes a second record stamped
 `"after"` carrying `extra.maintenance` and `extra.maintenance_s`. Engines with
 no repair path (MariaDB, AliSQL, Valkey, Percona Search) write one record per
 step and carry `extra.repair_path = "none"`; pgvector carries
-`"vacuum_analyze"`. `OPTIMIZE TABLE` is not used for MHNSW or VIDX: at 1M rows
+`"vacuum_analyze"`.
+
+**Percona Server belongs in the second list at its pinned version, and a
+reader looking for it in either list would until now have found it in
+neither.** Its driver declares the `"index-replace"` repair mechanism, but
+that mechanism is the same `ALTER TABLE … ADD VECTOR KEY … ALGORITHM=INPLACE`
+that `config/engines/percona.yml`'s `capabilities.bulk_vector_index_build:
+false` records as killing the server at this pin. Measured on
+`full-20261015-215006`, it returned in 1–4 ms and changed nothing: identical
+`index_bytes` to the byte and identical recall to five decimals in all 20
+before/after pairs. The host therefore tells the harness to withdraw the
+repair path, Percona Server writes **one** record per step carrying
+`extra.repair_path = "none"`, and no `"after"` record exists to be read as a
+repair. If `capabilities.bulk_vector_index_build` is ever flipped to `true`,
+it moves back to the first list with no other change. `OPTIMIZE TABLE` is not used for MHNSW or VIDX: at 1M rows
 it rebuilds the whole vector index, which is a separate experiment and not a
 churn step.
 

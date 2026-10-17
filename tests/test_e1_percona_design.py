@@ -1646,7 +1646,7 @@ CITED_IN_REPO = {
         ("harness/workloads/build.py", "ingest_wall_s"),
     "harness/datasets.py:492":
         ("harness/datasets.py", "1,183,514 training rows"),
-    "harness/main.py:209-227":
+    "harness/main.py:237-255":
         ("harness/main.py", "def _detect_march"),
     "harness/drivers/mysql_family.py:58":
         ("harness/drivers/mysql_family.py", "def to_binary_f32"),
@@ -1724,7 +1724,10 @@ BARE_CONTINUATIONS = {
         ("return {", '"PerconaDriver": PerconaDriver'),
     ("harness/drivers/postgres.py", 710, 730):
         "def _driver_table()",
-    ("harness/main.py", 283, 283):
+    # Re-derived with `grep -n`, not by arithmetic: the ops harness gained
+    # `--no-bulk-vector-index-build` in `parse_args` and a declaration hook
+    # inside `driver_factory`, which moved everything in `main()` below them.
+    ("harness/main.py", 331, 331):
         "args.march or _detect_march()",
 }
 
