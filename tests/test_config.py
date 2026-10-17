@@ -3985,11 +3985,17 @@ class TestAStubResultCannotSuppressAConfiguration:
 
 
 class TestTheServerSideOfAnOpsPhaseIsKept:
-    """The ann path keeps both halves because engine and benchmark share a
-    container. The ops path splits them and kept only the client's, so a churn
-    that stalled with the client blocked on a socket and the server at its idle
-    CPU baseline could not be settled from the run directory: the half that
-    would have said was discarded with the container."""
+    """The ops path runs the engine and the harness in two containers and kept
+    only the client's output, so a churn that stalled with the client blocked
+    on a socket and the server at its idle CPU baseline could not be settled
+    from the run directory: the half that would have said was discarded with
+    the container.
+
+    This docstring used to add that the ann path keeps both halves because the
+    engine and the benchmark share one container there. They do share one, but
+    the overlay starts the engine through the same `vb-entrypoint server`, so
+    it gets the same `--log-error=<file>` and the shared stream carries no
+    more of the server's voice than this one did. See `_save_server_log`."""
 
     def _source(self):
         return open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()

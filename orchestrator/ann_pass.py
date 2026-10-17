@@ -17,15 +17,28 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
-import yaml
-
 from . import docker_ctl
 from . import engines as engines_mod
 from .config import ResolvedResources, server_args
 
+# Re-exported, not just imported: `cli.py` and a dozen tests reach these
+# through `ann_pass`, and the split that moved them into their own module is
+# about where the code lives, not about who may call it. `render_config`
+# deliberately stayed here -- docs/09 §4.10 is a historical record of the
+# Percona addition carrying ten line citations into it, and moving the
+# function would have falsified the section rather than updated it.
+from .ann_config import (  # noqa: F401
+    config_path,
+    expected_result_count,
+    expected_results,
+    result_stem,
+    result_stems,
+    write_config,
+)
 
 
-# ann-benchmarks raises this when every configuration is already done.
+# ann-benchmarks raises this when a run has no definitions left. NOT only when
+# everything is already done -- see the handling in `run_engine`.
 # See ann_benchmarks/main.py: `raise Exception("Nothing to run")`.
 NOTHING_TO_RUN = "Nothing to run"
 
@@ -302,101 +315,6 @@ def render_config(engine: str, profile: Dict[str, Any],
     }
 
 
-def config_path(work_dir: str, engine: str) -> str:
-    """Where the rendered ann-benchmarks config for one engine lives.
-
-    Shared by the writer and the reader, so the grid a sweep is checked
-    against is the file the container actually consumed.
-    """
-    return os.path.join(work_dir, "ann_benchmarks", "algorithms", engine,
-                        "config.yml")
-
-
-def _combination_count(spec: Any) -> int:
-    """How many definitions one `arg_groups` entry expands to.
-
-    ann-benchmarks takes the cartesian product of the *list* values in a dict
-    and leaves anything else fixed, so `{"M": [8, 16, 32], "efConstruction":
-    [200], "engine": "InnoDB"}` is three definitions, not nine and not one.
-    Counting the scalar `engine` as a sweep would inflate the expectation and
-    fail every complete phase.
-    """
-    if isinstance(spec, dict):
-        total = 1
-        for value in spec.values():
-            if isinstance(value, list):
-                total *= len(value)
-        return total
-    if isinstance(spec, list):
-        return len(spec)
-    return 1
-
-
-def expected_result_count(body: Dict[str, Any]) -> int:
-    """How many result files a rendered config asks ann-benchmarks to write.
-
-    One file per (definition, query argument group): definitions are the
-    product of the list-valued index parameters, summed over `arg_groups`
-    entries and run groups, and query argument groups are the product of the
-    `query_args` lists (every `render_config` branch emits exactly one list
-    there, the profile's `ef_search`, so in practice its length).
-
-    The rendered config is the only place that says how many there should be
-    -- the grid comes from the profile, the resource pass and
-    `render_config`'s per-engine branch, and no record of it reaches the
-    result tree -- so without this, `after` can only be compared against
-    `before`, which cannot tell a finished sweep from an interrupted one. See
-    `run_engine`. Returns 0 for a body it cannot read, which switches that
-    check off rather than guessing: 0 can never be a shortfall.
-    """
-    total = 0
-    if not isinstance(body, dict):
-        return 0
-    for definition in ((body.get("float") or {}).get("any") or []):
-        if not isinstance(definition, dict):
-            continue
-        for group in (definition.get("run_groups") or {}).values():
-            if not isinstance(group, dict):
-                continue
-            definitions = sum(_combination_count(entry)
-                              for entry in (group.get("arg_groups") or [{}]))
-            points = 1
-            for values in (group.get("query_args") or []):
-                points *= len(values) if isinstance(values, list) else 1
-            total += definitions * points
-    return total
-
-
-def expected_results(work_dir: str, engine: str) -> int:
-    """`expected_result_count` for the config rendered into the working copy.
-
-    Read back from disk rather than passed in: the body is rendered by the
-    caller that writes it and `run_engine` is handed only the profile, and a
-    render that failed to land must not be checked against a grid that
-    existed only in memory.
-    """
-    try:
-        with open(config_path(work_dir, engine)) as fh:
-            body = yaml.safe_load(fh)
-    except (OSError, yaml.YAMLError):
-        return 0
-    return expected_result_count(body)
-
-
-def write_config(work_dir: str, engine: str, body: Dict[str, Any]) -> str:
-    """Write the rendered config into the disposable ann-benchmarks working copy."""
-    path = config_path(work_dir, engine)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    header = (
-        f"# GENERATED by vector-bench for engine '{engine}'. Do not edit.\n"
-        f"# Regenerate with: ./run-benchmark.sh render --profile <name>\n"
-    )
-    with open(path, "w") as fh:
-        fh.write(header)
-        yaml.safe_dump(body, fh, sort_keys=False, default_flow_style=False)
-    return path
-
-
 # In the ann pass the database server and the ann-benchmarks client share one
 # container, so they also share one cgroup memory limit. The client's share is
 # not small and is not constant: ann-benchmarks loads the corpus into RAM twice
@@ -596,7 +514,22 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
     # point of leaving the results tree in place between runs. Recognise it
     # rather than reporting three healthy engines as broken.
     if rc != 0 and NOTHING_TO_RUN in text:
-        if after > 0:
+        # GATED ON THE SAME EXPECTATION AS THE CLEAN-EXIT PATH BELOW, because
+        # "Nothing to run" does NOT mean "every configuration is done". It
+        # means the definition list was empty by the time main() looked, and
+        # already-done is only one of the ways that happens. The other one
+        # matters here: in --local mode `check_module_import_and_constructor`
+        # drops a definition whose module will not import with a logged
+        # warning and no raise (NO_MODULE; a missing *constructor* does raise),
+        # and the already-run filter runs BEFORE it. So a shared tree holding
+        # 16 of 24 plus a bench image whose algorithm module lost a dependency
+        # in a rebuild gives: 8 definitions survive the resume filter, all 8
+        # are dropped for the import, the list is empty, main() raises.
+        # Reading that as success checkpointed the phase, --resume never came
+        # back, and the report carried 16 of 24 curves -- which is exactly the
+        # defect the shortfall check below exists to prevent, one branch away
+        # from it.
+        if after > 0 and (not expected or after >= expected):
             print(
                 f"[ann] nothing to do: all {after} configuration(s) for "
                 f"{engine} / {dataset} already have results in {results_dir}. "
@@ -604,9 +537,16 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             )
             return 0
         print(
-            f"[ann] FAILED: ann-benchmarks had nothing to run and there are no "
-            f"existing results in {results_dir}. The rendered config matched no "
-            f"definitions, or the algorithm module failed to import.",
+            f"[ann] FAILED: ann-benchmarks had nothing to run, and "
+            f"{results_dir} holds {after} result file(s)"
+            + (f" where the rendered config asks for {expected}."
+               if expected else " and the rendered config could not be read.")
+            + f"\n[ann] Either the config matched no definitions, or the "
+            f"algorithm module failed to import and every remaining "
+            f"definition was silently dropped -- ann-benchmarks logs that as a "
+            f"warning and then reports having nothing to run. Look for "
+            f"'could not be loaded; skipping' in the log saved beside the "
+            f"measurements.",
             file=sys.stderr,
         )
         return 1
@@ -649,13 +589,11 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             )
         return 1
     if rc == 0:
-        if after == before:
-            print(f"[ann] nothing to do: all {after} configuration(s) for "
-                  f"{engine} / {dataset} already have results "
-                  f"(pass --force to recompute)")
-        else:
-            print(f"[ann] {after - before} new result file(s), {after} total")
-
+        # THE SHORTFALL TEST COMES FIRST, before anything is reported as done.
+        # Reporting "nothing to do: all 16 configuration(s) already have
+        # results" and then "FAILED: 16 of 24" on the next line, at the end of
+        # a seven-hour phase, is a log that argues with itself.
+        #
         # A PARTIAL SWEEP IS NOT A COMPLETE ONE, and until this check it was
         # recorded as one: the case above catches the total loss
         # (`after == 0`) and nothing caught the partial, because `after`
@@ -687,6 +625,13 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
                 file=sys.stderr,
             )
             return 1
+
+        if after == before:
+            print(f"[ann] nothing to do: all {after} configuration(s) for "
+                  f"{engine} / {dataset} already have results "
+                  f"(pass --force to recompute)")
+        else:
+            print(f"[ann] {after - before} new result file(s), {after} total")
     return rc
 
 

@@ -29,7 +29,9 @@ THREE DEFECTS, one per heading below:
 
   D1  the engine's own error log never leaves the container. Four engines are
       started with `--log-error=<file>`, so `docker logs` is the banner and
-      the file is in the volume that teardown deletes.
+      the file is in the volume that teardown deletes. mongodb redirects
+      mongot's log into that volume too, with a shell `>` rather than a flag,
+      which is why the guard here looks for every spelling and not just one.
   D2  the phase-log filename had no dataset in it and is opened "w", so a
       four-dataset profile wrote one name four times.
   D3  `after > 0` was taken as a complete sweep. ann-benchmarks runs each
@@ -64,18 +66,38 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: traced back to a directory rather than to a memory.
 RUN_ID = "full-20261015-215006"
 
-#: Engines started with `--log-error=<file>`, and the file each one names.
-#: `mariadb123` is `alias_of: mariadb`, so it is started by the same
+#: Engines whose entrypoint sends a log to a FILE, and the file each one
+#: names. `mariadb123` is `alias_of: mariadb`, so it is started by the same
 #: entrypoint and logs to the same path.
+#:
+#: `mongodb` is here and it is the odd one: `mongod` itself runs in the
+#: foreground unredirected, so `docker logs` has it, but `start_mongot`
+#: redirects MONGOT's log into the data volume -- and vector search on this
+#: engine happens in mongot. The key is still `error_log` because that is the
+#: mechanism it needs; the config comment says what it actually is.
 FILE_LOGGING = {
     "percona": ("percona", "/var/lib/vbench/percona.err"),
     "mariadb": ("mariadb", "/var/lib/vbench/mariadb.err"),
     "mariadb123": ("mariadb", "/var/lib/vbench/mariadb.err"),
     "alisql": ("alisql", "/var/lib/vbench/alisql.err"),
+    "mongodb": ("mongodb", "/var/lib/vbench/mongot/mongot.log"),
 }
 
-#: Engines that log to stderr, where `docker logs` already carries it all.
-STDERR_LOGGING = ("pgvector", "mongodb", "valkey")
+#: Engines whose every log reaches the container's stdout, so `docker logs`
+#: already carries all of it and a second copy would be noise.
+STDERR_LOGGING = ("pgvector", "valkey")
+
+#: EVERY WAY A SERVER HERE COULD BE TOLD TO LOG TO A FILE, not just the
+#: MySQL-family flag. The first version of the guard below grepped
+#: `--log-error` alone, and its failure message -- "{engine}'s entrypoint now
+#: redirects the server's log to a file" -- was ALREADY UNTRUE OF MONGODB when
+#: it was written: `start_mongot` redirects with a plain shell `>`. The test
+#: passed only because it was looking for a flag mongod does not take. A guard
+#: that can only see one vendor's spelling is a guard that reports what it
+#: happens to understand.
+LOG_TO_FILE_MARKERS = ("--log-error", "--logpath", "--logfile",
+                       "logging_collector", "log_directory", ".log\"",
+                       ".log'", ".log ")
 
 
 def _entrypoint(name):
@@ -93,8 +115,8 @@ class TestTheFileLoggingEnginesDeclareTheirErrorLog:
 
     It is not derivable: the path is chosen by the entrypoint, the orchestrator
     never sees that shell script, and `docker logs` gives no hint that the
-    interesting stream went elsewhere. Four engines need it and three must not
-    have it, because for those three the existing capture is already complete
+    interesting stream went elsewhere. Five engines need it and two must not
+    have it, because for those two the existing capture is already complete
     and a second copy of the same lines would be noise.
     """
 
@@ -104,11 +126,11 @@ class TestTheFileLoggingEnginesDeclareTheirErrorLog:
         want = FILE_LOGGING[engine][1]
         got = engines_mod.registry(refresh=True)[engine].error_log
         assert got == want, (
-            f"{engine} is started with --log-error, so without "
-            f"runtime.error_log its own diagnostics stay in the container and "
+            f"{engine}'s entrypoint sends a log to a file, so without "
+            f"runtime.error_log those diagnostics stay in the container and "
             f"go with the volume; expected {want!r}, got {got!r}")
 
-    @pytest.mark.parametrize("engine", sorted(FILE_LOGGING))
+    @pytest.mark.parametrize("engine", sorted(set(FILE_LOGGING) - {"mongodb"}))
     def test_it_matches_the_entrypoint_that_starts_the_server(self, engine):
         """The config and the shell script must name the same file.
 
@@ -133,14 +155,58 @@ class TestTheFileLoggingEnginesDeclareTheirErrorLog:
             f"to --log-error, so the declared error_log is not where the "
             f"server logs")
 
+    def test_the_mongot_path_is_composed_from_the_entrypoint(self):
+        """mongodb spells it differently, so it is checked differently.
+
+        No flag and no LOG_FILE: `start_mongot` redirects with a shell `>` to
+        `${MONGOT_DATA}/mongot.log`. Both halves are read here, so a change to
+        either the variable's default or the redirection fails rather than
+        leaving the config pointing at a file nothing writes.
+        """
+        source = _entrypoint("mongodb")
+        match = re.search(r'MONGOT_DATA="\$\{VB_MONGOT_DATA:-([^}]+)\}"', source)
+        assert match, "entrypoint-mongodb.sh no longer sets MONGOT_DATA"
+        assert '>"${MONGOT_DATA}/mongot.log"' in source, (
+            "entrypoint-mongodb.sh no longer redirects mongot into "
+            "MONGOT_DATA/mongot.log")
+        assert f"{match.group(1)}/mongot.log" == FILE_LOGGING["mongodb"][1]
+
+    def test_mongod_itself_still_reaches_stdout(self):
+        """Which is why the declared path is mongot's and not mongod's, and why
+        the stdout capture is still worth keeping for this engine."""
+        source = _entrypoint("mongodb")
+        assert re.search(r"^\s*mongod --dbpath", source, re.MULTILINE), source[:0]
+        assert "--logpath" not in source
+
     @pytest.mark.parametrize("engine", STDERR_LOGGING)
-    def test_the_stderr_engines_declare_nothing(self, engine):
-        """Absence is the statement that `docker logs` is already complete."""
+    def test_the_stdout_only_engines_declare_nothing(self, engine):
+        """Absence is the statement that `docker logs` is already complete.
+
+        Checked against every spelling in `LOG_TO_FILE_MARKERS`, not just the
+        MySQL flag -- see the note on that tuple for why a narrower guard
+        passed while being wrong.
+        """
         from orchestrator import engines as engines_mod
         assert engines_mod.registry(refresh=True)[engine].error_log is None
-        assert "--log-error" not in _entrypoint(engine), (
-            f"{engine}'s entrypoint now redirects the server's log to a file, "
-            f"so it needs a runtime.error_log like the MySQL family's")
+        source = _entrypoint(engine)
+        found = [m for m in LOG_TO_FILE_MARKERS if m in source]
+        assert not found, (
+            f"{engine}'s entrypoint now sends a log to a file ({found}), so it "
+            f"needs a runtime.error_log like the other five")
+
+    def test_every_engine_is_accounted_for_one_way_or_the_other(self):
+        """A new engine must land in one of the two tables, not neither.
+
+        Discovery is by directory, so an engine added later appears in the
+        registry without appearing here, and would silently inherit the
+        stdout-only treatment whether or not that is right for it.
+        """
+        from orchestrator import engines as engines_mod
+        known = set(engines_mod.known_engines(refresh=True))
+        classified = set(FILE_LOGGING) | set(STDERR_LOGGING)
+        assert known == classified, (
+            f"unclassified: {sorted(known - classified)}; "
+            f"stale: {sorted(classified - known)}")
 
 
 class _FakeExec:
@@ -238,9 +304,9 @@ class TestTheServerLogThatMattersIsTheOneInTheContainer:
 
     `_save_server_log`'s own docstring already made the right argument -- "the
     half that would have said was discarded when the container was removed" --
-    and then captured the container's stdout, which for these four engines is
-    the entrypoint banner. Six such files in run full-20261015-215006 are
-    three lines each.
+    and then captured the container's stdout, which for the four MySQL-family
+    engines is the entrypoint banner. Six such files in run
+    full-20261015-215006 are three lines each.
     """
 
     def test_a_file_logging_engine_gets_its_error_log_archived(
@@ -362,6 +428,115 @@ class TestTheServerLogThatMattersIsTheOneInTheContainer:
             "requirement this test guards has changed shape")
 
 
+
+class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
+    """The one path where the server's log was most wanted and least likely.
+
+    `__enter__` runs three steps and the last two can fail -- a missing image,
+    or a server that never answers inside `wait_healthy`'s five minutes. On
+    failure it tears down and re-raises, and `run_harness` is never entered,
+    so neither capture ran and `teardown` removed the volume the engine's own
+    log lives in. A percona that refuses to start under a tuned
+    `innodb_buffer_pool_size` left "did not become ready within 300s" and the
+    three-line banner, and the assertion that caused it was deleted.
+    """
+
+    def _wire(self, monkeypatch, tmp_path, exists=True, error_log=True):
+        """Every docker call `__enter__` and `teardown` make, replaced.
+
+        `teardown` records whether the logs were already on disk when it ran,
+        which is how the before-teardown ordering is asserted rather than
+        assumed.
+        """
+        from orchestrator import docker_ctl, ops_pass
+        seen = {}
+
+        def remove_volume(name):
+            seen["logs_at_teardown"] = _log_names(tmp_path)
+
+        for name, value in (
+            ("create_network", lambda *a, **k: "net"),
+            ("create_volume", lambda *a, **k: "vol"),
+            ("image_exists", lambda *a, **k: True),
+            ("start", lambda *a, **k: "cid"),
+            ("stop", lambda *a, **k: None),
+            ("remove", lambda *a, **k: None),
+            ("remove_network", lambda *a, **k: None),
+            ("remove_volume", remove_volume),
+            ("remove_tree_as_root", lambda *a, **k: True),
+            ("container_exists", lambda *a, **k: exists),
+            ("logs", lambda *a, **k: "[vb-percona] exec mysqld ..."),
+        ):
+            monkeypatch.setattr(ops_pass.docker_ctl, name, value)
+
+        def never_ready(*a, **k):
+            raise docker_ctl.DockerError(
+                "container ...-srv did not become ready within 300s")
+
+        monkeypatch.setattr(ops_pass.docker_ctl, "wait_healthy", never_ready)
+        monkeypatch.setattr(docker_ctl, "exec_in", _FakeExec(
+            {"/var/lib/vbench/percona.err":
+             "[ERROR] [MY-012271] InnoDB: Cannot allocate memory for the "
+             "buffer pool\n"} if error_log else {}))
+        return seen
+
+    def test_the_error_log_comes_out_before_the_volume_is_removed(
+            self, tmp_path, monkeypatch):
+        from orchestrator import docker_ctl, ops_pass
+        seen = self._wire(monkeypatch, tmp_path)
+        run = _ops_run(tmp_path, "percona")
+        with pytest.raises(docker_ctl.DockerError):
+            run.__enter__()
+        names = _log_names(tmp_path)
+        assert [n for n in names if "server-error" in n], names
+        text = (tmp_path / "run" / "logs"
+                / [n for n in names if "server-error" in n][0]).read_text()
+        assert "Cannot allocate memory" in text, (
+            "the reason the server refused to start is the whole point of "
+            "this path")
+        assert seen["logs_at_teardown"] == names, (
+            "teardown removes the volume the file lives in, so a capture that "
+            "runs after it captures nothing: at teardown the directory held "
+            f"{seen['logs_at_teardown']} and afterwards {names}")
+
+    def test_a_setup_that_never_made_a_container_writes_no_log(
+            self, tmp_path, monkeypatch):
+        """A missing image raises before `docker run`, and `docker logs` then
+        answers with the daemon's "No such container" on stderr. Archiving
+        that under a `-server-` name would put a Docker error in the run
+        directory as though the server had said it."""
+        self._wire(monkeypatch, tmp_path, exists=False)
+        from orchestrator import docker_ctl
+        run = _ops_run(tmp_path, "percona")
+        with pytest.raises(docker_ctl.DockerError):
+            run.__enter__()
+        assert _log_names(tmp_path) == []
+
+    def test_it_still_tears_down(self, tmp_path, monkeypatch):
+        """The capture is added in front of teardown, not instead of it: a
+        failed setup must still not leak a volume, a network and a root-owned
+        corpus directory."""
+        from orchestrator import docker_ctl
+        seen = self._wire(monkeypatch, tmp_path)
+        with pytest.raises(docker_ctl.DockerError):
+            _ops_run(tmp_path, "percona").__enter__()
+        assert "logs_at_teardown" in seen, "remove_volume was never reached"
+
+    def test_a_capture_that_fails_does_not_mask_the_real_error(
+            self, tmp_path, monkeypatch):
+        """The setup failure is the diagnosis; losing the log must not replace
+        it with an exception about logging."""
+        from orchestrator import docker_ctl, ops_pass
+        self._wire(monkeypatch, tmp_path, error_log=False)
+
+        def explode(*a, **k):
+            raise RuntimeError("daemon went away")
+
+        monkeypatch.setattr(ops_pass.docker_ctl, "container_exists", explode)
+        with pytest.raises(docker_ctl.DockerError) as caught:
+            _ops_run(tmp_path, "percona").__enter__()
+        assert "did not become ready" in str(caught.value)
+
 # ---------------------------------------------------------------------------
 # D2 -- each dataset overwrote the previous dataset's log
 # ---------------------------------------------------------------------------
@@ -456,6 +631,176 @@ class TestEachDatasetKeepsItsOwnPhaseLog:
 # D3 -- a partially crashed ANN sweep was checkpointed as complete
 # ---------------------------------------------------------------------------
 
+#: What each engine's `full` grid asks for, per resource pass. MEASURED, by
+#: rendering the config and counting the file names it leads to.
+#:
+#: THE WHOLE TABLE EXISTS BECAUSE ONE ROW IS NOT ENOUGH. Every `run_engine`
+#: test below drives percona under `full`, and percona is 24 in BOTH passes --
+#: so four separate defects were invisible: reading the count for a hardcoded
+#: engine, returning a hardcoded 24 whenever the config parses, and getting
+#: either aggregation wrong in a way that happens to land on 24 for this one
+#: grid. mariadb is where it bites, at 24 normalized and 16 tuned, because the
+#: tuned pass gives it its own `m_values_by_engine`.
+FULL_PROFILE_COUNTS = {
+    ("percona", "normalized"): 24, ("percona", "tuned"): 24,
+    ("mariadb", "normalized"): 24, ("mariadb", "tuned"): 16,
+    ("mariadb123", "normalized"): 24, ("mariadb123", "tuned"): 16,
+    ("alisql", "normalized"): 24, ("alisql", "tuned"): 16,
+    ("pgvector", "normalized"): 48, ("pgvector", "tuned"): 144,
+    ("valkey", "normalized"): 24, ("valkey", "tuned"): 72,
+    ("mongodb", "normalized"): 8, ("mongodb", "tuned"): 16,
+}
+
+#: Result file names an ACTUAL ann-benchmarks run left in
+#: `results/annb/normalized/fashion-mnist-784-euclidean/10/`, with the
+#: arguments that produced them.
+#:
+#: This is the one part of the reproduction in `ann_config` that cannot be
+#: settled by reading upstream: it has to agree with `json.dumps`' spacing and
+#: key order and with `re`'s `\W` class, exactly. These literals are the only
+#: external ground truth available -- `results/` is gitignored, so they are
+#: copied in rather than read, and the listing they came from is
+#: `euclidean_M_16_engine_InnoDB_{10,40,160}.hdf5` under `mariadb/` and
+#: `alisql/` and `euclidean_M_16_build_mode_post_efConstruction_200_{...}.hdf5`
+#: under `pgvector/`.
+REAL_RESULT_STEMS = [
+    (["euclidean", {"M": 16, "engine": "InnoDB"}, 10],
+     "euclidean_M_16_engine_InnoDB_10"),
+    (["euclidean", {"M": 16, "engine": "InnoDB"}, 40],
+     "euclidean_M_16_engine_InnoDB_40"),
+    (["euclidean", {"M": 16, "engine": "InnoDB"}, 160],
+     "euclidean_M_16_engine_InnoDB_160"),
+    (["euclidean", {"M": 16, "build_mode": "post", "efConstruction": 200}, 10],
+     "euclidean_M_16_build_mode_post_efConstruction_200_10"),
+    (["euclidean", {"M": 16, "build_mode": "post", "efConstruction": 200}, 40],
+     "euclidean_M_16_build_mode_post_efConstruction_200_40"),
+    (["euclidean", {"M": 16, "build_mode": "post", "efConstruction": 200}, 160],
+     "euclidean_M_16_build_mode_post_efConstruction_200_160"),
+]
+
+
+def _render(engine, profile_name, resource_pass):
+    from orchestrator import ann_pass
+    from orchestrator.config import load_profile, load_resources
+    return ann_pass.render_config(engine, load_profile(profile_name),
+                                  load_resources(resource_pass), resource_pass)
+
+
+def _body(run_groups, name="e"):
+    """A minimal rendered body, for the cases no profile produces."""
+    return {"float": {"any": [{"name": name, "base_args": ["@metric"],
+                               "run_groups": run_groups}]}}
+
+
+class TestTheResultFileNameIsWhatGetsCounted:
+    """ann-benchmarks names the file from the ARGUMENTS and nothing else.
+
+    `results.build_result_filepath` is handed
+    `definition.arguments + query_arguments`; the run group's name is not in
+    the path. So two definitions with equal argument values write ONE file,
+    and multiplying grid sizes over-counts -- which would make a healthy phase
+    fail the shortfall check and blame a worker that never died. Counting the
+    set of file names cannot make that mistake.
+    """
+
+    @pytest.mark.parametrize("data,stem", REAL_RESULT_STEMS,
+                             ids=[s for _d, s in REAL_RESULT_STEMS])
+    def test_it_reproduces_a_name_a_real_run_wrote(self, data, stem):
+        from orchestrator import ann_config
+        assert ann_config.result_stem(data) == stem
+
+    def test_a_repeated_index_value_is_one_file(self):
+        from orchestrator import ann_config
+        body = _body({"g": {"arg_groups": [{"M": [16, 16]}],
+                            "query_args": [[10, 20]]}})
+        assert ann_config.expected_result_count(body) == 2, (
+            "M: [16, 16] is two definitions writing the same two file names; "
+            "the arithmetic this replaces said 4")
+
+    def test_a_repeated_query_value_is_one_file(self):
+        from orchestrator import ann_config
+        body = _body({"g": {"arg_groups": [{"M": [16]}],
+                            "query_args": [[10, 10, 20]]}})
+        assert ann_config.expected_result_count(body) == 2
+
+    def test_values_the_sanitiser_cannot_tell_apart_are_one_file(self):
+        """`\\W+` -> `_` collapses the quotes, so 10 and "10" name one file."""
+        from orchestrator import ann_config
+        body = _body({"g": {"arg_groups": [{"M": [16]}],
+                            "query_args": [[10, "10"]]}})
+        assert ann_config.expected_result_count(body) == 1
+
+    def test_two_run_groups_that_differ_only_by_name_share_their_files(self):
+        """The case that would have broken a future engine branch.
+
+        Every branch of `render_config` today happens to put its
+        distinguishing value inside the arg dict -- `build_mode` for pgvector
+        and valkey, `quantization` for mongodb, `engine` for the MySQL family.
+        A branch distinguishing its run groups by NAME alone would write one
+        set of files and be charged for two, and every complete phase of that
+        engine would fail after hours with a message about a dead worker.
+        """
+        from orchestrator import ann_config
+        body = _body({"a": {"arg_groups": [{"M": [8, 16, 32]}],
+                            "query_args": [[10, 20]]},
+                      "b": {"arg_groups": [{"M": [16, 32]}],
+                            "query_args": [[10, 20]]}})
+        assert ann_config.expected_result_count(body) == 6, (
+            "six distinct (M, ef) pairs across the two groups; the arithmetic "
+            "this replaces said 10")
+
+    def test_equal_stems_under_two_algorithms_are_two_files(self):
+        """Upstream writes under `results/<dataset>/<count>/<algorithm>/`, so
+        the algorithm IS in the path even though the run group is not. Merging
+        them would under-count, and under-counting hides a lost curve."""
+        from orchestrator import ann_config
+        body = {"float": {"any": [
+            {"name": "one", "base_args": ["@metric"],
+             "run_groups": {"g": {"arg_groups": [{"M": [16]}],
+                                  "query_args": [[10]]}}},
+            {"name": "two", "base_args": ["@metric"],
+             "run_groups": {"g": {"arg_groups": [{"M": [16]}],
+                                  "query_args": [[10]]}}},
+        ]}}
+        assert ann_config.expected_result_count(body) == 2
+
+    def test_arg_group_entries_are_multiplied_not_added(self):
+        """W10. `generate_arg_combinations` expands each `arg_groups` entry and
+        then takes the cartesian PRODUCT of the expansions. Summing them --
+        which is what this helper did first, and what its docstring wrongly
+        claimed upstream does -- gives 5 where 6 files are written.
+        """
+        from orchestrator import ann_config
+        body = _body({"g": {"arg_groups": [{"M": [8, 16, 32]},
+                                           {"ef": [100, 200]}],
+                            "query_args": [[10]]}})
+        assert ann_config.expected_result_count(body) == 6
+
+    def test_query_arg_lists_are_multiplied_not_replaced(self):
+        """W11. `query_args` is expanded by the same cartesian product, so two
+        lists are every pair of them, not the last list."""
+        from orchestrator import ann_config
+        body = _body({"g": {"arg_groups": [{"M": [16]}],
+                            "query_args": [[10, 20], [1, 2, 3]]}})
+        assert ann_config.expected_result_count(body) == 6
+
+    def test_a_definition_with_no_query_args_still_writes_one_file(self):
+        """`definition.query_argument_groups or [[]]` -- one iteration and one
+        file, not zero."""
+        from orchestrator import ann_config
+        assert ann_config.expected_result_count(
+            _body({"g": {"arg_groups": [{"M": [8, 16]}]}})) == 2
+
+    def test_a_scalar_index_parameter_is_not_a_sweep(self):
+        """`engine: "InnoDB"` is one value carried, not a list to multiply by."""
+        from orchestrator import ann_config
+        assert ann_config.expected_result_count(
+            _body({"g": {"arg_groups": [{"M": [8, 16, 32],
+                                         "efConstruction": [200],
+                                         "engine": "InnoDB"}],
+                         "query_args": [[10]]}})) == 3
+
+
 class TestTheExpectedResultCountComesFromTheRenderedConfig:
     """The rendered config is the only source of truth for the grid.
 
@@ -464,13 +809,6 @@ class TestTheExpectedResultCountComesFromTheRenderedConfig:
     nothing else to compare `after` against.
     """
 
-    def _body(self, engine, profile_name, resource_pass):
-        from orchestrator import ann_pass
-        from orchestrator.config import load_profile, load_resources
-        return ann_pass.render_config(engine, load_profile(profile_name),
-                                      load_resources(resource_pass),
-                                      resource_pass)
-
     def test_the_full_profile_asks_percona_for_twenty_four(self):
         """3 M x 1 efConstruction x 8 ef_search, in both passes.
 
@@ -478,28 +816,56 @@ class TestTheExpectedResultCountComesFromTheRenderedConfig:
         normalized gist phase completed 16 `Running query argument group`
         blocks and its tuned gist phase completed 24.
         """
-        from orchestrator import ann_pass
+        from orchestrator import ann_config
         for resource_pass in ("normalized", "tuned"):
-            body = self._body("percona", "full", resource_pass)
+            body = _render("percona", "full", resource_pass)
             group = body["float"]["any"][0]["run_groups"]["innodb"]
             assert len(group["arg_groups"][0]["M"]) == 3
             assert len(group["arg_groups"][0]["efConstruction"]) == 1
             assert len(group["query_args"][0]) == 8
-            assert ann_pass.expected_result_count(body) == 24, resource_pass
+            assert ann_config.expected_result_count(body) == 24, resource_pass
 
-    def test_it_moves_with_the_grid(self, tmp_path):
+    @pytest.mark.parametrize("engine,resource_pass",
+                             sorted(FULL_PROFILE_COUNTS),
+                             ids=[f"{e}-{p}"
+                                  for e, p in sorted(FULL_PROFILE_COUNTS)])
+    def test_every_engine_and_pass_gets_its_own_number(self, engine,
+                                                       resource_pass,
+                                                       tmp_path):
+        """W6 and W7, through `write_config` -- the path `run_engine` uses.
+
+        Reading the count for a fixed engine, or returning a fixed 24 whenever
+        the config parses, passes every percona case and fails here.
+        """
+        from orchestrator import ann_config
+        body = _render(engine, "full", resource_pass)
+        ann_config.write_config(str(tmp_path), engine, body)
+        assert (ann_config.expected_results(str(tmp_path), engine)
+                == FULL_PROFILE_COUNTS[(engine, resource_pass)])
+
+    def test_the_passes_disagree_for_at_least_one_engine(self):
+        """Non-vacuity for the table above. If every engine were 24 in both
+        passes the parametrised case could not see the pass being ignored --
+        which is exactly how it was invisible while only percona was driven."""
+        differing = {engine for (engine, _p) in FULL_PROFILE_COUNTS
+                     if FULL_PROFILE_COUNTS[(engine, "normalized")]
+                     != FULL_PROFILE_COUNTS[(engine, "tuned")]}
+        assert "mariadb" in differing, differing
+        assert len(differing) >= 4, differing
+
+    def test_it_moves_with_the_grid(self):
         """HONEST arm: the `full` grid. MUTANT arm: one M value removed.
 
         A count that does not move with the config is a constant, and a
         constant cannot tell a short sweep from a complete one.
         """
-        from orchestrator import ann_pass
-        honest_body = self._body("percona", "full", "normalized")
-        mutant_body = self._body("percona", "full", "normalized")
+        from orchestrator import ann_config
+        honest_body = _render("percona", "full", "normalized")
+        mutant_body = _render("percona", "full", "normalized")
         mutant_body["float"]["any"][0]["run_groups"]["innodb"][
             "arg_groups"][0]["M"] = [16]
-        honest = ann_pass.expected_result_count(honest_body)
-        mutant = ann_pass.expected_result_count(mutant_body)
+        honest = ann_config.expected_result_count(honest_body)
+        mutant = ann_config.expected_result_count(mutant_body)
         print(f"HONEST (M=[8,16,32]) = {honest}")
         print(f"MUTANT (M=[16])      = {mutant}")
         assert honest != mutant, (
@@ -508,42 +874,76 @@ class TestTheExpectedResultCountComesFromTheRenderedConfig:
             f"returned {honest}")
         assert (honest, mutant) == (24, 8)
 
-    def test_multiple_run_groups_are_summed(self):
-        """pgvector renders two build modes as two run groups, and a definition
-        in either writes result files."""
-        from orchestrator import ann_pass
-        body = self._body("pgvector", "full", "normalized")
-        groups = body["float"]["any"][0]["run_groups"]
-        assert len(groups) == 2, sorted(groups)
-        assert ann_pass.expected_result_count(body) == 48
+    def test_every_profile_in_the_repo_renders_and_counts(self):
+        """No profile may produce a body the counter reads as zero.
 
-    def test_a_scalar_index_parameter_is_not_a_sweep(self):
-        """`engine: "InnoDB"` is one value carried, not a list to multiply by.
-        Counting it as a sweep would inflate the expectation and fail every
-        complete phase."""
-        from orchestrator import ann_pass
-        assert ann_pass._combination_count(
-            {"M": [8, 16, 32], "efConstruction": [200], "engine": "InnoDB"}) == 3
+        Zero switches the shortfall check off silently, so a profile whose
+        body this helper chokes on would lose the guard without saying so.
+        `render_config` refusing outright is the only acceptable way for a
+        profile and an engine not to go together.
+        """
+        from orchestrator import ann_config, ann_pass
+        from orchestrator import engines as engines_mod
+        from orchestrator.config import CONFIG_DIR, load_profile, load_resources
+        names = sorted(f[:-4] for f in
+                       os.listdir(os.path.join(CONFIG_DIR, "profiles"))
+                       if f.endswith(".yml"))
+        assert len(names) >= 8, names
+        checked = 0
+        for profile_name in names:
+            profile = load_profile(profile_name)
+            for resource_pass in ("normalized", "tuned"):
+                resources = load_resources(resource_pass)
+                for engine in engines_mod.known_engines(refresh=True):
+                    try:
+                        body = ann_pass.render_config(engine, profile,
+                                                      resources, resource_pass)
+                    except ValueError:
+                        continue          # a refusal is a legitimate answer
+                    count = ann_config.expected_result_count(body)
+                    assert count > 0, (profile_name, resource_pass, engine)
+                    checked += 1
+        assert checked >= 100, checked
 
     def test_an_unreadable_config_switches_the_check_off(self, tmp_path):
         """Zero, not a guess. A rendered config that cannot be read is a
-        reason to fall back to today's behaviour, not a reason to fail a
-        phase whose grid is unknown.
+        reason to fall back to today's behaviour, not a reason to fail a phase
+        whose grid is unknown.
         """
-        from orchestrator import ann_pass
-        assert ann_pass.expected_results(str(tmp_path), "percona") == 0
-        path = ann_pass.config_path(str(tmp_path), "percona")
+        from orchestrator import ann_config
+        assert ann_config.expected_results(str(tmp_path), "percona") == 0
+        path = ann_config.config_path(str(tmp_path), "percona")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
             fh.write("float: [this: is\n  not: valid\n")
-        assert ann_pass.expected_results(str(tmp_path), "percona") == 0
+        assert ann_config.expected_results(str(tmp_path), "percona") == 0
+
+    def test_a_body_with_an_unrunnable_run_group_counts_zero(self):
+        """`prepare_args` raises on a run group carrying neither `args` nor
+        `arg_groups`, so the run would not start at all. Counting only the
+        groups that DO parse would under-count and hide a real shortfall."""
+        from orchestrator import ann_config
+        assert ann_config.expected_result_count(
+            {"float": {"any": [{"name": "e", "base_args": [],
+                                "run_groups": {
+                                    "ok": {"arg_groups": [{"M": [8]}],
+                                           "query_args": [[10]]},
+                                    "bad": {"query_args": [[10]]}}}]}}) == 0
 
     def test_it_reads_the_file_the_container_will_read(self, tmp_path):
-        from orchestrator import ann_pass
-        body = self._body("percona", "full", "normalized")
+        from orchestrator import ann_config, ann_pass
+        body = _render("percona", "full", "normalized")
         written = ann_pass.write_config(str(tmp_path), "percona", body)
-        assert written == ann_pass.config_path(str(tmp_path), "percona")
-        assert ann_pass.expected_results(str(tmp_path), "percona") == 24
+        assert written == ann_config.config_path(str(tmp_path), "percona")
+        assert ann_config.expected_results(str(tmp_path), "percona") == 24
+
+    def test_the_names_are_still_reachable_through_ann_pass(self):
+        """`cli.py` and a dozen existing tests call these on `ann_pass`. The
+        split moved where they live, not who may call them."""
+        from orchestrator import ann_config, ann_pass
+        for name in ("config_path", "write_config", "expected_result_count",
+                     "expected_results", "result_stem", "result_stems"):
+            assert getattr(ann_pass, name) is getattr(ann_config, name), name
 
 
 class _Resolved:
@@ -678,6 +1078,38 @@ class TestAPartialSweepIsNotACompleteOne:
     returning non-zero is what brings `--resume` back to the missing curve.
     """
 
+    @pytest.mark.parametrize("engine,resource_pass",
+                             sorted(FULL_PROFILE_COUNTS),
+                             ids=[f"{e}-{p}"
+                                  for e, p in sorted(FULL_PROFILE_COUNTS)])
+    def test_every_engine_and_pass_is_judged_against_its_own_grid(
+            self, engine, resource_pass, tmp_path, monkeypatch):
+        """W6, and the reason every other case here cannot see it.
+
+        `_AnnHarness` defaults to percona under `full`, and percona asks for 24
+        in BOTH passes -- so `run_engine` reading the expectation for a
+        hardcoded engine, or for a hardcoded pass, passed every test in this
+        file. It is caught here and only here, because this drives the real
+        `run_engine` for an engine whose number is different: mariadb is 24
+        normalized and 16 tuned, so a complete 16-file tuned mariadb sweep
+        judged against percona's 24 would be reported as a lost curve and
+        checkpointed out of the run.
+
+        Both directions, for all fourteen: the exact count passes, one file
+        short fails.
+        """
+        want = FULL_PROFILE_COUNTS[(engine, resource_pass)]
+        complete = _AnnHarness(tmp_path / "c", monkeypatch, engine=engine,
+                               resource_pass=resource_pass)
+        assert complete.run(want, 0) == 0, (
+            f"{engine}/{resource_pass} wrote all {want} files and was still "
+            f"reported as short")
+        short = _AnnHarness(tmp_path / "s", monkeypatch, engine=engine,
+                            resource_pass=resource_pass)
+        assert short.run(want - 1, 0) == 1, (
+            f"{engine}/{resource_pass} wrote {want - 1} of {want} files and "
+            f"was reported as complete")
+
     def test_a_sweep_that_lost_a_curve_is_reported(self, tmp_path,
                                                     monkeypatch, capsys):
         """HONEST arm: 16 of the 24 the config asks for, exit 0 -- this run.
@@ -714,6 +1146,60 @@ class TestAPartialSweepIsNotACompleteOne:
         harness = _AnnHarness(tmp_path, monkeypatch).seed(24)
         assert harness.run(0, 1, lines=[
             "Traceback (most recent call last):",
+            f"Exception: {ann_pass.NOTHING_TO_RUN}"]) == 0
+
+    def test_nothing_to_run_over_a_short_tree_is_not_a_success(
+            self, tmp_path, monkeypatch, capsys):
+        """HONEST arm: 16 of 24 on disk. MUTANT arm: 24 of 24. Same exit, same
+        output from ann-benchmarks; only the tree differs.
+
+        "Nothing to run" does NOT mean "everything is done". `main()` raises
+        it whenever the definition list is empty when it looks, and the resume
+        filter is only one of the things that empties it: in --local mode
+        `check_module_import_and_constructor` drops a definition whose module
+        will not import with a logged WARNING and no raise, and it runs AFTER
+        the resume filter. So a bench image whose algorithm module lost a
+        dependency in a rebuild, over a tree holding 16 of 24, left 8
+        definitions to run, dropped all 8, raised -- and this returned 0, the
+        phase was checkpointed, and the report carried 16 of 24 curves. That
+        is the defect the shortfall check exists to prevent, arriving through
+        the one branch that was not gated on it.
+        """
+        from orchestrator import ann_pass
+        said = [
+            "WARNING ann_benchmarks.algorithms.percona.module could not be "
+            "loaded; skipping",
+            "Traceback (most recent call last):",
+            f"Exception: {ann_pass.NOTHING_TO_RUN}",
+        ]
+        honest = _AnnHarness(tmp_path / "h", monkeypatch).seed(16).run(0, 1,
+                                                                      lines=said)
+        message = capsys.readouterr().err
+        mutant = _AnnHarness(tmp_path / "m", monkeypatch).seed(24).run(0, 1,
+                                                                      lines=said)
+        print(f"HONEST (16 of 24 on disk, Nothing to run) = {honest}")
+        print(f"MUTANT (24 of 24 on disk, Nothing to run) = {mutant}")
+        assert honest != mutant, (
+            "DEAD PROBE: a 'Nothing to run' over a tree missing a third of "
+            f"its files returned the same code as one over a complete tree, "
+            f"so --resume will never come back for it. Both arms returned "
+            f"{honest}")
+        assert honest == 1
+        assert mutant == 0
+        assert "16 result file(s)" in message and "24" in message, message
+        assert "could not be loaded" in message, (
+            "the message has to name the import failure as a cause, because "
+            f"that is the one an operator would not guess: {message!r}")
+
+    def test_nothing_to_run_with_an_unknown_grid_stays_a_success(
+            self, tmp_path, monkeypatch):
+        """`expected == 0` switches the gate off here too. Without a grid to
+        compare against there is no evidence of a shortfall, and failing a
+        resumption on no evidence would break the path that works."""
+        from orchestrator import ann_pass
+        harness = _AnnHarness(tmp_path, monkeypatch).seed(16)
+        harness.drop_rendered_config()
+        assert harness.run(0, 1, lines=[
             f"Exception: {ann_pass.NOTHING_TO_RUN}"]) == 0
 
     def test_a_tree_holding_more_than_this_profile_asks_for_is_not_a_failure(
@@ -758,3 +1244,131 @@ class TestAPartialSweepIsNotACompleteOne:
         harness.run(16, 0, lines=["mariadb.InterfaceError: Server has gone away"])
         logs = os.listdir(os.path.join(harness.paths["run_dir"], "logs"))
         assert logs == ["percona-gist-960-euclidean-ann-normalized.log"], logs
+
+    def test_a_short_sweep_is_not_also_reported_as_done(self, tmp_path,
+                                                        monkeypatch, capsys):
+        """The shortfall test runs before anything is called complete.
+
+        It used to run after, so a seven-hour phase that lost a curve ended
+        with "nothing to do: all 16 configuration(s) ... already have results"
+        on stdout and "FAILED: 16 of 24" on stderr -- a log arguing with
+        itself about what had just happened, in the place an operator looks
+        first.
+        """
+        harness = _AnnHarness(tmp_path, monkeypatch).seed(16)
+        assert harness.run(16, 0) == 1
+        captured = capsys.readouterr()
+        assert "nothing to do" not in captured.out, captured.out
+        assert "new result file" not in captured.out, captured.out
+        assert "16 of 24" in captured.err
+
+    def test_a_complete_sweep_is_still_reported_as_done(self, tmp_path,
+                                                        monkeypatch, capsys):
+        """Non-vacuity for the test above: the reporting still happens, it is
+        only gated behind the shortfall test."""
+        harness = _AnnHarness(tmp_path, monkeypatch).seed(24)
+        assert harness.run(24, 0) == 0
+        assert "nothing to do" in capsys.readouterr().out
+
+    def test_new_results_are_still_counted_out(self, tmp_path, monkeypatch,
+                                               capsys):
+        harness = _AnnHarness(tmp_path, monkeypatch).seed(8)
+        assert harness.run(24, 0) == 0
+        assert "16 new result file(s), 24 total" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The citations this change moved, and could not see moving
+# ---------------------------------------------------------------------------
+
+#: What each bare `:N` in docs/09 §4.10 is pointing at, read out of the
+#: section's own prose.
+#:
+#: WHY THIS IS HERE AT ALL. `tests/test_e1_percona_design.py` guards every
+#: citation in that document of the form `path:N` -- but §4.10 writes nine of
+#: them as a BARE `:N`, taking the file from its heading, and the guard's
+#: pattern needs a path. So the one section devoted to `ann_pass.py` was the
+#: one section whose pointers into it were unchecked, and all nine went stale
+#: the moment this change put an import block above `render_config`. They were
+#: found by hand, which is the thing this table exists to stop happening
+#: again. Numbers are not asserted here: the anchor is, and the test re-derives
+#: the number the way a reader would.
+#:
+#: Each anchor must occur ONCE in `ann_pass.py` -- that is what makes "the
+#: section cites it" a checkable claim. (How often the SECTION cites it is a
+#: different count and does not matter: `:150` is quoted three times.) The two
+#: `efConstruction` citations have no unique anchor and get their own test.
+SECTION_4_10_ANCHORS = (
+    "def render_config",
+    'if engine in MARIADB_ENGINES + ("alisql",)',
+    'elif engine == "pgvector":',
+    'ann.get("pgvector_build_modes"',
+    'elif engine == "valkey":',
+    'ann.get("valkey_build_modes"',
+    'elif engine == "percona":',
+)
+
+
+def _section_4_10():
+    with open(os.path.join(REPO, "docs", "09-adding-percona-server.md")) as fh:
+        doc = fh.read()
+    return doc.split("### 4.10")[1].split("\n### ")[0]
+
+
+def _ann_pass_lines():
+    with open(os.path.join(REPO, "orchestrator", "ann_pass.py")) as fh:
+        return fh.read().splitlines()
+
+
+class TestSection410StillPointsIntoAnnPass:
+    """Nine pointers into a file this change reorganised, none of them guarded.
+
+    The section is `### 4.10 orchestrator/ann_pass.py`, so its bare `:N`
+    citations mean lines of that file. Two of them are the same string
+    (`"efConstruction": ef_constructions`, which occurs three times in the
+    file), so those are checked by position within their branch rather than by
+    uniqueness.
+    """
+
+    def test_the_section_still_cites_the_file_by_line(self):
+        """Non-vacuity: if the citations were ever rewritten into another form
+        the tests below would pass by finding nothing."""
+        cited = re.findall(r"`:(\d+)`", _section_4_10())
+        assert len(cited) >= 9, cited
+        assert len(set(cited)) == 9, sorted(set(cited))
+
+    @pytest.mark.parametrize("anchor", sorted(SECTION_4_10_ANCHORS))
+    def test_each_cited_line_holds_what_the_section_says(self, anchor):
+        """Every anchor the section names must sit on a line it cites."""
+        lines = _ann_pass_lines()
+        cited = {int(n) for n in re.findall(r"`:(\d+)`", _section_4_10())}
+        found = {n for n, line in enumerate(lines, 1) if anchor in line}
+        assert len(found) == 1, (
+            f"{anchor!r} occurs {len(found)} times in ann_pass.py; §4.10's "
+            f"citation of it is only checkable while it is unique")
+        assert found & cited, (
+            f"docs/09 §4.10 describes {anchor!r} at one of {sorted(cited)}, "
+            f"but it is at {sorted(found)}. Re-derive the citation with "
+            f"grep -n against orchestrator/ann_pass.py as it now stands.")
+
+    def test_the_two_ef_construction_citations_are_inside_their_branches(self):
+        """`"efConstruction": ef_constructions` occurs three times -- pgvector,
+        valkey and percona. §4.10 cites the first two, as the keys the MySQL
+        family cannot emit, so each cited line must fall after its own branch
+        and before the next one."""
+        lines = _ann_pass_lines()
+        cited = {int(n) for n in re.findall(r"`:(\d+)`", _section_4_10())}
+        at = [n for n, line in enumerate(lines, 1)
+              if '"efConstruction": ef_constructions' in line]
+        assert len(at) == 3, at
+        branches = {name: n for name, n in (
+            (name, n) for n, line in enumerate(lines, 1)
+            for name in ("pgvector", "valkey", "percona")
+            if f'elif engine == "{name}":' in line)}
+        for name, nxt in (("pgvector", "valkey"), ("valkey", "percona")):
+            inside = [n for n in at
+                      if branches[name] < n < branches[nxt]]
+            assert len(inside) == 1, (name, inside)
+            assert inside[0] in cited, (
+                f"§4.10 cites the {name} efConstruction at one of "
+                f"{sorted(cited)}; it is at {inside[0]}")

@@ -323,6 +323,22 @@ def is_running(name: str) -> bool:
     return (proc.stdout or "").strip() == "true"
 
 
+def container_exists(name: str) -> bool:
+    """Whether the container is there at all, running or exited.
+
+    Distinct from `is_running`, and the distinction is the one that matters
+    when a phase failed during startup: a container that exited still HAS the
+    logs, so `is_running` is the wrong question to ask before collecting them.
+    What this rules out is the container never having been created -- a
+    missing image, a failed network -- where `logs` would otherwise return the
+    daemon's "No such container" on stderr and that text would be archived as
+    though the server had said it.
+    """
+    proc = _run(["docker", "inspect", "--type", "container", name],
+                check=False, timeout=30)
+    return proc.returncode == 0
+
+
 def logs(name: str, tail: int = 100) -> str:
     proc = _run(["docker", "logs", "--tail", str(tail), name], check=False, timeout=60)
     return ((proc.stdout or "") + (proc.stderr or "")).strip()

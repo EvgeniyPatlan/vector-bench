@@ -52,18 +52,23 @@ class EngineRuntime:
     #: Absolute path, inside the container, of the file the server writes its
     #: own diagnostics to -- i.e. what the entrypoint gives `--log-error`.
     #:
-    #: Set only by the four engines started that way (`mariadb`, `mariadb123`,
-    #: `alisql`, `percona`). For those, the container's stdout is the
-    #: entrypoint banner and everything the server itself says goes into a
-    #: file in the data volume that teardown removes, so the ops path copies
-    #: it out first. None -- the default, and the case for the engines that
-    #: log to stderr -- keeps the `docker logs` capture that already carries
-    #: everything for them.
+    #: Set by the four engines started that way -- `mariadb`, `mariadb123`,
+    #: `alisql`, `percona` -- whose container stdout is then the entrypoint
+    #: banner while everything the server itself says goes into a file in the
+    #: data volume that teardown removes. Also set by `mongodb`, which takes
+    #: no such flag but redirects `mongot`'s log into that volume with a shell
+    #: `>`; there `docker logs` still carries mongod, so the two captures are
+    #: complementary rather than one replacing the other.
     #:
-    #: LAST IN THE DATACLASS AND DEFAULTED, deliberately. A field with no
-    #: default inserted mid-list breaks every positional construction of this
-    #: type, and `tests/test_webui_setup.py` builds one by hand; defaulting it
-    #: also matches the config, where the key is genuinely optional.
+    #: None -- the default, and the case for `pgvector` and `valkey` -- keeps
+    #: the `docker logs` capture that already carries everything for them.
+    #: The ops path copies this file out before teardown either way.
+    #:
+    #: LAST IN THE DATACLASS AND DEFAULTED, deliberately, and in that order:
+    #: Python forbids a field without a default after one that has it, so
+    #: giving this a default -- which the config makes right, the key being
+    #: genuinely optional -- is what forces it to the end rather than beside
+    #: `data_mount` where it reads best.
     error_log: Optional[str] = None
 
     @property

@@ -108,6 +108,17 @@ class OpsRun:
             # BaseException, not Exception: the widest window here is
             # wait_healthy's five-minute poll, and the likeliest thing to
             # arrive during it is the operator's Ctrl-C.
+            #
+            # THE LOGS COME OUT BEFORE TEARDOWN, because this is the one path
+            # where the server's own log is most wanted and was least likely
+            # to exist. `run_harness` is never entered when setup fails, so
+            # neither capture ran, and `teardown` then removed the volume: a
+            # server that refused to start under a tuned
+            # `innodb_buffer_pool_size` left "did not become ready within
+            # 300s" plus the three-line banner, and the assertion that
+            # actually caused it was deleted. Cannot raise -- see
+            # `_save_startup_log`.
+            self._save_startup_log()
             self.teardown()
             raise
         return self
@@ -353,26 +364,43 @@ class OpsRun:
     def _save_server_log(self) -> None:
         """Archive what the server said, not only what the client saw.
 
-        The ann path gets this for free: the engine and the benchmark share one
-        container, so one stream carries both sides. The ops path splits them,
-        and only the client's half was ever kept. A Valkey churn then stalled
-        with the client blocked on a socket and the server at its idle CPU
+        Only the client's half was ever kept. A Valkey churn then stalled with
+        the client blocked on a socket and the server at its idle CPU
         baseline, and the question of which one was wrong could not be answered
         from the run directory at all -- the half that would have said was
         discarded when the container was removed.
 
-        TWO CAPTURES, because for four of the seven engines `docker logs` is
-        not the server's voice. `mariadb`, `mariadb123`, `alisql` and `percona`
-        are all started with `--log-error=<file>`, so their stdout is the
-        entrypoint banner -- three lines -- and everything the server itself
-        has to say goes into a file in the data volume that teardown deletes.
-        That is precisely the half this method was added to keep, and for those
-        engines it was capturing the wrong one: 13 of the 24 ops units in run
+        THE ANN PATH DOES NOT GET THIS FOR FREE, and that gap is still open.
+        This docstring used to say it did, on the grounds that the engine and
+        the benchmark share one container there. They do share one, but
+        `overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py` starts the engine
+        with `Popen([ENTRYPOINT, "server"])` -- `/usr/local/bin/vb-entrypoint`,
+        the same script, because every bench image is `FROM runtime AS bench`
+        -- so mysqld is given the same `--log-error=<file>` and that one
+        stream carries the client's half plus the banner, exactly as here.
+        What the ann path has instead is that `ann_pass.run_engine`
+        bind-mounts `state_dir` at the engine's `data_mount` read-write, so
+        the file does land on the host: root-owned, keyed by (pass, engine) and
+        NOT by dataset, and wiped by the next dataset's
+        `shutil.rmtree(state_dir)`. Nothing copies it into the run directory
+        yet.
+
+        TWO CAPTURES, because for five of the seven engines `docker logs` is
+        not all of the server's voice, and for four of those it is almost none
+        of it. `mariadb`, `mariadb123`, `alisql` and `percona` are started
+        with `--log-error=<file>`, so their stdout is the entrypoint banner --
+        three lines -- and everything the server itself has to say goes into a
+        file in the data volume that teardown deletes. That is precisely the
+        half this method was added to keep, and for those engines it was
+        capturing the wrong one: 13 of the 24 ops units in run
         full-20261015-215006 died inside the first INSERT with
         `mariadb.InterfaceError: Lost connection to server during query`, and
-        all six server logs it archived are the banner. `runtime.error_log`
-        names the file; `_save_server_error_log` copies it out while the
-        container is still up.
+        all six server logs it archived are the banner. `mongodb` is the fifth
+        and a partial case -- `mongod` does log to stdout, but `mongot`, which
+        is where vector search actually happens, is redirected into the data
+        volume -- so for it both captures carry something.
+        `runtime.error_log` names the file; `_save_server_error_log` copies it
+        out while the container is still up.
 
         Independent of each other, and neither can end the run: a server whose
         stdout is empty is exactly the one whose file log matters, so an
@@ -387,6 +415,28 @@ class OpsRun:
                 self.paths["run_dir"], self.engine, self.dataset,
                 f"server-{self.tag}", self.resource_pass, text.splitlines())
         self._save_server_error_log()
+
+    def _save_startup_log(self) -> None:
+        """`_save_server_log`, but only once there is a container to ask.
+
+        Setup fails in three places and only the last one has started a
+        server: a missing image raises before `docker run`, and
+        `create_network` / `create_volume` raise before that. In those cases
+        `docker logs` answers with the daemon's "No such container ..." on
+        stderr, which `logs` folds into its return value -- and archiving that
+        as `<engine>-<dataset>-server-<tag>-<pass>.log` would put a Docker
+        error in the run directory under a name that reads as the server's own
+        account of itself.
+
+        Cannot raise: `container_exists` is a `check=False` inspect, and
+        `_save_server_log` already swallows everything underneath it.
+        """
+        try:
+            if not docker_ctl.container_exists(self.server_name):
+                return
+        except Exception:                        # pragma: no cover - defensive
+            return
+        self._save_server_log()
 
     def _save_server_error_log(self) -> None:
         """Copy the engine's own `--log-error` file out before teardown.
