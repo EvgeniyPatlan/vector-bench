@@ -54,6 +54,7 @@ measurement container at `docker_ctl.run_foreground`; both fakes record their
 argv so the tests can assert what WOULD have been run.
 """
 
+import glob
 import os
 import re
 import subprocess
@@ -390,6 +391,130 @@ class TestReadingTheErrorLogOutOfTheContainerCannotFail:
                             subprocess.CompletedProcess([], 0, "", ""))
         assert docker_ctl.copy_file_out("srv", "/x.err", str(tmp_path)) is None
 
+    def test_the_copied_log_is_bounded_before_it_is_archived(self, tmp_path,
+                                                             monkeypatch):
+        """`docker cp` has no `--tail`, so the BOUND IS THE CALLER'S JOB.
+
+        `copy_file_out`'s docstring states it as a contract and nothing
+        checked it: replacing `lines[-SERVER_LOG_TAIL:]` with `lines` passed
+        the entire suite. An unbounded error log would then be archived whole
+        into the run directory, where every other capture is capped at the
+        same figure -- and `export` ships whatever the run directory holds.
+        """
+        from orchestrator import ops_pass
+        overshoot = 25
+        body = "".join(f"line {i}\n"
+                       for i in range(ops_pass.SERVER_LOG_TAIL + overshoot))
+
+        def copy_file_out(name, path, dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, "percona.err")
+            with open(dest, "w") as fh:
+                fh.write(body)
+            return dest
+
+        monkeypatch.setattr(ops_pass.docker_ctl, "read_file_tail",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(ops_pass.docker_ctl, "copy_file_out",
+                            copy_file_out)
+        run = _ops_run(tmp_path, "percona")
+        text = run._read_error_log("/var/lib/vbench/percona.err")
+        kept = text.splitlines()
+        assert len(kept) == ops_pass.SERVER_LOG_TAIL, len(kept)
+        assert kept[-1] == f"line {ops_pass.SERVER_LOG_TAIL + overshoot - 1}", (
+            "the TAIL is what matters -- the lines written while something was "
+            "going wrong are the last ones")
+        assert kept[0] == f"line {overshoot}"
+
+    def test_the_scratch_copy_is_always_cleaned_up(self, tmp_path,
+                                                   monkeypatch):
+        """It holds a FULL copy of the error log, once per failed phase.
+
+        Deleting the `finally` passed the entire suite, and nine failed phases
+        in the reference run would have been nine leaked copies sitting beside
+        the corpus.
+        """
+        from orchestrator import ops_pass
+        monkeypatch.setattr(ops_pass.docker_ctl, "read_file_tail",
+                            lambda *a, **k: None)
+
+        def copy_file_out(name, path, dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, "percona.err")
+            with open(dest, "w") as fh:
+                fh.write("[ERROR] signal 11\n")
+            return dest
+
+        monkeypatch.setattr(ops_pass.docker_ctl, "copy_file_out",
+                            copy_file_out)
+        run = _ops_run(tmp_path, "percona")
+        assert run._read_error_log("/var/lib/vbench/percona.err")
+        leaked = glob.glob(os.path.join(str(tmp_path / "state"),
+                                        "vb-errlog-*"))
+        assert leaked == [], leaked
+
+    def test_the_scratch_copy_is_cleaned_up_on_an_interrupt_too(
+            self, tmp_path, monkeypatch):
+        """The `finally` covers the operator's second Ctrl-C, which is the one
+        case a success-path cleanup would miss."""
+        from orchestrator import ops_pass
+        monkeypatch.setattr(ops_pass.docker_ctl, "read_file_tail",
+                            lambda *a, **k: None)
+
+        def interrupted(name, path, dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+            with open(os.path.join(dest_dir, "percona.err"), "w") as fh:
+                fh.write("half a log\n")
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(ops_pass.docker_ctl, "copy_file_out", interrupted)
+        run = _ops_run(tmp_path, "percona")
+        with pytest.raises(KeyboardInterrupt):
+            run._read_error_log("/var/lib/vbench/percona.err")
+        leaked = glob.glob(os.path.join(str(tmp_path / "state"),
+                                        "vb-errlog-*"))
+        assert leaked == [], leaked
+
+    def test_the_copy_lands_beside_the_corpus_and_not_in_tmp(self, tmp_path,
+                                                             monkeypatch):
+        """The copy is unbounded, and /tmp is on the small filesystem.
+
+        `docker_ctl.create_volume`'s docstring makes the same argument for the
+        corpus: a benchmark box typically has a small root volume and a large
+        data mount. mongodb's declared log grows for the length of a phase.
+        """
+        from orchestrator import ops_pass
+        seen = {}
+        real = ops_pass.tempfile.mkdtemp
+
+        def mkdtemp(*a, **k):
+            seen["dir"] = k.get("dir")
+            return real(*a, **k)
+
+        monkeypatch.setattr(ops_pass.tempfile, "mkdtemp", mkdtemp)
+        monkeypatch.setattr(ops_pass.docker_ctl, "read_file_tail",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(ops_pass.docker_ctl, "copy_file_out",
+                            lambda *a, **k: None)
+        run = _ops_run(tmp_path, "percona")
+        assert run._read_error_log("/var/lib/vbench/percona.err") is None
+        assert seen["dir"] == run.paths["engine_state"], seen
+
+    def test_an_unwritable_scratch_location_returns_none_like_the_rest(
+            self, tmp_path, monkeypatch):
+        """`read_file_tail` and `copy_file_out` return None for everything;
+        this must not be the one link in the chain that raises."""
+        from orchestrator import ops_pass
+        monkeypatch.setattr(ops_pass.docker_ctl, "read_file_tail",
+                            lambda *a, **k: None)
+
+        def refuse(*a, **k):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(ops_pass.tempfile, "mkdtemp", refuse)
+        run = _ops_run(tmp_path, "percona")
+        assert run._read_error_log("/var/lib/vbench/percona.err") is None
+
 
 def _ops_run(tmp_path, engine, dataset="gist-960-euclidean", tag="m8-incremental"):
     """An OpsRun with no containers behind it.
@@ -554,14 +679,30 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
     three-line banner, and the assertion that caused it was deleted.
 
     THE ORDERING IS ASSERTED AGAINST `stop`, NOT AGAINST `remove_volume`, and
-    that correction is the point of this class's shape. `remove_volume` is
-    teardown's FIFTH call, after `stop` and `remove` -- so a capture moved
-    inside `teardown` between `remove` and `remove_volume` satisfied "the log
-    existed before the volume went" and passed, while in production nullifying
-    the entire fix: `docker exec` needs a running container, so after `stop`
-    the error log reads back as nothing and only the banner is archived. The
-    fakes now gate `docker exec` on a running flag that `stop` clears, and
-    record a call order.
+    the reason is NOT the one an earlier revision of this docstring gave.
+
+    `remove_volume` is teardown's fifth call, so a capture moved inside
+    `teardown` before it satisfied "the log existed before the volume went"
+    and passed while being wrong. That much stands. But the mechanism stated
+    here was "`docker exec` needs a running container, so after `stop` the
+    error log reads back as nothing" -- and once `_read_error_log` gained its
+    `docker cp` fallback, that stopped being true. `docker cp` goes through
+    the daemon, so between `stop` and `remove` the log IS still retrievable;
+    `test_a_server_that_died_is_copied_out_instead` is the proof of it.
+
+    The real boundaries, as the fakes below now model them separately:
+
+    * before `stop` -- `docker exec` works, so the BOUNDED tail is used.
+    * after `stop`, before `remove` -- exec fails, `docker cp` still works.
+      The log survives, but only through the unbounded copy.
+    * after `remove` -- both fail. This is where the fix is nullified, and it
+      is `remove`, not `stop`, that draws that line.
+
+    So precede-`stop` is a stricter requirement than strictly necessary, kept
+    deliberately: it is the only placement that does not force the capture
+    onto a copy of an unbounded file. `test_the_capture_is_not_inside_teardown`
+    forbids the bad placement unconditionally, so no guard depends on which
+    of the two calls is the operative one.
     """
 
     def _wire(self, monkeypatch, tmp_path, exists=True, error_log=True,
@@ -573,15 +714,20 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
         """
         from orchestrator import docker_ctl, ops_pass
         order = []
-        state = {"running": True}
+        # TWO FLAGS, NOT ONE, because the two mechanisms lose access at
+        # different calls and collapsing them is what let a wrong reason stand:
+        # `stop` ends `docker exec`, `remove` ends `docker cp` as well.
+        state = {"running": True, "exists": True}
+        server = f"{_ops_run(tmp_path, 'percona').server_name}"
 
         def record(label, fn=None):
             def call(*a, **k):
                 order.append(label)
-                if label in ("stop", "remove"):
-                    # What the daemon does, and the reason the ordering
-                    # matters: after this, `docker exec` cannot get in.
+                if label == "stop":
                     state["running"] = False
+                if label == "remove" and a and a[0] == server:
+                    state["running"] = False
+                    state["exists"] = False
                 return fn(*a, **k) if fn else None
             return call
 
@@ -617,7 +763,8 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
 
         def copy_file_out(name, path, dest_dir):
             order.append("cp")
-            if not copyable or path not in files:
+            # `docker cp` survives `stop` and dies with `remove`.
+            if not state["exists"] or not copyable or path not in files:
                 return None
             os.makedirs(dest_dir, exist_ok=True)
             dest = os.path.join(dest_dir, os.path.basename(path))
@@ -647,27 +794,51 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
             f"this path; got {text!r}")
         assert "exec" in order and "stop" in order, order
         assert order.index("exec") < order.index("stop"), (
-            f"the capture must precede `stop`, not merely `remove_volume`: "
-            f"`docker exec` cannot enter a stopped container, so a capture "
-            f"after it reads nothing. Order was {order}")
+            f"the capture must precede `stop`: that is the only placement "
+            f"where the BOUNDED `docker exec` tail still works, so the "
+            f"capture is not forced onto an unbounded `docker cp` of a file "
+            f"with no size limit. Order was {order}")
+        assert "cp" not in order, (
+            f"nothing should have fallen back to the unbounded copy while the "
+            f"container was still running: {order}")
 
-    def test_a_capture_after_stop_would_have_read_nothing(self, tmp_path,
-                                                          monkeypatch):
-        """Non-vacuity for the ordering assertion above.
+    def test_after_stop_the_log_survives_only_through_the_unbounded_copy(
+            self, tmp_path, monkeypatch):
+        """Why precede-`stop` is the requirement even though `stop` is not the
+        cliff edge.
 
-        If the fakes let `docker exec` succeed on a stopped container the test
-        would be measuring nothing, so this drives the same capture with the
-        container already stopped and shows the file does not appear.
+        `docker cp` goes through the daemon, so a capture after `stop` still
+        RETRIEVES the log -- the earlier claim that it "reads back as nothing"
+        was wrong once the fallback existed. What it loses is the bound: the
+        bounded `docker exec` tail is gone and the whole file gets copied.
         """
-        from orchestrator import docker_ctl
-        _order, state = self._wire(monkeypatch, tmp_path)
+        order, state = self._wire(monkeypatch, tmp_path, copyable=True)
+        run = _ops_run(tmp_path, "percona")
+        state["running"] = False          # `stop` has happened
+        run._save_startup_log()
+        assert "Cannot allocate memory" in (self._error_log_text(tmp_path) or "")
+        assert order.index("exec") < order.index("cp"), order
+
+    def test_after_remove_the_log_is_gone_for_good(self, tmp_path,
+                                                   monkeypatch):
+        """`remove`, not `stop`, is where the fix is nullified.
+
+        Both mechanisms need the container to EXIST; only one needs it to be
+        running. So this is the boundary a capture inside `teardown` falls the
+        wrong side of -- `remove` is teardown's second call.
+        """
+        order, state = self._wire(monkeypatch, tmp_path, copyable=True)
         run = _ops_run(tmp_path, "percona")
         state["running"] = False
+        state["exists"] = False           # `remove` has happened too
         run._save_startup_log()
         assert self._error_log_text(tmp_path) is None
+        assert "cp" in order, (
+            f"the copy should have been attempted and failed: {order}")
         assert [n for n in _log_names(tmp_path) if "server-error" not in n], (
-            "the stdout half should still be archived -- `docker logs` does "
-            "work on a stopped container")
+            "the stdout half should still be archived -- `docker logs` works "
+            "on a stopped container, and `container_exists` is faked True "
+            "here because this models the placement, not a vanished container")
 
     def test_a_server_that_died_is_copied_out_instead(self, tmp_path,
                                                       monkeypatch):
@@ -694,8 +865,10 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
 
     def test_a_file_that_cannot_be_copied_either_is_still_not_fatal(
             self, tmp_path, monkeypatch, capsys):
-        """Both mechanisms exhausted: stopped container, and the copy fails
-        too. One honest note, no file, and the run goes on."""
+        """Both mechanisms exhausted: the container is stopped so `docker exec`
+        cannot get in, AND the copy fails. One honest note, no file, and the
+        run goes on. The copy failing is what the `copyable=False` arm models
+        -- without it the fallback succeeds and there is no such case."""
         _order, state = self._wire(monkeypatch, tmp_path, copyable=False)
         run = _ops_run(tmp_path, "percona")
         state["running"] = False
@@ -778,19 +951,26 @@ class TestSetupThatNeverReachedTheHarnessStillExplainsItself:
 
         The source grep that guards the two container paths looks for the
         capture inside a `finally:`, which a capture moved into `teardown`
-        also satisfies -- and that placement reads nothing, because teardown
-        stops the container first. So the forbidden location is named here.
+        also satisfies. Teardown's second call is `remove`, after which
+        neither `docker exec` nor `docker cp` can reach the container at all,
+        so that placement loses the log outright. Named here because this
+        assertion is unconditional: it does not depend on which teardown call
+        is the operative one, which is the thing a previous revision got
+        wrong.
         """
         with open(os.path.join(REPO, "orchestrator", "ops_pass.py")) as fh:
             source = fh.read()
         teardown = source.split("def teardown")[1].split("\n    def ")[0]
+        assert "docker_ctl.remove(self.server_name)" in teardown, (
+            "teardown no longer removes the server container, so the reason "
+            "this location is forbidden has changed shape")
         for forbidden in ("_save_server_log", "_save_server_error_log",
                           "_save_startup_log", "read_file_tail",
                           "copy_file_out"):
             assert forbidden not in teardown, (
-                f"`{forbidden}` is inside `teardown`, which stops the "
-                f"container before it removes the volume -- so `docker exec` "
-                f"reads nothing and only the banner is archived")
+                f"`{forbidden}` is inside `teardown`, which removes the "
+                f"container before it removes the volume -- after that "
+                f"neither mechanism can reach the error log")
 
 
 # ---------------------------------------------------------------------------
@@ -1373,7 +1553,7 @@ class _AnnHarness:
                  dataset="gist-960-euclidean", resource_pass="normalized",
                  profile_name="full"):
         from orchestrator import ann_pass
-        from orchestrator.config import load_engine, load_profile, load_resources
+        from orchestrator.config import load_engine, load_profile
 
         self.ann_pass = ann_pass
         self.engine = engine
@@ -1391,8 +1571,12 @@ class _AnnHarness:
             path.mkdir(parents=True, exist_ok=True)
             self.paths[key] = str(path)
 
+        # Merged, like production: `cli.py` never renders from a bare
+        # `load_resources()`. Inert while `full.yml` carries no `resources:`
+        # block, and wrong in both directions the moment it gains one.
         self.body = ann_pass.render_config(
-            engine, self.profile, load_resources(resource_pass), resource_pass)
+            engine, self.profile, _resources(self.profile, resource_pass),
+            resource_pass)
         ann_pass.write_config(self.paths["work_annb"], engine, self.body)
 
         self.results_dir = ann_pass.annb_results_dir(
@@ -1483,6 +1667,30 @@ class TestAPartialSweepIsNotACompleteOne:
         assert short.run(want - 1, 0) == 1, (
             f"{engine}/{resource_pass} wrote {want - 1} of {want} files and "
             f"was reported as complete")
+
+    def test_a_profile_with_a_resources_block_is_judged_against_the_merge(
+            self, tmp_path, monkeypatch):
+        """The only case in this class that can see the merge at all.
+
+        Every other one drives `full`, which carries no `resources:` block, so
+        merged and unmerged resources render identically and `_AnnHarness`
+        reading a bare `load_resources()` was invisible -- correct by accident.
+        `m-sweep` tuned/mariadb is 40 merged and 16 unmerged, because the
+        profile clears the inherited `extras.m_values_by_engine` with `null`.
+
+        So a phase that wrote 16 of those 40 curves must FAIL. Read unmerged,
+        16 is the whole grid and it would be checkpointed complete -- which is
+        D3's defect arriving through the resource layer instead of through the
+        counter.
+        """
+        short = _AnnHarness(tmp_path / "s", monkeypatch, engine="mariadb",
+                            resource_pass="tuned", profile_name="m-sweep")
+        assert short.run(16, 0) == 1, (
+            "16 of m-sweep's 40 tuned mariadb curves is a lost sweep; read "
+            "against the unmerged grid it looks complete")
+        whole = _AnnHarness(tmp_path / "w", monkeypatch, engine="mariadb",
+                            resource_pass="tuned", profile_name="m-sweep")
+        assert whole.run(40, 0) == 0
 
     def test_a_sweep_that_lost_a_curve_is_reported(self, tmp_path,
                                                     monkeypatch, capsys):
@@ -1712,9 +1920,10 @@ class TestSection410StillPointsIntoAnnPass:
         the tests below would pass by finding nothing."""
         cited = re.findall(r"`:(\d+)`", _section_4_10())
         assert len(cited) >= 10, cited
-        # One per anchor, plus the two `efConstruction` lines that have no
-        # unique anchor and get their own test below.
-        assert len(set(cited)) == len(SECTION_4_10_ANCHORS) + 2, \
+        # One per anchor, plus the THREE `efConstruction` lines -- the
+        # string occurs three times, so none of them is uniquely
+        # anchorable and they get their own test below.
+        assert len(set(cited)) == len(SECTION_4_10_ANCHORS) + 3, \
             sorted(set(cited))
 
     @pytest.mark.parametrize("anchor", sorted(SECTION_4_10_ANCHORS))
@@ -1774,24 +1983,33 @@ class TestSection410StillPointsIntoAnnPass:
                 f"is lines {starts[engine]}-{ends[engine] - 1}. Re-derive it "
                 f"with grep -n against orchestrator/ann_pass.py.")
 
-    def test_the_two_ef_construction_citations_are_inside_their_branches(self):
-        """`"efConstruction": ef_constructions` occurs three times -- pgvector,
-        valkey and percona. §4.10 cites the first two, as the keys the MySQL
-        family cannot emit, so each cited line must fall after its own branch
-        and before the next one."""
+    def test_all_three_ef_construction_citations_are_inside_their_branches(self):
+        """`"efConstruction": ef_constructions` occurs THREE times now.
+
+        §4.10's bullet said "the two that do are ..." in the present tense
+        long after Percona's branch had added a third -- the same staleness
+        the section's preamble was corrected for in the commit that introduced
+        it. The bullet is past tense now and cites all three, so each cited
+        line must fall inside the branch that emits it. The string is not
+        unique, which is why these three cannot be covered by
+        `SECTION_4_10_ANCHORS`.
+        """
         lines = _ann_pass_lines()
         cited = {int(n) for n in re.findall(r"`:(\d+)`", _section_4_10())}
         at = [n for n, line in enumerate(lines, 1)
               if '"efConstruction": ef_constructions' in line]
         assert len(at) == 3, at
-        branches = {name: n for name, n in (
-            (name, n) for n, line in enumerate(lines, 1)
-            for name in ("pgvector", "valkey", "percona")
-            if f'elif engine == "{name}":' in line)}
-        for name, nxt in (("pgvector", "valkey"), ("valkey", "percona")):
-            inside = [n for n in at
-                      if branches[name] < n < branches[nxt]]
+        branches = {}
+        for n, line in enumerate(lines, 1):
+            match = re.match(r'\s*elif engine == "(\w+)":', line)
+            if match:
+                branches[match.group(1)] = n
+        ordered = sorted(branches.values()) + [len(lines) + 1]
+        for name in ("pgvector", "valkey", "percona"):
+            start = branches[name]
+            end = next(n for n in ordered if n > start)
+            inside = [n for n in at if start < n < end]
             assert len(inside) == 1, (name, inside)
             assert inside[0] in cited, (
-                f"§4.10 cites the {name} efConstruction at one of "
-                f"{sorted(cited)}; it is at {inside[0]}")
+                f"§4.10 does not cite the {name} efConstruction line; it is "
+                f"at {inside[0]} and the section cites {sorted(cited)}")

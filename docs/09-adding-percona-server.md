@@ -978,7 +978,7 @@ source:
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `ops_pass.py:254` reads the same key
+  # hard-coded default for that engine. `ops_pass.py:256` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
   tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
@@ -1263,9 +1263,11 @@ against the branch they claim by
 `tests/test_e10_failures_explain_themselves.py`, which is what caught that.
 
 - **`efConstruction`.** No existing MySQL-family branch emits it. The two that
-  do are `:180` (pgvector) and `:199` (valkey), and both sit inside a
+  did were `:180` (pgvector) and `:199` (valkey), and both sat inside a
   build-mode loop. The MySQL-family branch at `:150` has no equivalent, so a
-  Percona `arg_groups` carrying `efConstruction` has nowhere to come from.
+  Percona `arg_groups` carrying `efConstruction` had nowhere to come from.
+  There are three such lines now; the third, `:271` (percona), is the one
+  this section asked for.
 - **`build_modes`.** `:176` reads `ann.get("pgvector_build_modes", ["post"])`
   and `:195` reads `ann.get("valkey_build_modes", ["post"])`. A
   `percona_build_modes` key needs the same treatment, and it is the key that

@@ -121,8 +121,10 @@ class OpsRun:
             # `_save_startup_log`.
             #
             # TEARDOWN IS IN A `finally`, not merely sequenced after the
-            # capture. The capture can sit on 30 s + 60 s + 120 s of timeouts
-            # against a wedged daemon, and its inner handlers are
+            # capture. Against a wedged daemon the capture can sit on
+            # 30 + 60 + 120 + 300 s of timeouts -- inspect, logs, the exec
+            # tail, the `docker cp` fallback -- 510 s in all. Its handlers
+            # are
             # `except Exception`, which by design does not catch
             # KeyboardInterrupt -- so a second Ctrl-C aborts it at once. Merely
             # sequenced, that interrupt escapes past `teardown()` and leaks
@@ -407,7 +409,10 @@ class OpsRun:
         `mongod` does log to stdout, but `mongot`, where vector search
         actually happens, is redirected into the volume -- so both captures
         carry something. `runtime.error_log` names the file;
-        `_save_server_error_log` copies it out while the container is up.
+        `_save_server_error_log` copies it out before teardown -- through
+        `docker exec` while the container is up, and `docker cp` once it is
+        not, which is the case that matters when the server died rather than
+        merely failed its probe.
 
         Independent of each other, and neither can end the run: a server whose
         stdout is empty is exactly the one whose file log matters, so an
@@ -445,24 +450,38 @@ class OpsRun:
         """The tail of the engine's error log, however the container is doing.
 
         TWO MECHANISMS, because `wait_healthy` fails two ways and only one
-        leaves a container `docker exec` can enter: the 300 s probe timeout,
-        where it is still RUNNING and never answered, and `is_running()` false
-        -- "container ... exited during startup" -- where the server DIED,
-        which is the case whose last words are worth most. `docker cp` reads
-        through the daemon rather than through the container, so it covers the
-        second; it also has no `--tail`, so the copy is bounded here instead,
-        and deleted either way.
+        leaves a container `docker exec` can enter: its probe timeout, where
+        the server is still RUNNING and merely never answered, and
+        `is_running()` false -- "container ... exited during startup" -- where
+        it DIED, which is the case whose last words are worth most.
+        `docker_ctl.copy_file_out` covers the second and says how.
 
         Reading the host side of the bind-backed volume needs no docker at all
         and is deliberately NOT the fallback: the engine writes that file as
-        root inside the container, so `<engine_state>/ops/<volume>/…` is
-        typically root:root 0640 and unreadable to a non-root orchestrator.
+        root inside the container, so it is typically root:root 0640 and
+        unreadable to a non-root orchestrator -- the thing
+        `docker_ctl.remove_tree_as_root` exists for and branches on
+        `os.getuid() == 0` for.
+
+        RETURNS None FOR EVERYTHING, like the two functions it calls, which is
+        why the `mkdtemp` is inside a try: an unwritable scratch location is
+        one more way to have no log.
+
+        The copy lands under `engine_state`, not TMPDIR, for the reason
+        `docker_ctl.create_volume` gives about where the space is -- it is
+        unbounded by construction, and mongodb's log grows all phase.
         """
         text = docker_ctl.read_file_tail(self.server_name, error_log,
                                          lines=SERVER_LOG_TAIL)
         if text:
             return text
-        scratch = tempfile.mkdtemp(prefix="vb-errlog-")
+        try:
+            # Beside the corpus, on the filesystem sized for it.
+            parent = self.paths["engine_state"]
+            os.makedirs(parent, exist_ok=True)
+            scratch = tempfile.mkdtemp(prefix="vb-errlog-", dir=parent)
+        except (OSError, KeyError):
+            return None
         try:
             copied = docker_ctl.copy_file_out(self.server_name, error_log,
                                               scratch)
@@ -472,10 +491,14 @@ class OpsRun:
                 lines = fh.read().splitlines()
             print(f"[ops] {self.engine} is no longer running; its error log "
                   f"was copied out rather than read in place")
+            # Bounded HERE, because the copy could not be: every other
+            # capture is capped at this figure and `export` ships the lot.
             return "\n".join(lines[-SERVER_LOG_TAIL:]).strip() or None
         except OSError:
             return None
         finally:
+            # Once per failed phase, holding a FULL copy of the log: nine
+            # failures in the reference run would be nine of these.
             shutil.rmtree(scratch, ignore_errors=True)
 
     def _save_server_error_log(self) -> None:

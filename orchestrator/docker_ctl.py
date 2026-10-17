@@ -398,9 +398,14 @@ def copy_file_out(name: str, path: str, dest_dir: str) -> Optional[str]:
     orchestrator, which is why reading the bind directory directly is not the
     fallback here.
 
-    Unbounded, unlike `read_file_tail` -- `docker cp` has no `--tail`. The
-    caller bounds it afterwards by taking the last lines of the copy. Returns
-    the local path, or None for every failure.
+    Unbounded in SIZE, unlike `read_file_tail` -- `docker cp` has no `--tail`
+    -- so the caller bounds it afterwards by taking the last lines of the copy,
+    and chooses where the copy lands. Bounded in TIME at 300 s, which is the
+    largest single wait in the capture chain and the figure an operator needs:
+    `container_exists` 30 + `logs` 60 + `read_file_tail` 120 + this 300 is
+    510 s of worst case before a failed setup gives up and tears down.
+
+    Returns the local path, or None for every failure.
     """
     try:
         os.makedirs(dest_dir, exist_ok=True)
