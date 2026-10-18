@@ -842,12 +842,29 @@ def _storage(record: Dict[str, Any]) -> str:
 def _build_table(summary: Dict[str, Any]) -> str:
     # Ingest rate lives on the `ingest` record, not on `index_build`; reading it
     # off the build record produced an em dash in every row.
-    # Keyed on the storage engine as well. Without it MariaDB's InnoDB and
-    # MyISAM builds collided and one rate was printed for both rows, which
-    # reported MyISAM's 210 rows/s as 80 on 11.8 and its 305 as 51 on 12.3.
+    #
+    # **This key must name every axis `_run_unit` loops, because each one it
+    # omits silently publishes one unit's rate beside another unit's build
+    # time.** `storage_engine` was added first: MariaDB's InnoDB and MyISAM
+    # builds collided and one rate was printed for both rows, which reported
+    # MyISAM's 210 rows/s as 80 on 11.8 and its 305 as 51 on 12.3.
+    #
+    # `m` is the same bug one axis over. It cannot show at all until one
+    # (engine, dataset, pass, mode, storage) holds two M values, which is why
+    # it was found by `full-20261015-215006` (percona, 4 datasets x M 8/16/32
+    # x both resource passes): that bundle published four self-refuting rows
+    # out of eleven in section 5. With `m` absent
+    # every M record for one (engine, dataset, pass, mode, storage) collapsed
+    # into a single dict entry and the last one written won: fashion-mnist
+    # printed 598 rows/s beside its own M=16 build of 167.1 s over 60,000 rows
+    # (359), 545 beside M=32's 370.3 s (162) and 598 beside the other M=32's
+    # 356.9 s (168), and sift-128 printed 206 beside M=16's 2,344.5 s over
+    # 1,000,000 rows (427). For an incremental build the build wall clock IS
+    # the load, so each of those rows carried the arithmetic that refuted it --
+    # and a reader had no way to tell which of the two numbers was the stray.
     ingest_by_key = {
         (i.get("engine"), i.get("dataset"), i.get("resource_pass"),
-         i.get("build_mode"), i.get("storage_engine")):
+         i.get("m"), i.get("build_mode"), i.get("storage_engine")):
             i.get("ingest_rows_per_s")
         for i in summary.get("ingest", [])
     }
@@ -855,12 +872,47 @@ def _build_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("build", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # The pass is in the sort as well as in the
+                                   # key: it is an axis of the grid, and with
+                                   # it absent two rows differing only by pass
+                                   # landed in whatever order the records were
+                                   # written in.
+                                   #
+                                   # **This changes section 5's row order for
+                                   # an already-archived bundle**: it used to
+                                   # run straight down M, and now groups by
+                                   # pass and then M. That is deliberate --
+                                   # the two passes are different machines and
+                                   # reading down an M column that alternates
+                                   # between them compares nothing. No cell
+                                   # value moves; only which row prints first.
+                                   r.get("resource_pass") or "",
                                    r.get("m") or 0, r.get("storage_engine") or "")):
         ingest_rate = ingest_by_key.get(
             (r.get("engine"), r.get("dataset"), r.get("resource_pass"),
-             r.get("build_mode"), r.get("storage_engine")))
+             r.get("m"), r.get("build_mode"), r.get("storage_engine")))
         rows.append([
-            _label(r.get("engine", "?")), r.get("dataset", "?"), str(r.get("m", "—")),
+            _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # The resource pass, for the reason the key above carries it and
+            # sections 7, 8 and 9's tables all print it: the two passes hand
+            # the server different machines, so two rows differing only by
+            # pass are not two readings of one configuration. In
+            # `full-20261015-215006` fashion-mnist M=8 appeared twice --
+            # 110.1 s at 6.5 GiB peak RSS and 100.3 s at 44.4 GiB -- with
+            # nothing on the page saying which budget either row ran under,
+            # and section 1 names a single pass (`tuned` there), so the
+            # 8-core/16 GB normalized row read as a 76-core/112.5 GiB one.
+            r.get("resource_pass") or "—",
+            # `_fmt`, not `str(...)`. This was the one ops-unit M cell in the
+            # file spelled `str(r.get("m", "—"))`, and it rendered correctly
+            # only by accident: a record carrying `m: None` -- the key present
+            # and the value absent, which `.get`'s default does not catch --
+            # produced the literal string "None", and `_md_table`'s
+            # `_sanitise_cell` happened to map "None" to an em dash. Remove
+            # that arm and this cell prints `None` on the page with the whole
+            # suite still green. `str()` also renders a float M as "16.0"
+            # where every other table prints "16".
+            _fmt(r.get("m"), 0),
             # MariaDB is measured on InnoDB and MyISAM under the tuned pass, and
             # without this column those two rows are identical on the page while
             # differing 6x in ingest rate.
@@ -881,8 +933,8 @@ def _build_table(summary: Dict[str, Any]) -> str:
             _index_build_kind(r),
         ])
     table = _md_table(
-        ["Engine", "Dataset", "M", "Storage", "Build mode", "Build time",
-         "Ingest rate", "Peak server RSS", "Index size",
+        ["Engine", "Dataset", "Pass", "M", "Storage", "Build mode",
+         "Build time", "Ingest rate", "Peak server RSS", "Index size",
          "Time to queryable index (s)", "Index build"],
         rows,
     )
@@ -1104,11 +1156,24 @@ def _operating_point_table(summary: Dict[str, Any]) -> str:
 
     Deliberately wider than §2.3.2's "engine · chosen ef · recall · status".
     The remaining columns are what make a row identify one measurement: a
-    profile sweeping M calibrates once per M, so Dataset / Pass / M / Build
-    are the difference between four rows and one row printed four times. The
-    Grid column is there because a sweep can stop early, and "chose ef 640 out
-    of a grid whose largest point is 640" is a different fact from "chose 640
-    out of 1000".
+    profile sweeping M calibrates once per M, so Dataset / Pass / M /
+    Build mode / Storage are the difference between four rows and one row
+    printed four times. The Grid column is there because a sweep can stop
+    early, and "chose ef 640 out of a grid whose largest point is 640" is a
+    different fact from "chose 640 out of 1000".
+
+    **`Storage` is a fix, and the sentence above used to omit it.**
+    `operating_point_key` separates units by `resource_pass` plus
+    `build_signature`, and the signature contains the storage engine, so a
+    MariaDB sweep on InnoDB and on MyISAM produces two rows -- two separate
+    calibrations on two different indexes -- whose every printed identity
+    cell was the same. `loaders.operating_points` has always carried
+    `storage_engine` on the row; only this table dropped it. Unlike the
+    `build_mode` omission in sections 7 and 9, this one is latent rather than
+    live: every committed profile pins `mariadb_storage_engines: [InnoDB]`
+    today, and `config/profiles/tuned-complete.yml` documents how to widen it
+    again -- which the tuned-complete run did, and `_build_table`'s comment
+    records what that measured.
     """
     rows = []
     for point in summary.get("operating_points", []) or []:
@@ -1133,7 +1198,14 @@ def _operating_point_table(summary: Dict[str, Any]) -> str:
         rows.append([
             _label(point.get("engine", "?")), point.get("dataset", "?"),
             point.get("resource_pass") or "—",
-            str(point.get("m") or "—"), point.get("build_mode") or "—",
+            # `_fmt`, not `str(... or "—")`: the latter renders a float M as
+            # "16.0" where the five other ops-unit tables print "16", and
+            # this table names Pass, M and Build mode beside each other, so a
+            # reader scanning down M across sections sees two spellings of
+            # one number.
+            _fmt(point.get("m"), 0),
+            point.get("build_mode") or "—",
+            _storage(point),
             ef_cell,
             # Requested vs searched: MongoDB cannot search fewer candidates
             # than k, so its "ef 10" at k=100 is a search of 100, and two
@@ -1169,8 +1241,17 @@ def _operating_point_table(summary: Dict[str, Any]) -> str:
             "0.18 apart. Re-run with `ef_mode: calibrated` to populate this "
             "section.\n")
     return _md_table(
-        ["Engine", "Dataset", "Pass", "M", "Build", "Chosen ef_search",
-         "Effective ef", "Recall@k", "Target", "Status", "Grid points"],
+        # `Build mode`, not `Build`. This column is `build_mode` -- the same
+        # ops-unit axis the other six tables print -- and it was the only one
+        # naming it differently, which is the `Pass` / `Resource pass`
+        # divergence the convention guard in
+        # `tests/test_e10_report_unit_join_keys.py` exists to prevent, sitting
+        # inside this file. `Build` is also ambiguous here in a way it is not
+        # elsewhere: section 5 has a `Build time` column, so a bare `Build`
+        # beside `Chosen ef_search` reads as a duration.
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage",
+         "Chosen ef_search", "Effective ef", "Recall@k", "Target", "Status",
+         "Grid points"],
         rows,
     ) + _operating_point_notes(summary)
 
@@ -1319,10 +1400,44 @@ def _engines_without_an_operating_point(summary: Dict[str, Any]
 # unexplained duplicates, and the largest result in the tuned-complete run --
 # that MariaDB loses 3-10% of its throughput to churn on MyISAM against 84-86%
 # on InnoDB -- was invisible on the page.
+#
+# `Pass`, `M` and `Build mode` are here for the same reason and were added by
+# the same kind of evidence. **The ops phase loops four axes** --
+# `resource_pass` x `m_values` x `build_modes` x `storage_engines`
+# (`orchestrator/cli.py`) -- and this table named one of the four, so the
+# other three rendered as duplicate rows. In `full-20261015-215006`
+# five fashion-mnist rows at one client read 1,677 / 2,037 / 1,952 / 1,673 /
+# 1,789 QPS -- five different (pass, M) units, in that order
+# (normalized M=32, normalized M=8, tuned M=16, tuned M=32, tuned M=8) -- and
+# the page could not tell them apart. The pass is the damaging half: the
+# normalized pass gives the server 8 cores and 16 GB
+# (`config/resources/normalized.yml`) against the tuned pass's 76 cores and
+# 112.5 GiB in that run, section 1 names one pass for the whole report, so an
+# 8-core throughput read as a 76-core one. Section 8's filtered table already
+# carried all three columns, which is why the same grid is legible there.
+#
+# **`Build mode` is not hypothetical and did not show in that run only
+# because `config/profiles/percona.yml` pins `[incremental]`.**
+# `full.yml`, `main.yml`, `smoke.yml` and `quick.yml` all set
+# `pgvector_build_modes: [post, incremental]` and the ops loop runs a unit per
+# mode, so a pgvector run publishes two concurrency points per (pass, M,
+# storage) that are different indexes -- a bulk-built one and an incrementally
+# maintained one. Rendered without this column they carry byte-identical
+# identity cells across a 22% throughput spread, which is this section's
+# defect exactly, one axis further out.
 def _concurrency_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(summary.get("concurrency", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # All four ops-unit axes sort ahead of the
+                                   # client count, so each unit's scaling
+                                   # curve is contiguous instead of
+                                   # interleaved with the others at every
+                                   # client count. `m or 0`, not `str(m)`: as
+                                   # text, M 8/16/32 sorts 16, 32, 8.
+                                   r.get("resource_pass") or "",
+                                   r.get("m") or 0,
+                                   r.get("build_mode") or "",
                                    r.get("storage_engine") or "",
                                    r.get("clients") or 0)):
         extra = r.get("extra") or {}
@@ -1342,6 +1457,13 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
         pool = extra.get("query_pool")
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # All four unit axes, spelled and ordered exactly as
+            # `_filtered_table` and the churn-under-writes table spell them
+            # (Pass, M, Build mode, Storage), so one reader convention covers
+            # every table that renders an ops unit.
+            r.get("resource_pass") or "—",
+            _fmt(r.get("m"), 0),
+            r.get("build_mode") or "—",
             _storage(r),
             str(r.get("clients", "—")),
             _fmt(r.get("qps"), 0),
@@ -1371,12 +1493,12 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _client_cpu_cell(extra),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Clients", "QPS", "Spread",
-         "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Clients",
+         "QPS", "Spread", "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
          "Scaling efficiency", "Queries in service", "Query pool", "Reuse",
          "Client CPU"],
         rows,
-    ) + _concurrency_notes(summary)
+    ) + BUILD_MODE_COLUMN_NOTE + _concurrency_notes(summary)
 
 
 def _efficiency_cell(extra: Dict[str, Any]) -> str:
@@ -1705,6 +1827,44 @@ def _tie_cells(records: List[Dict[str, Any]],
     return cells
 
 
+#: What the `Build mode` column in sections 7 and 9 is, and what it is not.
+#:
+#: **Those two sections print the DECLARED mode and cannot print what
+#: happened, so they must not look as though they do.** `cli.py`'s ops loop
+#: defaults the mode to `post` for any engine that does not declare
+#: `capabilities.bulk_vector_index_build: false`, and for MHNSW and VIDX --
+#: which maintain their graph on every INSERT and have no separable build
+#: step -- `post` is a no-op. So a MariaDB concurrency row reads `post` beside
+#: an index that was built incrementally. The column is still right as an
+#: identity: it is the ops-unit axis, and two rows differing only in it are
+#: two different indexes. It is wrong only if read as a description of the
+#: build.
+#:
+#: Section 5 is where the description lives, and it is deliberately a SECOND
+#: column there: `_index_build_kind` classifies what the record actually says
+#: happened and carries a distinct "not recorded" value for records that
+#: predate the field. Sections 7 and 9 cannot compute it -- `separable_build`
+#: is written on `index_build` records and on nothing else (measured on
+#: `full-20261015-215006`: present on 11 of 11 build records, absent from all
+#: 55 concurrency and all 70 churn records), so deriving it here would mean
+#: joining a concurrency row to a build row, which is the exact defect this
+#: table was just fixed for. Pointing at section 5 is the honest move;
+#: inventing the join is not.
+#:
+#: One constant, two readers, for the reason `TIE_COLUMN_NOTE` below is one:
+#: two sections wording the same caveat differently is how one of them comes
+#: to be edited into saying something the other contradicts.
+BUILD_MODE_COLUMN_NOTE = (
+    "\n_**“Build mode”** is the ops-unit axis this row was measured in, not a "
+    "statement about how the index was built. The orchestrator defaults it to "
+    "`post` for every engine that does not declare otherwise, and MHNSW and "
+    "VIDX build their graph on every INSERT — for them `post` is a no-op and "
+    "the index is incremental whatever this cell says. Two rows differing "
+    "only in this column are two different indexes, which is why it is here. "
+    "What each build actually did is section 5's `Index build` column, which "
+    "is derived from the build record rather than from the requested mode._\n")
+
+
 #: The footnote under every table that carries a tie column. One string, used
 #: by both, because two copies of an explanation drift and the churn table and
 #: the filtered table are explaining the same column.
@@ -1873,8 +2033,10 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
         "qualifying vectors is less work. Anything that applies the predicate "
         "during or after the graph walk gets slower, because it has to travel "
         "further to find k survivors.\n\n"
-        "**One row per filter column per ops unit, and they can disagree.** "
-        "The ratio is taken across the two ends of ONE curve — one column, "
+        "**One row per corpus per filter column per ops unit, and they can "
+        "disagree.** "
+        "The ratio is taken across the two ends of ONE curve — one dataset, "
+        "one column, "
         "one iterative-scan mode, one resource pass, and one (M, build mode, "
         "storage engine) unit. Every one of those changes the answer, and the "
         "ops phase loops the last three: pgvector's `post` and `incremental` "
@@ -1891,6 +2053,18 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
         "could not express.\n",
     ]
     rows = [[_label(s["engine"]),
+             # **`Dataset` is a fix, not an addition.** This table named every
+             # ops-unit axis and not the corpus, so two datasets' curves
+             # collapsed into repeated rows: on `full-20261015-215006` its 21
+             # rows carried only 12 distinct identities, 8 of them appearing
+             # two or three times -- `tuned | 16 | incremental | InnoDB | tag`
+             # twice, once at `0.7 -> 10.1 ms` and once at `0.9 -> 15.8 ms`.
+             # Those are two corpora, and a reader had the same two readings
+             # available as everywhere else in this series: a noisy
+             # measurement, or a duplicated row. `generate.py` has always put
+             # `dataset` in the grouping key and carried it on every entry;
+             # only the renderer dropped it.
+             s.get("dataset") or "—",
              s.get("resource_pass") or "—",
              _fmt(s.get("m"), 0),
              s.get("build_mode") or "—",
@@ -1903,8 +2077,15 @@ def _filter_strategy_table(summary: Dict[str, Any]) -> str:
              s.get("iterative_scan") or "—",
              s["observed"]]
             for s in strategies]
+    # **Deliberately NOT sorted by the unit axes**, unlike sections 5, 7 and
+    # 9. `generate.filter_strategies` ranks these by `ratio`, because the
+    # question this table answers is "which engines' latency moved, and how
+    # hard" -- reading it means scanning the Change column, so grouping by
+    # unit would scatter the ranking that is its whole point. Contiguity is
+    # the invariant in the grouped tables; it is not one here, and the
+    # identity columns are what keeps two rows apart instead.
     parts.append(_md_table(
-        ["Engine", "Pass", "M", "Build mode", "Storage", "Column",
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Column",
          "Selectivity", "Median latency", "Change",
          "Recall at the narrow end", "Iterative scan", "Observed strategy"],
         rows))
@@ -1934,6 +2115,25 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     writes are the same phase with a `churn_fraction` and a multi-client QPS,
     and they belong in their own table below rather than in a column of
     single-client ones.
+
+    **`Pass`, `M` and `Build mode` are a fix of the same shape as `Repair`.**
+    `churn_group` below has always held all three constant when deciding what
+    a row is tied with, so the renderer knew they were part of a row's
+    identity while the header named none of them -- and the churn-under-writes
+    table immediately below this one prints all three.
+    `full-20261015-215006` swept M 8/16/32 over two resource passes, so every
+    (dataset, fraction, state) appeared five times with the engine, dataset,
+    storage, churn and repair cells byte-identical: at 10% before repair,
+    recalls 0.9865 / 0.9594 / 0.9672 / 0.9860 / 0.9598 and QPS 1,503 / 1,898 /
+    1,561 / 1,331 / 1,829, which reads as one noisy measurement of one index
+    instead of five readings of five. The pass matters most: it gave the
+    server 8 cores and 16 GB under `normalized` against 76 cores and
+    112.5 GiB under `tuned` in that run, so a QPS column with no pass beside
+    it is not a comparison at all. `build_mode` is in for the reason
+    `_concurrency_table`'s comment gives -- the profiles that set
+    `pgvector_build_modes: [post, incremental]` run an ops unit per mode, and
+    a bulk-built index and an incrementally maintained one are two indexes,
+    not one index measured twice.
     """
     from report.churn_state import churn_measurements, maintenance_state
 
@@ -1958,6 +2158,24 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     rows = []
     for r in sorted(measurements,
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   # **The four unit axes sort ahead of BOTH
+                                   # the fraction and the state rank, and the
+                                   # state rank stays last.** That precedence
+                                   # is the whole legibility claim and it is
+                                   # the one thing here a green suite does not
+                                   # protect: move these four behind the state
+                                   # rank and the page still renders, every
+                                   # number still correct, but a unit's
+                                   # `before` and `after` rows end up as many
+                                   # rows apart as the grid is wide -- five, on
+                                   # `full-20261015-215006` -- which is the
+                                   # "two readings of one noisy index" shape
+                                   # the `Repair` column exists to prevent.
+                                   # `m or 0`, not `str(m)`, for the reason
+                                   # `_filtered_table` gives.
+                                   r.get("resource_pass") or "",
+                                   r.get("m") or 0,
+                                   r.get("build_mode") or "",
                                    r.get("storage_engine") or "",
                                    r.get("churn_fraction") or 0,
                                    # Ranked, not sorted as strings: "after"
@@ -1971,6 +2189,12 @@ def _churn_table(summary: Dict[str, Any]) -> str:
         state = maintenance_state(r)
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
+            # The three axes `churn_group` above already holds constant, now
+            # named on the page as well. Same spelling and same order as
+            # `_filtered_table` and `_churn_during_writes_table`.
+            r.get("resource_pass") or "—",
+            _fmt(r.get("m"), 0),
+            r.get("build_mode") or "—",
             _storage(r),
             f"{(r.get('churn_fraction') or 0):.0%}",
             _churn_state_cell(state, extra),
@@ -1981,10 +2205,11 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             tie_cells.get(id(r), TIE_ALONE_CELL),
         ])
     return _md_table(
-        ["Engine", "Dataset", "Storage", "Churn", "Repair", "Recall@k",
-         "Recall drop vs baseline", "QPS", "Index size", "Tied with"],
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
+         "Repair", "Recall@k", "Recall drop vs baseline", "QPS", "Index size",
+         "Tied with"],
         rows,
-    ) + TIE_COLUMN_NOTE + _churn_notes(summary) \
+    ) + BUILD_MODE_COLUMN_NOTE + TIE_COLUMN_NOTE + _churn_notes(summary) \
         + _churn_during_writes_table(summary)
 
 

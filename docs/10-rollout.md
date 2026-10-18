@@ -209,7 +209,7 @@ below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:2633`), computed by
+report** (`report/render.py:2858`), computed by
 `report/crosscheck.py:327`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
@@ -388,7 +388,7 @@ is still true.
 
 **This section now exists.** `report/crosscheck.py:327`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:2633`). It is the check that cross-references
+as section 10 (`report/render.py:2858`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -412,7 +412,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2258` and `docs/05-methodology.md:939` both say
+matched rows. `report/render.py:2483` and `docs/05-methodology.md:939` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
