@@ -651,9 +651,21 @@ def resolve_filter(cache_dir: str, dataset: Dataset, column: str,
 # Filtered ground truth
 # ---------------------------------------------------------------------------
 
+#: Corpus rows gathered per block while the qualifying subset is materialised.
+#: 8192 rows x 1536 dims x 4 B is 50 MB, so the block temporary stays small
+#: even for the widest dataset in KNOWN_DATASETS. Expressed in rows rather
+#: than bytes because it is a parameter a caller can pin, and a byte budget
+#: would make the row count — and with it the gather pattern — vary with the
+#: dim, which is the sort of thing that makes one dataset's numbers
+#: irreproducible from another's settings.
+GROUND_TRUTH_ROW_BLOCK = 8192
+
+
 def masked_ground_truth(train: numpy.ndarray, test: numpy.ndarray,
                         metric: str, k: int, mask: numpy.ndarray,
-                        batch_size: int = 256) -> numpy.ndarray:
+                        batch_size: int = 256,
+                        row_block: int = GROUND_TRUTH_ROW_BLOCK,
+                        ) -> numpy.ndarray:
     """Exact top-k over the rows `mask` selects.
 
     Brute force, in batches, because this must be exact: it is the yardstick
@@ -665,6 +677,64 @@ def masked_ground_truth(train: numpy.ndarray, test: numpy.ndarray,
     serves both columns. The alternative, a second copy of this loop for
     `ctag`, is two yardsticks that can drift apart, and the whole comparison
     hangs off them agreeing.
+
+    **This function once OOM-killed the client container.** Run
+    `full-20261015-215006`, `gist-960-euclidean / tuned / M=32`: after 5 h 46 m
+    of ingest and a complete concurrency grid, the filtered phase reached a
+    nominal 50% selectivity and `percona-ops-m32-incremental-tuned.log` ends
+    mid-sentence at "computing exact ground truth for tag at a nominal 50% of
+    rows…" with no traceback, while the server container's memory samples run
+    to the end of the phase. An abrupt end with no exception is a kill, not a
+    failure, and it cost the 50% point and the entire churn step for the only
+    gist unit that had ever survived its own load. The client limit is 8 GiB
+    (`memory.client_limit_gb: 8`); the caller still holds `dataset.train`,
+    3.84 GB at that shape, so only ~4.75 GB was ever available here. Four
+    allocations, none of them necessary, spent more than that:
+
+    * the one-step gather `train[qualifying]` (1.92 GB at 500,000 x 960),
+      which on the ANGULAR path is held *beside* the normalized copy
+      `_normalize` returns, so that path peaked at two full subsets;
+    * `(subset ** 2).sum(axis=1)` inside the query loop — loop-invariant, and
+      a third full-size copy rebuilt on every batch;
+    * three more score-matrix-sized temporaries (512 MB each) from evaluating
+      the expanded distance as one expression;
+    * `numpy.argpartition(..., axis=1)`, which returns a full
+      (batch, n_qualify) **int64** array — 1.02 GB, twice the score matrix —
+      before `[:, :k]` discards all but ten columns of it.
+
+    All four are gone. `row_block` bounds the gather and the norm pass;
+    `batch_size` keeps its old meaning and batches *queries*.
+
+    What is deliberately **not** done is scoring the corpus rows in blocks and
+    merging a running top-k, which is the obvious way to make the peak
+    independent of the selectivity. It cannot be done without changing the
+    answer, measured two ways on numpy 1.26.4:
+
+    * splitting `batch @ subset.T` along either axis **can** change the
+      computed distances in their last bits, because the BLAS picks its kernel
+      and its blocking from the shape it is handed. Splitting a
+      256 x 5,000 x 960 product into 1,024-row column blocks moves values near
+      31 by up to 7.6e-05, ~2.4e-6 relative. Small shapes can come out
+      bit-identical — 4 x 256 x 16 in 64-row blocks does — so this is a hazard
+      rather than a guarantee, which for a yardstick is the same thing. On a
+      corpus seeded with rows one ULP apart it reordered the top-10 of 4 to 17
+      queries in 20.
+    * among *exactly* equal distances the surviving order is whatever
+      `argpartition`'s introselect happens to leave behind. Measured, both
+      metrics: in a 100-row corpus holding ten copies each of ten distinct
+      4-dim vectors, queried with row 0, the ten rows tied at distance zero
+      come back as `[6, 9, 0, 8, 7, 1, 5, 2, 4, 3]`
+      (`test_argpartition_does_not_resolve_a_tie_by_row_id` pins it). It is
+      not a rule to be reimplemented: ten tied rows *and nothing else* come
+      back `[0..9]`, because introselect leaves an array that short alone.
+      That is exactly the point — the order is an artefact of how the
+      partition ran, not a property of the data, so no merge over blocks can
+      reproduce it without the whole score row in front of it.
+
+    So the qualifying axis is gathered in blocks but **scored whole**, and
+    every engine is still scored against the array the previous runs were.
+    `tests/test_e10_filtered_ground_truth_memory.py` holds the current
+    algorithm as a reference and asserts bit-identical output.
     """
     qualifying_mask = numpy.asarray(mask)
     if qualifying_mask.dtype != numpy.dtype(bool):
@@ -682,42 +752,112 @@ def masked_ground_truth(train: numpy.ndarray, test: numpy.ndarray,
         )
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    if row_block < 1:
+        raise ValueError(f"row_block must be at least 1, got {row_block}")
 
     qualifying = numpy.nonzero(qualifying_mask)[0]
     if len(qualifying) == 0:
         raise ValueError("no rows qualify for this filter")
 
-    subset = train[qualifying]
-    if metric == ANGULAR:
-        subset = _normalize(subset)
-        queries = _normalize(test)
-    else:
-        queries = test
+    n_qualify = len(qualifying)
+    dim = int(train.shape[1])
 
-    k = min(k, len(qualifying))
+    # One full-size subset, written block by block into a buffer that is
+    # allocated once. `subset = train[qualifying]` followed by
+    # `subset = _normalize(subset)` reads as two statements and allocates two
+    # arrays that are briefly live together; normalizing each block as it
+    # lands keeps a single full-size array plus one `row_block`-sized
+    # temporary. The dtype is pinned here rather than inferred later because
+    # the ANGULAR path's buffer has to match what `_normalize` returns, or
+    # every row would be rounded twice.
+    subset = numpy.empty((n_qualify, dim),
+                         dtype="<f4" if metric == ANGULAR else train.dtype)
+    for start in range(0, n_qualify, row_block):
+        rows = qualifying[start:start + row_block]
+        # The gathered block is deliberately not given a name. A name holds two
+        # blocks at once across each loop edge, and — the part that actually
+        # costs — keeps the *last* one alive for the whole rest of the call.
+        # Measured on the 30,000 x 512 probe, whose final block is 5,424 rows:
+        # the euclidean peak goes 93.10 -> 104.21 MB, which is exactly the
+        # 11.11 MB that trailing block occupies. The ANGULAR path reads
+        # 112.05 MB either way and buys nothing here, because its peak is set
+        # earlier by `_normalize`'s own temporaries, while the gathered block
+        # is necessarily alive as its argument.
+        subset[start:start + len(rows)] = (
+            _normalize(train[rows]) if metric == ANGULAR else train[rows]
+        )
+    queries = _normalize(test) if metric == ANGULAR else test
+
+    k = min(k, n_qualify)
     if k < 1:
         raise ValueError(f"k must be at least 1, got {k}")
     out = numpy.empty((len(queries), k), dtype=numpy.int64)
 
+    # ||x||^2 per qualifying row, hoisted: it does not depend on the query
+    # batch, and computing it inside the loop rebuilt a whole extra copy of
+    # the subset every time round.
+    #
+    # Deliberately **not** `numpy.einsum("ij,ij->i", subset, subset)`, which
+    # allocates only the n-element result and is the obvious way to write
+    # this. Measured on numpy 1.26.4 it disagrees with
+    # `(subset ** 2).sum(axis=1)` in the last bits for every shape tried,
+    # because it does not reproduce the per-row pairwise summation `.sum` uses.
+    # This term is per *column* of the score matrix, so unlike the per-query
+    # term below it decides the ordering — swapping it would rescore every
+    # filtered recall number in every archived report. Row-blocked `.sum` is
+    # bit-identical instead, because each row's reduction reads only that row.
+    row_sq = None
+    if metric != ANGULAR:
+        row_sq = numpy.empty(n_qualify, dtype=subset.dtype)
+        for start in range(0, n_qualify, row_block):
+            block = subset[start:start + row_block]
+            row_sq[start:start + len(block)] = (block ** 2).sum(axis=1)
+
+    # One score matrix for the whole run, reused batch by batch. Written as
+    # `scores = batch @ subset.T` the matrix is reallocated per batch, and
+    # because the name is only rebound once the new one exists, the old and the
+    # new are briefly live together: at the gist shape the final short batch
+    # allocated 464 MB beside the 512 MB it was replacing. `numpy.matmul` with
+    # `out=` is the same gemm over the same shapes — the sub-view handed to it
+    # is (len(batch), n_qualify), exactly what `batch @ subset.T` would be — so
+    # the arithmetic is untouched.
+    score_buf = numpy.empty(
+        (min(batch_size, len(queries)), n_qualify),
+        dtype=numpy.result_type(queries.dtype, subset.dtype),
+    )
+
     for start in range(0, len(queries), batch_size):
         batch = queries[start:start + batch_size]
+        # Scored across the whole qualifying axis in one call, on purpose: the
+        # docstring has the measurement showing that splitting this gemm
+        # changes the distances it returns.
+        scores = score_buf[:len(batch)]
+        numpy.matmul(batch, subset.T, out=scores)
         if metric == ANGULAR:
             # Cosine distance ordering is the reverse of dot-product ordering
             # once both sides are unit-normalized.
-            scores = -(batch @ subset.T)
+            numpy.negative(scores, out=scores)
         else:
             # ||a-b||^2 expanded; the ||a||^2 term is constant per query and so
             # does not affect ordering, but is kept for numerical clarity.
-            scores = (
-                (batch ** 2).sum(axis=1, keepdims=True)
-                - 2.0 * (batch @ subset.T)
-                + (subset ** 2).sum(axis=1)[None, :]
-            )
-        idx = numpy.argpartition(scores, kth=k - 1, axis=1)[:, :k]
-        ordered = numpy.take_along_axis(
-            idx, numpy.argsort(numpy.take_along_axis(scores, idx, axis=1), axis=1), axis=1
-        )
-        out[start:start + len(batch)] = qualifying[ordered]
+            # Accumulated in place rather than as one expression, which built
+            # a fresh score matrix for each of the three operations. The
+            # rearrangement from `a - 2*g + c` to `(-2*g) + a + c` is exact,
+            # not approximate: IEEE negation and scaling by a power of two are
+            # exact, and addition commutes.
+            scores *= -2.0
+            scores += (batch ** 2).sum(axis=1, keepdims=True)
+            scores += row_sq[None, :]
+        for i in range(len(batch)):
+            # One query row at a time, because `numpy.argpartition(axis=1)`
+            # returns a full (batch, n_qualify) int64 array — at the gist shape
+            # 1.02 GB, twice the score matrix it indexes — and `[:, :k]` then
+            # throws away all but k columns. Per row that allocation is 4 MB.
+            # numpy runs the same 1-D introselect on each row either way, so
+            # the indices and their order among equal distances are unchanged.
+            row = scores[i]
+            picked = numpy.argpartition(row, kth=k - 1)[:k]
+            out[start + i] = qualifying[picked[numpy.argsort(row[picked])]]
 
     return out
 
@@ -725,19 +865,25 @@ def masked_ground_truth(train: numpy.ndarray, test: numpy.ndarray,
 def filtered_ground_truth(train: numpy.ndarray, test: numpy.ndarray,
                           metric: str, k: int, tag_threshold: int,
                           buckets: int = TAG_BUCKETS,
-                          batch_size: int = 256) -> numpy.ndarray:
+                          batch_size: int = 256,
+                          row_block: int = GROUND_TRUTH_ROW_BLOCK,
+                          ) -> numpy.ndarray:
     """Exact top-k over only the rows passing `tag < tag_threshold`.
 
     A thin wrapper: it builds the `tag` mask and hands it to
     `masked_ground_truth`, which does the work. Kept because every caller and
     test that predates the second filter column speaks in terms of a tag
     threshold, and because the tag column is the control case that stays.
+
+    Both blocking parameters are passed straight through. A wrapper that
+    accepted only one of them would quietly give its callers the default for
+    the other, which is the drift this wrapper exists to prevent.
     """
     mask = assign_tags(len(train), buckets) < tag_threshold
     if not mask.any():
         raise ValueError(f"no rows qualify for tag < {tag_threshold}")
     return masked_ground_truth(train, test, metric, k, mask,
-                               batch_size=batch_size)
+                               batch_size=batch_size, row_block=row_block)
 
 
 def _normalize(a: numpy.ndarray) -> numpy.ndarray:

@@ -539,13 +539,13 @@ CITED_IN_REPO = {
         ("report/crosscheck.py", "def consistency_checks"),
     "report/crosscheck.py:105":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
-    "report/render.py:2633":
+    "report/render.py:2858":
         ("report/render.py", "## 10. Consistency checks"),
     # These two cited the stale sentences until they were corrected; they now
     # cite the corrected ones. The anchor is the same phrase in both files,
     # which is deliberate: it is the polarity-bearing clause, so a row that
     # still matched after a wrong rewrite would be a row worth nothing.
-    "report/render.py:2258":
+    "report/render.py:2483":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
     "docs/05-methodology.md:953":
@@ -1278,8 +1278,8 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
     def test_the_document_names_both_places(self):
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
-        assert "report/render.py:2258" in section
-        assert "docs/05-methodology.md:953" in section
+        assert "report/render.py:2483" in section
+        assert "docs/05-methodology.md:939" in section
 
 
 # ---------------------------------------------------------------------------
