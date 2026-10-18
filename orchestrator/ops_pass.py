@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -108,7 +109,31 @@ class OpsRun:
             # BaseException, not Exception: the widest window here is
             # wait_healthy's five-minute poll, and the likeliest thing to
             # arrive during it is the operator's Ctrl-C.
-            self.teardown()
+            #
+            # THE LOGS COME OUT BEFORE TEARDOWN, because this is the one path
+            # where the server's own log is most wanted and was least likely
+            # to exist. `run_harness` is never entered when setup fails, so
+            # neither capture ran, and `teardown` then removed the volume: a
+            # server that refused to start under a tuned
+            # `innodb_buffer_pool_size` left "did not become ready within
+            # 300s" plus the three-line banner, and the assertion that
+            # actually caused it was deleted. Cannot raise -- see
+            # `_save_startup_log`.
+            #
+            # TEARDOWN IS IN A `finally`, not merely sequenced after the
+            # capture. Against a wedged daemon the capture can sit on
+            # 30 + 60 + 120 + 300 s of timeouts -- inspect, logs, the exec
+            # tail, the `docker cp` fallback -- 510 s in all. Its handlers
+            # are
+            # `except Exception`, which by design does not catch
+            # KeyboardInterrupt -- so a second Ctrl-C aborts it at once. Merely
+            # sequenced, that interrupt escapes past `teardown()` and leaks
+            # every one of the things listed above. The `finally` is what makes
+            # the fast abort safe.
+            try:
+                self._save_startup_log()
+            finally:
+                self.teardown()
             raise
         return self
 
@@ -244,8 +269,8 @@ class OpsRun:
             rc = docker_ctl.run_foreground(spec, timeout=timeout_s,
                                            sink=captured)
             saved = docker_ctl.save_phase_log(
-                self.paths["run_dir"], self.engine, f"ops-{self.tag}",
-                self.resource_pass, captured)
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"ops-{self.tag}", self.resource_pass, captured)
             if saved:
                 print(f"[ops] log -> "
                       f"{os.path.relpath(saved, self.paths['run_dir'])}")
@@ -353,23 +378,172 @@ class OpsRun:
     def _save_server_log(self) -> None:
         """Archive what the server said, not only what the client saw.
 
-        The ann path gets this for free: the engine and the benchmark share one
-        container, so one stream carries both sides. The ops path splits them,
-        and only the client's half was ever kept. A Valkey churn then stalled
-        with the client blocked on a socket and the server at its idle CPU
+        Only the client's half was ever kept. A Valkey churn then stalled with
+        the client blocked on a socket and the server at its idle CPU
         baseline, and the question of which one was wrong could not be answered
         from the run directory at all -- the half that would have said was
         discarded when the container was removed.
+
+        THE ANN PATH DOES NOT GET THIS FOR FREE, and that gap is still open.
+        This docstring used to say it did, because the engine and the
+        benchmark share one container there. They do, but
+        `overlay/.../vb_mysql.py` starts the engine with
+        `Popen([ENTRYPOINT, "server"])` -- the same `vb-entrypoint`, since
+        every bench image is `FROM runtime AS bench` -- so mysqld gets the
+        same `--log-error=<file>` and that stream carries no more of the
+        server than this one did. What the ann path has instead is
+        `run_engine`'s read-write bind of `state_dir` at the engine's
+        `data_mount`, so the file lands on the host: root-owned, keyed by
+        (pass, engine) and NOT by dataset, wiped by the next dataset's
+        `rmtree`. Nothing copies it into the run directory yet.
+
+        TWO CAPTURES, because for five of the seven engines `docker logs` is
+        not all of the server's voice, and for four of those it is almost none
+        of it. `mariadb`, `mariadb123`, `alisql` and `percona` are started
+        with `--log-error=<file>`, so their stdout is the entrypoint banner --
+        three lines -- and everything the server says goes into a file in the
+        data volume that teardown deletes. That is the half this method was
+        added to keep, and for those engines it was capturing the wrong one;
+        `config/engines/percona.yml`'s `error_log` records what that cost in
+        run full-20261015-215006. `mongodb` is the fifth and a partial case:
+        `mongod` does log to stdout, but `mongot`, where vector search
+        actually happens, is redirected into the volume -- so both captures
+        carry something. `runtime.error_log` names the file;
+        `_save_server_error_log` copies it out before teardown -- through
+        `docker exec` while the container is up, and `docker cp` once it is
+        not, which is the case that matters when the server died rather than
+        merely failed its probe.
+
+        Independent of each other, and neither can end the run: a server whose
+        stdout is empty is exactly the one whose file log matters, so an
+        exception from the first must not skip the second.
         """
         try:
             text = docker_ctl.logs(self.server_name, tail=SERVER_LOG_TAIL)
         except Exception:
+            text = ""
+        if text:
+            docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"server-{self.tag}", self.resource_pass, text.splitlines())
+        self._save_server_error_log()
+
+    def _save_startup_log(self) -> None:
+        """`_save_server_log`, but only once there is a container to ask.
+
+        Setup fails in three places and only the last has started a server: a
+        missing image raises before `docker run`, and `create_network` /
+        `create_volume` before that. `container_exists` is what rules those
+        out, and its own docstring says why asking is necessary.
+
+        Cannot raise: that inspect is `check=False`, and `_save_server_log`
+        swallows everything underneath it.
+        """
+        try:
+            if not docker_ctl.container_exists(self.server_name):
+                return
+        except Exception:                        # pragma: no cover - defensive
             return
-        if not text:
-            return
-        docker_ctl.save_phase_log(
-            self.paths["run_dir"], self.engine, f"server-{self.tag}",
-            self.resource_pass, text.splitlines())
+        self._save_server_log()
+
+    def _read_error_log(self, error_log: str) -> Optional[str]:
+        """The tail of the engine's error log, however the container is doing.
+
+        TWO MECHANISMS, because `wait_healthy` fails two ways and only one
+        leaves a container `docker exec` can enter: its probe timeout, where
+        the server is still RUNNING and merely never answered, and
+        `is_running()` false -- "container ... exited during startup" -- where
+        it DIED, which is the case whose last words are worth most.
+        `docker_ctl.copy_file_out` covers the second and says how.
+
+        Reading the host side of the bind-backed volume needs no docker at all
+        and is deliberately NOT the fallback: the engine writes that file as
+        root inside the container, so it is typically root:root 0640 and
+        unreadable to a non-root orchestrator -- the thing
+        `docker_ctl.remove_tree_as_root` exists for and branches on
+        `os.getuid() == 0` for.
+
+        RETURNS None FOR EVERYTHING, like the two functions it calls, which is
+        why the `mkdtemp` is inside a try: an unwritable scratch location is
+        one more way to have no log.
+
+        The copy lands under `engine_state`, not TMPDIR, for the reason
+        `docker_ctl.create_volume` gives about where the space is -- it is
+        unbounded by construction, and mongodb's log grows all phase.
+        """
+        text = docker_ctl.read_file_tail(self.server_name, error_log,
+                                         lines=SERVER_LOG_TAIL)
+        if text:
+            return text
+        try:
+            # Beside the corpus, on the filesystem sized for it.
+            parent = self.paths["engine_state"]
+            os.makedirs(parent, exist_ok=True)
+            scratch = tempfile.mkdtemp(prefix="vb-errlog-", dir=parent)
+        except (OSError, KeyError):
+            return None
+        try:
+            copied = docker_ctl.copy_file_out(self.server_name, error_log,
+                                              scratch)
+            if not copied:
+                return None
+            with open(copied, errors="replace") as fh:
+                lines = fh.read().splitlines()
+            print(f"[ops] {self.engine} is no longer running; its error log "
+                  f"was copied out rather than read in place")
+            # Bounded HERE, because the copy could not be: every other
+            # capture is capped at this figure and `export` ships the lot.
+            return "\n".join(lines[-SERVER_LOG_TAIL:]).strip() or None
+        except OSError:
+            return None
+        finally:
+            # Once per failed phase, holding a FULL copy of the log: nine
+            # failures in the reference run would be nine of these.
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def _save_server_error_log(self) -> None:
+        """Copy the engine's own `--log-error` file out before teardown.
+
+        Only for an engine whose config declares `runtime.error_log`; the
+        engines that log to stderr are already covered by `docker logs` above
+        and this is a no-op for them, so their behaviour is unchanged.
+
+        Must run BEFORE teardown and does, because every caller reaches it from
+        a `finally` inside a `with OpsRun(...)` block, and `teardown` -- which
+        stops the container and then removes the volume the file lives in -- is
+        `__exit__`. There is no second chance after that: the file is not on
+        the host, and the volume is bind-backed under state/ops, which
+        `remove_tree_as_root` then deletes as well.
+
+        NOTHING HERE MAY RAISE. This is on the path a crashed phase takes, and
+        a phase that has already lost its measurement must not also lose the
+        run because its log could not be fetched. Every failure -- no such
+        engine, no such file, an unreadable path, a container that has gone, no
+        daemon -- degrades to a printed note and no file. `_read_error_log`
+        returns None for all of them; the try is for the registry lookup and
+        the write.
+        """
+        try:
+            error_log = engines_mod.get(self.engine).error_log
+            if not error_log:
+                return
+            text = self._read_error_log(error_log)
+            if not text:
+                print(f"[ops] note: {self.engine} declares "
+                      f"runtime.error_log={error_log} but nothing could be "
+                      f"read from it; the server's own log is not in this run "
+                      f"directory", file=sys.stderr)
+                return
+            saved = docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"server-error-{self.tag}", self.resource_pass,
+                text.splitlines())
+            if saved:
+                print(f"[ops] server error log -> "
+                      f"{os.path.relpath(saved, self.paths['run_dir'])}")
+        except Exception as exc:                 # pragma: no cover - defensive
+            print(f"[ops] note: could not archive {self.engine}'s error log: "
+                  f"{exc}", file=sys.stderr)
 
     # ------------------------------------------------------------------
 

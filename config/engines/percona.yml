@@ -291,6 +291,23 @@ runtime:
   port: 3306
   data_mount: /var/lib/vbench
   server_data_mount: /server-data/data
+  # Where mysqld's own diagnostics land INSIDE the container. Must equal
+  # LOG_FILE's default in docker/percona/entrypoint-percona.sh, which is what
+  # it passes to --log-error; tests/test_e10_failures_explain_themselves.py
+  # reads both and fails if they drift.
+  #
+  # This key exists because that is a path in the data volume and not a
+  # stream: the container's stdout is the three-line entrypoint banner, and
+  # teardown stops the container and removes the volume. In run
+  # full-20261015-215006, 13 of 24 ops units died inside the first INSERT with
+  # `mariadb.InterfaceError: Lost connection to server during query` within
+  # 0.5-5.5 s, server RSS flat at the buffer-pool baseline and CPU at 0.16
+  # cores -- and whether that was a signal, an assertion or a refused
+  # statement could not be established afterwards, because every
+  # logs/percona-server-*.log in that run is the banner and the file that
+  # would have said was deleted with the volume. ops_pass copies this out
+  # before teardown.
+  error_log: /var/lib/vbench/percona.err
   credentials:
     user: "bench"
     password: "bench"

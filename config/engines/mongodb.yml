@@ -138,6 +138,18 @@ runtime:
   # Where the server keeps its data inside the image.
   data_mount: /var/lib/vbench
   server_data_mount: /server-data/mongot
+  # NOT a server error log, and the key's name oversells it: `mongod` itself
+  # runs in the foreground with no redirection, so its log is on the
+  # container's stdout and `docker logs` has it. THIS IS MONGOT'S, the search
+  # side -- docker/mongodb/entrypoint-mongodb.sh's `start_mongot` redirects it
+  # to "${MONGOT_DATA}/mongot.log" with MONGOT_DATA defaulting to
+  # /var/lib/vbench/mongot, i.e. into the data volume that teardown deletes.
+  # Vector search on this engine happens in mongot, so a phase that failed
+  # against an index stuck in PENDING explains itself there and nowhere else,
+  # and until this key that file left no trace in the run directory.
+  # tests/test_e10_failures_explain_themselves.py composes the same path from
+  # the entrypoint and fails if either half moves.
+  error_log: /var/lib/vbench/mongot/mongot.log
   credentials:
     user: "bench"
     password: "bench"

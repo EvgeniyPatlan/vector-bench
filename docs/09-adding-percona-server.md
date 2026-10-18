@@ -974,11 +974,11 @@ display_name: Percona Server
 family: mysql
 source:
   # The key is `tag` even though the value is a SHA, and that is not a
-  # cosmetic choice. `orchestrator/engines.py:63-65` is
+  # cosmetic choice. `orchestrator/engines.py:84-86` is
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `ops_pass.py:231` reads the same key
+  # hard-coded default for that engine. `ops_pass.py:256` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
   tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
@@ -1242,24 +1242,34 @@ together.
 This file is the one that *renders* the overlay `config.yml` this task wrote,
 and the previous revision of this document never mentioned it.
 
-`render_config()` (from `:112`) dispatches on engine name and ends:
+`render_config()` (from `:125`) dispatches on engine name and ends:
 
 ```python
-288        raise ValueError(f"unknown engine: {engine}")
+301        raise ValueError(f"unknown engine: {engine}")
 ```
 
-The branches are `:137` (`if engine in MARIADB_ENGINES + ("alisql",)`), `:154`
-(pgvector), `:173` (valkey) and `:193` (mongodb). **Percona matches none of
-them and lands on the `raise`.** Either add it to the MySQL-family condition at
-`:137` or give it a branch of its own, and a branch of its own is what the two
+The branches are `:150` (`if engine in MARIADB_ENGINES + ("alisql",)`), `:167`
+(pgvector), `:186` (valkey) and `:278` (mongodb). **Percona matched none of
+them and landed on the `raise`.** Either add it to the MySQL-family condition at
+`:150` or give it a branch of its own, and a branch of its own is what the two
 things §4.6 proposes actually need:
 
+The branch this section asked for is now `:206` (percona), and it was inserted
+at the position mongodb's branch used to occupy — which is why this list said
+`(mongodb)` against that line for two revisions, pointing at Percona's own
+branch while the sentence above it said Percona had none. Every `` `:N` ``
+below is a line of `orchestrator/ann_pass.py`; the labelled ones are checked
+against the branch they claim by
+`tests/test_e10_failures_explain_themselves.py`, which is what caught that.
+
 - **`efConstruction`.** No existing MySQL-family branch emits it. The two that
-  do are `:167` (pgvector) and `:186` (valkey), and both sit inside a
-  build-mode loop. The MySQL-family branch at `:137` has no equivalent, so a
-  Percona `arg_groups` carrying `efConstruction` has nowhere to come from.
-- **`build_modes`.** `:163` reads `ann.get("pgvector_build_modes", ["post"])`
-  and `:182` reads `ann.get("valkey_build_modes", ["post"])`. A
+  did were `:180` (pgvector) and `:199` (valkey), and both sat inside a
+  build-mode loop. The MySQL-family branch at `:150` has no equivalent, so a
+  Percona `arg_groups` carrying `efConstruction` had nowhere to come from.
+  There are three such lines now; the third, `:271` (percona), is the one
+  this section asked for.
+- **`build_modes`.** `:176` reads `ann.get("pgvector_build_modes", ["post"])`
+  and `:195` reads `ann.get("valkey_build_modes", ["post"])`. A
   `percona_build_modes` key needs the same treatment, and it is the key that
   makes §2.5's within-engine build comparison runnable.
 

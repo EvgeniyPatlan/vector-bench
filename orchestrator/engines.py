@@ -49,6 +49,27 @@ class EngineRuntime:
     tag: str
     #: Readiness probe argv, run in the server container until it succeeds.
     probe: Tuple[str, ...]
+    #: Absolute path, inside the container, of the file the server writes its
+    #: own diagnostics to -- i.e. what the entrypoint gives `--log-error`.
+    #:
+    #: Set by the four engines started that way -- `mariadb`, `mariadb123`,
+    #: `alisql`, `percona` -- whose container stdout is then the entrypoint
+    #: banner while everything the server itself says goes into a file in the
+    #: data volume that teardown removes. Also set by `mongodb`, which takes
+    #: no such flag but redirects `mongot`'s log into that volume with a shell
+    #: `>`; there `docker logs` still carries mongod, so the two captures are
+    #: complementary rather than one replacing the other.
+    #:
+    #: None -- the default, and the case for `pgvector` and `valkey` -- keeps
+    #: the `docker logs` capture that already carries everything for them.
+    #: The ops path copies this file out before teardown either way.
+    #:
+    #: LAST IN THE DATACLASS AND DEFAULTED, deliberately, and in that order:
+    #: Python forbids a field without a default after one that has it, so
+    #: giving this a default -- which the config makes right, the key being
+    #: genuinely optional -- is what forces it to the end rather than beside
+    #: `data_mount` where it reads best.
+    error_log: Optional[str] = None
 
     @property
     def credentials(self) -> Tuple[str, str]:
@@ -97,6 +118,9 @@ def _build(name: str, config: Dict[str, Any], fallback_index: int) -> EngineRunt
         label=str(label),
         tag=_source_tag(config),
         probe=tuple(str(a) for a in (runtime.get("probe") or ())),
+        # Not in `missing` above: an engine that logs to stderr declares no
+        # error_log and must keep working without one.
+        error_log=str(runtime["error_log"]) if runtime.get("error_log") else None,
     )
 
 

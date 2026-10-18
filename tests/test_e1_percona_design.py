@@ -281,7 +281,7 @@ class TestBuildArgConventions:
         assert args == {"PERCONA_TAG"}, args
 
     def test_the_arg_is_wired_to_the_env_var_the_manifest_reads(self):
-        """ops_pass.py:231 puts source.tag into VB_ENGINE_TAG; the image sets it
+        """ops_pass.py:256 puts source.tag into VB_ENGINE_TAG; the image sets it
         too, and an ARG declared but never used leaves it `unknown`."""
         dockerfile = open(os.path.join(DOCKER, "percona", "Dockerfile")).read()
         assert "VB_ENGINE_TAG=${PERCONA_TAG}" in dockerfile
@@ -1662,9 +1662,11 @@ CITED_IN_REPO = {
         ("harness/drivers/mysql_family.py", "host=self.spec.host"),
     "postgres.py:689":
         ("harness/drivers/postgres.py", "def _driver_classes()"),
-    "ops_pass.py:231":
+    "ops_pass.py:256":
         ("orchestrator/ops_pass.py", "VB_ENGINE_TAG"),
-    "orchestrator/engines.py:63-65":
+    # Moved from 63-65 by `runtime.error_log`, which added a field to
+    # `EngineRuntime` above it. Re-derived with grep, not by arithmetic.
+    "orchestrator/engines.py:84-86":
         ("orchestrator/engines.py", "def _source_tag"),
     "docs/07-planning-a-run.md:505":
         ("docs/07-planning-a-run.md", "60,000-row smoke"),

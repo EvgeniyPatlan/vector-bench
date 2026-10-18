@@ -3803,7 +3803,8 @@ class TestPhaseLogsAreArchived:
 
     def test_a_phase_log_is_written_beside_the_measurements(self, tmp_path):
         from orchestrator.docker_ctl import save_phase_log
-        path = save_phase_log(str(tmp_path), "valkey", "ops-m16-post", "tuned",
+        path = save_phase_log(str(tmp_path), "valkey", "glove-100-angular",
+                              "ops-m16-post", "tuned",
                               ["[churn] re-insert stopped after 0 rows",
                                "TimeoutError: Timeout reading from socket"])
         assert path and os.path.isfile(path)
@@ -3812,15 +3813,16 @@ class TestPhaseLogsAreArchived:
 
     def test_nothing_is_written_for_a_silent_phase(self, tmp_path):
         from orchestrator.docker_ctl import save_phase_log
-        assert save_phase_log(str(tmp_path), "e", "ann", "tuned", []) is None
+        assert save_phase_log(str(tmp_path), "e", "d", "ann", "tuned", []) is None
 
     def test_the_name_identifies_the_unit(self, tmp_path):
         """Six engines times two phases in one directory; a shared name would
         overwrite the one you came looking for."""
         from orchestrator.docker_ctl import save_phase_log
-        a = save_phase_log(str(tmp_path), "valkey", "ann", "tuned", ["a"])
-        b = save_phase_log(str(tmp_path), "mongodb", "ann", "tuned", ["b"])
-        c = save_phase_log(str(tmp_path), "valkey", "ann", "normalized", ["c"])
+        a = save_phase_log(str(tmp_path), "valkey", "glove", "ann", "tuned", ["a"])
+        b = save_phase_log(str(tmp_path), "mongodb", "glove", "ann", "tuned", ["b"])
+        c = save_phase_log(str(tmp_path), "valkey", "glove", "ann", "normalized",
+                           ["c"])
         assert len({a, b, c}) == 3
 
     def test_both_measurement_paths_save_theirs(self):
@@ -3833,7 +3835,7 @@ class TestPhaseLogsAreArchived:
         """Losing the log is bad; losing the measurement because the log could
         not be written would be worse."""
         from orchestrator.docker_ctl import save_phase_log
-        assert save_phase_log("/proc/nonexistent/nope", "e", "ann", "t",
+        assert save_phase_log("/proc/nonexistent/nope", "e", "d", "ann", "t",
                               ["x"]) is None
 
 
@@ -3983,11 +3985,17 @@ class TestAStubResultCannotSuppressAConfiguration:
 
 
 class TestTheServerSideOfAnOpsPhaseIsKept:
-    """The ann path keeps both halves because engine and benchmark share a
-    container. The ops path splits them and kept only the client's, so a churn
-    that stalled with the client blocked on a socket and the server at its idle
-    CPU baseline could not be settled from the run directory: the half that
-    would have said was discarded with the container."""
+    """The ops path runs the engine and the harness in two containers and kept
+    only the client's output, so a churn that stalled with the client blocked
+    on a socket and the server at its idle CPU baseline could not be settled
+    from the run directory: the half that would have said was discarded with
+    the container.
+
+    This docstring used to add that the ann path keeps both halves because the
+    engine and the benchmark share one container there. They do share one, but
+    the overlay starts the engine through the same `vb-entrypoint server`, so
+    it gets the same `--log-error=<file>` and the shared stream carries no
+    more of the server's voice than this one did. See `_save_server_log`."""
 
     def _source(self):
         return open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
@@ -4017,10 +4025,16 @@ class TestTheServerSideOfAnOpsPhaseIsKept:
         class Fake:
             server_name = "gone"
             engine = "valkey"
+            dataset = "glove-100-angular"
             tag = "m16-post"
             resource_pass = "tuned"
             paths = {"run_dir": str(tmp_path)}
             _save_server_log = ops_pass.OpsRun._save_server_log
+            # _save_server_log now also copies out the engine's own
+            # --log-error file, which is a second thing that must not be able
+            # to end the run. valkey declares no runtime.error_log, so this
+            # returns without touching docker.
+            _save_server_error_log = ops_pass.OpsRun._save_server_error_log
 
         import orchestrator.docker_ctl as dc
         original = dc.logs

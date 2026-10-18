@@ -137,6 +137,13 @@ runtime:
   # Where the server keeps its data inside the image.
   data_mount: /var/lib/vbench
   server_data_mount: /server-data/data
+  # Same path as 11.8: `alias_of: mariadb` means this engine is built from and
+  # started by docker/mariadb/entrypoint-mariadb.sh, so LOG_FILE's default
+  # there is this engine's error log too. The value is repeated rather than
+  # inherited because nothing merges one engine config into another, and
+  # tests/test_e10_failures_explain_themselves.py checks it against the
+  # entrypoint the alias resolves to.
+  error_log: /var/lib/vbench/mariadb.err
   credentials:
     user: "bench"
     password: "bench"
