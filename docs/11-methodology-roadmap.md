@@ -541,10 +541,23 @@ and adds no untested path.
 
 ### 4.6 Quantization is absent from the list of known asymmetries
 
-**Checked.** The structural-asymmetries bullet in `CLAUDE.md`, the known-asymmetries
-section of `docs/05-methodology.md` and the asymmetry text in
-`report/render.py` all name `ef_construction`, `build_mode` and AliSQL's
-InnoDB-and-READ-COMMITTED requirement. None of the three names quantization.
+**Checked, and the three lists do not agree with each other, which is a
+finding of its own.** There are three statements of the known asymmetries: the
+structural-asymmetries bullet in `CLAUDE.md`, the known-asymmetries section of
+`docs/05-methodology.md`, and `_known_asymmetries` in `report/render.py`, which
+is the one a reader of a report sees. All three name `ef_construction` and
+AliSQL's InnoDB-and-READ-COMMITTED requirement. **None of the three names
+quantization.**
+
+`build_mode` is named by two of the three — `CLAUDE.md` and
+`report/render.py`, the latter as *pgvector bulk-builds after load; MHNSW and
+VIDX build incrementally* — and **not** by `docs/05-methodology.md`, whose
+table has no bulk-versus-incremental row at all. That list is the stalest of
+the three in general: it still says `ef_construction` is exposed by pgvector
+alone, where `report/render.py` builds its row from the engines that actually
+ran and knows valkey-search exposes it too, and it carries no row for Percona
+Server or Percona Search. Bringing it level is not this item, but anyone
+editing one of the three should know there are three.
 
 It is the larger of the two asymmetries. `ef_construction` is a tuning axis: an engine that
 has it can trade build time for graph quality, and an engine that lacks it
