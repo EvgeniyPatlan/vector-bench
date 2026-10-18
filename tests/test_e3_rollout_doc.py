@@ -458,12 +458,12 @@ CITED_IN_REPO = {
     "report/measurement_versions.py:187-191":
         ("report/measurement_versions.py",
          "These versions denote the same measurement"),
-    "report/generate.py:858-859":
+    "report/generate.py:1213-1214":
         ("report/generate.py",
          'print(f"[report] {exc}", file=sys.stderr)'),
-    "report/render.py:99-100":
+    "report/render.py:326-327":
         ("report/render.py", '"Ops measurement version"'),
-    "orchestrator/manifest.py:80":
+    "orchestrator/manifest.py:219":
         ("orchestrator/manifest.py",
          '"ops_measurement_version": OPS_MEASUREMENT_VERSION'),
     # These two changed FILE, not just line. G3 split `clients.py`, which
@@ -539,13 +539,13 @@ CITED_IN_REPO = {
         ("report/crosscheck.py", "def consistency_checks"),
     "report/crosscheck.py:105":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
-    "report/render.py:2858":
+    "report/render.py:3201":
         ("report/render.py", "## 10. Consistency checks"),
     # These two cited the stale sentences until they were corrected; they now
     # cite the corrected ones. The anchor is the same phrase in both files,
     # which is deliberate: it is the polarity-bearing clause, so a row that
     # still matched after a wrong rewrite would be a row worth nothing.
-    "report/render.py:2483":
+    "report/render.py:2826":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
     "docs/05-methodology.md:953":
@@ -818,7 +818,7 @@ class TestTheRefusalIsCalledAndNotDescribed:
     def test_the_refusal_is_a_non_zero_exit_and_not_a_caveat(self):
         """§1 says there is no report at all, which is stronger than "the
         chart is refused" and is the half an operator plans around."""
-        body = _cited_body("report/generate.py", "853-859")
+        body = _cited_body("report/generate.py", "1208-1214")
         assert "MixedMeasurementVersions" in body
         assert "return 2" in body
         _claim("the refusal costs the whole report, not one chart")
@@ -1278,7 +1278,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
     def test_the_document_names_both_places(self):
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
-        assert "report/render.py:2483" in section
+        assert "report/render.py:2826" in section
         assert "docs/05-methodology.md:953" in section
 
 

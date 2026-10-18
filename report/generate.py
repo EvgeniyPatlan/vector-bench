@@ -19,7 +19,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for candidate in (VB_ROOT, "/opt", os.path.dirname(os.path.abspath(__file__))):
@@ -32,6 +32,14 @@ from report.render import (adopt_presentation as render_adopt_presentation,  # n
                            render_html, render_markdown)
 
 from report.render import ENGINE_LABEL  # noqa: E402  (one table, not two)
+# One reader of "which passes did this run execute", not two: the narrowing of
+# the ann tree, the two sections that describe the run and §2's Validity
+# notice all have to give the same answer.
+from report.render import (described_passes,  # noqa: E402
+                           passes_without_a_tree, recorded_passes)
+# The sentinel the loader labels an unattributable recall record with. Imported
+# rather than respelled -- the literal lives beside the code that applies it.
+from report.loaders import UNKNOWN_PASS, pass_or_unknown  # noqa: E402
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -160,6 +168,42 @@ def filtered_chart_entries(records: List[Dict[str, Any]], dataset: str,
     return [(f"filtered-{column}", partial(draw, column=column),
              (records, dataset))
             for column in columns]
+
+
+def qps_at_recall_entries(summary: Dict[str, Any], dataset: str,
+                          draw=None) -> List[Any]:
+    """The `(name, fn, payload)` chart entries for §4's floor bars.
+
+    One per resource pass once `per_dataset` is keyed by pass, because those
+    bars compare engines at ONE budget: two passes on one axis is fourteen
+    bars per floor on a nine-inch figure, paired only by a legend. A single
+    pass yields the one `qpsatrecall` entry this always had, so its stem --
+    and every published report's filename -- is unchanged.
+
+    `functools.partial` rather than a lambda, for the reason
+    `filtered_chart_entries` records above: a lambda closes over the NAME, so
+    every entry would draw whichever pass the comprehension finished on, and
+    the result is two filenames holding one chart.
+    """
+    from functools import partial
+
+    from report import charts as charts_mod
+    draw = draw or charts_mod.qps_at_recall
+    # Split on the run's pass count, not on this dataset's. One dataset's ANN
+    # phase failing in one pass is the normal shape -- the reference bundle has
+    # exactly that, sift measured in tuned only -- and splitting per dataset
+    # gave `qpsatrecall-normalized-glove…`, `qpsatrecall-tuned-glove…` and a
+    # bare `qpsatrecall-sift-128-euclidean`, whose figcaption then discriminates
+    # nothing. The on-figure title does not name the pass, so the stem is the
+    # only discriminator there is.
+    if len(described_passes(summary)) < 2:
+        return [("qpsatrecall", draw, (summary, dataset))]
+    present = sorted((summary.get("per_dataset", {}) or {}).get(dataset, {}),
+                     key=str)
+    return [(f"qpsatrecall-{resource_pass}",
+             partial(draw, resource_pass=resource_pass),
+             (summary, dataset))
+            for resource_pass in present]
 
 
 #: The axes `cli.py:_run_unit` loops over. One ops unit is one
@@ -339,6 +383,35 @@ def summarize(records: List[Dict[str, Any]],
         "failed_phases": [],
         "memory_pressure": [],
         "stale_ann": [],
+        # Passes this run executed whose recall this report does not carry,
+        # so §2 Validity can say so inside the document.
+        #
+        # An INTERSECTION, and the manifest half alone was a bug. The manifest
+        # says which passes have no locatable tree; it cannot say what the
+        # report ended up reading. Both whole-tree fallbacks in
+        # `_narrow_to_this_run` hand the loader the un-narrowed root, where
+        # `_pass_from_path` recovers the real pass from the directory layout --
+        # so §4 published a pass's recall under §2's bold claim that the same
+        # pass's "recall and throughput measurements are absent from every
+        # chart and table below". A reader who believed §2 then read a
+        # normalized table as tuned's, which is the misattribution this whole
+        # change exists to end, with Validity vouching for it.
+        #
+        # Not circular, which is what the comment here used to get wrong. A
+        # pure-records derivation would be: "absent from the records", proved
+        # by the records. The intersection is not, because the two halves are
+        # independent -- `phases[]` supplies "this pass ran" from the
+        # orchestrator's own log, and the records supply "and its recall is not
+        # here". A pass that ran and contributed no recall record is still
+        # named; a pass whose recall this report prints no longer is.
+        #
+        # `recall_records`, not `records`: the notice's claim is specifically
+        # about recall and throughput, and it says in the next breath that the
+        # ops measurements are unaffected. An ops record for the pass must not
+        # silence it.
+        "passes_without_a_tree": [
+            p for p in passes_without_a_tree(manifest or {})
+            if p not in {r.get("resource_pass") for r in recall_records}],
         "duplicate_ann": [],
         "recall_floor_gaps": [],
         "silent_ann_failures": [],
@@ -354,6 +427,67 @@ def summarize(records: List[Dict[str, Any]],
         "time_bounded_points": [],
         "passes": sorted({r.get("resource_pass") for r in records
                           if r.get("resource_pass")}),
+        # Every pass this report describes, computed ONCE and carried, because
+        # §1, §2, §4's headings and the floor chart's stem all have to agree
+        # about how many there are. They did not: §4 derived its own count
+        # from `per_dataset`, which holds only the passes that produced recall
+        # for one dataset, so a report whose §1 named two passes printed §4
+        # under a bare single-pass heading -- and the floor chart qualified
+        # glove's stem and not sift's, where only one pass had an ANN phase.
+        # Deriving one number in two files is the defect class this whole
+        # change is about.
+        #
+        # TWO readers share it, not four: §4's headings
+        # (`render._headline_tables`) and the floor chart's stem
+        # (`qps_at_recall_entries`). An earlier version of this comment
+        # claimed §1's row and §2's notice did too, and they do not -- §1
+        # derives from `_pass_resources(manifest)` and the single-valued
+        # `resource_pass`, and §2 reads `summary["passes_without_a_tree"]`.
+        # Those two are correct as they are; they are simply not this number's
+        # readers, and saying they were turned a narrow true claim into a
+        # broad false one.
+        #
+        # `render._pass_note` and `main`'s `passes_present` derive their own
+        # again, and disagree with these in grain: a dataset measured in one
+        # pass inside a two-pass run loses its `passcompare` figure with
+        # nothing said. Pre-existing on both sides and left alone
+        # deliberately; folding them in means deciding what a per-dataset pass
+        # set should mean for a run-level chart, which is a behaviour question
+        # and not a de-duplication.
+        #
+        # The UNION of the manifest's passes and the records', not the
+        # manifest's alone: `--from-records` over an archive carries no
+        # manifest at all, and records spanning two passes must still qualify
+        # the headings. `recorded_passes` already unions `config["passes"]`,
+        # the single-valued pair and `phases[]`, so a single-pass manifest and
+        # an archived one with no `passes` key both still come out at one --
+        # which the byte-identical single-pass path depends on.
+        # TWO record terms, and dropping either one regresses something.
+        #
+        # The first is any record naming a pass, whatever its phase. The
+        # reference bundle measures ops in both passes and recall in one, so
+        # on a manifest that names no passes -- a legacy single-valued pair
+        # with no `phases[]`, no manifest passes at all, or an empty
+        # `phases[]` -- the ops records are the only evidence the run had two,
+        # and without this term §4's recall heading and the floor-chart stem
+        # went bare on exactly those three shapes. That is the defect this
+        # change is named for, reintroduced by a narrowing meant only to
+        # normalise. It also kept `main`'s `passes_present` and this count
+        # agreeing on those shapes: without it `passcompare` drew a
+        # normalized-vs-tuned chart above a bare single-pass heading.
+        #
+        # The second runs recall records through `pass_or_unknown`, so this
+        # count and the keys `per_dataset` is built on cannot disagree about
+        # whether an unnamed pass exists -- a falsy name dropped from the
+        # count while the table kept it as a key is how §4 came to print two
+        # tables for one engine under one heading. A manifest never carries an
+        # unnamed pass, so only records need normalising.
+        "described_passes": sorted(
+            {name for name, _fp in recorded_passes(manifest or {})}
+            | {r.get("resource_pass") for r in records
+               if r.get("resource_pass")}
+            | {pass_or_unknown(r.get("resource_pass"))
+               for r in records if r.get("phase") == "recall_qps"}, key=str),
     }
 
     # Two results for one configuration means the report is reading more than
@@ -372,14 +506,34 @@ def summarize(records: List[Dict[str, Any]],
         # at all, flagging 8 more. build_signature takes the configuration from
         # the result filename instead, which covers axes this code has never
         # heard of.
+        #
+        # The RESOURCE PASS is named explicitly, because `build_signature`
+        # cannot see it. It reads `extra.source_file`, which is the result
+        # file's path relative to the tree it was read from -- and the trees
+        # are per pass, so one build configuration measured in both passes
+        # produces the SAME relative path and therefore the same signature.
+        # Once the report began reading both trees that stopped being an error
+        # path and became the normal one: a legitimate `--resource-pass both`
+        # run reported 123 of its own measurements as duplicates of each
+        # other, under prose telling the reader to delete one of the trees.
+        # Two passes are two budgets, which is the same reasoning the filtered
+        # ratio above records for its own key.
         by_config.setdefault(
-            (build_signature(r), r.get("ef_search")), []).append(r)
+            (build_signature(r), r.get("resource_pass"),
+             r.get("ef_search")), []).append(r)
     for key, group in sorted(by_config.items(), key=lambda kv: str(kv[0])):
         if len(group) > 1:
             first = group[0]
             summary["duplicate_ann"].append({
                 "engine": first.get("engine"), "dataset": first.get("dataset"),
-                "m": first.get("m"), "ef_search": key[1],
+                "m": first.get("m"), "ef_search": key[2],
+                # The pass, and the other two axes `build_signature` carries
+                # inside the filename it keys on: two rows can differ on any
+                # of them, and a table that prints neither reads as the same
+                # configuration listed twice -- which is the exact misreading
+                # this section exists to report.
+                "resource_pass": first.get("resource_pass"),
+                "build_mode": first.get("build_mode"),
                 "storage_engine": first.get("storage_engine"),
                 "ef_construction": first.get("ef_construction"),
                 "count": len(group),
@@ -401,7 +555,15 @@ def summarize(records: List[Dict[str, Any]],
     for r in recall_records:
         if r.get("qps") is None or r.get("ef_search") is None:
             continue
-        by_series.setdefault(build_signature(r), []).append(r)
+        # Per (configuration, pass), for the reason `by_config` above records
+        # at length: `build_signature` is blind to the pass, so two passes'
+        # curves merged into one series and every normalized point paired
+        # against a tuned point at higher effort read as throughput rising
+        # with effort. On a legitimate two-pass run that invented 97
+        # inversions, 71 of them past the first step, and presented them as
+        # "measurements of something other than the engine".
+        by_series.setdefault(
+            (build_signature(r), r.get("resource_pass")), []).append(r)
     for key, group in sorted(by_series.items(), key=lambda kv: str(kv[0])):
         ordered = sorted(group, key=lambda r: r["ef_search"])
         for previous, current in zip(ordered, ordered[1:]):
@@ -512,53 +674,88 @@ def summarize(records: List[Dict[str, Any]],
                 "queries": (r.get("extra") or {}).get("short_result_queries"),
             })
 
+    # Per (dataset, pass), and within that per engine. A frontier is a claim
+    # about one grid on one machine: `min_recall`, `max_recall`, `points` and
+    # `storage_engines` are all taken across the whole point set, so pooling
+    # two resource passes produced a row whose sample count was the sum of two
+    # machines' and whose recall range spanned both. Measured on a two-pass
+    # run: Percona 24 points became 48, pgvector 18 became 36, and §4 carried
+    # no column to say so.
+    # Normalised, so a record naming no pass keys one table called `unknown`
+    # rather than one called `None` -- the same word the count, the chart stem
+    # and the legend use. See `loaders.pass_or_unknown`.
+    passes = sorted({pass_or_unknown(r.get("resource_pass"))
+                     for r in recall_records}, key=str)
     for dataset in datasets:
-        per_engine: Dict[str, Any] = {}
-        for engine in engines:
-            points = [r for r in recall_records
-                      if r["dataset"] == dataset and r["engine"] == engine]
-            frontier = pareto_frontier(points)
-            if not frontier:
-                continue
-            # QPS at a recall floor is the comparison an operator actually
-            # makes: "how fast is it, at accuracy I can accept?"
-            entry: Dict[str, Any] = {"points": len(points)}
-            # Which storage engine reached each floor, not only how fast. The
-            # frontier spans every configuration swept, so on the tuned pass
-            # "MariaDB 12.3: 1,176 QPS" is a MyISAM result -- printing it
-            # unattributed credits it to the default build.
-            entry["storage_engines"] = sorted(
-                {p.get("storage_engine") for p in points if p.get("storage_engine")})
-            for floor in (0.90, 0.95, 0.99):
-                qualifying = [p for p in frontier if (p.get("recall_at_k") or 0) >= floor]
-                best = max(qualifying, key=lambda p: p["qps"]) if qualifying else None
-                entry[f"qps_at_recall_{int(floor * 100)}"] = best["qps"] if best else None
-                entry[f"qps_at_recall_{int(floor * 100)}_storage"] = (
-                    best.get("storage_engine") if best else None)
-                entry[f"qps_at_recall_{int(floor * 100)}_recall"] = (
-                    best.get("recall_at_k") if best else None)
-            entry["max_recall"] = max((p.get("recall_at_k") or 0) for p in frontier)
-            # The floor columns compare engines at an accuracy the operator
-            # accepts, which is only a comparison if both engines have
-            # measurements near it. ef_search cannot go below k and MHNSW
-            # exposes no ef_construction, so with M pinned there is no MariaDB
-            # configuration returning recall below about 0.975: its 0.90 and
-            # 0.95 figures are one measurement printed twice. Recording the
-            # lowest recall reached is what lets the report say so.
-            entry["min_recall"] = min((p.get("recall_at_k") or 0) for p in points)
-            for floor in (0.90, 0.95, 0.99):
-                if entry[f"qps_at_recall_{int(floor * 100)}"] is None:
+        for resource_pass in passes:
+            per_engine: Dict[str, Any] = {}
+            for engine in engines:
+                points = [
+                    r for r in recall_records
+                    if r["dataset"] == dataset and r["engine"] == engine
+                    and pass_or_unknown(
+                        r.get("resource_pass")) == resource_pass]
+                frontier = pareto_frontier(points)
+                if not frontier:
                     continue
-                if entry["min_recall"] > floor:
-                    summary["recall_floor_gaps"].append({
-                        "engine": engine, "dataset": dataset, "floor": floor,
-                        "lowest_recall": entry["min_recall"],
-                        "measured_at": entry[f"qps_at_recall_{int(floor * 100)}_recall"],
-                        "qps": entry[f"qps_at_recall_{int(floor * 100)}"],
-                    })
-            per_engine[engine] = entry
-        if per_engine:
-            summary["per_dataset"][dataset] = per_engine
+                # QPS at a recall floor is the comparison an operator actually
+                # makes: "how fast is it, at accuracy I can accept?"
+                entry: Dict[str, Any] = {"points": len(points)}
+                # Which storage engine reached each floor, not only how fast. The
+                # frontier spans every configuration swept, so on the tuned pass
+                # "MariaDB 12.3: 1,176 QPS" is a MyISAM result -- printing it
+                # unattributed credits it to the default build.
+                entry["storage_engines"] = sorted(
+                    {p.get("storage_engine") for p in points if p.get("storage_engine")})
+                for floor in (0.90, 0.95, 0.99):
+                    qualifying = [p for p in frontier if (p.get("recall_at_k") or 0) >= floor]
+                    best = max(qualifying, key=lambda p: p["qps"]) if qualifying else None
+                    entry[f"qps_at_recall_{int(floor * 100)}"] = best["qps"] if best else None
+                    entry[f"qps_at_recall_{int(floor * 100)}_storage"] = (
+                        best.get("storage_engine") if best else None)
+                    entry[f"qps_at_recall_{int(floor * 100)}_recall"] = (
+                        best.get("recall_at_k") if best else None)
+                entry["max_recall"] = max((p.get("recall_at_k") or 0) for p in frontier)
+                # The floor columns compare engines at an accuracy the operator
+                # accepts, which is only a comparison if both engines have
+                # measurements near it. ef_search cannot go below k and MHNSW
+                # exposes no ef_construction, so with M pinned there is no MariaDB
+                # configuration returning recall below about 0.975: its 0.90 and
+                # 0.95 figures are one measurement printed twice. Recording the
+                # lowest recall reached is what lets the report say so.
+                entry["min_recall"] = min((p.get("recall_at_k") or 0) for p in points)
+                for floor in (0.90, 0.95, 0.99):
+                    if entry[f"qps_at_recall_{int(floor * 100)}"] is None:
+                        continue
+                    if entry["min_recall"] > floor:
+                        summary["recall_floor_gaps"].append({
+                            "engine": engine, "dataset": dataset, "floor": floor,
+                            "lowest_recall": entry["min_recall"],
+                            "measured_at": entry[f"qps_at_recall_{int(floor * 100)}_recall"],
+                            "qps": entry[f"qps_at_recall_{int(floor * 100)}"],
+                        })
+                per_engine[engine] = entry
+            if per_engine:
+                # Keyed by the pair, and `render._headline_tables` emits one table
+                # per pass with the pass in its heading. The pass is a property of
+                # the whole table rather than of a row, because every figure in a
+                # row is derived across that table's point set -- which is also
+                # why §4 differs from §7-§10, whose rows are individual
+                # measurement windows and so carry a Pass cell instead. A scope
+                # that belongs to the table belongs in its heading, where a reader
+                # cannot drop it; as a cell, an engine measured twice becomes two
+                # rows with the same label and the qualifier has to be carried by
+                # eye. The prose under that table is also written in the singular
+                # about "the swept grid" and closes "this run pins M=16 for every
+                # engine": true per table, a per-row read under a column.
+                #
+                # The cross-pass comparison this does NOT provide is already
+                # built: `charts.pass_comparison` exists because that question
+                # "had to be reconstructed by hand from two tables", and its first
+                # dimension is recall throughput. A Pass column here would put
+                # that reconstruction back, one section earlier.
+                summary["per_dataset"].setdefault(dataset, {})[resource_pass] = \
+                    per_engine
 
     # Which filtering strategy each engine actually used, derived from how its
     # latency moves when the predicate narrows.
@@ -764,31 +961,175 @@ def attach_peak_rss(records: List[Dict[str, Any]],
             r.setdefault("extra", {})["peak_rss_source"] = "sampled"
 
 
-def _narrow_to_this_run(annb_dir: str, manifest: Dict[str, Any]) -> str:
-    """Point the loader at the tree this run actually wrote, if it exists.
+def _annb_root(annb_dir: str,
+               recorded: List[Tuple[str, Optional[str]]]) -> str:
+    """The shared annb root, even when the caller already narrowed to one tree.
+
+    `orchestrator/cli.py` narrows `--annb-results` to
+    `/results/annb/<pass>/<fingerprint>` on the host, because that is where
+    `ann_fingerprint` is importable. It can only ever name one tree -- it
+    reads the single-valued keys -- so a container handed that path cannot see
+    the other pass's results at all, however many passes this manifest
+    records. The whole results directory is mounted either way, so the other
+    tree is right there, two levels up.
+
+    Two conditions, and the second exists because the first is only about
+    **how the path is spelled**. A directory genuinely rooted at
+    `.../<pass>/<fingerprint>/` -- reachable by hand-passing
+    `--annb-results`, never by `cli.py` -- matches the spelling test, and
+    climbing out of it made the report declare a pass whose tree was right
+    there absent. So the contents are consulted too: a real annb root has a
+    child directory named for a pass, and a narrowed tree's children are
+    datasets. A root that is spelled like a narrowed tree *and* holds no pass
+    directory can still be mis-climbed, and has nothing to lose by it.
+    """
+    trimmed = annb_dir.rstrip(os.sep)
+    parent, base = os.path.split(trimmed)
+    spelled_like_a_tree = bool(base) and any(
+        base == fingerprint and os.path.basename(parent) == name
+        for name, fingerprint in recorded if fingerprint)
+    holds_a_pass_directory = any(
+        os.path.isdir(os.path.join(trimmed, name)) for name, _fp in recorded)
+    if spelled_like_a_tree and not holds_a_pass_directory:
+        return os.path.dirname(parent) or os.sep
+    return annb_dir
+
+
+def _narrow_to_this_run(annb_dir: str,
+                        manifest: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Every tree this run wrote, as (directory, resource pass) pairs.
 
     Results are stored under <pass>/<config fingerprint>. Walking the parent
     would pull in every configuration ever measured on this machine, which is
     how a 16 GB curve ended up in a report whose manifest said 64 GB. Falls
     back to the whole tree for older runs that predate the fingerprint, where
     the staleness check below is the only guard.
+
+    One pair per recorded pass, because a run of both passes writes two trees
+    and narrowing to one of them silently dropped the other: of the 42 hours
+    `full-20261015-215006` spent measuring, the report omitted the 13.1 hours
+    of normalized recall phases entirely, and printed the tuned machine's
+    limits above the normalized rows the ops path had still collected.
+
+    A tree the manifest names but disk does not have is reported and skipped;
+    the trees that are present are still read, because one pass's results
+    being gone is not a reason to lose the other's.
+
+    The pass travels beside the directory so the loader can label records that
+    carry no `resource_pass` attribute. `_pass_from_path` recovers it from the
+    layout, which only works relative to the root -- narrowing to a tree is
+    precisely what blinds it.
     """
-    cfg = manifest.get("config") or {}
-    pass_name = cfg.get("resource_pass")
-    # Taken from the manifest, not recomputed. This module runs inside a bench
-    # image that mounts report/ and harness/ only, so importing the orchestrator
-    # to derive it is not an option.
-    fingerprint = cfg.get("ann_fingerprint")
-    if not (pass_name and fingerprint):
-        return annb_dir
-    candidate = os.path.join(annb_dir, pass_name, fingerprint)
-    if os.path.isdir(candidate):
-        print(f"[report] ann-bench tree: {pass_name}/{fingerprint}")
-        return candidate
-    print(f"[report] no tree at {pass_name}/{fingerprint}; reading the whole "
-          f"ann-benchmarks directory. Results older than this run will be "
-          f"flagged in Validity.")
-    return annb_dir
+    recorded = recorded_passes(manifest)
+    root = _annb_root(annb_dir, recorded)
+    named = [(name, fp) for name, fp in recorded if fp]
+    if not named:
+        # Warned, not silent. Every pass this run executed is unnarrowable
+        # here -- the legacy class, a manifest predating `ann_fingerprint` --
+        # so the whole shared tree is read, which is the cross-configuration
+        # risk. This branch returned without a word, which left stdout silent
+        # while §2 spoke, and the two were not even describing the same thing.
+        _warn_about_unrecorded_passes(manifest)
+        return [(annb_dir, UNKNOWN_PASS)]
+
+    trees: List[Tuple[str, str]] = []
+    missing: List[str] = []
+    for name, fingerprint in named:
+        candidate = os.path.join(root, name, fingerprint)
+        if os.path.isdir(candidate):
+            print(f"[report] ann-bench tree: {name}/{fingerprint}")
+            trees.append((candidate, name))
+        else:
+            missing.append(f"{name}/{fingerprint}")
+
+    if not trees:
+        # Unchanged for a single pass, which is the only case that could reach
+        # this before: every tree the manifest names is gone, so there is
+        # nothing to narrow to and the staleness check in Validity takes over.
+        print(f"[report] no tree at {', '.join(missing)}; reading the whole "
+              f"ann-benchmarks directory. Results older than this run will be "
+              f"flagged in Validity.")
+        # Before the return, not after it. This branch is exactly the state an
+        # archived bundle is in -- a manifest naming a pass whose tree is not
+        # on this machine -- and the warning used to be unreachable there,
+        # because it sat below. No test saw it: `_archived_report` builds both
+        # trees, so the archived fixture never took this branch.
+        _warn_about_unrecorded_passes(manifest)
+        return [(root, UNKNOWN_PASS)]
+    if missing:
+        print(f"[report] no ann-bench tree at {', '.join(missing)}; those "
+              f"recall measurements are absent from this report. The "
+              f"{len(trees)} tree(s) that are present are still read, because "
+              f"one pass's results being gone is not a reason to lose "
+              f"another's. Look under {root} on the machine that measured "
+              f"them.")
+    _warn_about_unrecorded_passes(manifest)
+    return trees
+
+
+def _warn_about_unrecorded_passes(manifest: Dict[str, Any]) -> None:
+    """Name, on stdout, any pass whose results tree could not be narrowed to.
+
+    An archived manifest written before `config["passes"]` existed records one
+    pass in its config block and both of them in `phases[]`. The fingerprint
+    of the pass it does not name was never written down, and nothing here can
+    recompute it -- that needs `ann_fingerprint`, which lives in the
+    orchestrator. Guessing by listing `annb/<pass>/*` would be worse than
+    saying nothing: the tree is shared across runs, so any directory there
+    might belong to another configuration entirely, which is the 16 GB curve
+    under a 64 GB manifest all over again.
+
+    **This says less than §2 Validity does, and deliberately.** It runs before
+    a single record has been read, so the only thing it can know is that the
+    tree could not be narrowed to. Whether the pass's recall ends up in the
+    report is a different question with a different answer: both whole-tree
+    fallbacks in `_narrow_to_this_run` hand the loader the un-narrowed root,
+    and
+    `_pass_from_path` then recovers the real pass from the directory layout,
+    so a pass named here can still be published in §4. An earlier version of
+    this docstring claimed the two notices were one statement made twice "so
+    the two cannot disagree" -- they are two statements about two different
+    moments, and conflating them is exactly how §2 came to assert that recall
+    was absent from a table that was printing it. §2's notice is the
+    intersection; see `summarize`.
+
+    Called from every branch that fails to narrow, including the one that
+    finds no fingerprint at all: that branch reads the whole shared tree,
+    which is the cross-configuration risk worth hearing about, and it used to
+    return in silence.
+
+    stdout is not bundled by `./run-benchmark.sh export` and is not what
+    anybody reads six months later, which is why §2 exists as well as this.
+    """
+    orphans = passes_without_a_tree(manifest)
+    if not orphans:
+        return
+    one = len(orphans) == 1
+    # Hoisted, not inlined. Written inline this read
+    # `f"{"'s" if one else "'"}"` -- a replacement field reusing the enclosing
+    # f-string's own quote, which is PEP 701 and therefore Python 3.12+. On
+    # 3.11 it is a SyntaxError at module parse time, unconditional and
+    # independent of this warning ever firing, and `report/` is parsed by
+    # whatever `python3` the bench image has: both `postgres:17-bookworm` and
+    # `debian:bookworm-slim` are Debian 12, which ships 3.11. The failure mode
+    # is the one CLAUDE.md already records for this package -- a report that
+    # dies at the end of a twenty-hour run -- plus a documented-prerequisites
+    # host where `pytest` cannot even collect, because `tests/test_config.py`
+    # imports `report.generate` dozens of times. The whole repository was
+    # 3.11-compatible grammar until this line.
+    possessive = "'s" if one else "'"
+    print(f"[report] WARNING: this run also executed "
+          f"{', '.join(orphans)}, and the manifest records no ann "
+          f"fingerprint for {'it' if one else 'them'}, so this report cannot "
+          f"narrow to {'that pass' if one else 'those passes'}"
+          f"{possessive} results tree. "
+          f"Whatever recall it does read is attributed by the directory it "
+          f"came from, and §2 Validity names any pass whose recall is "
+          f"genuinely missing. The ops measurements are unaffected either "
+          f"way. A manifest predating per-pass recording can be completed "
+          f"without re-measuring anything: `run --resume --run-id "
+          f"{manifest.get('run_id', '<run>')}` records every pass's "
+          f"fingerprint and skips every finished unit.")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -802,7 +1143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_id = manifest.get("run_id", os.path.basename(run_dir))
 
     annb_dir = args.annb_results or os.path.join(os.path.dirname(run_dir), "annb")
-    annb_dir = _narrow_to_this_run(annb_dir, manifest)
+    annb_trees = _narrow_to_this_run(annb_dir, manifest)
     datasets_dir = args.datasets_dir or os.path.join(VB_ROOT, "datasets")
     if not os.path.isdir(datasets_dir):
         datasets_dir = "/datasets"
@@ -810,7 +1151,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     chart_dir = os.path.join(out_dir, "charts")
 
     print(f"[report] run       : {run_id}")
-    print(f"[report] ann-bench : {annb_dir}")
+    print(f"[report] ann-bench : "
+          f"{', '.join(path for path, _ in annb_trees)}")
     print(f"[report] datasets  : {datasets_dir}")
     print(f"[report] output    : {out_dir}")
 
@@ -847,7 +1189,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             records += loaders.load_ops_records(run_dir)
             print(f"[report] ops records: {len(records)}")
 
-            annb = loaders.load_annb_results(annb_dir, datasets_dir, run_id)
+            # Once per tree this run wrote. The pass name goes in as the
+            # loader's default label: inside a narrowed tree
+            # `_pass_from_path` has nothing left to read, so without it every
+            # result file that carries no `resource_pass` attribute would
+            # arrive labelled "unknown" and two passes would merge into one
+            # nameless column.
+            annb: List[Dict[str, Any]] = []
+            for tree, pass_name in annb_trees:
+                found = loaders.load_annb_results(tree, datasets_dir, run_id,
+                                                  pass_name)
+                if len(annb_trees) > 1:
+                    print(f"[report] ann-benchmarks records from "
+                          f"{pass_name}: {len(found)}")
+                annb += found
             records += annb
             print(f"[report] ann-benchmarks records: {len(annb)}")
     except versions.MixedMeasurementVersions as exc:
@@ -917,10 +1272,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     chart_paths: Dict[str, Dict[str, str]] = {}
 
     for dataset in summary["datasets"]:
-        by_engine: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # Keyed by (engine, pass), not by engine. A Pareto frontier drawn
+        # through two resource passes is a frontier of nothing: it takes the
+        # faster of two machines at every recall and draws a curve no
+        # configuration ever produced. `charts.pareto` styles off the engine
+        # half and names the pass in the legend only when more than one is
+        # present, so a single-pass run draws and labels exactly as before.
+        by_engine: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
         for r in records:
             if r.get("phase") == "recall_qps" and r.get("dataset") == dataset:
-                by_engine[r["engine"]].append(r)
+                by_engine[(r["engine"], r.get("resource_pass"))].append(r)
         k = next((r.get("k") for r in records
                   if r.get("dataset") == dataset and r.get("k")), 10)
 
@@ -981,7 +1342,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # still mostly below the floor anyone would ship.
             ("paretozoom", lambda *a, **kw: charts.pareto(*a, recall_floor=0.95, **kw),
              (dict(by_engine), dataset, k)),
-            ("qpsatrecall", charts.qps_at_recall, (summary, dataset)),
+            *qps_at_recall_entries(summary, dataset),
             ("latency", charts.latency_percentiles, (records, dataset)),
             ("build", charts.build_cost, (records, dataset)),
             ("storage", charts.storage_breakdown, (records, dataset)),

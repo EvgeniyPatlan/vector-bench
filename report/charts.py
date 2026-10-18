@@ -131,6 +131,22 @@ SERIES_KEY_WIDTH = 2
 # storage engine is carried by the linestyle instead.
 STORAGE_LINESTYLES = ("-", "--", ":", "-.")
 
+# Linestyles for the resource pass, used ONLY by `pareto`. Everywhere else the
+# linestyle already carries the storage engine (see `series_style`), so it is
+# not free -- but `pareto` draws one frontier per engine and never splits by
+# storage, which is exactly why it has a linestyle to spend. Without it the two
+# passes of one engine come out the same colour, the same marker and the same
+# line, distinguishable only by reading the legend, which is the defect
+# `series_style`'s own comment records for a second graph degree.
+PASS_LINESTYLES = ("-", "--", ":", "-.")
+
+#: `qps_at_recall`'s "whichever pass this summary has", distinct from `None`,
+#: which is a real pass key: records that carry no `resource_pass` group under
+#: it, and a report rebuilt from an archive predating the field is exactly that
+#: case. A `None` default would have made "no pass recorded" and "caller did
+#: not say" the same request.
+_ANY_PASS = object()
+
 
 def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
     """Identity of one plotted line: the engine, and which build it came from."""
@@ -288,7 +304,62 @@ def _bytes_formatter(value: float, _pos: int) -> str:
 # Recall / QPS
 # ---------------------------------------------------------------------------
 
-def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
+def _pass_label(resource_pass: Optional[str]) -> str:
+    """How a pass is named in a legend, including when it has no name.
+
+    Delegated, so the legend, §4's headings, the floor chart's stem and
+    `described_passes` all spell it the same way -- they spelled it three
+    different ways, one of them `None`.
+
+    The reason stated here used to conflate two inputs. A record the loader
+    labelled carries the STRING `"unknown"` and never arrives as `None`;
+    `None` means a record the loader never touched, which the tables would
+    otherwise render as a Python repr. It is the second case this handles.
+    """
+    from .loaders import pass_or_unknown
+
+    return pass_or_unknown(resource_pass)
+
+
+def pareto_engine_of(key: Any) -> Any:
+    """The engine half of a `pareto` key, which may be a bare engine name."""
+    return key[0] if isinstance(key, tuple) else key
+
+
+def pareto_pass_of(key: Any) -> Optional[str]:
+    """The resource pass half of a `pareto` key, or None if it has none."""
+    return key[1] if isinstance(key, tuple) and len(key) > 1 else None
+
+
+def pareto_series_style(key: Any, ordered_passes: Sequence[Any]
+                        ) -> Tuple[Dict[str, Any], str]:
+    """The style and legend label for one `(engine, pass)` frontier.
+
+    Split out of `pareto` so the decision is testable without matplotlib,
+    which lives in the bench images rather than on a host built from the
+    documented prerequisites. A test that had to draw could only assert that
+    the call returned, which is how two mutants of this logic -- keying by
+    engine alone, and not varying the linestyle -- both left the suite green.
+
+    Colour and marker come from the engine, so one engine stays recognisable
+    across both of its lines. The pass is added to the label and takes the
+    linestyle, and both only when the run measured more than one pass: with a
+    single pass the style and label are byte-identical to what this chart drew
+    before the key grew. Without the linestyle the two passes of one engine
+    come out the same colour, the same marker and the same line -- the defect
+    `series_style`'s own comment records for a second graph degree.
+    """
+    style = dict(style_for(pareto_engine_of(key)))
+    label = style["label"]
+    resource_pass = pareto_pass_of(key)
+    if len(ordered_passes) > 1:
+        label += f" / {_pass_label(resource_pass)}"
+        style["linestyle"] = PASS_LINESTYLES[
+            list(ordered_passes).index(resource_pass) % len(PASS_LINESTYLES)]
+    return style, label
+
+
+def pareto(records_by_engine: Dict[Any, List[Dict[str, Any]]], dataset: str,
            k: int, out_dir: str, stem: str,
            scatter: bool = True,
            recall_floor: Optional[float] = None) -> Optional[Dict[str, str]]:
@@ -298,7 +369,32 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
     point behind it. Showing the raw points matters: a frontier drawn through
     three widely-scattered measurements deserves less trust than one drawn
     through thirty tight ones, and hiding the scatter hides that.
+
+    Keyed by `(engine, resource_pass)` rather than by engine. A frontier taken
+    across two passes is a frontier of nothing: it picks the faster of two
+    machines at every recall and draws a curve no configuration ever produced.
+    The colour and marker come from the engine half, so an engine stays
+    recognisable across both of its lines, and the pass is added to the legend
+    only when the run measured more than one -- which leaves a single-pass
+    chart identical to what it drew before, legend included. The idiom is
+    `churn_impact`'s, which suffixes its label the same way for the same
+    reason.
+
+    A plain engine name is still accepted, so a caller that has no pass to
+    offer -- `--from-records` over an archive that predates the field -- is
+    not required to invent one.
     """
+    # `None` is kept in the ordering, not filtered out: `('mariadb', None)`
+    # beside `('mariadb', 'tuned')` drew one engine's two frontiers under one
+    # label and one linestyle, and `_pass_label` names the unlabelled half
+    # instead of leaving an empty suffix.
+    #
+    # Reachable only from a hand-assembled or third-party records file:
+    # `load_annb_results` sets `resource_pass` unconditionally and the value
+    # is always truthy, so nothing this pipeline writes produces the state.
+    # Kept because the cost is one `key=str` and the failure is silent.
+    ordered_passes = sorted({pareto_pass_of(key) for key in records_by_engine},
+                            key=str)
     from .loaders import pareto_frontier
 
     if not any(records_by_engine.values()):
@@ -325,8 +421,8 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
     ax.set_xscale("logit")
 
     plotted = False
-    for engine, points in sorted(records_by_engine.items()):
-        style = style_for(engine)
+    for key, points in sorted(records_by_engine.items(), key=lambda kv: str(kv[0])):
+        style, label = pareto_series_style(key, ordered_passes)
         usable = [p for p in points
                   if p.get("recall_at_k") is not None and p.get("qps")]
         if recall_floor is not None:
@@ -348,7 +444,7 @@ def pareto(records_by_engine: Dict[str, List[Dict[str, Any]]], dataset: str,
                 [p["recall_at_k"] for p in frontier], [p["qps"] for p in frontier],
                 color=style["color"], marker=style["marker"],
                 linestyle=style["linestyle"], linewidth=2.0, markersize=6,
-                label=style["label"], zorder=3,
+                label=label, zorder=3,
             )
 
     if not plotted:
@@ -1306,15 +1402,30 @@ def memory_timeline(series: Dict[str, List[Dict[str, Any]]], out_dir: str,
     return _save(fig, out_dir, stem)
 
 def qps_at_recall(summary: Dict[str, Any], dataset: str, out_dir: str,
-                  stem: str, floors: Sequence[float] = (0.90, 0.95, 0.99)
+                  stem: str, floors: Sequence[float] = (0.90, 0.95, 0.99),
+                  resource_pass: Any = _ANY_PASS
                   ) -> Optional[Dict[str, str]]:
     """Grouped bars: best QPS each engine reaches at each recall floor.
 
     This is the comparison an operator actually makes — "how fast is it at an
     accuracy I can accept" — and it is hard to read off a Pareto curve, because
     the eye compares the curves rather than their heights at one x.
+
+    One chart per resource pass, selected by `resource_pass`, because the bars
+    are a comparison between engines at one budget. Pooling two passes into one
+    axis would put fourteen bars at each floor on a nine-inch figure and ask
+    the reader to pair them by legend; `generate.py` emits one entry per pass
+    instead, the way it already does one per filter column. `_ANY_PASS` takes
+    whichever single pass the summary holds, so a caller with nothing to say
+    about passes still gets the chart it used to get.
     """
-    per_engine = (summary.get("per_dataset", {}) or {}).get(dataset, {})
+    by_pass = (summary.get("per_dataset", {}) or {}).get(dataset, {}) or {}
+    if resource_pass is _ANY_PASS:
+        if len(by_pass) != 1:
+            return None
+        per_engine = next(iter(by_pass.values()))
+    else:
+        per_engine = by_pass.get(resource_pass) or {}
     if not per_engine:
         return None
 

@@ -51,8 +51,33 @@ def knn_recall(dataset_distances: numpy.ndarray, run_distances: numpy.ndarray,
     return total / n
 
 
+#: The pass label a recall record carries when neither the result file's
+#: `resource_pass` attribute nor the directory layout says which pass produced
+#: it. Named rather than spelled twice: `report/generate.py` has to hand it in
+#: explicitly for the whole-tree fallback, and two copies of a sentinel drift.
+UNKNOWN_PASS = "unknown"
+
+
+def pass_or_unknown(value: Any) -> str:
+    """One spelling for a record that names no resource pass.
+
+    A record this pipeline wrote always names one -- `load_annb_results` sets
+    the field unconditionally and the value is always truthy -- so this is
+    reached only by a hand-assembled or third-party `records.jsonl`. It
+    existed anyway, three times over: §4 keyed its tables on the raw value and
+    printed `#### d — None`, the floor chart's stem became `qpsatrecall-None`,
+    and the chart legend said `unknown`. Three spellings of one thing in one
+    report, one of them a Python repr in a published artefact -- and §4 printed
+    two tables for one engine under an IDENTICAL heading when a falsy pass sat
+    beside a named one, because the count filtered it out and the table key
+    did not.
+    """
+    return UNKNOWN_PASS if not value else str(value)
+
+
 def load_annb_results(annb_dir: str, datasets_dir: str,
-                      run_id: str, resource_pass_default: str = "unknown"
+                      run_id: str,
+                      resource_pass_default: str = UNKNOWN_PASS
                       ) -> List[Dict[str, Any]]:
     """Walk ann-benchmarks HDF5 results and emit recall/QPS records."""
     records: List[Dict[str, Any]] = []
