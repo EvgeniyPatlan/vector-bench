@@ -326,17 +326,38 @@ class TestTheParsersFoundSomething:
 
     def test_the_index_does_not_read_the_documentation(self):
         """`docs/` is excluded on purpose: a symbol that exists only in prose
-        must not resolve. Asserted rather than trusted to the directory list,
-        because adding "docs" to `SOURCE_DIRS` would silently turn every
-        assertion here into a check that docs/11 agrees with docs/05."""
+        must not resolve, or this file becomes a check that docs/11 agrees
+        with docs/05.
+
+        TWO INDEPENDENT MECHANISMS EXCLUDE IT, and an earlier revision of this
+        test named the wrong one. It said it protected against `"docs"` being
+        added to `SOURCE_DIRS` -- and planting exactly that left it PASSING,
+        because `.md` is not in `INDEXED_SUFFIXES`, so walking `docs/` yields
+        no indexed file and the path assertion is satisfied by an empty set.
+        The suffix list is the real protection and the directory list is the
+        belt; the mutation needs BOTH edits to land, and a test that names one
+        of two mechanisms is dead against a change to the other. Both are
+        asserted now.
+        """
         idx = _index()
         assert not any(os.sep + "docs" + os.sep in f for f in idx["files"])
+        assert ".md" not in INDEXED_SUFFIXES, (
+            "Markdown is now indexed, so a symbol docs/11 cites could resolve "
+            "against another document's prose instead of against code")
+        assert "docs" not in SOURCE_DIRS
 
     def test_the_classifier_found_paths_symbols_and_prose(self):
-        """Floors with about a tenth of slack, measured against what the
-        document carries today: 38 paths, 79 symbols, 16 prose spans. Enough
-        that tightening a paragraph does not fail here, not enough that a
-        classifier could lose a quarter of what it finds and stay green."""
+        """Floors with about a tenth of slack below what the document carries.
+
+        NO EXACT COUNTS HERE, and that is the second time this change learned
+        the lesson it is about. This docstring used to print the three figures
+        it was calibrated against. They were true at the commit that added
+        them and false two commits later -- one prose span and one symbol
+        arrived with the follow-ups, and nothing told the author -- which is
+        the #41/#43 mechanism exactly, inside the file written to stop it. A
+        floor is checked on every run and cannot drift; a figure in a comment
+        is checked by nobody. The assertions below are the calibration.
+        """
         paths, symbols, prose = classify(_doc())
         assert len(paths) >= 34, sorted(paths)
         assert len(symbols) >= 70, len(symbols)
@@ -462,6 +483,30 @@ class TestTheGuardsOwnLimitsAreRecordedInTheDocument:
                          text, re.I) or "failed the plant" in text
         assert re.search(r"excludes itself from its own index", text, re.I)
         assert re.search(r"checking itself", text, re.I)
+
+    def test_the_directory_form_scope_limit_is_recorded(self):
+        """The third limit: `_PATH_RE` is anchored on an extension, so a
+        trailing-slash citation into a generated tree is read as prose and
+        escapes both the existence and the generated-tree checks.
+
+        Recorded rather than closed, because the document depends on the
+        behaviour -- it names `sources/`, `work/` and `tests/` in code font --
+        and asserted here so the page cannot stop warning about a hole the
+        guard still has. The behaviour itself is pinned below.
+        """
+        text = _plain(_doc())
+        assert re.search(r"file extension", text, re.I)
+        assert re.search(
+            r"directory citation into a generated\s*tree is exactly as "
+            r"uncheckable", text, re.I)
+
+    def test_the_directory_form_really_does_classify_as_prose(self):
+        """The behaviour the paragraph above describes, measured. If a later
+        change made `_PATH_RE` accept a directory, the page's warning would be
+        obsolete and this fails rather than the page going quietly stale."""
+        paths, symbols, prose = classify("`work/ann-benchmarks/some/dir/`")
+        assert paths == set() and symbols == set()
+        assert prose == {"work/ann-benchmarks/some/dir/"}
 
     def test_the_order_dependent_assertion_is_recorded_too(self):
         """The companion failure, from the same probe. Kept beside the first
@@ -659,6 +704,25 @@ class TestTheProvenanceDistinctionsSurvive:
         it has done exactly that."""
         count = len(re.findall(mark, _plain(_doc()), re.I))
         assert count >= floor, f"{mark}: {count}"
+
+    def test_studied_is_applied_and_not_only_defined(self):
+        """`studied` is the mark most at risk of becoming decoration.
+
+        It is down to ONE live application -- §2.4's warm-up invariance --
+        because §7's two halves were reclassified to `checked` once the
+        ann-benchmarks runner turned out to be readable in the documented
+        read-only vendor input rather than only in a generated tree. That is
+        the right direction to move a claim in, but it leaves the occurrence
+        floor above being satisfied mostly by §1's table and the bullet that
+        explains the table. So this asserts APPLICATION: the mark has to
+        appear somewhere after §1, on an actual claim, or the vocabulary is
+        defined and unused and the page's provenance scheme is theatre.
+        """
+        after_table = _doc().split("## 2.", 1)[1]
+        assert re.search(r"\bstudied\b", _plain(after_table), re.I), (
+            "no claim after §1 is marked `studied`; either a finding that was "
+            "not re-derived has been mis-marked `checked`, or the mark should "
+            "leave the provenance table")
 
     def test_the_unconfirmed_items_are_named_rather_than_counted(self):
         """The two engines whose compression support cannot be checked here

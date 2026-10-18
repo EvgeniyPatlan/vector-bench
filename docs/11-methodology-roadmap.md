@@ -102,6 +102,18 @@ Left in, that is worse than a guard that checks nothing, because it reads as
 coverage and would have accepted a citation into thin air. The file now
 excludes itself from its own index and asserts that it does.
 
+A third limit, smaller, and a scope boundary rather than a bug. The guard
+recognises a path by its **file extension**, so a citation in directory form —
+a trailing-slash path into a tree, however deep — is classified as prose and
+escapes both the existence check and the generated-tree check. That is
+deliberate and this page depends on it: it names `sources/`, `work/`,
+`results/` and `tests/` in code font as the things they are, and a classifier
+strict enough to reject those would reject every sentence about them. The
+consequence to be aware of is that **a deep directory citation into a generated
+tree is exactly as uncheckable as a file citation into one, and is not
+flagged** — so the discipline §0 asks for is the author's there, not the
+guard's.
+
 The general form is worth carrying to the next guard of this shape: **a check
 that builds a corpus and then searches it must say what is in the corpus, and
 a check that lives inside its own corpus is checking itself.** The companion
@@ -376,10 +388,21 @@ like every other engine's rather than comparing a wall against the graph caches
 `mhnsw_max_cache_size` and `vidx_hnsw_cache_size` are, ends in *and we record
 the gauge instead*.
 
-There is no collection site. A search of every `.py` in the tree for that
-status variable, in any casing, returns exactly one hit, and that hit is a test
-asserting that the documentation text still says what it says. The audit trail
-is a sentence about a sentence.
+**There is no collection site, and the search is worth reporting precisely
+because the precise answer is the stronger one.** Grepping every `.py` in the
+tree for that status variable, in any casing, returns **no hit at all** — not
+one, none. Dropping to the bare suffix returns a single near-hit, and it is not
+a collection site either: a class docstring in
+`tests/test_e1_percona_design.py` naming a vendor MTR result file, inside a
+test about `docs/09-adding-percona-server.md`'s *arithmetic*. And a
+case-sensitive search for the capitalised status-variable prefix *Innodb_*
+anywhere under `harness/`, `report/` or `orchestrator/` returns nothing — in
+italics because it is a fragment of a name and not a name, which this page's §0
+rule and its guard both insist on — so it is not that the
+gauge is read under another name: nothing in the three directories that could
+record a status variable reads one from this engine at all. The lowercase
+`innodb_hnsw_ef_search` and `innodb_buffer_pool_size` that do appear are server
+variables this framework *sets*, which is the opposite direction.
 
 **The fix is a choice of two, and either is honest.** Collect it — a per-phase
 `SHOW GLOBAL STATUS` read in `harness/drivers/mysql_family.py`, stamped into
@@ -402,12 +425,23 @@ window is as long as the re-insert takes, which is a property of the engine and
 the churn fraction.
 
 So the headline ratio that `window_ratio` computes — a p99 under writes over a
-baseline p99 — divides a nearest-rank percentile over a few hundred samples by
-one over hundreds of thousands. **Reasoned**, and it is only arithmetic: a
-nearest-rank p99 over 300 samples is the third slowest of the 300, while over
-300,000 it is the three-thousandth slowest, and the two estimators have
-different bias and wildly different variance. Those are not two samples of one
-quantity, and **the guard whose entire stated purpose is refusing ratios of
+baseline p99 — divides two nearest-rank percentiles taken over sample counts
+that are **unequal by an unknown factor in an unknown direction**. Both halves
+run the same reader pool at whatever rate the server allows, and both
+accumulate one sample per completed query, so the longer window carries the
+more samples: on a slow engine or a large churn fraction the re-insert outlasts
+30 seconds and the *during-writes* window is the larger, and on a fast one it
+is the smaller. Neither the factor nor the direction is recorded, and an
+earlier draft of this page asserted a direction — a few hundred samples under
+writes against hundreds of thousands at baseline — which nothing in the code
+supports and which this paragraph used to state as though it were measured.
+
+Why unequal counts matter at all is **reasoned**, and it is arithmetic:
+`percentile` is nearest rank, `ceil(q × n)` into an ascending sort, so a p99
+over 300 samples is the **fourth** slowest of the 300 and a p99 over 300,000 is
+the **3,001st** slowest. Those two estimators have different bias and wildly
+different variance, so a ratio of them is not a ratio of one quantity measured
+twice — and **the guard whose entire stated purpose is refusing ratios of
 different things does not check the axis that differs.**
 
 `PoolSpec`'s own docstring lists two ratios of exactly that shape already
@@ -715,18 +749,28 @@ claim, and the general claim is the one a reader will take from it.
 
 ## 7. Tier 4 — the ann path's headline estimator is a minimum over N runs
 
-**Half checked, half studied, and the halves are worth separating because
-they sit on opposite sides of the repository boundary.** **Checked:**
-`report/loaders.py` reads the best search time out of each result file's
-attributes and publishes its reciprocal as the QPS, so the headline throughput
-on this framework's recall chart is one over a *minimum*. **Studied:** that the
-minimum is taken over the N runs — ann-benchmarks' own runner keeps the
-smallest elapsed time across its iterations — comes from a read-only study of
-that project's runner and was **not** re-derived for this page. It could not
-be: ann-benchmarks is used unmodified, its tree is a disposable clone under
-`work/`, and `work/` is generated and gitignored, so there is nothing to read
-on a fresh checkout. That is also why its runner is named here rather than
-cited as a path.
+**Checked**, on both sides of the repository boundary — and where the far side
+was checked, since it is not in this tree. `report/loaders.py` reads the best
+search time out of each result file's attributes and publishes its reciprocal
+as the QPS, so the headline throughput on this framework's recall chart is one
+over a *minimum*. That the minimum is taken over the N runs was read in
+ann-benchmarks' own runner, in the **read-only vendor input** `CLAUDE.md` names
+as `$VB_REPO_ANNB` — the same kind of source, and the same kind of caveat, as
+§4.4's vendor reads: the runner initialises a best search time to infinity,
+loops `run_count` times, and keeps `min(best_search_time, search_time)` on each
+pass, writing both that minimum and `run_count` into the result attributes.
+
+Two things make this reproducible rather than one machine's reading.
+`scripts/prepare-harness.sh` clones the ann-benchmarks working copy **from**
+that read-only input, so the tree under `work/` is a clone of it rather than an
+independent download; and `overlay/ann-benchmarks/` contains nothing but
+per-engine `algorithms/<engine>/` directories — no runner and no *run.py* — so
+the overlay cannot have changed the file the claim is about. (Both of those
+vendor filenames are in italics, for the reason §0 gives: the guard rejected
+them in code font on the first run of this very correction, because neither is
+a path in this repository. The rule caught its own author twice.) The runner is
+therefore named here rather than cited as a path because it is not in *this*
+repository, not because it was unreadable.
 
 A minimum over N draws from a noisy positive variable is a biased estimator of
 the quantity, and — **reasoned**, as a fact about estimators rather than a
@@ -741,13 +785,15 @@ hands it to ann-benchmarks unchanged.
 
 Three things compound it:
 
-* **QPS and latency come from different runs** — **studied**, same source
-  and same caveat as above. The best search time is the minimum over all N;
-  the per-query times array that the published percentiles derive from is the
-  last iteration's. So a chart can carry a throughput from one iteration
-  beside percentiles from another. **Checked** on this side of the boundary:
-  the ann loader in `report/loaders.py` takes both out of the same file and
-  does not reconcile them. The ops path refuses exactly
+* **QPS and latency come from different runs** — **checked**, in the same
+  runner and by the same route as above. The per-query results list is
+  **reassigned inside** the `run_count` loop and returned after it, so the
+  times dataset the published percentiles derive from holds the **last**
+  iteration's latencies while the throughput beside them is the **minimum**
+  over all N. A chart therefore carries a throughput from one iteration beside
+  percentiles from another, and the ann loader in `report/loaders.py` takes
+  both out of the same file without reconciling them. The ops path refuses
+  exactly
   this mismatch, deliberately and with a comment explaining it: the recall and
   the status of its median window ride inside the same sample tuple
   specifically so that "the recall of the median window" is true by
