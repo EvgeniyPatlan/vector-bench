@@ -80,10 +80,36 @@ a parser that silently matched nothing fails instead of passing over an empty
 set — one guard in this series shipped green because it scanned zero files, and
 that failure mode is worth more care than the thing being guarded.
 
-What the guard cannot establish: that a symbol still **means** what this page
-says it means. A renamed-away symbol fails; a symbol that kept its name and
-changed its behaviour does not. That is the honest limit of a symbol citation,
-and it is the price paid for one that does not rot weekly.
+**Two limits of this kind of guard, one of which it had before it was probed.**
+
+The first is structural and remains: the guard cannot establish that a symbol
+still **means** what this page says it means. A renamed-away symbol fails; a
+symbol that kept its name and changed its behaviour does not. That is the
+honest limit of a symbol citation, and it is the price paid for one that does
+not rot weekly. It is why the passages this page leans on are quoted here
+rather than only pointed at.
+
+The second was a real defect, found by planting a failure rather than by
+reading, and it is worth recording because it is the characteristic bug of
+every guard shaped like this one. **A guard whose index of the tree includes
+the guard itself can certify a symbol that exists nowhere but in the guard.**
+The index covers `tests/`, deliberately — several things this page has to name
+live only there — and the guard is a file in `tests/`, so the names it spells
+while describing what it would reject were resolvable *as citations*. The first
+run of its planted arm therefore passed the live document and **failed the
+plant**: the bad symbol resolved, against the test asserting that it must not.
+Left in, that is worse than a guard that checks nothing, because it reads as
+coverage and would have accepted a citation into thin air. The file now
+excludes itself from its own index and asserts that it does.
+
+The general form is worth carrying to the next guard of this shape: **a check
+that builds a corpus and then searches it must say what is in the corpus, and
+a check that lives inside its own corpus is checking itself.** The companion
+failure arrived from the same probe and is of the same family — one assertion
+here passed in isolation and failed under the full suite, because another test
+creates `state/` while it runs, so the assertion was about execution order and
+not about this document at all. Both were invisible to reading and both
+surfaced the moment the guard was asked to fail on purpose.
 
 ## 1. Provenance of every claim here
 

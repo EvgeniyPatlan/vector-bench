@@ -431,6 +431,53 @@ class TestEverySymbolTheDocumentNamesStillResolves:
         assert "tests/test_e15_methodology_roadmap_doc.py" in paths
 
 
+class TestTheGuardsOwnLimitsAreRecordedInTheDocument:
+    """§0 has to state what this file cannot do, including its own past bug.
+
+    Pinned because it is the paragraph a later tidy-up deletes first: it is
+    self-critical, it is about the test file rather than about the methodology,
+    and it reads as an aside. It is neither. The self-poisoning failure is the
+    characteristic bug of every guard that builds a corpus and then searches
+    it, and the next author to write one of those will read this page before
+    reading this file -- so the warning has to survive in the page.
+    """
+
+    def test_the_meaning_limit_is_stated(self):
+        """The structural limit: a rename fails, a behaviour change does not."""
+        text = _plain(_doc())
+        assert re.search(r"cannot establish", text, re.I)
+        assert re.search(r"kept its name and\s*changed its behaviour", text, re.I)
+
+    def test_the_self_poisoning_bug_is_recorded(self):
+        """The defect, named as a defect rather than softened into a design
+        note -- and named with its mechanism, because "the guard had a bug" is
+        not transferable and "a guard inside its own corpus checks itself" is.
+        """
+        text = _plain(_doc())
+        assert re.search(
+            r"index of the tree includes\s*the guard itself", text, re.I), (
+            "§0 must record that the guard's index once included the guard, "
+            "which is what let a planted bad symbol resolve")
+        assert re.search(r"passed the live document and \*{0,2}failed the\s*plant",
+                         text, re.I) or "failed the plant" in text
+        assert re.search(r"excludes itself from its own index", text, re.I)
+        assert re.search(r"checking itself", text, re.I)
+
+    def test_the_order_dependent_assertion_is_recorded_too(self):
+        """The companion failure, from the same probe. Kept beside the first
+        because the pair is the point: neither was visible to reading."""
+        text = _plain(_doc())
+        assert re.search(r"passed in isolation and failed under the full suite",
+                         text, re.I)
+        assert "state/" in _doc()
+
+    def test_the_file_really_does_exclude_itself(self):
+        """The claim above, verified against the index rather than trusted to
+        the prose -- so a document saying the hole is closed and a guard that
+        reopened it cannot coexist."""
+        assert SELF not in {os.path.abspath(f) for f in _index()["files"]}
+
+
 class TestTheDocumentMakesNoLineCitation:
     """The citation policy, executable.
 
