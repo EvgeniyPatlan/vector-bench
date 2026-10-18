@@ -429,7 +429,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2483` and `docs/05-methodology.md:939` both say
+matched rows. `report/render.py:2483` and `docs/05-methodology.md:953` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`

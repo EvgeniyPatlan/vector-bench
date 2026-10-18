@@ -1279,7 +1279,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
         assert "report/render.py:2483" in section
-        assert "docs/05-methodology.md:939" in section
+        assert "docs/05-methodology.md:953" in section
 
 
 # ---------------------------------------------------------------------------
