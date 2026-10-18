@@ -1485,7 +1485,7 @@ class TestForkIsForcedByTheCallersAndNotChosen:
     """
 
     def test_the_real_factory_cannot_be_pickled(self):
-        """Measured against the shape `harness/main.py:270` actually has.
+        """Measured against the shape `harness/main.py:298` actually has.
 
         A `def` nested inside `main()`, whose `__qualname__` is
         `main.<locals>.driver_factory`. Pickle resolves a function by

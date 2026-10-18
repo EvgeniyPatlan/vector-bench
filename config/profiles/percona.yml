@@ -97,9 +97,18 @@ ops:
   # and `filtered` are kept because they are cheap at this corpus size and a
   # build-mode change can move query latency as well as build cost — an index
   # built in one pass over sorted data is not laid out like one grown row by
-  # row. `churn` is deliberately out: Percona's repair path rebuilds the whole
-  # graph (docs/09 §2.7), so a churn phase here would cost on the order of a
-  # bulk build per fraction and tell us nothing about either axis above.
+  # row. `churn` is deliberately out, and the REASON changed even though the
+  # decision did not. It used to read "Percona's repair path rebuilds the
+  # whole graph (docs/09 §2.7), so a churn phase here would cost on the order
+  # of a bulk build per fraction" -- which is no longer the fact: at the
+  # pinned `source.tag` that repair is withdrawn
+  # (`capabilities.bulk_vector_index_build: false`) and a churn phase would
+  # cost nothing extra for it, because `maintain()` returns without issuing
+  # the ALTER. `churn` stays out because this profile exists to compare the
+  # two BUILD MODES and churn measures neither axis above -- and, at this pin,
+  # because the repair whose cost would have made it interesting does not run.
+  # If the capability is ever flipped to `true`, the original cost argument
+  # becomes live again and is the reason to keep churn out.
   workloads: [build, concurrency, filtered]
   m_values: [16]
   ef_search: 100

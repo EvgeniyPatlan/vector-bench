@@ -755,9 +755,17 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
                  resource_pass: str, resources: Dict[str, Any],
                  build_mode: str = "post",
                  storage_engine: str = "InnoDB",
-                 iterative_scan: Optional[Union[str, Sequence[str]]] = None
+                 iterative_scan: Optional[Union[str, Sequence[str]]] = None,
+                 bulk_vector_index_build: bool = True
                  ) -> List[str]:
     """Translate a profile into ops-harness command-line arguments.
+
+    `bulk_vector_index_build` is the engine's own declaration, read by
+    `cli.py:_bulk_vector_index_build`, and its default here is True for the
+    same reason the default is True there: absence of the declaration has to
+    mean today's behaviour. The only call site derives it from the engine
+    config, so the default is reached by hand-built calls and by tests, both
+    of which are about engines whose bulk build works.
 
     `iterative_scan` takes one mode or several. One is emitted verbatim, which
     is what the only call site in `cli.py` passes today -- it resolves the
@@ -786,6 +794,28 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
             (ops.get("ef_calibration") or DEFAULT_EF_CALIBRATION)),
         "--storage-engine", storage_engine,
         "--build-mode", build_mode,
+        # Emitted only when the engine declares its bulk vector index build
+        # BROKEN. That makes it the SECOND conditional flag in this list --
+        # `--quantization` three lines below is the other -- and the only one
+        # of the two that carries no value. The "emit unconditionally" rule
+        # `--ef-mode`, `--churn-readers` and `--filtered-budget` follow is
+        # about keys that carry a VALUE a profile chose, where an omitted flag
+        # would leave a reader inferring the workload's default at the time.
+        # This one is a declaration, and exactly one engine config makes it,
+        # so mirroring the config -- six engines say nothing, and absence
+        # there reads as "the bulk build works" -- keeps one fact with one
+        # default on both sides of the container boundary rather than two
+        # spellings of it.
+        #
+        # **The flag itself is not the readable artefact, and it would be
+        # wrong to claim it is: NOTHING in this repo writes the harness argv
+        # to disk or to the phase log.** What a reader actually sees is
+        # `PerconaDriver.maintain()`'s own print, which does reach the phase
+        # log and names the statement, the capability and the measurement.
+        # This flag's job is only to carry the host's decision across the
+        # container boundary.
+        *([] if bulk_vector_index_build
+          else ["--no-bulk-vector-index-build"]),
         "--churn-budget", _budget_arg(ops, "churn_budget_s",
                                       DEFAULT_CHURN_BUDGET_S),
         # Read from the same extras render_config uses for the recall path, so
