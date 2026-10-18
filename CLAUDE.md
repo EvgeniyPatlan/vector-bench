@@ -247,4 +247,8 @@ phase, per `(M, build_mode)`:
 flag) · `03-running-manually.md` (standalone: each engine by hand with `docker run` and raw
 SQL) · `04-engine-notes.md` (per-implementation traps) · `05-methodology.md` (what is measured,
 fairness policy, known asymmetries) · `06-new-machine.md` · `07-planning-a-run.md` (read before
-any long run) · `08-web-ui.md` (the browser front end, its access model and its limits).
+any long run) · `08-web-ui.md` (the browser front end, its access model and its limits) ·
+`11-methodology-roadmap.md` (what the measurement methodology cannot yet observe, what it
+already handles, and in what order to address the rest — a design document, nothing in it is
+implemented; it cites code **by symbol and never by line**, and
+`tests/test_e15_methodology_roadmap_doc.py` enforces that).
