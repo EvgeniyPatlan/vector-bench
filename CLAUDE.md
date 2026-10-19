@@ -28,7 +28,7 @@ in step with it. `orchestrator/engines.py` is the registry everything derives fr
 ## Commands
 
 ```bash
-python3 -m pytest tests/ -q                 # ~1,700 tests, ~70 s. The fast inner loop.
+python3 -m pytest tests/ -q                 # thousands of tests, ~6 min. The fast inner loop.
 ./tests/make-tiny-dataset.sh                # synthetic corpus, no download
 ./run-benchmark.sh run --profile dev        # ~1 min/engine end-to-end cycle
 ./run-benchmark.sh run --profile smoke      # ~45 min/pass gate before any long run
@@ -44,6 +44,12 @@ python3 -m pytest tests/ -q                 # ~1,700 tests, ~70 s. The fast inne
 
 Never pipe pytest through `tail`/`head` in a command whose exit status matters — a broken
 commit has already gone out that way, because the pipeline swallowed the non-zero exit.
+
+**That first figure is deliberately vague.** It read "~1,700 tests, ~70 s" for a long time
+after the suite had passed 3,600 tests and six minutes, because an exact count is wrong again
+the next time anyone adds a test, and a count nobody maintains is worse than no count: it
+tells a reader the run they are watching has hung. Run `--collect-only` for the real number
+when you need it, and if you change this line, keep it to a magnitude.
 
 Host requirements are deliberately only `docker`, `python3`, `pyyaml`, `git`, `curl`. Do not
 add a host-side Python dependency: a benchmark framework must not modify the machine it
@@ -247,4 +253,17 @@ phase, per `(M, build_mode)`:
 flag) · `03-running-manually.md` (standalone: each engine by hand with `docker run` and raw
 SQL) · `04-engine-notes.md` (per-implementation traps) · `05-methodology.md` (what is measured,
 fairness policy, known asymmetries) · `06-new-machine.md` · `07-planning-a-run.md` (read before
-any long run) · `08-web-ui.md` (the browser front end, its access model and its limits).
+any long run) · `08-web-ui.md` (the browser front end, its access model and its limits) ·
+`09-adding-percona-server.md` (how the seventh engine was added, and the vendor behaviour that
+decided each choice) · `10-rollout.md` (what to run after this series, in what order, and the
+two checks that cannot be done as specified) · `11-methodology-roadmap.md` (what the
+measurement methodology cannot yet observe, what it already handles, and in what order to
+address the rest — a design document, nothing in it is implemented).
+
+Each of the last three is guarded: `tests/test_e1_percona_design.py`,
+`tests/test_e3_rollout_doc.py` and `tests/test_e15_methodology_roadmap_doc.py` fail when the
+document drifts from the tree. **09 and 10 cite `file:line` and 11 cites symbols only** — and
+if you are adding a document, copy 11. Line citations in 09 and 10 have rotted twice in two
+days and put `master` red both times (#41, #43), both times because a later round of edits in
+the same change moved lines after the citations were derived. A line number dies to any edit
+above it; a symbol name dies only to a rename.
