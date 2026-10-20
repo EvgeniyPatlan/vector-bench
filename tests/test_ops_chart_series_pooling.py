@@ -1,4 +1,5 @@
-"""Every ops chart pooled the two resource passes into one series.
+"""Every ops chart pooled the two resource passes into one series, and the
+filtered chart pooled pgvector's two iterative_scan modes on top of that.
 
 `charts.series_key` was `(engine, build_signature(record))` and both branches
 of `build_signature` are blind to `resource_pass`: the column fallback does
@@ -11,6 +12,12 @@ no machine ever produced.
 Measured on `PS/new/full-20261015-215006`, the seven-engine run of 2026-10-15:
 the fashion-mnist filtered chart drew 24 series and every single one of them
 had x = [0.01, 0.01, 0.1, 0.1, 0.5, 0.5].
+
+PR #45 then made pgvector's filtered phase measure two `hnsw.iterative_scan`
+modes, which the same key also pooled -- and those differ by an order of
+magnitude in recall at the same selectivity, 0.0963 against about 0.97, so a
+pooled series plots as one line doubling back on itself at every x with
+nothing in the legend to attribute either reading.
 
 These tests do not read that bundle -- `results/` is gitignored and a test
 that needs a 126 MB archive is not a test. They rebuild its shape: two passes
@@ -58,6 +65,24 @@ def _two_passes():
                                  (0.50, 0.4989, 1240.0)):
             rows.append(_filtered_record(rp, sel, round(recall + bump, 6),
                                          qps + (40.0 if rp == "tuned" else 0.0)))
+    return rows
+
+
+def _two_scan_modes():
+    """PR #45's shape: one pgvector unit, one pass, two scan modes.
+
+    The recalls are the measured order-of-magnitude split the mode decides --
+    `off` collapses under a predicate, which is the collapse pgvector 0.8
+    shipped iterative scan to fix.
+    """
+    rows = []
+    for mode, recalls in (("off", (0.0963, 0.0971, 0.0990)),
+                          ("relaxed_order", (0.9690, 0.9712, 0.9745))):
+        for sel, recall in zip((0.01, 0.10, 0.50), recalls):
+            rows.append(_filtered_record(
+                "tuned", sel, recall,
+                1760.0 if mode == "off" else 180.0,
+                extra={"iterative_scan": mode}))
     return rows
 
 
@@ -121,6 +146,134 @@ class TestTheTwoResourcePassesAreNotOneSeries:
             charts_mod.series_key({"engine": "e"}))
 
 
+class TestTheTwoIterativeScanModesAreNotOneSeries:
+    """Defect 2, which PR #45 made live for pgvector's filtered phase."""
+
+    @staticmethod
+    def _pass_only_key(record):
+        """The key as of the resource-pass split: still no scan mode."""
+        return (record.get("engine"), loaders_mod.build_signature(record),
+                record.get("resource_pass"))
+
+    def test_the_pass_split_alone_still_pooled_them(self):
+        """Non-vacuity. One pass, one configuration, two modes: the pass in
+        the key does nothing here, which is why this is a second change and
+        not a consequence of the first."""
+        rows = _two_scan_modes()
+        assert len({self._pass_only_key(r) for r in rows}) == 1
+        assert len({(r["extra"] or {})["iterative_scan"] for r in rows}) == 2
+
+    def test_the_mode_separates_the_series(self):
+        rows = _two_scan_modes()
+        assert len({charts_mod.series_key(r) for r in rows}) == 2
+
+    def test_the_pooled_line_doubled_back_on_itself(self):
+        """The defect as a reader saw it: one series whose x repeats every
+        selectivity and whose y alternates between a tenth and nearly all of
+        the correct answers."""
+        rows = _two_scan_modes()
+        pooled = {}
+        for r in rows:
+            pooled.setdefault(self._pass_only_key(r), []).append(
+                (r["selectivity"], r["recall_at_k"]))
+        points = sorted(list(pooled.values())[0])
+        assert [x for x, _ in points] == [0.01, 0.01, 0.10, 0.10, 0.50, 0.50]
+        assert [y for _, y in points] == [0.0963, 0.9690, 0.0971, 0.9712,
+                                          0.0990, 0.9745]
+
+        split = {}
+        for r in rows:
+            split.setdefault(charts_mod.series_key(r), []).append(
+                r["selectivity"])
+        assert sorted(sorted(v) for v in split.values()) == [
+            [0.01, 0.10, 0.50], [0.01, 0.10, 0.50]]
+
+    def test_the_legend_attributes_each_reading(self):
+        """Splitting the lines without naming them leaves the reader exactly
+        where they were: two curves a decade apart and no way to say which
+        strategy produced either."""
+        labels = sorted(charts_mod.series_labels(_two_scan_modes()).values())
+        assert labels == [
+            "PostgreSQL (pgvector) / iterative_scan=off",
+            "PostgreSQL (pgvector) / iterative_scan=relaxed_order"]
+
+    def test_modes_and_passes_compose(self):
+        """A `--resource-pass both` run of a two-mode profile is four lines,
+        and the legend names both axes."""
+        rows = []
+        for rp in ("normalized", "tuned"):
+            for r in _two_scan_modes():
+                row = dict(r, resource_pass=rp)
+                row["extra"] = dict(r["extra"])
+                rows.append(row)
+        assert len({charts_mod.series_key(r) for r in rows}) == 4
+        base = "PostgreSQL (pgvector)"
+        assert sorted(charts_mod.series_labels(rows).values()) == [
+            f"{base} / normalized / iterative_scan=off",
+            f"{base} / normalized / iterative_scan=relaxed_order",
+            f"{base} / tuned / iterative_scan=off",
+            f"{base} / tuned / iterative_scan=relaxed_order"]
+
+
+class TestTheModeDidNotGoIntoTheSignature:
+    """Where it must NOT go, and the twelve rows that decided it.
+
+    `extra.iterative_scan` looks like a peer of `extra.quantization`, which
+    `build_signature`'s column fallback does list. It is not one.
+    `quantization` is None on every record of every phase in every shipped
+    profile, so it cannot separate two records that belong together;
+    `iterative_scan` is written by `harness/workloads/filtered.py` and by
+    nothing else, so within ONE ops unit the filtered records carry a mode
+    while that unit's calibration, concurrency and churn records carry None.
+
+    `loaders.operating_points` joins a calibration sweep to the workloads that
+    consumed it, across exactly those phases, through `build_signature`. On
+    `full-20261015-215006` that join goes from 54 rows to 66 if the field is
+    added to the fallback: twelve pgvector filtered half-rows, each with no
+    recall, no grid size and no point count, stranded on a key their own
+    calibration curve cannot reach. None of the 54 is lost, so nothing in the
+    suite would have caught it.
+    """
+
+    def _unit(self):
+        """One ops unit, two phases, as the harness writes it: a calibration
+        record with no mode, and the filtered records that followed it."""
+        rows = [{
+            "phase": "ef_calibration", "engine": "pgvector",
+            "dataset": "fashion-mnist-784-euclidean",
+            "resource_pass": "tuned", "m": 16, "build_mode": "post",
+            "storage_engine": "InnoDB", "ef_construction": 200,
+            "ef_search": ef, "recall_at_k": recall, "extra": {},
+        } for ef, recall in ((10, 0.91), (16, 0.95), (40, 0.99))]
+        for mode in ("off", "relaxed_order"):
+            rows.append(_filtered_record(
+                "tuned", 0.10, 0.0963 if mode == "off" else 0.969, 900.0,
+                ef_search=16,
+                extra={"iterative_scan": mode, "calibration_status": "ok"}))
+        return rows
+
+    def test_the_signature_is_blind_to_the_mode(self):
+        rows = self._unit()
+        assert len({loaders_mod.build_signature(r) for r in rows}) == 1
+
+    def test_the_sweep_and_its_workloads_stay_one_operating_point(self):
+        """The join this would have split. One unit in, one row out, carrying
+        both halves -- the chosen ef from the filtered records and the recall
+        from the calibration curve at that ef."""
+        rows = loaders_mod.operating_points(self._unit())
+        assert len(rows) == 1, rows
+        assert rows[0]["ef_search"] == 16
+        assert rows[0]["recall_at_k"] == 0.95
+        assert rows[0]["points_measured"] == 3
+
+    def test_the_mode_is_in_the_chart_key_and_not_the_unit_key(self):
+        """Both facts in one assertion, because together they are the design:
+        the charts separate the modes, the unit join does not see them."""
+        rows = [r for r in self._unit() if r["phase"] == "filtered"]
+        assert len({charts_mod.series_key(r) for r in rows}) == 2
+        assert len({loaders_mod.operating_point_key(r) for r in rows}) == 1
+
+
 class TestASinglePassReportDoesNotMove:
     """The fix must split a two-pass run and leave a one-pass run alone.
 
@@ -150,6 +303,46 @@ class TestASinglePassReportDoesNotMove:
         assert len({charts_mod.series_key(r) for r in rows}) == 1
         assert set(charts_mod.series_labels(rows).values()) == {
             "PostgreSQL (pgvector)"}
+
+    def test_records_with_no_scan_mode_group_exactly_as_before(self):
+        """`extra.iterative_scan` is absent on every pre-#45 ops record and on
+        every record of the other six engines, so it reads None. This is the
+        assertion that the key's growth is inert for all of them: the grouping
+        and the labels are identical to what the key produced before the field
+        was part of it, not merely similar.
+        """
+        rows = []
+        for engine in ("mariadb", "alisql", "valkey", "mongodb", "percona"):
+            for sel in (0.01, 0.10, 0.50):
+                rows.append(dict(_filtered_record("tuned", sel, 0.97, 500.0),
+                                 engine=engine))
+        without = {}
+        for r in rows:
+            # The key with the mode sliced back off, which is what it was.
+            without.setdefault(charts_mod.series_key(r)[:-1], []).append(r)
+        with_mode = {}
+        for r in rows:
+            with_mode.setdefault(charts_mod.series_key(r), []).append(r)
+        assert len(with_mode) == len(without) == 5
+        assert ([sorted(id(r) for r in v) for v in sorted(
+                    with_mode.values(), key=lambda v: v[0]["engine"])]
+                == [sorted(id(r) for r in v) for v in sorted(
+                    without.values(), key=lambda v: v[0]["engine"])])
+        assert all(not label.endswith("unset")
+                   for label in charts_mod.series_labels(rows).values())
+
+    def test_a_series_with_no_mode_beside_one_with_a_mode_says_so(self):
+        """`off` and "the engine's own default" are different measurements and
+        the record distinguishes them -- `cli._ops_iterative_scan` returns None
+        for a profile that declares nothing, and pinning `off` explicitly was
+        worth doing on its own grounds. A bare label beside a named one would
+        have published them as the same line."""
+        rows = _two_scan_modes()[:3] + [
+            _filtered_record("tuned", sel, 0.5, 700.0)
+            for sel in (0.01, 0.10, 0.50)]
+        assert sorted(charts_mod.series_labels(rows).values()) == [
+            "PostgreSQL (pgvector) / iterative_scan=off",
+            "PostgreSQL (pgvector) / iterative_scan=unset"]
 
 
 class TestTheSignatureStaysPassBlind:
@@ -213,3 +406,20 @@ class TestTheFilteredChartRendersTheSplit:
             "PostgreSQL (pgvector) / tuned"]
         for xs, _ys, _label in plotted:
             assert xs == [0.01, 0.10, 0.50], xs
+
+    def test_the_two_scan_modes_reach_plot_as_two_attributed_lines(self):
+        """The whole defect, at the level the chart hands to matplotlib:
+        before, one line with x = [0.01, 0.01, 0.1, 0.1, 0.5, 0.5] and y
+        alternating 0.0963 / 0.9690; after, two lines of three points each,
+        each legend naming its mode."""
+        plotted = self._plotted(_two_scan_modes())
+        assert len(plotted) == 2, plotted
+        by_label = {c[2]: (c[0], c[1]) for c in plotted}
+        assert sorted(by_label) == [
+            "PostgreSQL (pgvector) / iterative_scan=off",
+            "PostgreSQL (pgvector) / iterative_scan=relaxed_order"]
+        off = by_label["PostgreSQL (pgvector) / iterative_scan=off"]
+        relaxed = by_label[
+            "PostgreSQL (pgvector) / iterative_scan=relaxed_order"]
+        assert off == ([0.01, 0.10, 0.50], [0.0963, 0.0971, 0.0990])
+        assert relaxed == ([0.01, 0.10, 0.50], [0.9690, 0.9712, 0.9745])

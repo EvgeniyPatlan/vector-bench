@@ -124,13 +124,16 @@ SERIES_AXES = ("storage_engine", "ef_construction", "m")
 # for itself, as a storage engine does.
 AXIS_LABELS = {"storage_engine": "", "ef_construction": "ef_c=", "m": "M="}
 
-# (engine, configuration, resource pass). `churn` and `churn_impact` widen
-# this and slice it back, so this constant is the only place the width is
-# written down: neither of them holds a literal index, and
+# (engine, configuration, resource pass, iterative scan mode). `churn` and
+# `churn_impact` widen this key and slice it back, so this constant is the only
+# place the width is written down: neither of them holds a literal index, and
 # `tests/test_config.py` asserts both halves of that -- that the constant
 # equals the key's real length, and that `churn_impact`'s block contains no
-# `key[3]`. Growing `series_key` therefore means growing this and nothing else.
-SERIES_KEY_WIDTH = 3
+# `key[3]`. Growing `series_key` therefore means growing this and nothing else:
+# the two widenings this key has had cost one edit here and none at the eight
+# call sites, which is why widening the shared primitive was preferable to
+# keying six charts locally.
+SERIES_KEY_WIDTH = 4
 
 # Colour stays with the engine so versions remain comparable at a glance; the
 # storage engine is carried by the linestyle instead.
@@ -154,8 +157,8 @@ _ANY_PASS = object()
 
 
 def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    """Identity of one plotted line: the engine, which build it came from, and
-    which resource pass measured it.
+    """Identity of one plotted line: the engine, which build it came from,
+    which resource pass measured it, and which query strategy it used.
 
     **What leaving the pass out did, on real data.** Measured on
     `PS/new/full-20261015-215006`, a `--resource-pass both` run of all seven
@@ -189,6 +192,36 @@ def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
     `latency_percentiles`, the one chart here that plots ann records, pooled
     the passes exactly as the five ops charts did. `generate.py`'s `by_config`
     comment records the same mechanism from the detector's side.
+
+    **`extra.iterative_scan` is here for the same reason and emphatically NOT
+    in `build_signature`'s column fallback, and the difference is measured
+    rather than stylistic.** It looks like a peer of `quantization`, which the
+    fallback does list -- both are index or query properties with no column of
+    their own, and the signature's own docstring is about what omitting
+    `quantization` cost. The two are not peers. `quantization` is None on every
+    record of every phase in every shipped profile (`report/crosscheck.py`'s
+    key comment says so, and calls itself a guard against the day either path
+    carries it), so it cannot separate two records that belong together.
+    `iterative_scan` is written by `harness/workloads/filtered.py` and by
+    nothing else, so within ONE ops unit the filtered records carry a mode
+    while that unit's calibration, concurrency and churn records carry None.
+
+    `build_signature` is not only a series key: `loaders.operating_points`
+    joins a calibration sweep to the workloads that consumed it through
+    `operating_point_key`, and those are different phases of one unit. A field
+    present on one phase and absent on its siblings splits that join. Measured
+    on `full-20261015-215006`, where all 320 filtered records carry
+    `extra.calibration_status` and 72 of them carry
+    `extra.iterative_scan: off` while all 163 calibration records carry None:
+    adding the field to the fallback takes the operating-point table from 54
+    rows to 66. The 12 extra rows are pgvector's filtered records stranded on a
+    key their own calibration curve cannot reach, so each arrives with no
+    recall, no grid size and no point count -- twelve half-rows published in a
+    table whose job is to say what ef each unit settled on. None of the
+    original 54 is lost, so nothing in the suite would have caught it.
+
+    Composed here, the field reaches only the charts, where every function
+    filters to one phase first and the cross-phase join never happens.
     """
     from .loaders import build_signature
     # The whole signature, not its last element: the filename branch ends in
@@ -199,9 +232,11 @@ def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
     # one engine the existing ordering of configurations is a prefix of the new
     # one and the two passes of a configuration sort adjacently. Charts order
     # their series by `str(key)`, so the legend a reader already knows keeps
-    # its shape and only gains a split.
+    # its shape and only gains a split. The scan mode follows the pass for the
+    # same reason, and in the order the filtered table prints the two columns.
     return (record.get("engine"), build_signature(record),
-            record.get("resource_pass"))
+            record.get("resource_pass"),
+            (record.get("extra") or {}).get("iterative_scan"))
 
 
 def _config_tokens(record: Dict[str, Any]) -> Optional[List[str]]:
@@ -220,21 +255,33 @@ def _key_suffixes(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
     """How one engine's series name the axes that are in the key but not in
     the base label, or the empty string where the run did not vary them.
 
-    `series_key` carries the resource pass, and neither branch of
-    `series_labels` can name it: the filename branch reads ann-benchmarks'
-    result stem, and the trees are per pass so the stem is identical in both;
-    the fallback branch reads `SERIES_AXES`, which lists build axes. So
+    `series_key` carries the resource pass and `extra.iterative_scan`, and
+    neither branch of `series_labels` can name either: the filename branch
+    reads ann-benchmarks' result stem, and the trees are per pass so the stem
+    is identical in both and never mentions a query-time session setting at
+    all; the fallback branch reads `SERIES_AXES`, which lists build axes. So
     splitting the series without this would have produced two lines with the
     same legend text -- the measurements separated and still unattributable,
     which is half the defect and the less obvious half.
 
-    Named only when the engine was measured in more than one pass. That is
-    `pareto_series_style`'s rule and it is kept for its reason: on a one-pass
-    report the label is byte-identical to what every chart drew before the key
-    grew, so a single-pass report does not change at all. `churn` and
-    `churn_impact` apply the same rule to the axes they append themselves.
+    **For the scan mode that half is the whole point.** PR #45 made pgvector's
+    filtered phase measure `off` and `relaxed_order`, and the two differ by an
+    order of magnitude in recall at the same selectivity: 0.0963 against about
+    0.97. Two unlabelled lines a decade apart on a recall axis do not read as
+    two strategies, they read as a measurement nobody can use.
+
+    Each axis is named only when the engine actually varied it. That is
+    `pareto_series_style`'s rule and it is kept for its reason: on a run that
+    varied neither, the label is byte-identical to what every chart drew
+    before the key grew, so such a report does not change at all. It also
+    settles the records that carry no mode -- every pre-#45 ops record and
+    every record of the other six engines, where `extra.iterative_scan` is
+    absent and reads None. One value is not more than one value, so those
+    engines' labels and series are untouched. `churn` and `churn_impact` apply
+    the same rule to the axes they append themselves.
     """
     passes = {r.get("resource_pass") for r in rows}
+    scans = {(r.get("extra") or {}).get("iterative_scan") for r in rows}
     # Assigned per KEY and not accumulated per RECORD: a series holds one
     # record per x, so `+=` over the records spelled the pass once per point
     # -- "PostgreSQL (pgvector) / normalized / normalized / normalized" at
@@ -246,6 +293,16 @@ def _key_suffixes(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
         suffix = ""
         if len(passes) > 1:
             suffix += f" / {_pass_label(r.get('resource_pass'))}"
+        if len(scans) > 1:
+            # Spelled with the record's own field name, and the raw mode
+            # beside it, because the filtered and strategy tables print that
+            # exact string under an "Iterative scan" column -- a reader
+            # carrying a line from the chart to its row has one spelling to
+            # match. A series whose records carry no mode while a sibling's do
+            # says so rather than going bare, or "the engine's default" and
+            # "not recorded" would look like the same line.
+            scan = (r.get("extra") or {}).get("iterative_scan")
+            suffix += f" / iterative_scan={scan if scan else 'unset'}"
         suffixes[series_key(r)] = suffix
     return suffixes
 
@@ -903,11 +960,21 @@ def _calibration_marks(records: List[Dict[str, Any]], dataset: str
     Keyed on the ENGINE and not on the plotted series key, because the mark is
     a statement about the engine's floor and ceiling rather than about one
     line. One engine owns several plotted series -- `series_key` separates the
-    build configuration and the resource pass, as `operating_points` keys the
-    pass separately -- so an engine whose floor sits above the target in the
-    tuned pass and not the normalized one earns the mark on all of its lines,
-    and the footnote names the pass and the M so the reader is not left to
-    guess which of them it applies to.
+    build configuration, the resource pass and the scan mode, as
+    `operating_points` keys the pass separately -- so an engine whose floor
+    sits above the target in the tuned pass and not the normalized one earns
+    the mark on all of its lines, including the normalized ones that reached
+    the target.
+
+    **The footnote does not say WHICH pass or M earned the mark, and that is
+    stated rather than left to be discovered.** `recalls` carries both on
+    every entry and `_calibration_footnote` unpacks them as `_pass` and `_m`
+    and prints neither -- only the engine and its best achieved recall. The
+    pass split narrows the consequence without removing it: a reader can now
+    see which LINES carry the mark, where before one pooled line carried a
+    mark earned in a pass it was half made of. Widening the sentence means
+    deciding what it says for an engine daggered in both passes, which is a
+    rendering question and not this key's.
 
     `recalls` carries the recall actually achieved, which §2.3.3 requires
     beside the `target_unreached` mark. It is the calibration sweep's recall at
@@ -1922,8 +1989,11 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     # while the pass was absent from `series_key`, because the shared label
     # could not see it. Now that the pass is IN the key, `_key_suffixes` adds
     # it to the shared label under the identical "only when more than one"
-    # rule, and keeping this block as well printed it twice -- "MariaDB 11.8
-    # (MHNSW) / tuned (post) / tuned".
+    # rule, and keeping this block as well printed it twice. Measured over a
+    # two-pass churn fixture with the removed lines reinstated: the shipped
+    # label is "MariaDB 11.8 (MHNSW) / tuned" and theirs was
+    # "MariaDB 11.8 (MHNSW) / tuned / tuned", with the build mode landing
+    # between the two on a figure that varies it as well.
     modes = {key[SERIES_KEY_WIDTH + 1] for key in retained}
 
     for key, points in sorted(retained.items(), key=lambda kv: str(kv[0])):
