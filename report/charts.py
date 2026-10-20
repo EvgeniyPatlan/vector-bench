@@ -124,8 +124,13 @@ SERIES_AXES = ("storage_engine", "ef_construction", "m")
 # for itself, as a storage engine does.
 AXIS_LABELS = {"storage_engine": "", "ef_construction": "ef_c=", "m": "M="}
 
-# (engine, configuration). churn_impact widens this and slices it back.
-SERIES_KEY_WIDTH = 2
+# (engine, configuration, resource pass). `churn` and `churn_impact` widen
+# this and slice it back, so this constant is the only place the width is
+# written down: neither of them holds a literal index, and
+# `tests/test_config.py` asserts both halves of that -- that the constant
+# equals the key's real length, and that `churn_impact`'s block contains no
+# `key[3]`. Growing `series_key` therefore means growing this and nothing else.
+SERIES_KEY_WIDTH = 3
 
 # Colour stays with the engine so versions remain comparable at a glance; the
 # storage engine is carried by the linestyle instead.
@@ -149,12 +154,54 @@ _ANY_PASS = object()
 
 
 def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
-    """Identity of one plotted line: the engine, and which build it came from."""
+    """Identity of one plotted line: the engine, which build it came from, and
+    which resource pass measured it.
+
+    **What leaving the pass out did, on real data.** Measured on
+    `PS/new/full-20261015-215006`, a `--resource-pass both` run of all seven
+    engines: the filtered chart for fashion-mnist drew 24 series and EVERY one
+    of them had x = [0.01, 0.01, 0.1, 0.1, 0.5, 0.5] -- the normalized point
+    and the tuned point at each selectivity, in one series, joined by a line no
+    machine ever produced. The same pooling was in `build_cost`, `concurrency`,
+    `churn`, `latency_percentiles` and `calibration_curves`, because all six
+    group through this function. The two passes are two memory and CPU budgets;
+    `pareto` splits on them and says so in `pareto_series_style`, §4's tables
+    key on them, `loaders.operating_point_key` keys on them, and
+    `generate.py`'s duplicate and inversion detectors name them explicitly
+    beside the signature. Every consumer that had to tell two budgets apart
+    already did. The charts in the middle were the exception.
+
+    **Composed here rather than folded into `build_signature`, which is the
+    established pattern and not a convenience.** `loaders.operating_point_key`
+    is `(resource_pass, build_signature(record))` and its docstring records
+    why: for the MySQL-family engines nothing else in the signature separates
+    the two passes, so each consumer that needs the pass adds it at its own
+    call site. The signature is deliberately pass-blind and that is pinned, not
+    merely observed -- `tests/test_e14_per_pass_manifest.py`'s
+    `test_the_fixture_really_does_collide` asserts that two records differing
+    only in `resource_pass` produce ONE signature, so moving the pass into
+    `build_signature` fails that test by design.
+
+    Both branches of the signature are blind to the pass, so this is not a
+    column-fallback problem. The ann result trees are per pass, so one build
+    configuration measured in both produces the same RELATIVE path and
+    therefore the same file-branch signature -- which is why
+    `latency_percentiles`, the one chart here that plots ann records, pooled
+    the passes exactly as the five ops charts did. `generate.py`'s `by_config`
+    comment records the same mechanism from the detector's side.
+    """
     from .loaders import build_signature
     # The whole signature, not its last element: the filename branch ends in
     # the build stem, but the column fallback ends in one field, and taking
     # [-1] blindly collapsed every fallback record into a single series.
-    return (record.get("engine"), build_signature(record))
+    #
+    # The pass goes AFTER the signature rather than before it, so that within
+    # one engine the existing ordering of configurations is a prefix of the new
+    # one and the two passes of a configuration sort adjacently. Charts order
+    # their series by `str(key)`, so the legend a reader already knows keeps
+    # its shape and only gains a split.
+    return (record.get("engine"), build_signature(record),
+            record.get("resource_pass"))
 
 
 def _config_tokens(record: Dict[str, Any]) -> Optional[List[str]]:
@@ -167,6 +214,40 @@ def _config_tokens(record: Dict[str, Any]) -> Optional[List[str]]:
     if signature[0] != "file":
         return None
     return str(signature[-1]).split("_")
+
+
+def _key_suffixes(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
+    """How one engine's series name the axes that are in the key but not in
+    the base label, or the empty string where the run did not vary them.
+
+    `series_key` carries the resource pass, and neither branch of
+    `series_labels` can name it: the filename branch reads ann-benchmarks'
+    result stem, and the trees are per pass so the stem is identical in both;
+    the fallback branch reads `SERIES_AXES`, which lists build axes. So
+    splitting the series without this would have produced two lines with the
+    same legend text -- the measurements separated and still unattributable,
+    which is half the defect and the less obvious half.
+
+    Named only when the engine was measured in more than one pass. That is
+    `pareto_series_style`'s rule and it is kept for its reason: on a one-pass
+    report the label is byte-identical to what every chart drew before the key
+    grew, so a single-pass report does not change at all. `churn` and
+    `churn_impact` apply the same rule to the axes they append themselves.
+    """
+    passes = {r.get("resource_pass") for r in rows}
+    # Assigned per KEY and not accumulated per RECORD: a series holds one
+    # record per x, so `+=` over the records spelled the pass once per point
+    # -- "PostgreSQL (pgvector) / normalized / normalized / normalized" at
+    # three selectivities. Every field read here is part of the key, so two
+    # records that share a key compute the same suffix and the assignment is
+    # idempotent whichever of them is reached last.
+    suffixes: Dict[Tuple[Any, ...], str] = {}
+    for r in rows:
+        suffix = ""
+        if len(passes) > 1:
+            suffix += f" / {_pass_label(r.get('resource_pass'))}"
+        suffixes[series_key(r)] = suffix
+    return suffixes
 
 
 def series_labels(records: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
@@ -215,6 +296,15 @@ def series_labels(records: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
                     label += (f" / {AXIS_LABELS[axis]}{value}"
                               if AXIS_LABELS[axis] else f" / {value}")
             labels[series_key(r)] = label
+
+    # After both branches rather than inside either, because the axes
+    # `_key_suffixes` names are in the key and in neither branch's source of
+    # truth -- the filename tokens above, and `SERIES_AXES` below. Folding it
+    # into the branches would have meant writing it twice and re-indenting the
+    # one that returns early.
+    for rows in per_engine.values():
+        for key, suffix in _key_suffixes(rows).items():
+            labels[key] += suffix
     return labels
 
 
@@ -812,12 +902,12 @@ def _calibration_marks(records: List[Dict[str, Any]], dataset: str
 
     Keyed on the ENGINE and not on the plotted series key, because the mark is
     a statement about the engine's floor and ceiling rather than about one
-    line. `series_key` is (engine, build_signature) and `build_signature`
-    omits `resource_pass`, so one engine measured in both passes is one series
-    here while `operating_points` keys the pass separately -- an engine whose
-    floor sits above the target in the tuned pass and not the normalized one
-    therefore earns the mark, and the footnote names both so the reader is not
-    left to guess which half it applies to.
+    line. One engine owns several plotted series -- `series_key` separates the
+    build configuration and the resource pass, as `operating_points` keys the
+    pass separately -- so an engine whose floor sits above the target in the
+    tuned pass and not the normalized one earns the mark on all of its lines,
+    and the footnote names the pass and the M so the reader is not left to
+    guess which of them it applies to.
 
     `recalls` carries the recall actually achieved, which §2.3.3 requires
     beside the `target_unreached` mark. It is the calibration sweep's recall at
@@ -1281,7 +1371,14 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
     # Keyed `series_key(r) + (state,)` and sliced back with
     # `SERIES_KEY_WIDTH`, which is the idiom `churn_impact` below already uses
-    # to widen this key by the resource pass and the build mode.
+    # to widen this key by the build mode. The state stays a LOCAL extension
+    # and did not follow the resource pass into `series_key`: the pass is an
+    # axis of every ops chart, while this state exists on churn records and on
+    # no other phase. (Worded without naming the key itself, deliberately:
+    # `tests/test_t4b_readers.py` pins how many times that word occurs across
+    # `report/*.py` against a paragraph in `harness/workloads/churn.py`, so a
+    # comment here that spelled it would fail the suite on a prose count and
+    # the fix would be an edit to a file this change has no business in.)
     states = {maintenance_state(r) for r in plotted_records} - {None}
     by_series: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
     for r in plotted_records:
@@ -1760,6 +1857,19 @@ def churn_retention(records: List[Dict[str, Any]], dataset: str
             continue
         if maintenance_state(r) == "after":
             continue
+        # The tuple is a CARRIER, not a discriminator, and both appended
+        # fields are already inside `series_key`: `build_signature`'s column
+        # fallback holds `build_mode` and has since it was written, and the
+        # pass joined `series_key` when the ops charts stopped pooling the two
+        # budgets. They are appended anyway so `churn_impact` can read them
+        # back off the key at `SERIES_KEY_WIDTH` and `SERIES_KEY_WIDTH + 1` for
+        # its legend, which is the shape `tests/test_config.py` and
+        # `tests/test_t4b_readers.py` both look this function's result up by
+        # and which `harness/workloads/churn.py` cites as "a key shape T4b does
+        # not own". Appending a field the key already carries cannot change the
+        # partition -- both are functions of the record -- so the redundancy
+        # costs nothing and dropping it would break two consumers to tidy one
+        # tuple.
         key = series_key(r) + (r.get("resource_pass"), r.get("build_mode"))
         if (r.get("churn_fraction") or 0) == 0:
             baseline[key] = r["qps"]
@@ -1802,11 +1912,18 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     for v in storages.values():
         v.sort(key=lambda x: (x is None, x))
 
-    # Resource pass and build mode are named only when the figure actually
-    # holds more than one of them. On a single-pass run they turned every
-    # legend entry into "... (post) / tuned", which crowds out the storage
-    # engine -- the one distinction this chart exists to show.
-    passes = {key[SERIES_KEY_WIDTH] for key in retained}
+    # The build mode is named only when the figure actually holds more than one
+    # of them. On a single-mode run it turned every legend entry into
+    # "... (post)", which crowds out the storage engine -- the one distinction
+    # this chart exists to show.
+    #
+    # **The resource pass used to be named here too, on the same rule, and is
+    # not any more: `series_labels` names it now.** It had to be named locally
+    # while the pass was absent from `series_key`, because the shared label
+    # could not see it. Now that the pass is IN the key, `_key_suffixes` adds
+    # it to the shared label under the identical "only when more than one"
+    # rule, and keeping this block as well printed it twice -- "MariaDB 11.8
+    # (MHNSW) / tuned (post) / tuned".
     modes = {key[SERIES_KEY_WIDTH + 1] for key in retained}
 
     for key, points in sorted(retained.items(), key=lambda kv: str(kv[0])):
@@ -1817,8 +1934,6 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         label = labels.get(key[:SERIES_KEY_WIDTH], key[0])
         if key[SERIES_KEY_WIDTH + 1] and len(modes) > 1:
             label += f" ({key[SERIES_KEY_WIDTH + 1]})"
-        if key[SERIES_KEY_WIDTH] and len(passes) > 1:
-            label += f" / {key[SERIES_KEY_WIDTH]}"
         ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] for p in points],
                 color=style["color"], marker=style["marker"],
                 linestyle=style["linestyle"], linewidth=1.9, markersize=6,

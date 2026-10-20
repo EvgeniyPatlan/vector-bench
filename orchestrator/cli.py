@@ -690,20 +690,19 @@ def _ops_iterative_scan(engine: str, profile: Dict[str, Any],
     on `extra.iterative_scan`, so a `relaxed_order` record lands beside an
     `off` one and not on top of it.
 
-    **That is true of the two tables and NOT of the chart, and the gap is known
-    and unfixed.** `report/render.py`'s filtered and strategy tables carry the
+    **That is true of the two tables and, as of the pass split, half true of
+    the chart.** `report/render.py`'s filtered and strategy tables carry the
     mode in their group key and in a rendered column, so a reader can attribute
-    every number to the mode that produced it. The filtered CHART cannot:
-    `charts.series_key` is `(engine, loaders.build_signature(record))` and that
-    signature's column fallback omits `extra.iterative_scan`, so two modes
-    become one line doubling back on itself at every selectivity. The same key
-    omits `resource_pass`, which is the shared cause and the reason this is a
-    pre-existing fault rather than one this change introduces: on the archived
-    records every engine's filtered series already pools the normalized and
-    tuned points at each x. Fixing it is a grouping change that moves all seven
-    engines and every existing report, with the duplicate detector downstream
-    of it, so it is deliberately deferred -- but it must land before anyone
-    generates a report from a two-mode run.
+    every number to the mode that produced it. `charts.series_key` is now
+    `(engine, loaders.build_signature(record), resource_pass)`, which closes
+    the half of the chart defect that was pre-existing rather than introduced
+    here: on the archived records every engine's filtered series pooled the
+    normalized and tuned points at each x, and the pass in the key splits them.
+    The mode is the half that remains. `build_signature`'s column fallback
+    omits `extra.iterative_scan` and nothing else in the key carries it, so two
+    modes are still one line doubling back on itself at every selectivity --
+    and that half must land before anyone generates a report from a two-mode
+    run.
 
     A profile that declares nothing still passes nothing, so the engine keeps
     its own default and the record keeps saying so.
