@@ -1972,12 +1972,56 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
     churn_records = [r for r in churn_measurements(records)
                      if r.get("dataset") == dataset and r.get("qps")]
-    labels = series_labels(churn_records)
-    storages: Dict[str, List[Optional[str]]] = {}
-    for key in {series_key(r) for r in churn_records}:
-        storages.setdefault(key[0], []).append(None)
-    for v in storages.values():
-        v.sort(key=lambda x: (x is None, x))
+    # `_grouped`, not a second copy of its loop, and this is the repair of a
+    # defect rather than a tidy-up. The hand-rolled block that stood here was
+    #
+    #     storages = {}
+    #     for key in {series_key(r) for r in churn_records}:
+    #         storages.setdefault(key[0], []).append(None)
+    #
+    # -- one entry per series, and the entry a literal `None` instead of that
+    # series' own `storage_engine`. `series_style` looks the record's storage
+    # engine up in this list with `.index()`, so the list has to CONTAIN the
+    # values, and it did not. The crash was therefore guaranteed on any engine
+    # with more than one series and impossible on any engine with one, because
+    # the lookup sits behind `len(storages) > 1`: a one-series engine gets
+    # `[None]`, the guard stays shut and the literal is never read. That guard
+    # is why this shipped. Regenerated against `PS/new/full-20261015-215006`,
+    # the seven-engine `--resource-pass both` run of 2026-10-15, where each
+    # engine has six churn series (three graph degrees over two passes) and
+    # pgvector twelve:
+    #
+    #   [report] chart churnimpact-fashion-mnist-784-euclidean failed: 'InnoDB' is not in list
+    #   [report] chart churnimpact-glove-100-angular failed: 'InnoDB' is not in list
+    #   [report] chart churnimpact-sift-128-euclidean failed: 'InnoDB' is not in list
+    #
+    # -- every dataset that ran the churn workload. `generate.py` catches per
+    # chart so one bad figure cannot kill a twenty-hour run's report, so the
+    # stem never reached `chart_paths` and neither renderer emitted it or
+    # linked it: the loss was three silently absent figures, not a broken
+    # page. That bundle's own shipped report has 47 SVGs including `churn-*`
+    # and no `churnimpact-*` at all.
+    #
+    # The shared helper is reused rather than the pattern copied because a
+    # second hand-rolled copy of a de-duplicating loop is how this diverged in
+    # the first place: `_grouped` is forty lines up and `charts.churn`, the
+    # sibling chart on these same records, already calls it. The key shapes do
+    # differ -- `retained` is keyed `series_key(r) + (resource_pass,
+    # build_mode)` -- but that is the loop below's business and not the
+    # helper's. What `_grouped` returns is keyed by the engine (`key[0]`) and
+    # by `key[:SERIES_KEY_WIDTH]`, which is exactly how both dicts are read
+    # here already, so the wider key never reaches it.
+    #
+    # `_grouped` samples `storage_engine` and `m` off one record per series.
+    # Sound for these records and not by luck: the ops harness writes no
+    # `extra.source_file`, so `build_signature` takes its column branch, which
+    # names both fields -- all 203 churn records in that bundle took it and no
+    # series held two values of either.
+    #
+    # `groups` is discarded: the series partition comes from `churn_retention`,
+    # which is `_grouped`'s partition with the ratio's own exclusions applied
+    # (the pre-churn baseline, the repaired measurement, the reader pool).
+    _groups, labels, storages, degrees = _grouped(churn_records)
 
     # The build mode is named only when the figure actually holds more than one
     # of them. On a single-mode run it turned every legend entry into
@@ -1999,14 +2043,37 @@ def churn_impact(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     for key, points in sorted(retained.items(), key=lambda kv: str(kv[0])):
         sample = next(r for r in churn_records
                       if series_key(r) == key[:SERIES_KEY_WIDTH])
-        style = series_style(sample, storages.get(key[0]))
+        # `degrees` as well, which this chart never passed at all -- the same
+        # root cause one step further on, since the block above had no
+        # equivalent of `_grouped`'s second list to hand over. Colour is the
+        # engine and the linestyle is now really the storage engine, so on the
+        # 2026-10-15 run, which varies storage on no engine and sweeps three
+        # graph degrees on every one, repairing only the storage list would
+        # have published six MariaDB lines identical in colour, marker,
+        # linestyle and width, separable only by reading the legend. That is
+        # verbatim the defect `series_style`'s own comment records against two
+        # AliSQL curves, and the alpha and width it returns are the channels
+        # it exists to set.
+        style = series_style(sample, storages.get(key[0]), degrees.get(key[0]))
         points = sorted(points)
         label = labels.get(key[:SERIES_KEY_WIDTH], key[0])
         if key[SERIES_KEY_WIDTH + 1] and len(modes) > 1:
             label += f" ({key[SERIES_KEY_WIDTH + 1]})"
+        # `.get` with this chart's own 1.9 as the fallback, not `style["..."]`:
+        # `series_style` adds `alpha` and `linewidth` only when the engine
+        # actually swept more than one degree, which is the same "only when
+        # more than one" rule the legend above follows. So a single-degree run
+        # draws at the 1.9 and the full opacity it always did, and a report
+        # that swept one M does not move. (`charts.churn` reads the linestyle
+        # and hardcodes its own 1.8, so it computes `degrees` and discards the
+        # distinction. That is its bug to fix, on its own figure, with its own
+        # before and after; it is not fixed by a change whose diff is this
+        # function.)
         ax.plot([0] + [p[0] for p in points], [1.0] + [p[1] for p in points],
                 color=style["color"], marker=style["marker"],
-                linestyle=style["linestyle"], linewidth=1.9, markersize=6,
+                linestyle=style["linestyle"],
+                linewidth=style.get("linewidth", 1.9),
+                alpha=style.get("alpha"), markersize=6,
                 label=label)
 
     ax.axhline(1.0, color="#888888", linewidth=1.0, linestyle=":")
