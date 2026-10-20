@@ -124,15 +124,29 @@ SERIES_AXES = ("storage_engine", "ef_construction", "m")
 # for itself, as a storage engine does.
 AXIS_LABELS = {"storage_engine": "", "ef_construction": "ef_c=", "m": "M="}
 
-# (engine, configuration, resource pass, iterative scan mode). `churn` and
-# `churn_impact` widen this key and slice it back, so this constant is the only
-# place the width is written down: neither of them holds a literal index, and
-# `tests/test_config.py` asserts both halves of that -- that the constant
-# equals the key's real length, and that `churn_impact`'s block contains no
-# `key[3]`. Growing `series_key` therefore means growing this and nothing else:
-# the two widenings this key has had cost one edit here and none at the eight
-# call sites, which is why widening the shared primitive was preferable to
-# keying six charts locally.
+# (engine, configuration, resource pass, iterative scan mode).
+#
+# This constant is the only place the width is written down, which is what made
+# the two widenings this key has had cost one edit here and none at its seven
+# call sites -- and why widening the shared primitive beat keying six charts
+# locally. Three functions do arithmetic on it and none holds a literal index:
+# `churn` and `churn_retention` WIDEN it, the first by one axis of its own and
+# the second by the pass and the build mode for `churn_impact` to read back
+# off; `churn` and `churn_impact` SLICE it back at this offset. (`charts.churn`
+# names its own axis and says why this comment does not -- a prose count in
+# `tests/test_t4b_readers.py` pins how often that word may appear across
+# `report/*.py`, against a paragraph in a file this change may not touch.)
+#
+# `tests/test_config.py::test_the_key_width_matches_the_key` enforces that, and
+# the rule is worth reading before widening again, because the guard itself has
+# been wrong twice. It asserts this constant equals the key's real length; it
+# forbids any numeric subscript on `key` except `key[0]` (the engine, read
+# positionally on purpose) anywhere in the series-key family; and it requires
+# every width-dependent function to name this constant. Both the family and the
+# width-dependence are derived from the AST rather than listed -- the listed
+# version named two functions and missed the second widener, and the version
+# before that forbade the literals `key[:3]` and `key[3]`, which stopped being
+# the dangerous ones the moment the key reached width 3.
 SERIES_KEY_WIDTH = 4
 
 # Colour stays with the engine so versions remain comparable at a glance; the
@@ -276,17 +290,43 @@ def _key_suffixes(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
     same legend text -- the measurements separated and still unattributable,
     which is half the defect and the less obvious half.
 
-    **For the scan mode that half is the whole point.** PR #45 made pgvector's
-    filtered phase measure `off` and `relaxed_order`. Only one side of that
-    comparison is measured and this says which. MEASURED, on
-    `full-20261015-215006` at 10% selectivity on `tag`: pgvector's twelve `off`
-    points read 0.0963-0.1584 where the other six engines' forty read
-    0.9340-0.9997. EXPECTED, and labelled as such because **no archived record
-    reads `relaxed_order` at all**: iterative scan is the feature pgvector 0.8
-    shipped to fix exactly that collapse, so the second mode is expected to
-    land about a decade above the first. The chart has to attribute both
-    either way -- two unlabelled lines that far apart on a recall axis do not
-    read as two strategies, they read as a measurement nobody can use.
+    **For the scan mode that half is the whole point, and both sides of it are
+    now measured.** `percona-20261020-140151`, which finished at
+    2026-10-20T14:30:54Z, is the first run to put both modes on disk. It is one
+    engine, one pass, one M, and both modes at the same selectivity -- the
+    exact shape this key exists to separate -- and every one of the four points
+    used the vector index:
+
+        mode           column  selectivity  recall@k      QPS   p99 (ms)
+        off            tag          0.1000    0.0985   2316.5      0.565
+        relaxed_order  tag          0.1000    0.9995    692.9      2.569
+        off            ctag         0.1252    0.1770   2263.7      0.575
+        relaxed_order  ctag         0.1252    0.9990    151.1     27.989
+
+    So the mode is worth about a factor of ten in recall and costs a factor of
+    three to fifteen in throughput, and that trade is the whole content of
+    PR #45's axis. What the chart did with it, measured at the point
+    `charts.filtered` hands to `plot()`, before the mode joined the key:
+
+        column=tag    1 series, 'PostgreSQL (pgvector)'
+                      x = [0.1, 0.1]        y = [0.0985, 0.9995]
+        column=ctag   1 series, 'PostgreSQL (pgvector)'
+                      x = [0.1252, 0.1252]  y = [0.1770, 0.9990]
+
+    One series per column, both of its points at the same x, so the line is a
+    vertical segment spanning a factor of ten in recall under a legend entry
+    that names neither end. After, two series per column, one point each, each
+    legend naming its mode. This run is the only evidence on disk that the axis
+    does anything, and it was the one the chart could not show.
+
+    **An earlier revision of this paragraph said "no archived record reads
+    `relaxed_order` at all" and used that to label the second mode's recall as
+    an expectation.** The magnitude of the guess was right and the premise was
+    never sound: the evidence behind it was a count over
+    `full-20261015-215006` alone, written as a universal over every archived
+    record, and the run above landed nineteen minutes before the commit
+    carrying it. An unscoped universal over a corpus that grows is the wrong
+    form for a comment; a figure attached to a named, dated run is not.
 
     Each axis is named only when the engine actually varied it. That is
     `pareto_series_style`'s rule and it is kept for its reason: on a run that
@@ -552,8 +592,15 @@ def pareto(records_by_engine: Dict[Any, List[Dict[str, Any]]], dataset: str,
     recognisable across both of its lines, and the pass is added to the legend
     only when the run measured more than one -- which leaves a single-pass
     chart identical to what it drew before, legend included. The idiom is
-    `churn_impact`'s, which suffixes its label the same way for the same
-    reason.
+    `_key_suffixes`', which suffixes `series_labels`' text the same way for the
+    same reason -- and this chart keeps its own copy because its key is
+    `(engine, resource_pass)` and not a `series_key`, so it never reaches that
+    helper.
+
+    That sentence used to credit `churn_impact`, which did name the pass itself
+    until the pass joined `series_key` and the shared label took the job over.
+    It is the second of two pointers at the same deleted block, the other being
+    in `charts.churn`; both rotted in a change whose diff contained neither.
 
     A plain engine name is still accepted, so a caller that has no pass to
     offer -- `--from-records` over an archive that predates the field -- is

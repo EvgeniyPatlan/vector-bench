@@ -5419,26 +5419,113 @@ class TestTwoGraphDegreesAreTwoLines:
         guard written against one width stops guarding the moment the width
         moves, which is the same silent-widening shape the key itself is about.
 
-        So: no numeric subscript on `key` anywhere in either function that
-        widens the key, except `key[0]`, which is the engine and is read
+        So: no numeric subscript on `key` anywhere in any function that widens
+        or slices the key, except `key[0]`, which is the engine and is read
         positionally on purpose everywhere. And the constant must actually
         appear, or a block with no literals and no constant passes by saying
         nothing.
+
+        **THE SET OF FUNCTIONS IS DERIVED TOO, and a written-down pair missed
+        one.** This listed `("churn_impact", "churn")` and described them as
+        "either function that widens the key" -- but the functions that WIDEN
+        are `charts.churn` and `charts.churn_retention`, while `churn_impact`
+        only slices. So the second widener was uncovered by a hand-kept list
+        inside a guard whose entire subject is a hand-kept list going stale.
+        `_key_arithmetic_functions` finds them from the AST instead.
+
+        It returns TWO sets, because the two assertions have different scopes
+        and conflating them fails honestly on `_grouped`: that function reads
+        `key[0]` to bucket by engine and never touches the width, so the
+        literal rule applies to it and the constant rule must not.
+
+        Two accepted limits, recorded rather than fixed. The regex wants the
+        digit immediately after `[` or `[:`, so `key[ 4]` and `key[2 + 2]`
+        slip through -- contrived enough that catching them costs more
+        readability than it buys -- and `key[-1]` slips through too, which is
+        fine because a negative index is width-independent and stays correct
+        however the key grows. And the block comes from
+        `ast.get_source_segment`, so it includes comments: a future comment
+        that quotes `key[3]` as an example will fail this test. That is the
+        safe direction to err, and the fix is to spell the example in prose.
         """
         import re
 
         from report.charts import SERIES_KEY_WIDTH, series_key
         assert SERIES_KEY_WIDTH == len(series_key({"engine": "e"}))
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
-        for name in ("churn_impact", "churn"):
+        subscripts, width_dependent = self._key_arithmetic_functions(source)
+        # Non-vacuity: a derivation that selects nothing is a guard that
+        # stopped working and looks identical to a clean run. The two
+        # wideners and the slicer must all be in, and `_grouped` must be in
+        # the literal set without being in the width set -- which is the
+        # distinction a single set got wrong.
+        assert {"churn", "churn_retention", "churn_impact"} <= width_dependent
+        assert "_grouped" in subscripts
+        assert "_grouped" not in width_dependent
+        # And `pareto`'s accessors stay out: their key is
+        # `(engine, resource_pass)`, so `key[1]` there is correct and has
+        # nothing to do with this width.
+        assert not {"pareto_pass_of", "pareto_engine_of"} & subscripts
+        for name in sorted(subscripts):
             block = self._function_source(source, name)
-            assert "SERIES_KEY_WIDTH" in block, (
-                f"{name} slices the key but names no width constant")
             literals = re.findall(r"key\[:?(\d+)\s*[\]:]", block)
             assert set(literals) <= {"0"}, (
                 f"{name} indexes the key with literal(s) "
                 f"{sorted(set(literals))}; use SERIES_KEY_WIDTH so the "
                 f"width is written down once")
+        for name in sorted(width_dependent):
+            block = self._function_source(source, name)
+            assert "SERIES_KEY_WIDTH" in block, (
+                f"{name} does width-dependent key arithmetic but names no "
+                f"width constant")
+
+    @staticmethod
+    def _key_arithmetic_functions(source):
+        """Top-level functions in `charts.py` that touch a series key, by AST.
+
+        Returns `(subscripts, width_dependent)`.
+
+        `subscripts` is every function that subscripts a name called `key`.
+        The literal rule applies to all of them.
+
+        `width_dependent` is those that either add to a `series_key(...)`
+        result -- widening it, so a consumer has to know the offset -- or
+        subscript `key` by anything other than the literal 0. Only these must
+        name the constant. For a widener the mention may well be in prose
+        rather than code, and that is the point: the comment naming
+        `SERIES_KEY_WIDTH` IS the contract with whoever slices it back.
+        """
+        import ast
+
+        subscripts, width_dependent = set(), set()
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            # In scope only if the function handles THIS key. `pareto`'s key is
+            # `(engine, resource_pass)` and `pareto_pass_of` reads `key[1]` off
+            # it perfectly correctly, so selecting on the identifier `key`
+            # alone condemns a different key's accessor. Naming `series_key` or
+            # `SERIES_KEY_WIDTH` is what makes a function this key's business.
+            family = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            if not family & {"series_key", "SERIES_KEY_WIDTH"}:
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.BinOp)
+                        and isinstance(inner.op, ast.Add)
+                        and isinstance(inner.left, ast.Call)
+                        and isinstance(inner.left.func, ast.Name)
+                        and inner.left.func.id == "series_key"):
+                    width_dependent.add(node.name)
+                if (isinstance(inner, ast.Subscript)
+                        and isinstance(inner.value, ast.Name)
+                        and inner.value.id == "key"):
+                    subscripts.add(node.name)
+                    index = inner.slice
+                    benign = (isinstance(index, ast.Constant)
+                              and index.value == 0)
+                    if not benign:
+                        width_dependent.add(node.name)
+        return subscripts, width_dependent
 
     @staticmethod
     def _function_source(source, name):

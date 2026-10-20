@@ -14,14 +14,22 @@ the fashion-mnist filtered chart drew 24 series and every single one of them
 had x = [0.01, 0.01, 0.1, 0.1, 0.5, 0.5].
 
 PR #45 then made pgvector's filtered phase measure two `hnsw.iterative_scan`
-modes, which the same key also pooled -- and those differ by an order of
-magnitude in recall at the same selectivity, 0.0963 against about 0.97, so a
-pooled series plots as one line doubling back on itself at every x with
-nothing in the legend to attribute either reading.
+modes, which the same key also pooled. `PS/percona-20261020-140151` is the
+first run with both on disk, and at 10% selectivity on `tag` -- one engine,
+one pass, one M, both modes, all four points on the vector index -- `off`
+reads recall 0.0985 at 2,316 QPS against `relaxed_order`'s 0.9995 at 693. So a
+pooled series plots as one line doubling back on itself at every x, a factor
+of ten in recall apart, with nothing in the legend to attribute either
+reading.
 
-These tests do not read that bundle -- `results/` is gitignored and a test
-that needs a 126 MB archive is not a test. They rebuild its shape: two passes
-of one configuration, which is the smallest set that reproduces the pooling.
+(An earlier revision of this paragraph wrote "about 0.97" for the second mode.
+That was a guess of the right magnitude made before any run measured it, and
+it is not what the run says.)
+
+These tests do not read either bundle -- `results/` is gitignored and a test
+that needs a 126 MB archive is not a test. They rebuild those shapes: two
+passes of one configuration, and two modes of one configuration, which are the
+smallest sets that reproduce each pooling.
 """
 import os
 import sys
@@ -305,11 +313,19 @@ class TestASinglePassReportDoesNotMove:
             "PostgreSQL (pgvector)"}
 
     def test_records_with_no_scan_mode_group_exactly_as_before(self):
-        """`extra.iterative_scan` is absent on every pre-#45 ops record and on
-        every record of the other six engines, so it reads None. This is the
-        assertion that the key's growth is inert for all of them: the grouping
-        and the labels are identical to what the key produced before the field
-        was part of it, not merely similar.
+        """`extra.iterative_scan` is written by `harness/workloads/filtered.py`
+        and by nothing else, so it is absent -- and reads None -- on every
+        record of every other phase and on every engine but pgvector, which is
+        the only one with the setting. This is the assertion that the key's
+        growth is inert for all of them: the grouping and the labels are
+        identical to what the key produced before the field was part of it, not
+        merely similar.
+
+        It is NOT absent on pre-#45 records, which an earlier revision of this
+        docstring claimed: `cli._ops_iterative_scan` already pinned `off`
+        explicitly, so all 72 of pgvector's filtered records in
+        `full-20261015-215006` carry the field. #45 added a second value, not
+        the field. The engines below are the six that never carry it.
         """
         rows = []
         for engine in ("mariadb", "alisql", "valkey", "mongodb", "percona"):
@@ -392,8 +408,11 @@ class TestTheFilteredChartRendersTheSplit:
 
         Axes.plot = recording
         try:
-            charts_mod.filtered(records, "fashion-mnist-784-euclidean",
-                                tempfile.mkdtemp(), "ev", column=column)
+            # `TemporaryDirectory`, not `mkdtemp`: every call here writes an
+            # SVG and a PNG, and `mkdtemp` left both behind on every suite run.
+            with tempfile.TemporaryDirectory() as out:
+                charts_mod.filtered(records, "fashion-mnist-784-euclidean",
+                                    out, "ev", column=column)
         finally:
             Axes.plot = real
         return [c for c in calls if c[2] is not None]
@@ -546,9 +565,10 @@ class TestTheFileBranchIsSplitByThePassToo:
 
         Axes.plot = recording
         try:
-            charts_mod.latency_percentiles(
-                _two_passes_ann(), "fashion-mnist-784-euclidean",
-                tempfile.mkdtemp(), "ev")
+            with tempfile.TemporaryDirectory() as out:
+                charts_mod.latency_percentiles(
+                    _two_passes_ann(), "fashion-mnist-784-euclidean",
+                    out, "ev")
         finally:
             Axes.plot = real
 
@@ -565,7 +585,18 @@ class TestTheResourcePassIsNamedOnceAndOnlyOnce:
     Removing that block was necessary -- keeping it alongside the shared label
     printed the pass twice, measured over a two-pass churn fixture as
     "MariaDB 11.8 (MHNSW) / tuned / tuned" -- and nothing then stopped it
-    coming back. This is that guard.
+    coming back.
+
+    **ONE of the two tests below is that guard**, and the distinction is worth
+    stating because it is easy to count them as two.
+    `test_no_plotted_legend_entry_names_a_pass_twice` is the one that dies to
+    reinstating the block: it reads the labels `churn_impact` actually hands to
+    `plot()`. `test_the_shared_label_carries_the_pass_exactly_once` asserts a
+    different property -- that `series_labels` names the pass once, which is
+    why the local block became redundant -- and it survives the reinstatement,
+    because the shared label is still correct when something appends to it
+    afterwards. It earns its place by holding on a host with no matplotlib,
+    where the rendering half skips.
     """
 
     def _rows(self):
@@ -608,8 +639,9 @@ class TestTheResourcePassIsNamedOnceAndOnlyOnce:
 
         Axes.plot = recording
         try:
-            assert charts_mod.churn_impact(
-                self._rows(), "d", tempfile.mkdtemp(), "ci") is not None
+            with tempfile.TemporaryDirectory() as out:
+                assert charts_mod.churn_impact(
+                    self._rows(), "d", out, "ci") is not None
         finally:
             Axes.plot = real
 
