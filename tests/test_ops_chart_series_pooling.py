@@ -423,3 +423,199 @@ class TestTheFilteredChartRendersTheSplit:
             "PostgreSQL (pgvector) / iterative_scan=relaxed_order"]
         assert off == ([0.01, 0.10, 0.50], [0.0963, 0.0971, 0.0990])
         assert relaxed == ([0.01, 0.10, 0.50], [0.9690, 0.9712, 0.9745])
+
+
+# ---------------------------------------------------------------------------
+# The FILE branch of build_signature
+# ---------------------------------------------------------------------------
+
+def _ann_record(resource_pass, ef_search, *, engine="mariadb123", m=16,
+                stem=None, **kw):
+    """One recall/QPS record of the shape `loaders.load_annb_results` writes.
+
+    `extra.source_file` is a path RELATIVE to the ann results tree it was read
+    from, and those trees are per resource pass
+    (`results/annb/<pass>/<fingerprint>/`), so one build configuration
+    measured in both passes produces the IDENTICAL relative path. That is why
+    the file branch is every bit as pass-blind as the column fallback, and it
+    is the claim this fixture exists to make executable. Shape copied from a
+    real record of `full-20261015-215006`:
+
+        fashion-mnist-784-euclidean/10/mariadb123/euclidean_M_8_engine_InnoDB_200.hdf5
+    """
+    stem = stem or f"euclidean_M_{m}_engine_InnoDB"
+    record = {
+        "phase": "recall_qps", "engine": engine,
+        "dataset": "fashion-mnist-784-euclidean",
+        "resource_pass": resource_pass, "m": m, "storage_engine": "InnoDB",
+        "ef_search": ef_search, "recall_at_k": 0.97, "qps": 900.0,
+        "latency_p50_ms": 1.2 + ef_search / 1000.0,
+        "latency_p99_ms": 3.4 + ef_search / 500.0,
+        "extra": {"source_file": f"fashion-mnist-784-euclidean/10/{engine}/"
+                                 f"{stem}_{ef_search}.hdf5"},
+    }
+    record.update(kw)
+    return record
+
+
+def _two_passes_ann():
+    """One ann configuration, both passes, a four-point ef sweep each."""
+    return [_ann_record(rp, ef) for rp in ("normalized", "tuned")
+            for ef in (10, 120, 160, 200)]
+
+
+class TestTheFileBranchIsSplitByThePassToo:
+    """**The widest claim this change makes, and it rested on nothing.**
+
+    `series_key`'s docstring argues that BOTH branches of `build_signature`
+    are blind to the resource pass, and that this is therefore not a
+    column-fallback defect. Every other fixture in this file is an ops record
+    with no `extra.source_file`, so every one of them exercises the column
+    branch -- which meant a regression applying the pass on the `cols` branch
+    only would have shipped with the whole suite green, and
+    `latency_percentiles`, the one chart here that plots ann records, would
+    have silently resumed pooling the two passes.
+
+    Measured on `full-20261015-215006`: 590 ann records, 52 distinct
+    file-branch signatures, and **21 of those 52 span both resource passes.**
+    """
+
+    def test_the_fixture_really_does_take_the_file_branch(self):
+        """Non-vacuity, and the one assertion that keeps this class honest: if
+        the fixture ever loses its `source_file` it silently becomes a fourth
+        copy of the column-branch tests."""
+        signatures = {loaders_mod.build_signature(r)
+                      for r in _two_passes_ann()}
+        assert all(s[0] == "file" for s in signatures), signatures
+
+    def test_the_file_branch_collides_across_the_two_passes(self):
+        """The mechanism: per-pass trees, identical relative path. One
+        signature for both passes, which is what the charts then pooled."""
+        rows = _two_passes_ann()
+        assert len({loaders_mod.build_signature(r) for r in rows}) == 1
+        assert len({r["resource_pass"] for r in rows}) == 2
+        assert len({(r["extra"] or {})["source_file"] for r in rows
+                    if r["ef_search"] == 200}) == 1
+
+    def test_the_pass_separates_the_series_on_this_branch(self):
+        rows = _two_passes_ann()
+        assert len({charts_mod.series_key(r) for r in rows}) == 2
+
+    def test_the_label_names_the_pass_on_this_branch(self):
+        """`series_labels`' filename branch compares result stems within an
+        engine and finds nothing differing, so it returns the bare engine
+        label for both passes -- the pass can only come from
+        `_key_suffixes`."""
+        labels = sorted(charts_mod.series_labels(_two_passes_ann()).values())
+        assert labels == ["MariaDB 12.3 (MHNSW) / normalized",
+                          "MariaDB 12.3 (MHNSW) / tuned"]
+
+    def test_an_ann_record_carries_no_scan_mode_and_is_not_split_by_one(self):
+        """`extra.iterative_scan` is written by the ops harness only, so on
+        this branch it is absent on every record. The mode must therefore do
+        nothing here at all."""
+        rows = _two_passes_ann()
+        assert not any((r["extra"] or {}).get("iterative_scan") for r in rows)
+        assert len({charts_mod.series_key(r) for r in rows}) == 2
+        assert not any("iterative_scan" in label for label
+                       in charts_mod.series_labels(rows).values())
+
+    @needs_matplotlib
+    def test_latency_percentiles_draws_one_line_per_pass(self):
+        """At the level `latency_percentiles` hands to matplotlib.
+
+        Before: one series per configuration, so both passes' p50 points
+        landed in one sorted-by-ef list and the line ran 10, 10, 120, 120,
+        160, 160, 200, 200 -- doubling back at every search width. After: two
+        lines of four points, and because the engine is the panel this chart
+        strips the engine off the label, so the legend reads bare
+        "normalized" and "tuned".
+        """
+        import tempfile
+
+        from matplotlib.axes import Axes
+
+        calls = []
+        real = Axes.plot
+
+        def recording(self, *args, **kwargs):
+            if len(args) >= 2 and isinstance(args[0], list):
+                calls.append((list(args[0]), list(args[1]),
+                              kwargs.get("label")))
+            return real(self, *args, **kwargs)
+
+        Axes.plot = recording
+        try:
+            charts_mod.latency_percentiles(
+                _two_passes_ann(), "fashion-mnist-784-euclidean",
+                tempfile.mkdtemp(), "ev")
+        finally:
+            Axes.plot = real
+
+        labelled = [c for c in calls if c[2] is not None]
+        assert len(labelled) == 2, labelled
+        assert sorted(c[2] for c in labelled) == ["normalized", "tuned"]
+        for xs, _ys, _label in labelled:
+            assert xs == [10, 120, 160, 200], xs
+
+
+class TestTheResourcePassIsNamedOnceAndOnlyOnce:
+    """`churn_impact` named the pass itself while `series_key` lacked it.
+
+    Removing that block was necessary -- keeping it alongside the shared label
+    printed the pass twice, measured over a two-pass churn fixture as
+    "MariaDB 11.8 (MHNSW) / tuned / tuned" -- and nothing then stopped it
+    coming back. This is that guard.
+    """
+
+    def _rows(self):
+        rows = []
+        for resource_pass in ("normalized", "tuned"):
+            for frac, qps in ((0.0, 100.0), (0.10, 40.0), (0.25, 30.0)):
+                rows.append({
+                    "phase": "churn", "engine": "mariadb", "dataset": "d",
+                    "resource_pass": resource_pass, "m": 16,
+                    "build_mode": "post", "storage_engine": "InnoDB",
+                    "churn_fraction": frac, "qps": qps, "recall_at_k": 0.9,
+                    "extra": {},
+                })
+        return rows
+
+    def test_the_shared_label_carries_the_pass_exactly_once(self):
+        """Pure logic, so this half holds on a host with no matplotlib."""
+        rows = self._rows()
+        retained = charts_mod.churn_retention(rows, "d")
+        labels = charts_mod.series_labels(rows)
+        assert len(retained) == 2, retained
+        for key in retained:
+            label = labels[key[:charts_mod.SERIES_KEY_WIDTH]]
+            name = key[charts_mod.SERIES_KEY_WIDTH]
+            assert label.count(name) == 1, (label, name)
+
+    @needs_matplotlib
+    def test_no_plotted_legend_entry_names_a_pass_twice(self):
+        import tempfile
+
+        from matplotlib.axes import Axes
+
+        labels = []
+        real = Axes.plot
+
+        def recording(self, *args, **kwargs):
+            if kwargs.get("label"):
+                labels.append(kwargs["label"])
+            return real(self, *args, **kwargs)
+
+        Axes.plot = recording
+        try:
+            assert charts_mod.churn_impact(
+                self._rows(), "d", tempfile.mkdtemp(), "ci") is not None
+        finally:
+            Axes.plot = real
+
+        assert len(labels) == 2, labels
+        assert sorted(labels) == ["MariaDB 11.8 (MHNSW) / normalized",
+                                  "MariaDB 11.8 (MHNSW) / tuned"]
+        for label in labels:
+            for name in ("normalized", "tuned"):
+                assert label.count(name) <= 1, label

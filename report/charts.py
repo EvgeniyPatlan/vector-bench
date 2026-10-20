@@ -198,27 +198,39 @@ def series_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
     rather than stylistic.** It looks like a peer of `quantization`, which the
     fallback does list -- both are index or query properties with no column of
     their own, and the signature's own docstring is about what omitting
-    `quantization` cost. The two are not peers. `quantization` is None on every
-    record of every phase in every shipped profile (`report/crosscheck.py`'s
-    key comment says so, and calls itself a guard against the day either path
-    carries it), so it cannot separate two records that belong together.
-    `iterative_scan` is written by `harness/workloads/filtered.py` and by
-    nothing else, so within ONE ops unit the filtered records carry a mode
-    while that unit's calibration, concurrency and churn records carry None.
+    `quantization` cost.
 
-    `build_signature` is not only a series key: `loaders.operating_points`
-    joins a calibration sweep to the workloads that consumed it through
-    `operating_point_key`, and those are different phases of one unit. A field
-    present on one phase and absent on its siblings splits that join. Measured
-    on `full-20261015-215006`, where all 320 filtered records carry
-    `extra.calibration_status` and 72 of them carry
-    `extra.iterative_scan: off` while all 163 calibration records carry None:
-    adding the field to the fallback takes the operating-point table from 54
-    rows to 66. The 12 extra rows are pgvector's filtered records stranded on a
-    key their own calibration curve cannot reach, so each arrives with no
-    recall, no grid size and no point count -- twelve half-rows published in a
-    table whose job is to say what ef each unit settled on. None of the
-    original 54 is lost, so nothing in the suite would have caught it.
+    **The rule that separates them is WHICH records carry the field, not how
+    many.** An earlier draft of this comment said `quantization` was None on
+    every record of every phase and that is simply false: 6 records in
+    `full-20261015-215006` carry it, and they are mixed within one engine
+    across the two passes -- mongodb's `index_build`, `none` normalized and
+    `scalar` tuned. So "mixed within a unit" is not the discriminator either.
+
+    The discriminator is `loaders.operating_points`. `build_signature` is not
+    only a series key: that function joins a calibration sweep to the
+    workloads that consumed it through `operating_point_key`, and a record
+    enters the join iff its phase is `PHASE_CALIBRATION` (the curve half) or
+    it carries `extra.calibration_status` (the chosen half). **An axis is safe
+    in the signature iff it never appears on a record that joins**, because a
+    field present on one member of a unit and absent on its siblings splits
+    them apart. Counted on that bundle:
+
+        quantization     6 carriers,  0 join -- `index_build` only, which is
+                         neither phase and carries no status
+        iterative_scan  72 carriers, 72 join -- `filtered` only, which IS the
+                         join's own downstream half
+
+    That is the test to apply to a third axis, and it is the one this change
+    got right for the wrong reason first time.
+
+    What the wrong placement costs, measured: adding `iterative_scan` to the
+    fallback takes the operating-point table from 54 rows to 66. The 12 extra
+    rows are pgvector's filtered records stranded on a key their own
+    calibration curve cannot reach, so each arrives with no recall, no grid
+    size and no point count -- twelve half-rows published in a table whose job
+    is to say what ef each unit settled on. None of the original 54 is lost,
+    so nothing in the suite would have caught it.
 
     Composed here, the field reaches only the charts, where every function
     filters to one phase first and the cross-phase join never happens.
@@ -265,20 +277,36 @@ def _key_suffixes(rows: List[Dict[str, Any]]) -> Dict[Tuple[Any, ...], str]:
     which is half the defect and the less obvious half.
 
     **For the scan mode that half is the whole point.** PR #45 made pgvector's
-    filtered phase measure `off` and `relaxed_order`, and the two differ by an
-    order of magnitude in recall at the same selectivity: 0.0963 against about
-    0.97. Two unlabelled lines a decade apart on a recall axis do not read as
-    two strategies, they read as a measurement nobody can use.
+    filtered phase measure `off` and `relaxed_order`. Only one side of that
+    comparison is measured and this says which. MEASURED, on
+    `full-20261015-215006` at 10% selectivity on `tag`: pgvector's twelve `off`
+    points read 0.0963-0.1584 where the other six engines' forty read
+    0.9340-0.9997. EXPECTED, and labelled as such because **no archived record
+    reads `relaxed_order` at all**: iterative scan is the feature pgvector 0.8
+    shipped to fix exactly that collapse, so the second mode is expected to
+    land about a decade above the first. The chart has to attribute both
+    either way -- two unlabelled lines that far apart on a recall axis do not
+    read as two strategies, they read as a measurement nobody can use.
 
     Each axis is named only when the engine actually varied it. That is
     `pareto_series_style`'s rule and it is kept for its reason: on a run that
     varied neither, the label is byte-identical to what every chart drew
-    before the key grew, so such a report does not change at all. It also
-    settles the records that carry no mode -- every pre-#45 ops record and
-    every record of the other six engines, where `extra.iterative_scan` is
-    absent and reads None. One value is not more than one value, so those
-    engines' labels and series are untouched. `churn` and `churn_impact` apply
-    the same rule to the axes they append themselves.
+    before the key grew, so such a report does not change at all.
+
+    That is also what settles the archived run, for a narrower reason than an
+    earlier draft of this comment gave. **#45 added a second VALUE, not the
+    field.** `cli._ops_iterative_scan` already pinned `off` explicitly, so all
+    72 of pgvector's filtered records in `full-20261015-215006` read `off` and
+    not one reads None; the records that read None are the other six engines'
+    248 filtered records and every record of every other phase. "Absent on
+    every pre-#45 record" was wrong both ways round. What matters is only that
+    no engine on that run carries two values, and one value is not more than
+    one value, so every label and every series there is untouched by this
+    axis.
+
+    `charts.churn` appends its own extra axis and names it under this same
+    rule; `churn_impact` names the build mode off the key `churn_retention`
+    appends for it.
     """
     passes = {r.get("resource_pass") for r in rows}
     scans = {(r.get("extra") or {}).get("iterative_scan") for r in rows}
@@ -1471,9 +1499,17 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         rows = sorted(rows, key=lambda r: r["churn_fraction"])
         fractions = [r["churn_fraction"] for r in rows]
         # The state is named only when the figure actually holds more than one
-        # of them, the way `churn_impact` names the pass and the build mode:
-        # on a run of engines with no repair path every entry would otherwise
-        # read "... / before", which is a distinction the run never made.
+        # of them, the way `churn_impact` names the build mode: on a run of
+        # engines with no repair path every entry would otherwise read
+        # "... / before", which is a distinction the run never made.
+        #
+        # This sentence used to say "the pass and the build mode", and it was
+        # true until the pass joined `series_key` and `churn_impact`'s local
+        # pass suffix went with it -- `series_labels` has already put the pass
+        # into the text being sliced out here. A cross-reference to a sibling's
+        # block is only as current as that block: this one rotted in the same
+        # change that deleted what it pointed at, five hundred lines away and
+        # outside its diff.
         label = labels[key[:SERIES_KEY_WIDTH]]
         if len(states) > 1 and key[SERIES_KEY_WIDTH]:
             label += f" / {key[SERIES_KEY_WIDTH]} repair"

@@ -5407,26 +5407,96 @@ class TestTwoGraphDegreesAreTwoLines:
 
     def test_the_key_width_matches_the_key(self):
         """churn_impact builds a wider key and slices it back, and it did that
-        with a literal 3 -- so changing the key shifted every index under it."""
+        with a literal 3 -- so changing the key shifted every index under it.
+
+        **The forbidden literals are DERIVED from the constant, and the second
+        half of this test was vacuous until they were.** It pinned the strings
+        `key[:3]` and `key[3]`, which were the hazardous ones at width 2. The
+        key has since been widened twice, and at width 4 the dangerous
+        literals are `key[:4]`, `key[4]` and `key[5]` -- none of which the old
+        assertions mentioned, so planting every one of them while deleting
+        `SERIES_KEY_WIDTH` from the block entirely left the suite green. A
+        guard written against one width stops guarding the moment the width
+        moves, which is the same silent-widening shape the key itself is about.
+
+        So: no numeric subscript on `key` anywhere in either function that
+        widens the key, except `key[0]`, which is the engine and is read
+        positionally on purpose everywhere. And the constant must actually
+        appear, or a block with no literals and no constant passes by saying
+        nothing.
+        """
+        import re
+
         from report.charts import SERIES_KEY_WIDTH, series_key
         assert SERIES_KEY_WIDTH == len(series_key({"engine": "e"}))
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
-        block = source.split("def churn_impact")[1]
-        assert "key[:3]" not in block
-        assert "key[3]" not in block
+        for name in ("churn_impact", "churn"):
+            block = self._function_source(source, name)
+            assert "SERIES_KEY_WIDTH" in block, (
+                f"{name} slices the key but names no width constant")
+            literals = re.findall(r"key\[:?(\d+)\s*[\]:]", block)
+            assert set(literals) <= {"0"}, (
+                f"{name} indexes the key with literal(s) "
+                f"{sorted(set(literals))}; use SERIES_KEY_WIDTH so the "
+                f"width is written down once")
+
+    @staticmethod
+    def _function_source(source, name):
+        """One top-level function's source, by AST rather than by substring.
+
+        `source.split("def churn")` matches `churn_impact` and
+        `churn_retention` as well, so the substring form could silently check
+        the wrong function -- or, worse, a prefix of the right one.
+        """
+        import ast
+
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(source, node)
+        raise AssertionError(
+            f"no top-level function {name!r} in report/charts.py")
 
     @needs_matplotlib
     def test_churn_still_renders_with_the_wider_key(self):
+        """**Two resource passes, which is what makes this test its own name.**
+
+        It pinned `resource_pass: "tuned"` on both rows, so the fixture was one
+        engine with one series -- and a one-series fixture renders at every key
+        width there has ever been. It was green at widths 2, 3 and 4 and would
+        have stayed green through any further widening, while being the only
+        test in the suite that renders this chart at all.
+
+        One series also kept it clear of the defect next door:
+        `churn_impact` built its storage list as one literal `None` per SERIES,
+        so its length was the series count rather than the number of distinct
+        storage engines. Widening the key doubled that count, which flipped
+        `series_style`'s `len(storages) > 1` gate open onto `[None, None]` and
+        made `.index("InnoDB")` raise. A second pass here is the whole fixture
+        needed to reach it: this test goes red on the widening alone and green
+        once `churn_impact` builds both lists from the records through
+        `_grouped`. `config/profiles/dev.yml` pins one configuration per engine
+        and lists `churn`, so that was an ordinary run shape, not a corner.
+        """
         import tempfile
         import matplotlib
         matplotlib.use("Agg")
         from report.charts import churn_impact
         rows = []
-        for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
-            rows.append({"phase": "churn", "engine": "mariadb", "dataset": "d",
-                         "storage_engine": "InnoDB", "m": 16, "qps": qps,
-                         "churn_fraction": frac, "resource_pass": "tuned",
-                         "build_mode": "post"})
+        for resource_pass in ("normalized", "tuned"):
+            for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
+                rows.append({"phase": "churn", "engine": "mariadb",
+                             "dataset": "d", "storage_engine": "InnoDB",
+                             "m": 16, "qps": qps, "churn_fraction": frac,
+                             "resource_pass": resource_pass,
+                             "build_mode": "post"})
+        # Non-vacuity: the fixture really does reach the condition this test is
+        # named for. Two series under one engine is what opens the gate that
+        # used to crash, and one pass would silently give one.
+        from report.charts import SERIES_KEY_WIDTH, churn_retention
+        retained = churn_retention(rows, "d")
+        assert len(retained) == 2, retained
+        assert len({k[:SERIES_KEY_WIDTH] for k in retained}) == 2
         with tempfile.TemporaryDirectory() as out:
             assert churn_impact(rows, "d", out, "c") is not None
 
