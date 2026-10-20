@@ -214,7 +214,7 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~726 h of ingest before a single query runs, and ~1,042 h of run time
+--resource-pass both` is ~726 h of ingest before a single query runs, and ~1,066 h of run time
 in the worst case once querying is counted — all seven engines, which is what that command
 measures when `--engines` is omitted. **The ingest figure covers six of those seven**: nothing
 has measured Percona's ingest rate, so the estimator names it in `engines_without_ingest_rate`

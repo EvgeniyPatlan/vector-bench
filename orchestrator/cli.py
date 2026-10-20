@@ -572,59 +572,113 @@ def _ops_storage_engines(engine: str, profile: Dict[str, Any],
     )
 
 
-def _yaml_mode_name(value: Any) -> str:
-    """The name a YAML scalar was written as, for keywords YAML 1.1 steals.
-
-    `iterative_scan: [off, relaxed_order]` does not parse to the strings it
-    looks like: YAML 1.1 reads a bare `off` as boolean False, so the list comes
-    back as `[False, "relaxed_order"]`. `str(False)` is "False", which is not a
-    pgvector mode and would reach the server as
-    `SET hnsw.iterative_scan = False`.
-    """
-    if value is True:
-        return "on"
-    if value is False:
-        return "off"
-    return str(value)
-
-
 def _ops_iterative_scan(engine: str, profile: Dict[str, Any],
                         resources: Dict[str, Any],
                         resource_pass: str) -> Optional[str]:
-    """The pgvector iterative-scan mode the ops phase should pin, or None.
+    """Every declared pgvector iterative-scan mode that validates, or None.
 
     `ops.pgvector_iterative_scan` has been declared by `main`, `full` and the
     tuned extras for as long as it has existed, the whole plumbing chain to
     `SET hnsw.iterative_scan` is built, and the report renders a column for
-    it -- but nothing ever passed it. Across the archived results, 58 pgvector
-    ops files and 69 filtered records, every one reads `iterative_scan: null`.
-    So three config files declared two modes, the report printed a column, and
-    the dimension never ran.
+    it. This call site was the one place that narrowed the declaration: it
+    took `list(declared)[0]` and discarded the rest, so `full`'s
+    `[off, relaxed_order]` measured `off` and nothing else, and the request
+    for a second mode was dropped silently with every other link in the chain
+    reporting success.
 
-    Pinning the FIRST declared value rather than looping is deliberate on both
-    counts. Explicit, because pgvector's own default is `off`: pinning it
-    changes no measured number today while making the record say `off` instead
-    of null, and the repo's standard is that a vendor default left in place
-    judges the vendor on a value it plainly intended you to set. First rather
-    than all, because looping here would multiply ops *units* -- `_run_unit`
-    reloads the corpus per unit, so varying a filtered-query setting would
-    re-run build, concurrency and churn and double pgvector's ingest to do it.
-    The loop belongs inside `harness/workloads/filtered.py`, which sets the
-    mode per selectivity against one loaded index; that is T3c's, not this
-    call site's.
+    **What that published.** The seven-engine run of 2026-10-15 wrote 72
+    pgvector filtered records, every one of them `extra.iterative_scan: off`,
+    and 49 of the 72 came out below 0.6 recall -- 0.0120 and 0.0186 at the
+    1.5% `ctag` point, 0.0963 at 10% `tag`, 0.4985 at 50% `tag`, all between
+    1,242 and 2,248 QPS. Those recalls sit almost exactly ON the selectivity,
+    which is the signature of a post-filter that takes the graph walk's k
+    candidates, throws away the ones the predicate rejects and never goes back
+    for more: the engine answers fast and wrong, and fast is what the QPS
+    column shows.
+
+    **`vector_index_used` is what settles it.** All 49 of those points used the
+    vector index, and 19 of the 23 points at or above 0.6 recall did NOT --
+    they fell back to a sequential scan, exact and about a third of the speed
+    (668-696 QPS against ~1,920). So every filtered query pgvector answered
+    from its HNSW index collapsed, and the only good recalls in the set are the
+    ones where the planner gave up on the index. The bullet in CLAUDE.md about
+    a full table scan being "indistinguishable in output from very accurate but
+    slow" is the other half of this: the scan is what kept any number in that
+    table above 0.6.
+
+    Iterative scan is the feature pgvector 0.8 shipped to fix precisely that
+    collapse, which makes the dropped dimension the one that decides whether
+    pgvector's index is usable under a predicate at all. The profile asks for
+    it and it never ran -- so the report judged pgvector on the vendor's own
+    default while this repo overrides MariaDB's and AliSQL's 16 MiB graph cache
+    on the stated grounds that leaving a vendor default in place "judges a
+    vendor on a value it plainly intended you to change".
+
+    **Why passing the whole list does not multiply ops units.** That was the
+    previous version of this docstring's objection, and it was right about
+    `_run_unit`: its `unit_count` is `m_values x build_modes x
+    storage_engines`, every unit reloads the corpus, and making the mode a
+    fourth axis THERE would re-run build, concurrency and churn once per mode
+    and double pgvector's ingest to vary a query-time session setting. It is
+    not an objection to handing this value a list, because the list is not an
+    axis here. `harness/workloads/filtered.py:run` loops the modes itself,
+    mode-major, against one already-loaded index -- one `SET` per mode, not
+    one unit per mode -- so the mode count multiplies the filtered grid and
+    nothing else. The loop that docstring deferred to a later change has
+    landed; this call site was the half that never caught up.
+
+    That version was also right that pinning `off` explicitly was worth doing
+    on its own: pgvector's default IS `off`, so recording it changed no
+    measured number while making the record say `off` rather than null. Those
+    records keep exactly that meaning. This adds records at the other declared
+    modes beside them rather than reinterpreting them, which is why no
+    `OPS_MEASUREMENT_VERSION` bump is owed -- the report keys filtered records
+    on `extra.iterative_scan`, so a `relaxed_order` record lands beside an
+    `off` one and not on top of it.
+
+    **That is true of the two tables and NOT of the chart, and the gap is known
+    and unfixed.** `report/render.py`'s filtered and strategy tables carry the
+    mode in their group key and in a rendered column, so a reader can attribute
+    every number to the mode that produced it. The filtered CHART cannot:
+    `charts.series_key` is `(engine, loaders.build_signature(record))` and that
+    signature's column fallback omits `extra.iterative_scan`, so two modes
+    become one line doubling back on itself at every selectivity. The same key
+    omits `resource_pass`, which is the shared cause and the reason this is a
+    pre-existing fault rather than one this change introduces: on the archived
+    records every engine's filtered series already pools the normalized and
+    tuned points at each x. Fixing it is a grouping change that moves all seven
+    engines and every existing report, with the duplicate detector downstream
+    of it, so it is deliberately deferred -- but it must land before anyone
+    generates a report from a two-mode run.
 
     A profile that declares nothing still passes nothing, so the engine keeps
     its own default and the record keeps saying so.
 
-    One new way for a run to die, named so nobody is surprised by it: a `SET`
-    is now issued where none ever was, and nothing catches around it, so a mode
-    this server rejects costs the whole ops unit -- `harness/main.py` wraps
-    concurrency, filtered and churn in one `except`, so the two workloads
-    either side of filtered are lost with it. The unit is checkpointed, so
-    `--resume` retries exactly that one. The validation below is what keeps the
-    risk to "pgvector removed a mode its own config still declares" rather than
-    "someone made a typo". Making that call fail soft belongs to whoever owns
-    `harness/`.
+    **Validation degrades per mode, not per engine.** An unrecognised entry is
+    dropped with a warning and the modes either side of it still run. Before,
+    one bad entry returned None for the whole engine and took the good modes
+    with it -- which would have turned a typo in a profile into a silent
+    return to the vendor default, the same failure this change exists to
+    close. The whitelist is the engine config's own
+    `capabilities.iterative_scan_modes` rather than a literal here because
+    `PostgresDriver.set_iterative_scan` interpolates the value into a `SET`:
+    an unvalidated string reaches the server verbatim. Every mode dropped is
+    treated as none declared -- None, and the engine's own default.
+
+    One way for a run to die, named so nobody is surprised by it, and now
+    named per mode: nothing catches around the `SET`, so a mode this server
+    rejects costs the whole ops unit. `harness/main.py` wraps concurrency,
+    filtered and churn in one `except`, so the two workloads either side of
+    filtered are lost with it. **The exposure is per mode and sequential**:
+    the workload issues one `SET` before each mode's grid, so N modes are N
+    chances to lose the unit, and a mode that fails after the first takes the
+    earlier modes' records down too -- a retried unit starts its output file
+    empty by design (`_run_unit` deletes it), so a second-mode failure costs
+    the first mode's measurements as well. The unit is checkpointed, so
+    `--resume` retries exactly that one. Validation above is what keeps the
+    risk at "pgvector removed a mode its own config still declares" rather
+    than "someone made a typo". Making that call fail soft belongs to whoever
+    owns `harness/`.
     """
     if engine != "pgvector":
         return None
@@ -633,18 +687,27 @@ def _ops_iterative_scan(engine: str, profile: Dict[str, Any],
                 or (profile.get("ops", {}) or {}).get("pgvector_iterative_scan"))
     if not declared:
         return None
-    mode = _yaml_mode_name(list(declared)[0])
     # Validated against the engine's own declaration rather than a list here:
-    # the driver interpolates this into a SET statement, so an unrecognised
-    # value would reach the server verbatim.
-    valid = {_yaml_mode_name(m) for m in
+    # the driver interpolates each mode into a SET statement, so an
+    # unrecognised value would reach the server verbatim.
+    valid = {ops_pass._yaml_mode_name(m) for m in
              (load_engine(engine).get("capabilities", {}) or {})
              .get("iterative_scan_modes", [])}
-    if valid and mode not in valid:
-        print(f"[ops] ignoring unknown pgvector iterative_scan mode {mode!r}; "
-              f"known modes are {', '.join(sorted(valid))}", file=sys.stderr)
+    modes: List[str] = []
+    for mode in ops_pass._declared_scan_modes(declared):
+        # Per mode, so one unknown entry costs that entry and not the engine.
+        if valid and mode not in valid:
+            print(f"[ops] ignoring unknown pgvector iterative_scan mode "
+                  f"{mode!r}; known modes are {', '.join(sorted(valid))}",
+                  file=sys.stderr)
+            continue
+        modes.append(mode)
+    if not modes:
         return None
-    return mode
+    # Comma-joined rather than returned as a list: `ops_pass.harness_args`
+    # accepts either, and a string is what survives the command line into
+    # `harness/main.py --iterative-scan`, which is where the workload reads it.
+    return ",".join(modes)
 
 
 def _read_manifest_config(run_dir: str) -> Dict[str, Any]:

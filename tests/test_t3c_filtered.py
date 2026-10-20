@@ -1362,6 +1362,70 @@ class TestTheIterativeScanModesAreLooped:
             "off", "off", "relaxed_order", "relaxed_order"]
         assert driver.iterative_scan_calls == ["off", "relaxed_order"]
 
+    def test_a_second_mode_costs_no_second_brute_force(self, tmp_path,
+                                                       monkeypatch):
+        """The cost claim the mode factor in `estimate._filtered_search` rests
+        on: a second mode re-measures the grid and recomputes NOTHING.
+
+        It holds because `datasets.filtered_truth_cache_name` keys the exact
+        ground truth on (dataset, metric, k, column, threshold, rows, buckets,
+        clusters, seed) and the mode is correctly absent -- the mode changes
+        what the engine returns, not what the right answer is. That is a
+        property of a key in another module, so nothing here failed when it was
+        true and nothing would fail if it stopped being: adding `mode` to that
+        key would silently turn one brute force per point into one per point
+        per mode, on the workload whose ground truth is already named in
+        `docs/07-planning-a-run.md` as an unmodelled cost outside
+        `ops.filtered_budget_s`.
+
+        Each arm gets its own cache directory, so both start cold and the
+        comparison is between two whole runs rather than between a cold pass
+        and a warm one.
+
+        Honest: 1 mode writes 2 records and 2 modes write 4, off the SAME 2
+            brute forces -- the second mode's two points are cache hits.
+        Mutant (`mode` added to `filtered_truth_cache_name`'s key, or the
+            cache bypassed): 4 computations for 2 modes, so the second mode
+            costs a second exact search over the qualifying rows and the
+            estimate's "+1 grid, no ingest" is wrong by a brute force per
+            point.
+        """
+        def run_with(modes, name):
+            calls = []
+            real = ds.masked_ground_truth
+
+            def counting(*a, **kw):
+                calls.append(1)
+                return real(*a, **kw)
+
+            recorder = records.Recorder(str(tmp_path / f"ops-{name}.jsonl"))
+            try:
+                run_ctx = RunContext(
+                    run_id=f"t3c-{name}", resource_pass="normalized",
+                    recorder=recorder, engine="fake", engine_tag="none",
+                    march="x86-64-v3", k=K,
+                    cache_dir=str(tmp_path / f"cache-{name}"))
+                monkeypatch.setattr(ds, "masked_ground_truth", counting)
+                dataset = tiny_dataset()
+                driver = two_column_driver(dataset, run_ctx.cache_dir,
+                                           ef_half=0.0)
+                fw.run(run_ctx, driver, dataset, index_spec(dataset),
+                       ef_search=64, selectivities=(0.10, 0.50),
+                       columns=(FILTER_TAG,), max_queries=8, warmup=0,
+                       indexed_rows=N_ROWS, iterative_scan=modes)
+                monkeypatch.undo()
+            finally:
+                recorder.close()
+            return len(calls), len(written(run_ctx))
+
+        one_bf, one_rows = run_with("off", "one")
+        two_bf, two_rows = run_with("off,relaxed_order", "two")
+
+        # The records double...
+        assert (one_rows, two_rows) == (2, 4)
+        # ...and the brute forces do not move at all.
+        assert one_bf == two_bf == 2, (one_bf, two_bf)
+
     def test_a_comma_string_and_a_sequence_are_the_same_request(self, ctx):
         """`harness/main.py` hands over `args.iterative_scan` verbatim, so the
         workload has to accept the only shape a command line can carry. A
@@ -1491,8 +1555,12 @@ class TestTheProfileKeysReachTheHarness:
 
     def test_several_scan_modes_are_comma_joined_and_one_is_verbatim(self):
         """The carriage §3.4 item 4 needs. A single string must pass through
-        unchanged, because `cli.py` resolves exactly one mode today and
-        `tests/test_estimate.py` pins the emitted value to it.
+        unchanged, because `cli.py:_ops_iterative_scan` comma-joins the modes
+        it resolves and hands the result over as one string -- so this
+        function sees `"off,relaxed_order"` from a two-mode profile and
+        `"off"` from a one-mode profile, and must not re-split or re-join
+        either. The list branch is still exercised by hand-built callers and
+        by the tests below.
 
         Mutant (`",".join(iterative_scan)` without the str branch): "off"
             becomes "o,f,f".
@@ -1507,6 +1575,35 @@ class TestTheProfileKeysReachTheHarness:
             ["off", "relaxed_order"]) == "off,relaxed_order"
         assert ops_pass._iterative_scan_modes([]) is None
         assert argv is not None
+
+    def test_a_raw_yaml_sequence_is_named_not_strd(self):
+        """The YAML 1.1 trap on the path `cli.py` does not take.
+
+        `iterative_scan: [off, relaxed_order]` parses as
+        `[False, "relaxed_order"]`, and the sequence branch used plain `str`,
+        so `str(False)` made it `"False,relaxed_order"` and the workload
+        issued `SET hnsw.iterative_scan = False` -- a value pgvector does not
+        have, which the server rejects, which costs the whole ops unit because
+        `harness/main.py` wraps concurrency, filtered and churn in one
+        `except`. That is the exact defect `_yaml_mode_name` exists to
+        prevent, and it survived on this branch because the one production
+        caller names and comma-joins its modes first and so reaches the string
+        branch. Nothing guarded it.
+
+        Honest: a raw YAML sequence comes back `"off,relaxed_order"`, and a
+            bare `on` -- the other keyword YAML 1.1 steals -- comes back
+            `"on"` rather than `"True"`.
+        Mutant (`str(mode)` restored in the sequence branch):
+            `"False,relaxed_order"` and `"True"`.
+        """
+        from orchestrator import ops_pass
+        assert ops_pass._iterative_scan_modes(
+            [False, "relaxed_order"]) == "off,relaxed_order"
+        assert ops_pass._iterative_scan_modes([True]) == "on"
+        # The empty-entry filter survives the change: a blank is still dropped
+        # rather than emitted as an empty mode between two commas.
+        assert ops_pass._iterative_scan_modes(["off", "", "strict_order"]) == (
+            "off,strict_order")
 
     def test_run_unit_puts_the_flags_on_the_real_command_line(self, tmp_path):
         """The link F-10 names: not `harness_args` in isolation, and not the

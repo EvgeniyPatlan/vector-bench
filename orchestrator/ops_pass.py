@@ -734,6 +734,57 @@ def _filter_columns(ops: Dict[str, Any]) -> List[str]:
     return [str(column) for column in declared]
 
 
+def _yaml_mode_name(value: Any) -> str:
+    """The name a YAML scalar was written as, for keywords YAML 1.1 steals.
+
+    `iterative_scan: [off, relaxed_order]` does not parse to the strings it
+    looks like: YAML 1.1 reads a bare `off` as boolean False, so the list comes
+    back as `[False, "relaxed_order"]`. `str(False)` is "False", which is not a
+    pgvector mode and would reach the server as
+    `SET hnsw.iterative_scan = False`.
+
+    It lives here rather than in `cli.py`, where it was written, because two
+    modules now have to name the same modes the same way -- see
+    `_declared_scan_modes` directly below for which two and why a drift
+    between them would matter.
+    """
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def _declared_scan_modes(declared: Any) -> List[str]:
+    """The iterative-scan modes a profile or extras block declares, named.
+
+    Two jobs, and both have to happen identically wherever the count matters:
+    YAML 1.1 name recovery (`_yaml_mode_name` above) and an order-preserving
+    de-duplication, because `[off, off]` asks for one measurement and not two
+    -- the same rule `harness/workloads/filtered.py:_scan_modes` applies on
+    the far side of the command line, so agreeing with it here keeps the
+    orchestrator's count and the workload's loop the same length.
+
+    Shared rather than written twice because two readers have to agree:
+    `cli.py:_ops_iterative_scan` decides what a run measures and
+    `estimate.py:_filtered_search` charges for it. A drift between those two
+    is an estimate that is wrong about the run it describes, which is the one
+    thing that estimator exists to avoid -- and the precedent is in this file
+    already, where `DEFAULT_FILTERED_BUDGET_S` is pinned against the
+    workload's own default by a test for exactly this reason.
+
+    Validation is deliberately NOT here. It needs the engine's own
+    `capabilities.iterative_scan_modes`, and only one of the two callers can
+    sensibly load an engine config; see `cli.py:_ops_iterative_scan`.
+    """
+    modes: List[str] = []
+    for value in declared or []:
+        mode = _yaml_mode_name(value)
+        if mode and mode not in modes:
+            modes.append(mode)
+    return modes
+
+
 def _iterative_scan_modes(iterative_scan) -> Optional[str]:
     """The `--iterative-scan` value, from one mode or several.
 
@@ -741,13 +792,26 @@ def _iterative_scan_modes(iterative_scan) -> Optional[str]:
     call site emitting exactly what it asked for; a sequence is joined with
     commas and the workload splits it again. `str` is checked first on purpose
     -- a string IS a sequence, and joining one gives "o,f,f".
+
+    **The sequence branch names its modes through `_yaml_mode_name` rather than
+    `str`,** which it did not until now. `str(False)` is "False", so a sequence
+    straight out of YAML -- `[off, relaxed_order]` parses as
+    `[False, "relaxed_order"]` -- would have emitted `--iterative-scan
+    False,relaxed_order` and put `SET hnsw.iterative_scan = False` on the wire.
+    "Would have", and not "did": that is the exact defect `_yaml_mode_name` was
+    written for, but it never fired here, because the only production caller --
+    `cli.py:_ops_iterative_scan` -- names and comma-joins its modes first and so
+    reaches the string branch above. Nothing guarded it;
+    `tests/test_t3c_filtered.py` now does. The function is cheap to call
+    correctly and `_yaml_mode_name` lives in this module, so the branch no
+    longer depends on its callers having been careful.
     """
     if iterative_scan is None:
         return None
     if isinstance(iterative_scan, str):
         return iterative_scan or None
-    modes = [str(mode) for mode in iterative_scan if str(mode)]
-    return ",".join(modes) or None
+    modes = [_yaml_mode_name(mode) for mode in iterative_scan]
+    return ",".join(mode for mode in modes if mode) or None
 
 
 def harness_args(profile: Dict[str, Any], m: int, engine: str,
@@ -767,14 +831,14 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     config, so the default is reached by hand-built calls and by tests, both
     of which are about engines whose bulk build works.
 
-    `iterative_scan` takes one mode or several. One is emitted verbatim, which
-    is what the only call site in `cli.py` passes today -- it resolves the
-    FIRST declared mode and pins it. Several are comma-joined for the workload
-    to loop, which is the shape PR 3 §3.4 item 4 costs out; nothing in the
-    orchestrator produces that shape yet, and turning it on is one line in
-    `cli.py:_ops_iterative_scan` (return the whole declared list rather than
-    `list(declared)[0]`). It is wired from this end so that the day it is
-    turned on, the carriage is already tested.
+    `iterative_scan` takes one mode or several. One is emitted verbatim and
+    several are comma-joined for the workload to loop, which is the shape
+    PR 3 §3.4 item 4 costs out. Both branches are now live: the only call site
+    in `cli.py` passes every declared mode that validates, so `main` and
+    `full` both reach this with `off,relaxed_order` and a profile naming one
+    mode still reaches it with that mode alone. This end was wired a round
+    before its caller was, which is why turning the caller on needed no change
+    here.
     """
     ops = profile.get("ops", {}) or {}
     ann = profile.get("ann", {}) or {}

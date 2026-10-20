@@ -38,7 +38,8 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
 # already imports orchestrator.cli for KNOWN_ENGINES, so ann_pass and
 # docker_ctl are on that path either way.
 from . import ann_pass
-from .ops_pass import DEFAULT_FILTERED_BUDGET_S, _filter_columns
+from .ops_pass import (DEFAULT_FILTERED_BUDGET_S, _declared_scan_modes,
+                       _filter_columns)
 
 # Measured ingest rates, rows/s, on a Xeon Gold 6230.
 #
@@ -492,6 +493,30 @@ def _concurrency_windows(plan: _QueryPlan) -> Optional[_QueryTerm]:
     )
 
 
+def _charged_scan_modes(plan: _QueryPlan) -> List[str]:
+    """The iterative-scan modes the filtered grid is charged for, per ops unit.
+
+    Engine-gated, and the gate has to be here rather than left to the profile
+    key being absent: `ops.pgvector_iterative_scan` is declared once in a
+    profile and `_run_unit` runs it for pgvector only, so a profile-only
+    reading would charge the other SIX engines -- `mariadb`, `mariadb123`,
+    `alisql`, `mongodb`, `valkey` and `percona` -- for a grid they measure
+    once. Six and not five: `mariadb123` is a second MariaDB and is as much an
+    engine here as the first, which is the kind of omission a count in the
+    sentence catches and a list alone does not. That is the mirror of
+    `cli.py:_ops_iterative_scan`'s own first line, and the two must keep
+    agreeing: the whole value of this term is that it describes the run the
+    orchestrator will actually start.
+
+    The engine name is spelled out rather than read from a capability, because
+    this function cannot load an engine config -- see `_filtered_search` on the
+    two approximations this term makes and why both fall on the safe side.
+    """
+    if plan.engine != "pgvector":
+        return []
+    return _declared_scan_modes(plan.ops.get("pgvector_iterative_scan"))
+
+
 def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
     """Filtered search: a fixed number of queries per point, capped per point.
 
@@ -532,31 +557,53 @@ def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
     abandon the query already running.
 
     **Both figures below are per ops unit, matched to a per-unit
-    denominator.** `main` runs SIX filtered points per ops unit -- two columns
-    x three selectivities -- and 8 ops units with three engines (mariadb 1 +
-    alisql 1 + pgvector 2 build modes, over 2 datasets), so 48 points per
-    profile. Pairing the per-unit overrun against the per-profile ceiling is
-    the error that has cost this repo the most: docs once said 46 h where the
-    code said 51.1, and CLAUDE.md was out by 270 h.
+    denominator.** `main` runs SIX filtered points per ops unit on an engine
+    with one mode -- two columns x three selectivities -- and TWELVE on
+    pgvector, which declares two. With three engines that is 8 ops units
+    (mariadb 1 + alisql 1 + pgvector 2 build modes, over 2 datasets), so
+    4 x 6 + 4 x 12 = 72 points per profile. Pairing the per-unit overrun
+    against the per-profile ceiling is the error that has cost this repo the
+    most: docs once said 46 h where the code said 51.1, and CLAUDE.md was out
+    by 270 h.
 
     At the 1.1 s a query measured for `tag` at 1%, the overrun is 6 x 1.1 =
-    **6.6 s against the 0.50 h a unit's six points can spend** -- 0.37%. The
-    same ratio per profile is 48 x 1.1 = 52.8 s against the printed 4.0 h.
-    Either pairing is honest; mixing them understates it eightfold.
+    **6.6 s against the 0.50 h a one-mode unit's six points can spend** --
+    0.37%, and the same 0.37% on pgvector, where both halves of the ratio
+    double. The same ratio per profile is 72 x 1.1 = 79.2 s against the
+    printed 6.0 h. Either pairing is honest; mixing them understates it
+    twelvefold -- 72 points over 6, where before the mode factor it was
+    eightfold over 48.
 
-    **One iterative-scan mode is counted, and the factor is deliberately not
-    in the arithmetic.** `cli.py:_ops_iterative_scan` resolves the FIRST
-    declared `ops.pgvector_iterative_scan` value and pins it, so the grid runs
-    once per ops unit whatever the profile declares. T3c put the loop inside
-    the workload and the comma-joined carriage inside `ops_pass.harness_args`,
-    so the harness and the command line both handle N modes -- but the one
-    call site that chooses them still chooses one, and a `* modes` here would
-    charge for runs nobody can currently start. When that call site is changed
-    to pass the whole list, multiply `points` by `len(modes)` and name it in
-    `shape`. `ops_pass._iterative_scan_modes` is the function that would
-    produce the count; it is deliberately NOT imported until it is used,
-    because an import whose only reader is a docstring is the shape of the
-    defect this whole dimension is an example of.
+    **The iterative-scan modes ARE in the arithmetic now, and the factor is
+    pgvector's alone.** `cli.py:_ops_iterative_scan` used to resolve the FIRST
+    declared `ops.pgvector_iterative_scan` value and pin it, so the grid ran
+    once per ops unit whatever a profile declared and a `* modes` here would
+    have charged for runs nobody could start. It now passes every declared
+    mode that validates, the workload loops them against one loaded index, and
+    this term doubles for pgvector on both `main` and `full` -- which is why
+    the factor had to arrive in the same change as the call site. An estimate
+    short by a whole mode is not a conservative estimate: `worst_s` is the
+    number the "a run longer than its estimate is a bug" convention refers to,
+    so understating it converts a correct run into a reported bug and a false
+    ceiling into a published one.
+
+    **Two approximations, both in the safe direction, both of which could
+    silently become unsafe.** This function is given a profile and an engine
+    name, not resources and not an engine config, so:
+
+      * The tuned pass's `resources.extras.pgvector_iterative_scan` is not
+        read -- the same limitation `_ops_units` documents for
+        `mariadb_storage_engines`, and for the same reason. Today `main.yml`,
+        `full.yml` and `tuned.yml` all declare `[off, relaxed_order]`, so
+        nothing is lost; extras that declared MORE modes than the profile
+        would under-report here, which is the direction that matters.
+      * Modes are counted as declared, without the engine-capability
+        validation the call site applies, so a profile naming a mode pgvector
+        does not have is charged for a grid the run will skip. That
+        over-charges, and over-charging leaves a ceiling a ceiling.
+
+    `_declared_scan_modes` is shared with that call site rather than
+    re-derived here, so the two cannot disagree about what `[off, off]` means.
     """
     if "filtered" not in plan.workloads:
         return None
@@ -568,12 +615,20 @@ def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
     max_queries = int(plan.ops.get("max_queries", 1000))
     budget = float(plan.ops.get("filtered_budget_s",
                                 DEFAULT_FILTERED_BUDGET_S) or 0.0)
-    points = len(columns) * len(selectivities)
+    # `max(1, ...)` and not `len(...)`: an engine with no iterative-scan knob,
+    # and a pgvector profile that declares no mode, both measure the grid once
+    # at whatever the engine's own default is. Zero modes is one pass, which
+    # is the same convention `filtered._scan_modes` keeps by returning
+    # `[None]` -- and a `len()` here would charge nothing at all for six of
+    # the seven engines.
+    mode_passes = max(1, len(_charged_scan_modes(plan)))
+    points = len(columns) * len(selectivities) * mode_passes
     queries = points * max_queries
     shape = (f"{len(columns)} filter column(s) x {len(selectivities)} "
              f"{'selectivity' if len(selectivities) == 1 else 'selectivities'}"
-             f" x {max_queries:,} queries = {queries:,} queries per ops unit, "
-             f"one iterative-scan mode")
+             f" x {mode_passes} iterative-scan "
+             f"{'mode' if mode_passes == 1 else 'modes'}"
+             f" x {max_queries:,} queries = {queries:,} queries per ops unit")
 
     # The cap, when there is one. `typical` still needs a rate: a budget says
     # what the work cannot exceed, not what it will take, and collapsing the
