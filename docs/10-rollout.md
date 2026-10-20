@@ -429,7 +429,7 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:2855` and `docs/05-methodology.md:953` both say
+matched rows. `report/render.py:2855` and `docs/05-methodology.md:971` both say
 so.
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
@@ -487,7 +487,7 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 Satisfied for the version: `orchestrator/manifest.py:222` writes
 `config.ops_measurement_version` from the constant, `report/render.py:355-356`
-prints it above the numbers, and `docs/05-methodology.md:1021-1022`
+prints it above the numbers, and `docs/05-methodology.md:1039-1040`
 documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
@@ -524,16 +524,16 @@ have to read the printed estimate against.**
 `orchestrator/estimate.py` ended `_effective_rate` with
 `_INGEST_ROWS_PER_S.get(engine, 300)`, so an engine with no entry in that table
 was modelled at 300 rows/s. The table's own measured MySQL-family rates are
-mariadb 150, mariadb123 110 and alisql 55 (`orchestrator/estimate.py:50`), so
+mariadb 150, mariadb123 110 and alisql 55 (`orchestrator/estimate.py:51`), so
 the fallback was **5.45× optimistic against the slowest engine already
 measured** — for an engine that builds its HNSW graph inside every INSERT,
 which is the slowest shape in the study.
 
 That contradicted the rule the comment above the table sets for itself. It is
 headed "Measured ingest rates, rows/s, on a Xeon Gold 6230"
-(`orchestrator/estimate.py:43`) and explains that the first guesses were
+(`orchestrator/estimate.py:44`) and explains that the first guesses were
 replaced because an estimate optimistic *by 3x* is worse than none
-(`orchestrator/estimate.py:43-51`). The fallback was a guess, was not measured,
+(`orchestrator/estimate.py:44-52`). The fallback was a guess, was not measured,
 and was optimistic by more than the margin that argument rejects. Measured on
 `main` before the fix: 273.45 rows/s for an unmeasured engine on glove-100
 against MariaDB's measured 147, putting **9.10 h** of invented ingest into a
@@ -541,7 +541,7 @@ published total (102.16 h against the honest 93.06 h) with nothing printed to
 say so.
 
 **What it does now.** `_effective_rate` returns `None` where nothing has been
-measured — `orchestrator/estimate.py:161` is `_INGEST_ROWS_PER_S.get(engine)`
+measured — `orchestrator/estimate.py:162` is `_INGEST_ROWS_PER_S.get(engine)`
 with no default — and `estimate_load_hours` reports
 `engines_without_ingest_rate` on the same terms the query half has always used
 for `engines_without_query_rate`: the engine is **named, contributes nothing to

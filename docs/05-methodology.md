@@ -627,10 +627,28 @@ the report once asserted for weeks that Valkey chose its strategy per query on
 the strength of its documentation while its own numbers said otherwise.
 
 pgvector's `hnsw.iterative_scan` is set explicitly rather than left at its
-default and is recorded on every filtered record. The workload can measure the
-grid once per declared mode against one loaded index; `ops.pgvector_iterative_scan`
-declares the modes and the orchestrator currently pins the first of them, so a
-run measures one mode and the record names which.
+default and is recorded on every filtered record. `ops.pgvector_iterative_scan`
+declares the modes, the orchestrator passes every one of them that the engine
+config recognises, and the workload measures the grid once per mode against one
+loaded index — so a run measures each declared mode and every record names
+which one produced it. `main` and `full` declare `off` and `relaxed_order`;
+`strict_order` is recognised but not declared by any profile.
+
+**The archive predates that, and it is not uniform — do not join it as though it
+were.** Of the 153 archived pgvector filtered records, 77 read
+`iterative_scan: null` and 76 read `off`. The `null` ones are every run from
+before the mode reached the harness at all, plus the normalized half of the
+2026-10-14 `smoke` run, whose profile declares no mode; the `off` ones are the
+72 of the 2026-10-15 `full` run plus 4 from that same smoke run's *tuned* pass,
+which picked the mode up from `config/resources/tuned.yml`'s extras. Until
+2026-10-20 only the first declared mode was ever passed, so no archived record
+reads `relaxed_order` at all. `null` and `off` are **different groups** to §5's
+tables, and should stay so: a `null` record was measured at whatever the
+server's default happened to be, which is not a value the run chose or recorded.
+
+The 2026-10-15 run put 49 of its 72 `off` points under 0.6 recall, each with
+recall close to the predicate's own selectivity, which is what a post-filter
+that does not go back for more candidates looks like.
 
 ### 2.5 Churn (ops harness)
 

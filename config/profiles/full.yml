@@ -59,6 +59,16 @@ ops:
   concurrency_repeats: 3
   selectivities: [0.01, 0.10, 0.50]
   churn_fractions: [0.10, 0.25]
-  # pgvector 0.8 only. Filtered search behaves very differently per mode, so all
-  # three are measured rather than leaving the default unstated.
+  # pgvector 0.8 only. Filtered search behaves very differently per mode, so
+  # the mode is stated rather than left at the vendor default -- and both of
+  # these are now measured, where `cli.py:_ops_iterative_scan` used to pin the
+  # first and drop the rest. That is what made the 2026-10-15 run publish 49
+  # of pgvector's 72 filtered points below 0.6 recall, all of them at `off`,
+  # with recall sitting on the selectivity itself.
+  #
+  # TWO of the three modes `config/engines/pgvector.yml` declares. This
+  # comment read "all three" while the list held two for as long as the list
+  # existed, and nothing caught it because neither entry ran: `strict_order`
+  # has never been measured here. Adding it costs this grid a third time for
+  # pgvector alone, which is a scope decision and not a comment fix.
   pgvector_iterative_scan: [off, relaxed_order]

@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from orchestrator import cli as cli_mod  # noqa: E402
 from orchestrator import estimate as est_mod  # noqa: E402
+from orchestrator import ops_pass as ops_pass_mod  # noqa: E402
 from orchestrator.cli import KNOWN_ENGINES  # noqa: E402
 from orchestrator.config import load_profile  # noqa: E402
 from orchestrator.estimate import (print_load_estimate,  # noqa: E402
@@ -244,13 +245,17 @@ class TestTotalHoursStillMeansIngest:
         reader baseline: 30 s per churn fraction, and pgvector pays it twice
         per (dataset, pass) because its two build modes are two ops units.
         The ingest figure grew in T5b, when PR 5 §5.2 added M=16 to
-        `main`'s ann grid. `long_run` did not move any of the three times,
-        which is the property being pinned: pgvector bulk-builds, so a third
-        reload costs it a quarter of an hour and the M-reload warning would
-        still be the wrong thing to print."""
+        `main`'s ann grid. It grew a fourth time when the iterative-scan modes
+        started reaching the run: `main` declares two, the filtered grid runs
+        once per mode, and 4 pgvector ops units x 6 points x 300 s is 2.0 h
+        more -- the only engine that moved, which is the point of charging it
+        per engine. `long_run` did not move any of the four times, which is
+        the property being pinned: pgvector bulk-builds, so a third reload
+        costs it a quarter of an hour and the M-reload warning would still be
+        the wrong thing to print."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.91
-        assert e["worst_case_total_hours"] == 7.48
+        assert e["worst_case_total_hours"] == 9.48
         assert e["long_run"] is False
 
 
@@ -401,26 +406,29 @@ class TestTheChurnFractionsAreCumulative:
         assert t["worst_hours"] == 0.50
 
 
-class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
-    """Filtered search runs `columns x selectivities x max_queries` queries per
-    ops unit, over the one iterative-scan mode the run pins. The shape is
-    exact and so, since T3c, is the ceiling: `ops.filtered_budget_s` caps
-    every point and the workload stops when it is spent. The *typical*
-    duration is still unknown, because no QPS has been measured, and the term
-    carries both facts so the output does not charge for the cost and disclaim
-    it at the same time.
+class TestTheFilteredTermChargesEveryModeItWillMeasure:
+    """Filtered search runs `columns x selectivities x modes x max_queries`
+    queries per ops unit. The shape is exact and so, since T3c, is the
+    ceiling: `ops.filtered_budget_s` caps every point and the workload stops
+    when it is spent. The *typical* duration is still unknown, because no QPS
+    has been measured, and the term carries both facts so the output does not
+    charge for the cost and disclaim it at the same time.
 
     Two columns, not one: `harness/workloads/filtered.py` measures `tag` and
     `ctag` by default because `build` loads both, so the point count doubled
     in T3c and this term has to double with it.
 
-    One mode: `cli.py:_ops_iterative_scan` pins the first declared
-    `ops.pgvector_iterative_scan` value, so a `* modes` factor could only ever
-    be `* 1` and is deliberately absent from the arithmetic. See
-    `_filtered_search`.
+    The mode factor arrived with the call site that produces it.
+    `cli.py:_ops_iterative_scan` used to pin the first declared
+    `ops.pgvector_iterative_scan` value, so `* modes` could only ever have
+    been `* 1`; it now passes every mode that validates, so the factor is real
+    and pgvector's filtered term doubles. It is charged PER ENGINE -- the
+    tests in this class run on `mariadb`, which has no such knob and pays one
+    pass whatever a profile declares. See `_charged_scan_modes`.
 
-    `main`: 2 columns x 3 selectivities x 500 queries = 3,000 queries per ops
-    unit, capped at 300 s a point.
+    `main`: 2 columns x 3 selectivities x 1 mode x 500 queries = 3,000 queries
+    per ops unit on six of the seven engines, 6,000 on pgvector, capped at
+    300 s a point either way.
     """
 
     PROFILE = {"name": "t", "ops": {"enabled": True, "workloads": ["filtered"],
@@ -434,14 +442,57 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
 
     def test_the_shape_is_stated_even_though_the_duration_is_not(self):
         t = self._term()
-        assert ("2 filter column(s) x 2 selectivities x 500 queries "
-                "= 2,000 queries") in t["basis"]
-        assert "one iterative-scan mode" in t["basis"]
+        assert ("2 filter column(s) x 2 selectivities x 1 iterative-scan mode "
+                "x 500 queries = 2,000 queries") in t["basis"]
         # Anchored: "2,000 queries per ops unit" is a substring of
         # "12,000 queries per ops unit".
         assert "= 2,000 queries per ops unit" in t["basis"]
         # The typical figure is still the thing no cap can supply.
         assert "at a rate nothing here has measured" in t["basis"]
+
+    def test_the_mode_factor_is_in_the_product_and_is_pgvectors_alone(self):
+        """The arithmetic the call-site change made owing, and the two mutants
+        either side of it.
+
+        `PROFILE` declares two modes here. On pgvector that is 2 x 2 x 2 = 8
+        points at 300 s = 0.67 h per ops unit; on mariadb it is 4 points and
+        0.33 h, because `_charged_scan_modes` gates on the engine.
+
+        Honest: 0.67 h for pgvector, 0.33 h for mariadb, from one profile.
+        Mutant (`mode_passes` dropped from `points`): pgvector reads 0.33 h,
+            so a run that will take an hour per unit is planned as half of
+            one and `worst_case_total_hours` stops being a ceiling.
+        Mutant (`_charged_scan_modes` returning the declared list for every
+            engine): mariadb reads 0.67 h, and the estimate charges six
+            engines for a dimension only pgvector has.
+        """
+        ops = dict(self.PROFILE["ops"])
+        ops["pgvector_iterative_scan"] = [False, "relaxed_order"]
+        profile = {"name": "t", "ops": ops}
+        pg = self._term(profile, engine="pgvector")
+        md = self._term(profile, engine="mariadb")
+        assert pg["worst_hours"] == 0.67
+        assert md["worst_hours"] == 0.33
+        assert ("2 filter column(s) x 2 selectivities x 2 iterative-scan "
+                "modes x 500 queries = 4,000 queries") in pg["basis"]
+        assert ("2 filter column(s) x 2 selectivities x 1 iterative-scan "
+                "mode x 500 queries = 2,000 queries") in md["basis"]
+
+    def test_a_mode_declared_twice_is_charged_once(self):
+        """`[off, off]` asks for one measurement, which is the rule
+        `filtered._scan_modes` applies to the same list on the far side of the
+        command line. Charged through the shared `_declared_scan_modes`, so
+        the estimate and the run cannot disagree about it.
+
+        Honest: 0.33 h, the same as one mode.
+        Mutant (`len(declared)` in place of `_declared_scan_modes`): 0.67 h,
+            and the estimate charges for a grid the workload de-duplicates
+            away.
+        """
+        ops = dict(self.PROFILE["ops"])
+        ops["pgvector_iterative_scan"] = [False, False, "off"]
+        t = self._term({"name": "t", "ops": ops}, engine="pgvector")
+        assert t["worst_hours"] == 0.33
 
     def test_an_unmeasurable_typical_is_flagged_not_scored_zero(self):
         """The typical figure, which a cap cannot supply.
@@ -605,8 +656,8 @@ class TestTheFilteredTermChargesOneModeAndSaysWhatItCannotKnow:
         # 2 columns x 1 selectivity x 500 = 1,000 queries at 0.9 QPS =
         # 1,111.1 s, capped at 2 points x 300 s = 600 s = 0.17 h.
         assert t["typical_hours"] == 0.17
-        assert ("2 filter column(s) x 1 selectivity x 500 queries "
-                "= 1,000 queries") in t["basis"]
+        assert ("2 filter column(s) x 1 selectivity x 1 iterative-scan mode "
+                "x 500 queries = 1,000 queries") in t["basis"]
 
     def test_the_default_matches_the_one_the_runner_uses(self):
         """Pinned against ops_pass rather than restated, because the defect was
@@ -635,6 +686,15 @@ class TestTheIterativeScanModeNowReachesTheRun:
     Passing the value through naively would have emitted nothing at all
     (`if iterative_scan:` is false for False) or `SET hnsw.iterative_scan =
     False`, which is not a mode pgvector has.
+
+    **And a third behind that**, which is what the later tests here are for:
+    once a mode did reach the run, only the FIRST declared one did.
+    `list(declared)[0]` discarded the rest, so `full`'s `[off, relaxed_order]`
+    measured `off` -- and the 2026-10-15 seven-engine run published 72
+    pgvector filtered records, all at `off`, 49 of them under 0.6 recall, each
+    one's recall sitting on the predicate's own selectivity. pgvector ships
+    iterative scan to fix exactly that collapse; the profile asked for it and
+    the request was dropped at the one call site that chooses.
     """
 
     def _resources(self, name):
@@ -646,18 +706,97 @@ class TestTheIterativeScanModeNowReachesTheRun:
         weight rather than load-bearing, and a reader should be told."""
         assert load_profile("main")["ops"]["pgvector_iterative_scan"][0] is False
 
-    def test_the_first_declared_mode_is_resolved_to_its_yaml_name(self):
+    def test_every_declared_mode_is_resolved_to_its_yaml_name(self):
+        """Honest: `main` declares `[off, relaxed_order]` and both come back,
+        in order, under the names they were written as.
+
+        Mutant (`list(declared)[0]`, which is what shipped): "off", so the
+            second mode never reaches a `SET` and the run measures the vendor
+            default while the profile says otherwise. This is the defect.
+        Mutant (`str()` in place of the YAML-name recovery): "False", which is
+            not a pgvector mode and would reach the server verbatim.
+        """
         mode = cli_mod._ops_iterative_scan(
             "pgvector", load_profile("main"),
             self._resources("normalized"), "normalized")
-        assert mode == "off"
+        assert mode == "off,relaxed_order"
+
+    def test_a_mode_the_engine_does_not_declare_is_dropped_on_its_own(self):
+        """Per-mode degradation, which the all-or-nothing form did not do.
+
+        Honest: the two good modes still run and the bad one is dropped with
+            the warning.
+        Mutant (`return None` on the first unknown mode, which is what
+            shipped): None for the whole engine, so one typo in a profile
+            silently returns pgvector to its vendor default -- the same
+            published-wrong-number outcome this change exists to close, from
+            the opposite direction.
+        """
+        profile = {"ops": {"pgvector_iterative_scan":
+                           [False, "sideways", "relaxed_order"]}}
+        assert cli_mod._ops_iterative_scan(
+            "pgvector", profile, {}, "normalized") == "off,relaxed_order"
+
+    def test_an_unvalidated_mode_never_reaches_the_joined_value(self):
+        """The guard that matters most, because
+        `PostgresDriver.set_iterative_scan` interpolates each mode into a
+        `SET` and an unrecognised string would reach the server verbatim.
+
+        Honest: "sideways" is absent from the result in both shapes -- alone
+            it yields None, beside a good mode it yields the good mode only.
+        Mutant (the `valid` check deleted): "off,sideways", so
+            `SET hnsw.iterative_scan = sideways` is issued and takes the whole
+            ops unit down with concurrency and churn.
+        """
+        one = {"ops": {"pgvector_iterative_scan": ["sideways"]}}
+        both = {"ops": {"pgvector_iterative_scan": [False, "sideways"]}}
+        assert cli_mod._ops_iterative_scan(
+            "pgvector", one, {}, "normalized") is None
+        joined = cli_mod._ops_iterative_scan(
+            "pgvector", both, {}, "normalized")
+        assert joined == "off"
+        assert "sideways" not in joined
+
+    def test_the_whitelist_is_the_engine_configs_own_declaration(self):
+        """Not a literal in `cli.py`. The pin is that every mode
+        `config/engines/pgvector.yml` declares resolves, so the day pgvector
+        adds or removes one, editing that file is the whole change.
+
+        Mutant (a hard-coded `{"off", "relaxed_order"}`): `strict_order`,
+            which the engine config declares and no profile uses, is refused
+            -- and the refusal would look like a profile typo.
+        """
+        from orchestrator.config import load_engine
+        declared = (load_engine("pgvector").get("capabilities") or {}
+                    ).get("iterative_scan_modes")
+        assert declared, "pgvector.yml no longer declares its modes"
+        profile = {"ops": {"pgvector_iterative_scan": list(declared)}}
+        resolved = cli_mod._ops_iterative_scan(
+            "pgvector", profile, {}, "normalized")
+        assert resolved == ",".join(
+            ops_pass_mod._yaml_mode_name(m) for m in declared)
+
+    def test_a_mode_declared_twice_is_passed_once(self):
+        """`[off, off]` asks for one measurement, which is also what
+        `filtered._scan_modes` would do with it on the far side of the command
+        line. De-duplicated here as well so the orchestrator's count and the
+        estimate's agree -- both read `ops_pass._declared_scan_modes`."""
+        profile = {"ops": {"pgvector_iterative_scan": [False, False, "off"]}}
+        assert cli_mod._ops_iterative_scan(
+            "pgvector", profile, {}, "normalized") == "off"
 
     def test_the_tuned_pass_reads_its_own_extras(self):
         """The two sources have to disagree for this to mean anything:
-        `main.yml:64` and `tuned.yml:68` both declare `[off, relaxed_order]`,
-        so a fixture built from the real files returns "off" whether the extras
-        branch is read or falls through to the profile. This also pins the
-        precedence, which nothing else did."""
+        `main.yml:201` and `tuned.yml:68` both declare `[off, relaxed_order]`,
+        so a fixture built from the real files returns "off,relaxed_order"
+        whether the extras branch is read or falls through to the profile --
+        which is why this one is synthetic. It also pins the precedence, which
+        nothing else did.
+
+        The two numbers above were `main.yml:64` and `:68`; `:64` was wrong on
+        master already, pointing at a comment about which profiles have an ann
+        phase. The return value was "off" until the resolver stopped dropping
+        every mode after the first."""
         profile = {"ops": {"pgvector_iterative_scan": ["off"]}}
         extras = {"extras": {"pgvector_iterative_scan": ["relaxed_order"]}}
         assert cli_mod._ops_iterative_scan(
@@ -667,13 +806,24 @@ class TestTheIterativeScanModeNowReachesTheRun:
             "pgvector", profile, extras, "normalized") == "off"
 
     def test_the_real_tuned_pass_resolves(self):
-        """Both real sources declare `off` first, so the pass makes no
-        difference today — pinned so that stops being invisible if one of them
-        changes."""
+        """Both real sources declare the same two modes in the same order, so
+        the pass makes no difference today — pinned so that stops being
+        invisible if one of them changes."""
         for pass_name in ("normalized", "tuned"):
             assert cli_mod._ops_iterative_scan(
                 "pgvector", load_profile("main"),
-                self._resources(pass_name), pass_name) == "off"
+                self._resources(pass_name),
+                pass_name) == "off,relaxed_order"
+
+    def test_the_profiles_that_declare_two_modes_get_two(self):
+        """Both headline profiles, against the real files rather than a
+        fixture, because the defect was invisible precisely in the files a run
+        actually uses."""
+        for name in ("main", "full"):
+            assert cli_mod._ops_iterative_scan(
+                "pgvector", load_profile(name),
+                self._resources("normalized"),
+                "normalized") == "off,relaxed_order"
 
     def test_nothing_is_pinned_for_an_engine_without_the_knob(self):
         assert cli_mod._ops_iterative_scan(
@@ -730,8 +880,8 @@ class TestTheIterativeScanModeNowReachesTheRun:
                  "checkpoints": str(tmp_path / "checkpoints")}
         with mock.patch.object(ops_pass, "harness_args", capture), \
              mock.patch.object(ops_pass, "OpsRun", FakeRun):
-            for engine, expected in (("pgvector", "off"), ("mariadb", None),
-                                     ("alisql", None)):
+            for engine, expected in (("pgvector", "off,relaxed_order"),
+                                     ("mariadb", None), ("alisql", None)):
                 captured.clear()
                 rc = cli_mod._run_unit(
                     "ops", engine, "glove-100-angular", load_profile("main"),
@@ -742,6 +892,68 @@ class TestTheIterativeScanModeNowReachesTheRun:
                 assert captured, f"{engine}: harness_args was never called"
                 for kwargs in captured:
                     assert kwargs.get("iterative_scan") == expected, engine
+
+    def test_two_modes_add_no_ops_unit_and_no_corpus_reload(self, tmp_path):
+        """The objection the old `_ops_iterative_scan` docstring raised against
+        passing a list, settled by measurement rather than by argument.
+
+        `_run_unit`'s `unit_count` is `m_values x build_modes x
+        storage_engines` and every unit reloads the corpus, so a mode that
+        became a fourth axis there would re-run build, concurrency and churn
+        per mode and double pgvector's ingest. It does not: the modes are one
+        argument to one `harness_args` call per unit, and the workload loops
+        them against the index that unit already built.
+
+        Honest: pgvector launches the same number of units under a profile
+            declaring two modes as under one -- 2 for `main` (1 M value x 2
+            build modes) -- and the only difference is the argument's value.
+        Mutant (the mode made an axis of the `for m / for build_mode /
+            for storage` loops): 4 units, and the second mode costs a full
+            reload of the corpus.
+        """
+        import argparse
+        from orchestrator import ops_pass
+        from orchestrator.config import load_resources
+
+        launched = []
+
+        class FakeRun:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def run_harness(self, args, output, **kw):
+                launched.append(list(args))
+                return 0
+
+        paths = {"run_dir": str(tmp_path),
+                 "checkpoints": str(tmp_path / "checkpoints")}
+        counts, flags = {}, {}
+        for label, modes in (("one", [False]),
+                             ("two", [False, "relaxed_order"])):
+            loaded = load_profile("main")
+            profile = dict(loaded, ops=dict(loaded["ops"],
+                                            pgvector_iterative_scan=modes))
+            launched.clear()
+            with mock.patch.object(ops_pass, "OpsRun", FakeRun):
+                rc = cli_mod._run_unit(
+                    "ops", "pgvector", "glove-100-angular", profile, {},
+                    load_resources("normalized"), None, "normalized", paths,
+                    "run-0", argparse.Namespace(force=False),
+                    checkpoints=None)
+            assert rc == 0
+            counts[label] = len(launched)
+            flags[label] = {
+                argv[argv.index("--iterative-scan") + 1] for argv in launched}
+
+        assert counts["one"] == counts["two"] == 2, counts
+        assert flags["one"] == {"off"}
+        assert flags["two"] == {"off,relaxed_order"}
 
     def test_the_harness_passes_it_on_to_the_workload(self):
         """The other unguarded link in the same chain, asserted at source
@@ -769,7 +981,7 @@ class TestTheIterativeScanModeNowReachesTheRun:
                 "pgvector", profile, resources, "normalized"),
         )
         assert "--iterative-scan" in argv
-        assert argv[argv.index("--iterative-scan") + 1] == "off"
+        assert argv[argv.index("--iterative-scan") + 1] == "off,relaxed_order"
 
     def test_the_old_call_site_emitted_nothing(self):
         """What the run has always done: no mode argument at all, which is how
@@ -836,8 +1048,15 @@ class TestTheIterativeScanModeNowReachesTheRun:
             recorder.close()
 
         written = list(records.read_records(recorder.path))
-        assert applied == ["off"]
-        assert [r["extra"]["iterative_scan"] for r in written] == ["off"]
+        # Both modes, in the order declared, each SET once and each producing
+        # its own record -- the end of the chain the run of 2026-10-15 got
+        # halfway along. One record per mode and not one record overwritten:
+        # the report keys filtered records on `extra.iterative_scan`, so these
+        # two land beside each other rather than on top of one another, which
+        # is why this change owes no OPS_MEASUREMENT_VERSION bump.
+        assert applied == ["off", "relaxed_order"]
+        assert [r["extra"]["iterative_scan"] for r in written] == [
+            "off", "relaxed_order"]
 
 
 class TestACapIsPrintedAsACapNotADuration:
@@ -917,7 +1136,14 @@ class TestTheWholeQueryEstimateForMain:
         assert term(e, "churn re-insert")["typical_hours"] == 4.77
         assert term(e, "churn re-insert")["worst_hours"] == 16.00
         assert term(e, "filtered search")["typical_hours"] == 0.0
-        assert term(e, "filtered search")["worst_hours"] == 8.00
+        # 10.0 and not 8.00 because the iterative-scan modes now reach the
+        # run. `main` declares two and only pgvector has the knob, so of the
+        # 16 ops units across seven engines the 4 pgvector ones pay 12 points
+        # x 300 s and the other 12 pay 6 -- 2.0 h more, charged to one engine.
+        # A `* modes` applied to the whole term instead would have charged the
+        # other six for a dimension they do not have, which is the mistake
+        # `_charged_scan_modes` exists to refuse.
+        assert term(e, "filtered search")["worst_hours"] == 10.00
         # 2 fractions x 30 s x 16 ops units across main's SEVEN engines and
         # two datasets = 960 s = 0.267 h, and it is both the typical figure
         # and the ceiling because the window is a fixed span. Over six
@@ -929,14 +1155,15 @@ class TestTheWholeQueryEstimateForMain:
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
         assert e["query_hours"] == 7.04
-        assert e["query_hours_worst"] == 26.27
+        assert e["query_hours_worst"] == 28.27
         # The totals move with the ENGINE LIST as well as with the ann M
-        # grid. Over six engines these were 100.16 and 116.39; the INGEST
+        # grid. Over six engines these were 100.16 and 116.39, before the
+        # iterative-scan modes added 2.0 h to pgvector alone; the INGEST
         # half of both is unchanged at 93.06, because Percona is named in
         # `engines_without_ingest_rate` and contributes nothing to it -- so
         # every hour of the difference is query time.
         assert e["typical_total_hours"] == 100.10
-        assert e["worst_case_total_hours"] == 119.33
+        assert e["worst_case_total_hours"] == 121.33
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1235,7 +1462,7 @@ class TestThePrintedOutput:
         `~0.0 h typical` alone would read as free. It is only not misleading
         because the worst case sits on the same line."""
         out = printed("main")
-        assert "filtered search        ~0.0 h typical, ~8.0 h worst case" in out
+        assert "filtered search        ~0.0 h typical, ~10.0 h worst case" in out
         # Anchored on the `=`, because "3,000 queries per ops unit" is a
         # substring of "13,000 queries per ops unit" -- the shape that has
         # cost this series four tests.
@@ -1244,7 +1471,7 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~119.3 h worst case" in out
+        assert "~121.3 h worst case" in out
         assert "~100.1 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):

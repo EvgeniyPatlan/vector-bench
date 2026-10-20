@@ -425,8 +425,15 @@ def _claim(name: str):
 #
 # Anchors are the thing the document points AT, not a string that happens to be
 # nearby. An anchor must not span a line break, because the body is joined with
-# newlines -- `estimate.py:48-49` was cited as `43-51` for exactly that reason,
+# newlines -- `estimate.py:49-50` is cited as `44-52` for exactly that reason,
 # the sentence it is quoted for breaking across the two lines.
+#
+# Those two numbers are a THIRD reference to the same lines, and nothing checks
+# them: the guard below compares `CITED_IN_REPO`'s keys against docs/10 and
+# never reads this comment. They said `48-49` and `43-51` until an import line
+# was added above `_INGEST_ROWS_PER_S` and moved both by one -- the same
+# one-line death that put master red in #41 and #43, surviving here because it
+# was in prose about the table rather than in the table.
 CITED_IN_REPO = {
     # doc spelling                            -> (real path, anchor)
     # Was `:261`, anchored on `OPS_MEASUREMENT_VERSION = 5`. G3 made the
@@ -512,14 +519,14 @@ CITED_IN_REPO = {
     # returns None, and the section cites the repaired call instead. The
     # anchor deliberately has NO default argument in it, so the old spelling
     # coming back fails this row rather than satisfying it.
-    "orchestrator/estimate.py:161":
+    "orchestrator/estimate.py:162":
         ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine)"),
-    "orchestrator/estimate.py:43":
+    "orchestrator/estimate.py:44":
         ("orchestrator/estimate.py",
          "Measured ingest rates, rows/s, on a Xeon Gold 6230."),
-    "orchestrator/estimate.py:43-51":
+    "orchestrator/estimate.py:44-52":
         ("orchestrator/estimate.py", "by 3x is worse than none"),
-    "orchestrator/estimate.py:50":
+    "orchestrator/estimate.py:51":
         ("orchestrator/estimate.py", '"mariadb": 150'),
     "config/profiles/main.yml:200":
         ("config/profiles/main.yml", "churn_readers: 4"),
@@ -528,7 +535,7 @@ CITED_IN_REPO = {
     "docs/05-methodology.md:490-497":
         ("docs/05-methodology.md",
          "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:1021-1022":
+    "docs/05-methodology.md:1039-1040":
         ("docs/05-methodology.md", "config.ops_measurement_version"),
     "config/profiles/main.yml:110":
         ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
@@ -548,7 +555,7 @@ CITED_IN_REPO = {
     "report/render.py:2855":
         ("report/render.py",
          "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:953":
+    "docs/05-methodology.md:971":
         ("docs/05-methodology.md",
          "the grids meet, so an empty section there is the fault case"),
     "docs/09-adding-percona-server.md:700":
@@ -1279,7 +1286,7 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
         assert "report/render.py:2855" in section
-        assert "docs/05-methodology.md:953" in section
+        assert "docs/05-methodology.md:971" in section
 
 
 # ---------------------------------------------------------------------------
