@@ -258,7 +258,7 @@ rig with `ssh -N -L 8080:127.0.0.1:8080 you@bench-host`. See
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--profile` | `quick` | `dev`, `smoke`, `quick`, **`main`**, `full`, or your own |
-| `--engines` | every engine | e.g. `mariadb,alisql` |
+| `--engines` | the profile's `engines:` list, else every engine | e.g. `mariadb,alisql`; may only narrow a profile's own list — see [docs/02](docs/02-running-with-framework.md#run-options) |
 | `--datasets` | from profile | Override the profile's dataset list |
 | `--resource-pass` | `both` | `normalized`, `tuned`, or `both` |
 | `--phases` | `both` | `ann` (recall/QPS), `ops` (build/concurrency/filtered/churn) |

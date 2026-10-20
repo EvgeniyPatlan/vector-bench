@@ -37,6 +37,131 @@ def load_profile(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "profiles", f"{name}.yml"))
 
 
+# A profile's `engines:` key is a RESTRICTION on the run, not a decoration, and
+# until these functions existed nothing HONOURED it. Two tests read it --
+# `test_e2_percona_wiring.py`'s `TestTheProfiles::
+# test_the_percona_profile_runs_only_percona` asserts the declared value, and
+# `TestEveryShippedProfileRenders` resolves it the way this file now does, under
+# a comment that attributed the resolution to `cmd_render`, which never did it.
+# So the tree knew what the key meant, in a test, and no production code acted
+# on it.
+#
+# `config/profiles/percona.yml` has declared `engines: [percona]` since it was
+# written, under an opening paragraph that says "NOT a comparison profile. It
+# runs one engine". `cli.cmd_run` resolved the list as
+# `args.engines or ",".join(KNOWN_ENGINES)` and never looked at the profile, so
+# the declaration was inert prose beside live code. The run at
+# `percona-20261020-140151`
+# measured ALL SEVEN engines under it -- 14 phases, two per engine, with
+# `ops-*`, `mem-*` and recall records for alisql, mariadb, mariadb123, mongodb,
+# pgvector and valkey beside percona -- and its manifest records
+# `config.profile.engines: ['percona']` next to seven populated `engines` keys.
+# It finished `status: completed`, because an engine nobody asked for cannot
+# fail.
+#
+# What it cost is worse than six engines' worth of time. Every axis this
+# profile has is Percona-only -- `resources.extras.percona_ef_construction`,
+# `ops.percona_build_modes` -- and `ops.subset_rows: 20000` was chosen to make
+# three Percona corpus reloads affordable, not to measure anything about
+# MariaDB. So the other six were measured at a grid designed for a different
+# engine, on a corpus sized for a different question, in a run directory whose
+# profile says one engine ran. That is this repo's signature failure: not a
+# crash, a credible-looking result that answers a question nobody asked.
+#
+# A RESTRICTION rather than a default, and the difference is the whole
+# precedence rule. `--datasets` overrides `profile.datasets` outright two lines
+# below the engine resolution in `cmd_run`, and copying that shape here would
+# have been wrong: a dataset list is a choice of corpus, while a profile that
+# names engines has a GRID that is only meaningful on them. `--profile percona
+# --engines mariadb` therefore has two readings -- "measure mariadb" and
+# "measure what the percona profile measures" -- which differ by a whole run,
+# and a stale command line is a likelier source of it than an intention. So an
+# explicit flag may NARROW the profile's list and `cmd_run` refuses to widen
+# it, rather than silently picking a winner. See the refusal there.
+
+
+def profile_engines(profile: Dict[str, Any]) -> List[str]:
+    """The engines a profile restricts itself to, or [] when it names none.
+
+    [] rather than every known engine, deliberately. This module cannot see the
+    registry -- `orchestrator/engines.py` imports *this* file, so that
+    dependency runs one way only -- and the caller holds `KNOWN_ENGINES`
+    anyway. Returning [] keeps the fall-back visible at the call site, as
+    `declared or KNOWN_ENGINES`, instead of burying a seven-engine default
+    inside a function named after one profile's key.
+
+    Every shipped profile but `percona` declares none, which is why honouring
+    the key changes exactly one profile's behaviour and leaves the hard-won
+    "a bare run measures everything" default (`cli.KNOWN_ENGINES`) intact.
+
+    De-duplicated, order preserved. A repeated name is not a request for two
+    measurements: the run loop would start the engine twice and write both
+    units into one run directory under one checkpoint key, so the second
+    silently overwrites the first and the report shows one. `cmd_run` applies
+    the same reduction to the resolved list, which is where `--engines
+    percona,percona` arrives.
+    """
+    declared = (profile or {}).get("engines")
+    if not declared:
+        return []
+    return dedupe(str(engine).strip() for engine in declared
+                  if str(engine).strip())
+
+
+def dedupe(names: Any) -> List[str]:
+    """First occurrence of each name, in order."""
+    return list(dict.fromkeys(names))
+
+
+def profile_engines_problem(profile: Dict[str, Any]) -> Optional[str]:
+    """Why a profile's `engines:` key cannot be honoured, or None.
+
+    **AN EMPTY OR NULL LIST RE-ARMS THE DEFECT THIS KEY EXISTS TO PREVENT, SO
+    IT IS REFUSED RATHER THAN READ AS "NO RESTRICTION".** `profile_engines`
+    answers [] for an absent key and for `engines: []` alike, and the call site
+    spells its fall-back `declared or KNOWN_ENGINES` -- so without this check
+    an operator who opens `percona.yml` in the web UI's profile editor and
+    empties the list gets all seven engines at the Percona-only grid, with no
+    note and no warning, completing and reporting success. That is
+    `percona-20261020-140151` verbatim, which is the run this key was made
+    load-bearing to prevent.
+
+    An ABSENT key is a different statement and stays silent: a profile that
+    never mentions engines is making no claim about which ones its grid suits,
+    and nine of the ten shipped profiles are in that case. A key that is
+    PRESENT and says nothing usable is a half-finished edit, and this repo
+    prefers failing loudly to producing a plausible wrong result.
+
+    A bare string is refused for a quieter reason: `engines: percona` iterates
+    as seven one-character names, so without this the refusal below fired
+    anyway and the note read "runs only p, e, r, c, o, n, a".
+    """
+    if "engines" not in (profile or {}):
+        return None
+    declared = (profile or {}).get("engines")
+    if (not isinstance(declared, list) or not declared
+            or not all(isinstance(e, str) and e.strip() for e in declared)):
+        return (f"engines must be a non-empty list of engine names; "
+                f"got {declared!r}. Remove the key entirely to run every "
+                f"engine -- an empty list reads as 'no restriction' and would "
+                f"measure all of them at this profile's grid.")
+    return None
+
+
+def engines_outside_profile(profile: Dict[str, Any],
+                            requested: List[str]) -> List[str]:
+    """Requested engines the profile's own list excludes, in request order.
+
+    Empty for a profile that declares no list: there is nothing to be outside
+    of, and a profile naming no engines is making no claim about which ones its
+    grid suits.
+    """
+    declared = set(profile_engines(profile))
+    if not declared:
+        return []
+    return [engine for engine in requested if engine not in declared]
+
+
 def load_resources(name: str) -> Dict[str, Any]:
     return _load(os.path.join(CONFIG_DIR, "resources", f"{name}.yml"))
 

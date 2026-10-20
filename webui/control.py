@@ -266,7 +266,7 @@ def put_profile(api: Api, match, _q, body=None) -> Response:
 
 def estimate(api: Api, _m, _q, body=None) -> Response:
     from orchestrator.cli import KNOWN_ENGINES, estimate_load_hours
-    from orchestrator.config import load_profile
+    from orchestrator.config import load_profile, profile_engines
 
     spec = body or {}
     name = spec.get("profile")
@@ -275,7 +275,17 @@ def estimate(api: Api, _m, _q, body=None) -> Response:
     except FileNotFoundError:
         return 404, {"error": f"no such profile: {name}"}
 
-    engines = [e for e in (spec.get("engines") or KNOWN_ENGINES)
+    # The profile's own engine list sits between the request and KNOWN_ENGINES,
+    # exactly as in `cli.cmd_run`, and the dataset line below has always done
+    # the same with `profile.datasets`. Not optional tidiness:
+    # `estimate_load_hours` returns its breakdown instead of printing it
+    # precisely "so the CLI and the web UI cannot report different numbers for
+    # the same plan" (its docstring), and `control.js` opens with
+    # `plan.engines: []` -- nothing checked. So picking the percona profile
+    # here previewed a seven-engine estimate for a job that `cmd_run` now runs
+    # on one, which is the same figure being wrong in a new direction.
+    engines = [e for e in (spec.get("engines") or profile_engines(profile)
+                           or KNOWN_ENGINES)
                if e in KNOWN_ENGINES]
     datasets = [d for d in (spec.get("datasets") or profile.get("datasets") or [])
                 if DATASET_RE.match(str(d))]

@@ -1911,10 +1911,42 @@ class TestTheWebUiAndTheCliCannotDisagree:
         payload = self._api({"profile": "main", "resource_pass": "normalized"})
         assert payload == est("main")
 
+    def test_a_profile_that_restricts_the_run_restricts_the_preview(self):
+        """The disagreement this class is named for, in the one place it could
+        still happen. `control.js` opens with `plan.engines: []`, so selecting
+        the percona profile and pressing nothing sent no engine list -- and the
+        endpoint fell back to the registry while `cmd_run` falls back to the
+        profile's `engines: [percona]`. The preview would have quoted a
+        seven-engine cost for a job that measures one."""
+        payload = self._api({"profile": "percona",
+                             "resource_pass": "normalized"})
+        named = (set(payload["per_engine_hours"])
+                 | set(payload["engines_without_ingest_rate"]))
+        assert named == {"percona"}, named
+        assert payload == est("percona", engines=["percona"])
+
+    def test_an_explicit_selection_still_overrides_the_profile(self):
+        """The request wins over the profile's list here, as the flag does over
+        it in `cmd_run`. The endpoint deliberately does NOT reproduce
+        `cmd_run`'s refusal of an engine the profile excludes: a preview is not
+        a run, and the launch it precedes is where that combination fails,
+        loudly and before anything starts."""
+        payload = self._api({"profile": "percona", "engines": ["mariadb"],
+                             "resource_pass": "normalized"})
+        assert list(payload["per_engine_hours"]) == ["mariadb"]
+
     def test_the_old_import_path_still_resolves(self):
-        """`webui/control.py:268` and `tests/test_config.py:4171` import these
-        from orchestrator.cli, and the move out to orchestrator/estimate.py
-        must not be visible to either."""
+        """`webui.control.estimate` and `test_config.py`'s
+        `TestTheMSweepProfileIsolatesGraphDegree::
+        test_the_estimate_covers_every_engine` import these from
+        orchestrator.cli, and the move out to orchestrator/estimate.py must not
+        be visible to either.
+
+        BY NAME BECAUSE THE LINES WERE WRONG: this read `webui/control.py:268`
+        and `tests/test_config.py:4171`. The first was right; the second was
+        297 lines out and pointed at a `_FakeConn` lambda, identically on
+        `master` at ffcb3a7, so it had never been re-derived since the split.
+        The real import is the one named above."""
         from orchestrator import cli
         assert cli.estimate_load_hours is est_mod.estimate_load_hours
         assert cli.print_load_estimate is est_mod.print_load_estimate

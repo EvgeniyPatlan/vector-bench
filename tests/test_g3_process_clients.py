@@ -2064,10 +2064,21 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
         THE CHANGE EDITS**, which is narrower than "a heading is safe and a
         value is not". A HEADING is safe because a bump adds a new one and
         never edits an old one. `"NAME = "` is safe too, with the literal
-        stopping before the value -- `tests/test_t2b_report.py:2021` and
-        `tests/test_config.py:6988`/`:7003` all split on
-        `"OPS_MEASUREMENT_EQUIVALENT_VERSIONS = "` and survive any bump, so
-        nobody should "fix" them. Only `"NAME = <value>"` breaks, because the
+        stopping before the value -- `test_t2b_report.py`'s
+        `TestTheMethodologyDoesNotCallADerivedSetAList::test_the_set_really_is_derived_and_not_a_literal`,
+        and `test_config.py`'s `TestTheEquivalenceSetCannotGrowByAccident::test_it_is_derived_from_those_names_rather_than_listed`
+        and `::test_the_recorded_version_name_does_not_track_the_current_one`
+        -- the three that split on
+        `"OPS_MEASUREMENT_EQUIVALENT_VERSIONS = "` -- all survive any bump, so
+        nobody should "fix" them. **BY NODE ID BECAUSE THE LINE NUMBERS WERE
+        ALREADY WRONG.** This sentence read `tests/test_t2b_report.py:2021`
+        and `tests/test_config.py:6988`/`:7003`; measured on `master` at
+        ffcb3a7, before the class that moved the last two, the three splits
+        were at :2056, :7012 and :7027 and the three cited lines held a `def`,
+        a line of prose and a `}`. Nothing guards a citation inside a comment
+        -- the doc guards check `docs/09` and `docs/10` only -- which is how
+        all three rotted unnoticed. A node id dies only to a rename.
+        Only `"NAME = <value>"` breaks, because the
         bump edits exactly what the literal embeds. The sweep in the commit
         message agrees -- it requires a digit after `VERSION`/`version`, so
         those three do not match it -- and it is only a loose one-line

@@ -40,9 +40,11 @@ from harness import datasets as datasets_mod  # noqa: E402
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
 from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
 from orchestrator import engines as engines_mod  # noqa: E402
-from orchestrator.config import (available_profiles, load_engine,  # noqa: E402
+from orchestrator.config import (available_profiles, dedupe,  # noqa: E402
+                                 engines_outside_profile, load_engine,
                                  load_profile, load_resources,
-                                 merge_resource_overrides, resolve_resources)
+                                 merge_resource_overrides, profile_engines,
+                                 profile_engines_problem, resolve_resources)
 from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 # The cost estimate lives in its own module; these are re-exported because
 # `webui/control.py` and `tests/test_config.py` import them from here and the
@@ -359,8 +361,34 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     profile = load_profile(args.profile)
+    # Before anything reads the key: a key that is PRESENT and unusable --
+    # `engines: []`, `engines:` with no value, a bare string -- must not be
+    # read as "no restriction", because the fall-back two statements below is
+    # spelled `declared or KNOWN_ENGINES` and would widen it back to seven
+    # silently. See `config.profile_engines_problem`; refused here rather than
+    # only in the web UI's validator because nothing on this path calls that.
+    problem = profile_engines_problem(profile)
+    if problem:
+        print(f"config/profiles/{args.profile}.yml: {problem}",
+              file=sys.stderr)
+        return 2
+    # The profile's own `engines:` key, honoured here and nowhere before this.
+    # `config/profiles/percona.yml` declared one engine and this line ran seven
+    # -- see `config.profile_engines` for the run that proves it, and for why
+    # the key restricts the run rather than merely defaulting it. Falling back
+    # to KNOWN_ENGINES when the profile declares none is what keeps every other
+    # profile behaving exactly as it did: a bare `run` still measures
+    # everything, which is its own hard-won default (see KNOWN_ENGINES above).
+    declared = profile_engines(profile)
     engines = [e.strip() for e in
-               (args.engines or ",".join(KNOWN_ENGINES)).split(",") if e.strip()]
+               (args.engines or ",".join(declared or KNOWN_ENGINES)).split(",")
+               if e.strip()]
+    # `--engines percona,percona` would otherwise start the engine twice and
+    # write both units into one run directory under one checkpoint key, so the
+    # second overwrites the first and the report shows one. Not a new hazard --
+    # it predates the profile key -- but the key gave this resolution a second
+    # source of duplicates, so the reduction belongs on the result of both.
+    engines = dedupe(engines)
     datasets = ([d.strip() for d in args.datasets.split(",") if d.strip()]
                 if args.datasets else list(profile.get("datasets", [])))
     # A profile may declare its own default pass. `mariadb-blog` does, because
@@ -371,11 +399,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.resource_pass is None and requested != "both":
         print(f"note: profile '{profile.get('name')}' defaults to the "
               f"'{requested}' pass only; override with --resource-pass both")
+    # Announced rather than assumed, like the pass note above it. The banner a
+    # few lines down prints a one-engine list where
+    # `docs/02-running-with-framework.md` documents `--engines` as defaulting
+    # to every engine, and a reader who does not know the profile restricts the
+    # run reads that banner as the bug rather than as the fix.
+    if declared and not args.engines:
+        print(f"note: profile '{profile.get('name')}' runs only "
+              f"{', '.join(declared)}; override with --engines")
     phases = (["ann", "ops"] if args.phases == "both" else [args.phases])
 
     unknown = set(engines) - set(KNOWN_ENGINES)
     if unknown:
         print(f"unknown engines: {sorted(unknown)}", file=sys.stderr)
+        return 2
+    # An explicit --engines may NARROW the profile's list and may not widen it.
+    # Refusing is the point rather than a nicety: the alternative is not
+    # "obey the flag", it is a run that measures an engine at another engine's
+    # grid and reports success, which is exactly what `percona-20261020-140151`
+    # did for six engines. Checked after the KNOWN_ENGINES check above so a
+    # typo'd name is still reported as a typo rather than as an exclusion.
+    outside = engines_outside_profile(profile, engines)
+    if outside:
+        print(f"profile '{profile.get('name')}' runs only "
+              f"{', '.join(declared)}, and --engines asked for "
+              f"{', '.join(outside)}.\n"
+              f"  Its grid, its resource extras and its corpus size are "
+              f"specific to the engine(s) it names, so measuring another one "
+              f"under it produces real numbers at the wrong grid.\n"
+              f"  Drop --engines to run the profile as written, narrow to a "
+              f"subset of {', '.join(declared)}, or choose a profile that "
+              f"measures {', '.join(outside)}.", file=sys.stderr)
         return 2
 
     run_id = args.run_id

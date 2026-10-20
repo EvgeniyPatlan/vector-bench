@@ -120,7 +120,7 @@ only SSH'd into.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--profile` | `quick` | `smoke`, `quick`, `full`, or your own in `config/profiles/` |
-| `--engines` | every engine | e.g. `mariadb,alisql` |
+| `--engines` | the profile's `engines:` list, else every engine | e.g. `mariadb,alisql`; may only **narrow** a profile's own list |
 | `--datasets` | from profile | Override the profile's dataset list |
 | `--resource-pass` | `both` | `normalized`, `tuned`, or `both` |
 | `--phases` | `both` | `ann` (recall/QPS), `ops` (build/concurrency/filtered/churn) |
@@ -129,6 +129,17 @@ only SSH'd into.
 | `--fail-fast` | off | Stop at the first failure instead of continuing |
 | `--no-report` | off | Skip report generation |
 | `--run-id` | timestamped | Reuse an id to add to an existing run directory |
+
+**`--engines` and `--datasets` are not symmetrical, deliberately.** A profile's
+dataset list is a choice of corpus and `--datasets` replaces it outright. A
+profile that declares `engines:` has a *grid* that is only meaningful on those
+engines — `config/profiles/percona.yml` is the one that does, and every axis it
+has is Percona-only — so `--engines` may select a subset of that list and is
+**refused** if it names anything outside it, rather than silently measuring one
+engine at another's grid. A profile that declares no `engines:` key is making no
+such claim, and `--engines` is free there. Omitting the key is also the only way
+to say "every engine": `engines: []` is refused as a half-finished edit, because
+reading it as "no restriction" is how a one-engine profile measured seven.
 
 ### `build` options
 
