@@ -1237,9 +1237,27 @@ class TestTheForbiddenVerdictIsAbsentEvenUnwrapped:
         with open(os.path.join(VB_ROOT, "report", "generate.py")) as fh:
             text = fh.read()
         # The UNWRAPPED form: that record is itself split across a line wrap
-        # (`generate.py:607-608`, `...Valkey "chooses its filtering strategy`
-        # / `per query" on the strength of its documentation.`), which is a
-        # neat demonstration of why the verbatim search is the weaker one.
+        # (`report/generate.py:804-805`, in the comment `summarize` carries
+        # above its `by_engine` filter-strategy grouping: `...Valkey "chooses
+        # its filtering strategy` / `per query" on the strength of its
+        # documentation.`), which is a neat demonstration of why the verbatim
+        # search is the weaker one.
+        #
+        # **RE-DERIVED, AND IT WAS NOT A HISTORICAL QUOTATION.** This read
+        # `c8de6a5:report/generate.py:607-608` in the present tense, and at
+        # that commit the two lines were a `server_memory_bytes` lookup and a
+        # `for name, rows` loop -- a memory ceiling, nothing to do with
+        # filter strategies. The
+        # citation is the EVIDENCE for the sentence around it: the argument is
+        # that the verbatim search is the weaker one *because* the record
+        # wraps, and these lines are offered as the demonstration. A reader
+        # following the old number could not confirm the premise of the
+        # `FILES` exclusion it justifies, which makes this worse than a stale
+        # pointer. It was wrong before this branch existed and the branch does
+        # not touch this file, so `tests/test_e16_citation_ratchet.py`
+        # grandfathers it; the repair is a re-derivation with the symbol
+        # named, not a revision prefix, because the claim is about the tree as
+        # it is now.
         assert self.PHRASE in self._unwrapped(text), (
             "report/generate.py no longer records the filter-strategy "
             "verdict it published wrongly; if that was deliberate, remove "

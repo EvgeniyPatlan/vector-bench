@@ -2071,11 +2071,12 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
         -- the three that split on
         `"OPS_MEASUREMENT_EQUIVALENT_VERSIONS = "` -- all survive any bump, so
         nobody should "fix" them. **BY NODE ID BECAUSE THE LINE NUMBERS WERE
-        ALREADY WRONG.** This sentence read `tests/test_t2b_report.py:2021`
-        and `tests/test_config.py:6988`/`:7003`; measured on `master` at
+        ALREADY WRONG.** This sentence read
+        `ffcb3a7:tests/test_t2b_report.py:2021` and
+        `ffcb3a7:tests/test_config.py:6988`/`:7003`; measured on `master` at
         ffcb3a7, before the class that moved the last two, the three splits
         were at :2056, :7012 and :7027 and the three cited lines held a `def`,
-        a line of prose and a `}`. Nothing guards a citation inside a comment
+        a line of prose and a `}`. Nothing guarded a citation inside a comment
         -- the doc guards check `docs/09` and `docs/10` only -- which is how
         all three rotted unnoticed. A node id dies only to a rename.
         Only `"NAME = <value>"` breaks, because the
@@ -2083,6 +2084,18 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
         message agrees -- it requires a digit after `VERSION`/`version`, so
         those three do not match it -- and it is only a loose one-line
         restatement that would condemn them.
+
+        **The `ffcb3a7:` prefixes on those two dead numbers are load-bearing,
+        and they were added later.** They are the `rev`-then-path form
+        `git show` takes, and they turn a claim nobody could check into one
+        anybody can: ask git for that file at that commit, print line 2021,
+        and the `def` is there. They are also what keeps this paragraph out of
+        `tests/test_e16_citation_ratchet.py`'s census, which counts the *live*
+        line citations in this tree's comments and refuses new ones. A
+        citation pinned to a revision cannot rot, because the tree it names is
+        frozen -- so it is not the thing being ratcheted, and the exemption is
+        the revision itself rather than an entry in a list of files allowed to
+        break the rule.
 
         The heading's presence is asserted, so the next bump fails LOUDLY
         here instead of silently widening again.
