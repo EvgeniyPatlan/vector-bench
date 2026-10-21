@@ -5407,26 +5407,183 @@ class TestTwoGraphDegreesAreTwoLines:
 
     def test_the_key_width_matches_the_key(self):
         """churn_impact builds a wider key and slices it back, and it did that
-        with a literal 3 -- so changing the key shifted every index under it."""
+        with a literal 3 -- so changing the key shifted every index under it.
+
+        **The forbidden literals are DERIVED from the constant, and the second
+        half of this test was vacuous until they were.** It pinned the strings
+        `key[:3]` and `key[3]`, which were the hazardous ones at width 2. The
+        key has since been widened twice, and at width 4 the dangerous
+        literals are `key[:4]`, `key[4]` and `key[5]` -- none of which the old
+        assertions mentioned, so planting every one of them while deleting
+        `SERIES_KEY_WIDTH` from the block entirely left the suite green. A
+        guard written against one width stops guarding the moment the width
+        moves, which is the same silent-widening shape the key itself is about.
+
+        So: no numeric subscript on `key` anywhere in any function that widens
+        or slices the key, except `key[0]`, which is the engine and is read
+        positionally on purpose everywhere. And the constant must actually
+        appear, or a block with no literals and no constant passes by saying
+        nothing.
+
+        **THE SET OF FUNCTIONS IS DERIVED TOO, and a written-down pair missed
+        one.** This listed `("churn_impact", "churn")` and described them as
+        "either function that widens the key" -- but the functions that WIDEN
+        are `charts.churn` and `charts.churn_retention`, while `churn_impact`
+        only slices. So the second widener was uncovered by a hand-kept list
+        inside a guard whose entire subject is a hand-kept list going stale.
+        `_key_arithmetic_functions` finds them from the AST instead.
+
+        It returns TWO sets, because the two assertions have different scopes
+        and conflating them fails honestly on `_grouped`: that function reads
+        `key[0]` to bucket by engine and never touches the width, so the
+        literal rule applies to it and the constant rule must not.
+
+        Two accepted limits, recorded rather than fixed. The regex wants the
+        digit immediately after `[` or `[:`, so `key[ 4]` and `key[2 + 2]`
+        slip through -- contrived enough that catching them costs more
+        readability than it buys -- and `key[-1]` slips through too, which is
+        fine because a negative index is width-independent and stays correct
+        however the key grows. And the block comes from
+        `ast.get_source_segment`, so it includes comments: a future comment
+        that quotes `key[3]` as an example will fail this test. That is the
+        safe direction to err, and the fix is to spell the example in prose.
+        """
+        import re
+
         from report.charts import SERIES_KEY_WIDTH, series_key
         assert SERIES_KEY_WIDTH == len(series_key({"engine": "e"}))
         source = open(os.path.join(VB_ROOT, "report", "charts.py")).read()
-        block = source.split("def churn_impact")[1]
-        assert "key[:3]" not in block
-        assert "key[3]" not in block
+        subscripts, width_dependent = self._key_arithmetic_functions(source)
+        # Non-vacuity: a derivation that selects nothing is a guard that
+        # stopped working and looks identical to a clean run. The two
+        # wideners and the slicer must all be in, and `_grouped` must be in
+        # the literal set without being in the width set -- which is the
+        # distinction a single set got wrong.
+        assert {"churn", "churn_retention", "churn_impact"} <= width_dependent
+        assert "_grouped" in subscripts
+        assert "_grouped" not in width_dependent
+        # And `pareto`'s accessors stay out: their key is
+        # `(engine, resource_pass)`, so `key[1]` there is correct and has
+        # nothing to do with this width.
+        assert not {"pareto_pass_of", "pareto_engine_of"} & subscripts
+        for name in sorted(subscripts):
+            block = self._function_source(source, name)
+            literals = re.findall(r"key\[:?(\d+)\s*[\]:]", block)
+            assert set(literals) <= {"0"}, (
+                f"{name} indexes the key with literal(s) "
+                f"{sorted(set(literals))}; use SERIES_KEY_WIDTH so the "
+                f"width is written down once")
+        for name in sorted(width_dependent):
+            block = self._function_source(source, name)
+            assert "SERIES_KEY_WIDTH" in block, (
+                f"{name} does width-dependent key arithmetic but names no "
+                f"width constant")
+
+    @staticmethod
+    def _key_arithmetic_functions(source):
+        """Top-level functions in `charts.py` that touch a series key, by AST.
+
+        Returns `(subscripts, width_dependent)`.
+
+        `subscripts` is every function that subscripts a name called `key`.
+        The literal rule applies to all of them.
+
+        `width_dependent` is those that either add to a `series_key(...)`
+        result -- widening it, so a consumer has to know the offset -- or
+        subscript `key` by anything other than the literal 0. Only these must
+        name the constant. For a widener the mention may well be in prose
+        rather than code, and that is the point: the comment naming
+        `SERIES_KEY_WIDTH` IS the contract with whoever slices it back.
+        """
+        import ast
+
+        subscripts, width_dependent = set(), set()
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            # In scope only if the function handles THIS key. `pareto`'s key is
+            # `(engine, resource_pass)` and `pareto_pass_of` reads `key[1]` off
+            # it perfectly correctly, so selecting on the identifier `key`
+            # alone condemns a different key's accessor. Naming `series_key` or
+            # `SERIES_KEY_WIDTH` is what makes a function this key's business.
+            family = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            if not family & {"series_key", "SERIES_KEY_WIDTH"}:
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.BinOp)
+                        and isinstance(inner.op, ast.Add)
+                        and isinstance(inner.left, ast.Call)
+                        and isinstance(inner.left.func, ast.Name)
+                        and inner.left.func.id == "series_key"):
+                    width_dependent.add(node.name)
+                if (isinstance(inner, ast.Subscript)
+                        and isinstance(inner.value, ast.Name)
+                        and inner.value.id == "key"):
+                    subscripts.add(node.name)
+                    index = inner.slice
+                    benign = (isinstance(index, ast.Constant)
+                              and index.value == 0)
+                    if not benign:
+                        width_dependent.add(node.name)
+        return subscripts, width_dependent
+
+    @staticmethod
+    def _function_source(source, name):
+        """One top-level function's source, by AST rather than by substring.
+
+        `source.split("def churn")` matches `churn_impact` and
+        `churn_retention` as well, so the substring form could silently check
+        the wrong function -- or, worse, a prefix of the right one.
+        """
+        import ast
+
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(source, node)
+        raise AssertionError(
+            f"no top-level function {name!r} in report/charts.py")
 
     @needs_matplotlib
     def test_churn_still_renders_with_the_wider_key(self):
+        """**Two resource passes, which is what makes this test its own name.**
+
+        It pinned `resource_pass: "tuned"` on both rows, so the fixture was one
+        engine with one series -- and a one-series fixture renders at every key
+        width there has ever been. It was green at widths 2, 3 and 4 and would
+        have stayed green through any further widening, while being the only
+        test in the suite that renders this chart at all.
+
+        One series also kept it clear of the defect next door:
+        `churn_impact` built its storage list as one literal `None` per SERIES,
+        so its length was the series count rather than the number of distinct
+        storage engines. Widening the key doubled that count, which flipped
+        `series_style`'s `len(storages) > 1` gate open onto `[None, None]` and
+        made `.index("InnoDB")` raise. A second pass here is the whole fixture
+        needed to reach it: this test goes red on the widening alone and green
+        once `churn_impact` builds both lists from the records through
+        `_grouped`. `config/profiles/dev.yml` pins one configuration per engine
+        and lists `churn`, so that was an ordinary run shape, not a corner.
+        """
         import tempfile
         import matplotlib
         matplotlib.use("Agg")
         from report.charts import churn_impact
         rows = []
-        for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
-            rows.append({"phase": "churn", "engine": "mariadb", "dataset": "d",
-                         "storage_engine": "InnoDB", "m": 16, "qps": qps,
-                         "churn_fraction": frac, "resource_pass": "tuned",
-                         "build_mode": "post"})
+        for resource_pass in ("normalized", "tuned"):
+            for frac, qps in ((0.0, 100.0), (0.1, 40.0)):
+                rows.append({"phase": "churn", "engine": "mariadb",
+                             "dataset": "d", "storage_engine": "InnoDB",
+                             "m": 16, "qps": qps, "churn_fraction": frac,
+                             "resource_pass": resource_pass,
+                             "build_mode": "post"})
+        # Non-vacuity: the fixture really does reach the condition this test is
+        # named for. Two series under one engine is what opens the gate that
+        # used to crash, and one pass would silently give one.
+        from report.charts import SERIES_KEY_WIDTH, churn_retention
+        retained = churn_retention(rows, "d")
+        assert len(retained) == 2, retained
+        assert len({k[:SERIES_KEY_WIDTH] for k in retained}) == 2
         with tempfile.TemporaryDirectory() as out:
             assert churn_impact(rows, "d", out, "c") is not None
 

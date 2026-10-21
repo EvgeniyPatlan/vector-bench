@@ -690,20 +690,21 @@ def _ops_iterative_scan(engine: str, profile: Dict[str, Any],
     on `extra.iterative_scan`, so a `relaxed_order` record lands beside an
     `off` one and not on top of it.
 
-    **That is true of the two tables and NOT of the chart, and the gap is known
-    and unfixed.** `report/render.py`'s filtered and strategy tables carry the
-    mode in their group key and in a rendered column, so a reader can attribute
-    every number to the mode that produced it. The filtered CHART cannot:
-    `charts.series_key` is `(engine, loaders.build_signature(record))` and that
-    signature's column fallback omits `extra.iterative_scan`, so two modes
-    become one line doubling back on itself at every selectivity. The same key
-    omits `resource_pass`, which is the shared cause and the reason this is a
-    pre-existing fault rather than one this change introduces: on the archived
-    records every engine's filtered series already pools the normalized and
-    tuned points at each x. Fixing it is a grouping change that moves all seven
-    engines and every existing report, with the duplicate detector downstream
-    of it, so it is deliberately deferred -- but it must land before anyone
-    generates a report from a two-mode run.
+    **That is now true of the chart as well, and it was not when this call
+    site was written.** `report/render.py`'s filtered and strategy tables
+    carry the mode in their group key and in a rendered column;
+    `charts.series_key` is `(engine, loaders.build_signature(record),
+    resource_pass, extra.iterative_scan)`, so each mode is its own line and
+    `charts._key_suffixes` names it in the legend. The key was
+    `(engine, build_signature)` alone, which pooled both axes: two modes
+    became one line doubling back on itself at every selectivity, and -- the
+    shared cause, and a fault that predated this change rather than one it
+    introduced -- so did the two resource passes, which is why all 24 of the
+    2026-10-15 fashion-mnist filtered series carried two points at every x.
+    The mode is composed into the chart key rather than into
+    `build_signature`, which also joins a calibration sweep to the workloads
+    that consumed it: `series_key`'s docstring records the twelve spurious
+    operating-point rows the other choice was measured to produce.
 
     A profile that declares nothing still passes nothing, so the engine keeps
     its own default and the record keeps saying so.
