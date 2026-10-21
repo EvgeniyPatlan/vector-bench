@@ -1572,8 +1572,19 @@ class TestEveryShippedProfileRenders:
         for name in self._profiles():
             profile = load_profile(name)
             # `engines:` when the profile names them, every known engine when
-            # it does not -- which is what `cmd_render` does, and is why a
-            # profile naming one engine can still be asked to render seven.
+            # it does not -- which is what `config.profile_engines` and
+            # `cli.cmd_run` resolve.
+            #
+            # **NOT what `cmd_render` does, though this comment said so until
+            # the key became load-bearing.** `cmd_render` loops `KNOWN_ENGINES`
+            # whatever the profile declares, deliberately, and
+            # `test_cmd_render_renders_every_known_engine_when_told_none` below
+            # asserts the literal expression that makes it so -- which is why a
+            # profile naming one engine can still be asked to render seven, and
+            # why a render failure for any of them is a whole-command failure.
+            # One file holding a comment and a test that contradicted each
+            # other about one function left a reader to conclude the pin was
+            # the stale half.
             engines = profile.get("engines") or list(KNOWN_ENGINES)
             resources = merge_resource_overrides(
                 load_resources(resource_pass), profile)

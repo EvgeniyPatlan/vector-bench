@@ -4933,6 +4933,317 @@ class TestARunMeasuresEveryEngineByDefault:
         assert "not found. Build it first" in source
 
 
+class TestAProfileThatNamesItsEnginesGetsThem:
+    """...and the one that does ran seven of them.
+
+    `config/profiles/percona.yml` has declared `engines: [percona]` since it
+    was written, above a description that reads "Percona Server alone". THE
+    MEASUREMENT: `PS/percona-20261020-140151` is a `status: completed` run of
+    that profile holding 14 phases, two per engine, with `ops-*`, `mem-*` and
+    recall records for alisql, mariadb, mariadb123, mongodb, pgvector and
+    valkey beside percona -- under a manifest whose `config.profile.engines`
+    reads `['percona']` next to seven populated `engines` keys.
+
+    Nothing read the key. `cmd_run` resolved `args.engines or
+    ",".join(KNOWN_ENGINES)`, and the only expression of the key's meaning
+    anywhere in the tree was in a *test* --
+    `tests/test_e2_percona_wiring.py::TestEveryShippedProfileRenders` resolves
+    `profile.get("engines") or KNOWN_ENGINES` and its comment attributes that
+    resolution to `cmd_render`, which does not do it either. So the tree knew
+    what the key meant and no production code honoured it.
+
+    Why the cost is not just six engines' worth of hours: every axis this
+    profile has is Percona-only (`resources.extras.percona_ef_construction`,
+    `ops.percona_build_modes`) and `ops.subset_rows: 20000` was chosen to make
+    three Percona corpus reloads affordable. The six were therefore measured at
+    a grid designed for a different engine, on a corpus sized for a different
+    question, and reported success -- a credible-looking answer to a question
+    nobody asked, which is this repo's signature failure rather than a crash.
+    """
+
+    def _args(self, **kw):
+        import argparse
+        spec = dict(profile="percona", engines=None, datasets=None,
+                    resource_pass="normalized", phases="both",
+                    run_id="probe-20260101-000000", resume=False, force=False)
+        spec.update(kw)
+        return argparse.Namespace(**spec)
+
+    def _plan(self, monkeypatch, tmp_path, **kw):
+        """What `cmd_run` resolved, read off the two calls it hands the list to.
+
+        Stopped at the free-disk check, which is the last thing before any
+        container could start: `_check_free_disk` returning True with
+        `--force` absent makes `cmd_run` return 4 of its own accord, so nothing
+        has to raise through it and both captures are complete first.
+
+        CAPTURING BOTH LISTS IS THE POINT. A change that narrowed the unit loop
+        while still handing `print_load_estimate` the registry would print a
+        seven-engine cost above a one-engine run, and the printed figure would
+        describe a different plan from the one about to execute -- the failure
+        this repo cares about, in a new place. Asserting they are equal costs
+        nothing and pins it.
+
+        `paths_for` is rerooted by substituting VB_ROOT rather than rebuilt,
+        so a key added to it lands here automatically instead of making this
+        harness quietly stale.
+        """
+        from orchestrator import cli as cli_mod
+        seen = {}
+
+        def _estimate(profile, engines, datasets, passes, phases):
+            seen["estimate"] = list(engines)
+
+        def _disk(paths, engines, datasets, passes):
+            seen["run"] = list(engines)
+            return True
+
+        args = self._args(**kw)
+        calls = self._reroot(monkeypatch, tmp_path)
+        datasets_dir = cli_mod.paths_for(args.run_id)["datasets"]
+        calls.clear()
+        os.makedirs(datasets_dir, exist_ok=True)
+        for dataset in load_profile(args.profile).get("datasets", []):
+            open(os.path.join(datasets_dir, f"{dataset}.hdf5"), "wb").close()
+
+        monkeypatch.setattr(cli_mod.docker_ctl, "docker_available", lambda: True)
+        monkeypatch.setattr(cli_mod, "print_load_estimate", _estimate)
+        monkeypatch.setattr(cli_mod, "_check_free_disk", _disk)
+
+        assert cli_mod.cmd_run(args) == 4, (
+            "the harness no longer stops at the disk check; the captures below "
+            "may be incomplete")
+        return seen
+
+    @staticmethod
+    def _reroot(monkeypatch, tmp_path):
+        """Point every path `cmd_run` can reach at tmp_path, counting the calls.
+
+        Returns the call list, so a caller can assert it stayed empty.
+
+        EVERY entry point here reroots, including the refusal ones that
+        "cannot" reach a directory. They could: under a mutant that drops the
+        refusal, `cmd_run` runs on past it and makes `results/<run-id>/` with
+        a manifest, and with `datasets/fashion-mnist-784-euclidean.hdf5`
+        present -- which the main checkout has, and which is the dataset
+        `percona.yml` names -- it would carry on into the free-disk check and
+        `_run_unit`. A probe that starts a benchmark while demonstrating that
+        a guard is gone is not a probe. Rerooting makes that structurally
+        impossible instead of relying on the guard under test.
+        """
+        from orchestrator import cli as cli_mod
+        root = str(tmp_path / "vb")
+        real_paths = cli_mod.paths_for
+        calls = []
+
+        def _paths(run_id):
+            calls.append(run_id)
+            return {key: value.replace(VB_ROOT, root)
+                    if isinstance(value, str) else value
+                    for key, value in real_paths(run_id).items()}
+
+        monkeypatch.setattr(cli_mod, "paths_for", _paths)
+        return calls
+
+    def _refuse(self, monkeypatch, capsys, tmp_path, **kw):
+        """A refusal, with a proof that it landed above `paths_for`.
+
+        The returned `calls` is asserted empty by every caller rather than
+        merely believed: "the check sits above `paths_for`" is a claim about
+        statement order that no reader can verify from the test, and the
+        rerooting in `_reroot` is what keeps a broken claim harmless.
+        """
+        from orchestrator import cli as cli_mod
+        calls = self._reroot(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_mod.docker_ctl, "docker_available", lambda: True)
+        code = cli_mod.cmd_run(self._args(**kw))
+        return code, capsys.readouterr().err, calls
+
+    def test_the_subject_of_this_class_is_still_what_it_says(self):
+        """Non-vacuity. If `percona.yml` stops declaring one engine, or the
+        registry stops holding seven, the assertions below become trivially
+        true and would stay green while proving nothing."""
+        from orchestrator.cli import KNOWN_ENGINES
+        assert load_profile("percona")["engines"] == ["percona"]
+        assert len(KNOWN_ENGINES) == 7
+        assert "engines" not in load_profile("smoke")
+
+    def test_a_bare_run_of_a_one_engine_profile_runs_one_engine(
+            self, monkeypatch, tmp_path):
+        seen = self._plan(monkeypatch, tmp_path)
+        assert seen["run"] == ["percona"]
+
+    def test_the_operator_is_told_the_profile_narrowed_the_run(
+            self, monkeypatch, tmp_path, capsys):
+        """The note is the only thing standing between a one-engine banner and
+        a reader who reaches for `--engines` because the banner looks broken --
+        `docs/02-running-with-framework.md` documents the flag's default as
+        every engine. Announced rather than assumed, like the
+        `default_resource_pass` note two statements above it in `cmd_run`, and
+        asserted here because a print nothing checks is a print that goes."""
+        self._plan(monkeypatch, tmp_path)
+        out = capsys.readouterr().out
+        assert "runs only percona" in out
+        assert "--engines" in out
+
+    def test_no_note_is_printed_when_the_profile_narrowed_nothing(
+            self, monkeypatch, tmp_path, capsys):
+        """A note on every run is a note nobody reads."""
+        self._plan(monkeypatch, tmp_path, profile="smoke")
+        assert "runs only" not in capsys.readouterr().out
+
+    def test_the_printed_cost_describes_the_run_and_not_the_registry(
+            self, monkeypatch, tmp_path):
+        seen = self._plan(monkeypatch, tmp_path)
+        assert seen["estimate"] == ["percona"]
+        assert seen["estimate"] == seen["run"]
+
+    def test_a_profile_naming_no_engines_still_runs_every_one(
+            self, monkeypatch, tmp_path):
+        """The default that this change must not touch. `run` defaulted to the
+        original three long after six existed; narrowing it again for profiles
+        that make no claim would be the same bug with a new cause."""
+        from orchestrator.cli import KNOWN_ENGINES
+        seen = self._plan(monkeypatch, tmp_path, profile="smoke")
+        assert seen["run"] == list(KNOWN_ENGINES)
+        assert seen["estimate"] == list(KNOWN_ENGINES)
+
+    def test_an_explicit_flag_narrows_a_profile_that_names_none(
+            self, monkeypatch, tmp_path):
+        seen = self._plan(monkeypatch, tmp_path, profile="smoke",
+                          engines="pgvector")
+        assert seen["run"] == ["pgvector"]
+
+    def test_an_explicit_flag_the_profile_allows_still_wins(
+            self, monkeypatch, tmp_path):
+        """The flag is honoured, not overridden by the profile. Spelling the
+        profile's own engine out loud has to behave like the bare run and not
+        like an argument with it."""
+        seen = self._plan(monkeypatch, tmp_path, engines="percona")
+        assert seen["run"] == ["percona"]
+        assert seen["estimate"] == ["percona"]
+
+    def test_an_engine_the_profile_excludes_is_refused(self, monkeypatch,
+                                                       capsys, tmp_path):
+        """PRECEDENCE, stated as a refusal. `--profile percona --engines
+        mariadb` reads two ways -- "measure mariadb" and "measure what the
+        percona profile measures" -- and the two differ by a whole run. The
+        combination is what fails, rather than one reading winning quietly."""
+        code, err, calls = self._refuse(monkeypatch, capsys, tmp_path,
+                                        engines="mariadb")
+        assert code == 2
+        assert "percona" in err and "mariadb" in err
+        assert "--engines" in err
+        assert calls == [], f"the refusal ran past paths_for: {calls}"
+
+    def test_a_partly_allowed_list_is_refused_whole(self, monkeypatch, capsys,
+                                                    tmp_path):
+        """`percona,mariadb` names one engine the profile runs and one it does
+        not. Running the intersection is the silent half-obedience this refusal
+        exists to prevent, so the named engine does not rescue the list."""
+        code, err, calls = self._refuse(monkeypatch, capsys, tmp_path,
+                                        engines="percona,mariadb")
+        assert code == 2
+        assert "mariadb" in err
+        assert calls == []
+
+    def test_a_typo_is_still_reported_as_a_typo(self, monkeypatch, capsys,
+                                                tmp_path):
+        """ORDERING, and asserted by the message rather than by the exit code,
+        which both checks share. The KNOWN_ENGINES check stays above the
+        profile check, so a misspelled name is reported as unknown rather than
+        as an engine the profile excludes -- which would send someone to edit
+        the profile over a typo on their own command line."""
+        code, err, calls = self._refuse(monkeypatch, capsys, tmp_path,
+                                        engines="mariadbb")
+        assert code == 2
+        assert "unknown engines" in err
+        assert "runs only" not in err, (
+            "the exclusion message won; the KNOWN_ENGINES check no longer "
+            "runs first")
+        assert calls == []
+
+    def test_a_declared_list_that_says_nothing_usable_is_refused(
+            self, monkeypatch, capsys, tmp_path):
+        """`engines: []` AND `engines:` WITH NO VALUE RE-ARM THE WHOLE DEFECT.
+
+        `profile_engines` answers [] for an absent key and for an empty one
+        alike, and `cmd_run`'s fall-back is spelled `declared or
+        KNOWN_ENGINES` -- so an operator who opens `percona.yml` in the web
+        UI's profile editor and empties the list would get all seven engines
+        at the Percona-only grid, with no note and no warning, completing and
+        reporting success. That is `percona-20261020-140151` exactly, the run
+        this key was made load-bearing to prevent. It is the one place the
+        silent-widening shape survived honouring the key.
+
+        Driven through a profile FILE rather than a dict, with `CONFIG_DIR`
+        pointed at tmp_path, because the point is what `run --profile <name>`
+        does with something somebody saved -- and because `engines:` with no
+        value only becomes `None` by going through the YAML parser.
+        """
+        from orchestrator import config as config_mod
+        # Read the real profile BEFORE CONFIG_DIR moves, so the probe inherits
+        # the grid that makes the widening expensive rather than a bare stub.
+        body = load_profile("percona")
+        del body["engines"]
+        head = yaml.safe_dump({**body, "name": "probe"})
+        profiles = tmp_path / "config" / "profiles"
+        profiles.mkdir(parents=True)
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", str(tmp_path / "config"))
+        for text, shown in (("engines: []", "an empty list"),
+                            ("engines:", "no value at all"),
+                            ("engines: percona", "a bare string"),
+                            ("engines: [percona, 7]", "a non-string member"),
+                            ("engines: [percona, '  ']", "a blank member")):
+            (profiles / "probe.yml").write_text(f"{head}\n{text}\n")
+            code, err, calls = self._refuse(monkeypatch, capsys,
+                                            tmp_path, profile="probe")
+            assert code == 2, f"{shown} was accepted"
+            assert "non-empty list of engine names" in err, shown
+            assert "probe.yml" in err, f"{shown}: the file is not named"
+            assert calls == [], f"{shown}: ran past paths_for"
+
+    def test_the_resolution_is_a_function_rather_than_an_expression(self):
+        """Read directly, because `cmd_run` cannot be asked about the empty
+        and whitespace cases without building a profile file for each."""
+        from orchestrator.config import (engines_outside_profile,
+                                         profile_engines,
+                                         profile_engines_problem)
+        assert profile_engines({"engines": ["a", " b "]}) == ["a", "b"]
+        assert profile_engines({"engines": ["a", "", "  "]}) == ["a"]
+        # A repeated name is not a request for two measurements: both units
+        # land in one run directory under one checkpoint key.
+        assert profile_engines({"engines": ["a", "b", "a"]}) == ["a", "b"]
+        # A profile that declares nothing, declares the key empty, or is not a
+        # dict at all are one answer: it restricts nothing.
+        assert profile_engines({}) == []
+        assert profile_engines({"engines": []}) == []
+        assert profile_engines(None) == []
+        assert engines_outside_profile({}, ["anything"]) == []
+        assert engines_outside_profile({"engines": ["a", "b"]}, ["a"]) == []
+        assert engines_outside_profile({"engines": ["a"]},
+                                       ["b", "a", "c"]) == ["b", "c"]
+        # ABSENT and PRESENT-BUT-EMPTY are the same answer from
+        # `profile_engines` and must not be the same answer here: one is a
+        # profile making no claim, the other is a half-finished edit.
+        assert profile_engines_problem({}) is None
+        assert profile_engines_problem(None) is None
+        assert profile_engines_problem({"engines": ["a"]}) is None
+        for bad in ([], None, "percona", ["a", 7], ["a", "  "], {}, 3):
+            assert profile_engines_problem({"engines": bad}), repr(bad)
+
+    def test_a_duplicate_on_the_command_line_runs_one_unit(
+            self, monkeypatch, tmp_path):
+        """`--engines percona,percona` would start the engine twice and write
+        both units into one run directory under one checkpoint key, so the
+        second overwrites the first and the report shows one. Predates the
+        profile key; the key gave the resolution a second source of
+        duplicates, so the reduction sits on the result of both."""
+        seen = self._plan(monkeypatch, tmp_path, engines="percona,percona")
+        assert seen["run"] == ["percona"]
+        assert seen["estimate"] == ["percona"]
+
+
 class TestGraphDegreeCanBeSweptWhereItIsTheOnlyKnob:
     """MHNSW and VIDX expose M and nothing else, and at M=16 their lowest query
     effort already returns recall 0.97-0.98. They therefore have no measurement

@@ -15,8 +15,19 @@ import yaml
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 REQUIRED_KEYS = ("name", "datasets")
+# Not a style list: a key missing from here is reported to the operator as
+# "unrecognised", so this set is a claim about what the orchestrator reads.
+#
+# `engines` was absent from it for as long as `config/profiles/percona.yml`
+# declared `engines: [percona]`, and so the one validator in the tree that
+# looks at profile keys called the one profile whose key was correct
+# unrecognised -- a warning, in the profile editor, where nobody running
+# `./run-benchmark.sh run --profile percona` would ever see it, while
+# `cli.cmd_run` ignored the key outright and measured all seven engines
+# (PS/percona-20261020-140151). Now that `config.profile_engines` reads it,
+# leaving it out would warn about a key that decides what a run measures.
 KNOWN_TOP_LEVEL = {
-    "name", "description", "datasets", "k", "runs", "ann", "ops",
+    "name", "description", "datasets", "engines", "k", "runs", "ann", "ops",
     "resources", "default_resource_pass",
 }
 
@@ -101,6 +112,16 @@ def validate(name: str, text: str) -> Tuple[List[str], List[str], Dict[str, Any]
     datasets = parsed.get("datasets")
     if datasets is not None and (not isinstance(datasets, list) or not datasets):
         errors.append("datasets must be a non-empty list")
+
+    # Borrowed rather than restated, so the editor's complaint and `cmd_run`'s
+    # refusal cannot drift into saying different things about one file. An
+    # ERROR and not a warning: `write_profile` refuses on errors only, and this
+    # editor is the realistic way `engines: [percona]` becomes `engines: []` --
+    # which would hand all seven engines the Percona-only grid without a word.
+    from orchestrator.config import profile_engines_problem
+    problem = profile_engines_problem(parsed)
+    if problem:
+        errors.append(problem)
 
     for section in ("ann", "ops"):
         block = parsed.get(section)

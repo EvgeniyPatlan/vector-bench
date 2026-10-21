@@ -108,6 +108,62 @@ class TestProfiles:
             "sample", "name: sample\ndatasets: [a]\nnonsense: 1\n")
         assert any("unrecognised top-level key: nonsense" in w for w in warnings)
 
+    @pytest.mark.parametrize("line,shown", [
+        ("engines: []", "an empty list"),
+        ("engines:", "no value at all"),
+        ("engines: percona", "a bare string"),
+        ("engines: [percona, 7]", "a non-string member"),
+    ])
+    def test_an_engines_key_that_says_nothing_usable_is_an_error(self, line,
+                                                                 shown):
+        """An ERROR, not a warning, because `write_profile` refuses on errors
+        only -- and this editor is the realistic way `engines: [percona]`
+        becomes `engines: []`, which would hand all seven engines the
+        Percona-only grid with nothing anywhere saying so. The rule is
+        borrowed from `config.profile_engines_problem` rather than restated,
+        so the editor and `cmd_run` cannot drift into disagreeing about one
+        file."""
+        errors, _w, _p = profiles_mod.validate(
+            "sample", f"name: sample\ndatasets: [a]\n{line}\n")
+        assert any("non-empty list of engine names" in e for e in errors), shown
+
+    def test_a_usable_engines_key_is_accepted(self, root):
+        """The other half: the key is now recognised AND writable, so a
+        one-engine profile can be authored in the editor at all."""
+        text = "name: fresh\ndatasets: [a]\nengines: [percona]\n"
+        errors, warnings, _p = profiles_mod.validate("fresh", text)
+        assert not errors
+        assert not [w for w in warnings if "unrecognised top-level key" in w]
+        ok, errors, _w = profiles_mod.write_profile(
+            os.path.join(root, "config"), "fresh", text)
+        assert ok and not errors
+
+    def test_every_shipped_profile_validates_without_a_warning_about_a_key(self):
+        """The whitelist is a claim about what the orchestrator reads, so a key
+        a shipped profile relies on must not be reported as unrecognised.
+
+        It was. `config/profiles/percona.yml` declared `engines: [percona]`
+        and this validator answered "unrecognised top-level key: engines" --
+        for the one profile whose key was right. The warning was correct about
+        the code and useless as a signal: it appears in the web UI's profile
+        editor, and the operator running `run --profile percona` from a
+        terminal never saw it while `cmd_run` ignored the key and measured all
+        seven engines. Checked over every shipped profile rather than over
+        `engines` alone, because the next key added to a profile and not to the
+        set would land in the same silence.
+        """
+        from orchestrator.cli import VB_ROOT as ROOT
+        directory = os.path.join(ROOT, "config", "profiles")
+        names = sorted(f[:-4] for f in os.listdir(directory)
+                       if f.endswith(".yml"))
+        assert len(names) >= 9, names          # non-vacuity
+        for profile in names:
+            with open(os.path.join(directory, f"{profile}.yml")) as fh:
+                errors, warnings, _p = profiles_mod.validate(profile, fh.read())
+            assert not errors, f"{profile}: {errors}"
+            stray = [w for w in warnings if "unrecognised top-level key" in w]
+            assert not stray, f"{profile}: {stray}"
+
     def test_write_creates_file(self, root):
         ok, errors, _w = profiles_mod.write_profile(
             os.path.join(root, "config"), "fresh", VALID.replace("sample", "fresh"))
