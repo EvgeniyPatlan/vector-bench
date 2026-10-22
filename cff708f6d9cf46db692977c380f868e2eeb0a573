@@ -1,0 +1,1 @@
+Credit: found by villagesql/vector-bench, branch tomas/villagesql-build-fairness, commit 96bdcb711, which measured a 60k-row pgvector incremental build at ~208 s on COPY against ~245 s on batched INSERT. The COPY-vs-INSERT asymmetry and the motivating measurement are theirs
