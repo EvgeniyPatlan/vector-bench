@@ -994,13 +994,29 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     #: specifically is invisible to every consumer. That is NOT the same as
     #: "nothing reads these columns positionally", which an earlier version
     #: of this comment claimed and which is false --
-    #: `tests/test_t3c_filtered.py:2263` reads the filtered table's cell
-    #: `[3]`, and `:1955-1958` reads the strategy table as `cells[-4]` and
-    #: `cells[-1]` behind a `len(cells) >= 12` gate that a 13-column header
-    #: would also pass if a column went missing. **An INSERTION is therefore
-    #: not safe**, and believing otherwise is what cost one commit in this
-    #: series 24 re-pointed assertion sites -- 25 integer subscripts -- in
-    #: `tests/test_t2b_report.py`.
+    #: `tests/test_t3c_filtered.py:2382` --
+    #: `test_the_m_column_sorts_numerically_not_as_text` -- reads the filtered
+    #: table's cell `[3]`, and `tests/test_t3c_filtered.py:2053-2055` --
+    #: `_published_strategies`, in the same class -- reads the strategy table
+    #: as `cells[-4]` and `cells[-1]` behind a `len(cells) >= 12` gate that a
+    #: 13-column header would also pass if a column went missing. **An
+    #: INSERTION is therefore not safe**, and believing otherwise is what
+    #: cost one commit in this series 24 re-pointed assertion sites -- 25
+    #: integer subscripts -- in `tests/test_t2b_report.py`.
+    #:
+    #: **BOTH NUMBERS WERE WRONG AND BOTH NOW CARRY THE SYMBOL BESIDE THEM.**
+    #: They read `c8de6a5:tests/test_t3c_filtered.py:2263` and
+    #: `c8de6a5:tests/test_t3c_filtered.py:1955-1958`, and at that commit 2263
+    #: held the opening of a nested `ast.walk` helper while 1955-1958 held a
+    #: section banner and the signature of `_filtered_record` -- none of which
+    #: reads a cell at all. Nothing had moved them recently; they were already
+    #: wrong, which is how most of the rotten citations found so far have
+    #: been wrong, and the reason `tests/test_e16_citation_ratchet.py` now
+    #: refuses new ones. The two live numbers above are re-derived rather than
+    #: converted to symbols, because repairing this tree's existing citations
+    #: was explicitly out of scope for the change that added that ratchet; the
+    #: symbol names are written beside them so the next reader can recover the
+    #: lines the next time they move.
     #:
     #: With nine tables carrying these axes across four column vocabularies
     #: there is no single achievable ordering for the whole file, so the set

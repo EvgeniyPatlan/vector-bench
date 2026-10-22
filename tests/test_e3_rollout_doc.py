@@ -608,6 +608,77 @@ def _cited_body(path: str, spec: str) -> str:
     return "\n".join(lines[lo - 1:hi])
 
 
+_MERGE_SUBJECT_RE = re.compile(r"Merge pull request #(\d+) from \S+/(\S+)")
+
+#: The numbers §1 calls absent from the merge numbering, as a PATTERN and not
+#: as one sentence -- the same choice `CLAIMS` makes above and for the same
+#: reason. The first version searched for the literal "#4 does not appear",
+#: which a reword to "#4 is absent from this history" would have reddened
+#: `master` for no defect at all: the brittleness this file spends its whole
+#: preamble arguing against.
+#:
+#: The subject is the number, the polarity is absence, and the wording is
+#: free. Bounded to one sentence (no period) and stopped at the next `#N`, so
+#: "#5 landed, and #4 does not appear" names #4 and not both.
+#: `TestTheAbsenceVocabularyIsNeitherBrittleNorVacuous` carries the rewordings
+#: it must accept and the forms it must still refuse.
+_ABSENT_NUMBER_RE = re.compile(
+    r"#(\d+)\b(?:(?!#\d)[^.])*?"
+    r"(?:does not appear|never appears|does not occur|is absent|"
+    r"does not exist|is missing|appears nowhere)")
+
+#: Rewordings the pattern must accept, and forms it must still refuse. Both
+#: are asserted, so the tolerance is executable rather than promised.
+ABSENCE_ACCEPTS = (
+    ("#4 does not appear in this history at all", [4]),
+    ("#4 is absent from this history", [4]),
+    ("#4 never appears as a merge", [4]),
+    ("#4 appears nowhere in the merge subjects", [4]),
+    ("the repository skipped a number: #4 does not occur", [4]),
+    # The absence phrase belongs to the nearer number, not to both: a
+    # pattern that swept up #5 here would read the document as naming two
+    # gaps and fail on correct prose.
+    ("#5 landed. #4 does not appear", [4]),
+)
+ABSENCE_REFUSES = (
+    # Present rather than absent: the polarity is the whole point.
+    "#4 appears in this history",
+    "#4 is in this history",
+    # A number that merged, described as merged.
+    "#16 landed as t5b-stats",
+    # No number at all.
+    "one pull request number does not appear in this history",
+)
+
+
+def _numbers_called_absent(text: str) -> set:
+    return {int(m) for m in _ABSENT_NUMBER_RE.findall(_plain(text))}
+
+
+def _merges_at(revision: str) -> Dict[int, str]:
+    """`{pull request number: branch}` for the merges reachable from `revision`.
+
+    Takes a revision rather than reading HEAD, so the same parser answers both
+    "what does the history say now" and "what did it say at the commit where
+    this guard went red", and the two cannot disagree about how a merge subject
+    is spelled.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "log", "--merges", "--format=%s", revision],
+            cwd=VB_ROOT, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(f"git unavailable: {exc}")
+    if out.returncode != 0:
+        pytest.skip(f"{revision} is not resolvable in this checkout")
+    found: Dict[int, str] = {}
+    for line in out.stdout.splitlines():
+        m = _MERGE_SUBJECT_RE.match(line)
+        if m:
+            found[int(m.group(1))] = m.group(2)
+    return found
+
+
 class TestTheClaimPatternsAreNeitherBrittleNorVacuous:
     """What `CLAIMS` is allowed to accept, and what it must still refuse.
 
@@ -1927,30 +1998,11 @@ class TestThePullRequestMappingMatchesTheHistory:
     than trusted.
     """
 
-    @pytest.fixture(scope="class")
-    def merges(self):
-        try:
-            out = subprocess.run(
-                ["git", "log", "--merges", "--format=%s"],
-                cwd=VB_ROOT, capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError) as exc:
-            pytest.skip(f"git unavailable: {exc}")
-        if out.returncode != 0:
-            pytest.skip("not a git checkout")
-        found = {}
-        for line in out.stdout.splitlines():
-            m = re.match(r"Merge pull request #(\d+) from \S+/(\S+)", line)
-            if m:
-                found[int(m.group(1))] = m.group(2)
-        if not found:
-            pytest.skip("no merge commits in this checkout")
-        return found
-
-    def test_the_history_was_read(self, merges):
-        """Non-vacuity: an empty mapping would make the rows below pass."""
-        assert len(merges) >= 10, sorted(merges)
-
-    @pytest.mark.parametrize("number,branch", [
+    #: §1's mapping table, as (repository pull request number, branch). Also
+    #: the definition of the span the gap assertion below runs over, which is
+    #: why it is a constant here rather than a literal in one decorator --
+    #: see `test_the_gap_in_the_numbering_is_the_one_the_document_names`.
+    MAPPING_ROWS = [
         (2, "pr-0-fake-driver"),
         (3, "pr-1-concurrency"),
         (5, "pr-3-filter"),
@@ -1959,7 +2011,20 @@ class TestThePullRequestMappingMatchesTheHistory:
         (9, "t4a-churn"),
         (12, "t4b-readers"),
         (16, "t5b-stats"),
-    ])
+    ]
+
+    @pytest.fixture(scope="class")
+    def merges(self):
+        found = _merges_at("HEAD")
+        if not found:
+            pytest.skip("no merge commits in this checkout")
+        return found
+
+    def test_the_history_was_read(self, merges):
+        """Non-vacuity: an empty mapping would make the rows below pass."""
+        assert len(merges) >= 10, sorted(merges)
+
+    @pytest.mark.parametrize("number,branch", MAPPING_ROWS)
     def test_the_row_names_a_merge_that_happened(self, merges, number,
                                                  branch):
         assert number in merges, (
@@ -1990,23 +2055,85 @@ class TestThePullRequestMappingMatchesTheHistory:
         restating: a monotonically increasing fact cannot be written down and
         stay true.
 
-        What is pinned instead is the claim the test is named for. The gap at
-        #4 is a fact about history, and history does not acquire new gaps, so
-        it holds indefinitely. Each individual row is checked by
-        `test_the_row_names_a_merge_that_happened` above, which is where a
-        wrong number belongs.
+        **THE GAP SET IS NOW COMPUTED OVER A CLOSED SPAN, AND THAT IS THE
+        SECOND HALF OF THE SAME FIX.** The pin that replaced `highest == 16`
+        was `gaps == [4]` over the whole log, justified in this docstring and
+        in docs/10 §1 by the claim that "history does not acquire new gaps".
+        **That claim is false, and it put `master` red on 2026-10-21.** #47
+        merged at 10:35 while #46 was still open, the whole-log computation
+        returned `[4, 46]`, and the gate failed on a document that was
+        correct; #46 merged at 16:17 and the gate went green again on its
+        own. A guard that fails on correct prose and then repairs itself when
+        an unrelated branch lands is the failure mode this file already
+        names twice -- it is not measuring its subject, and it teaches the
+        next author to delete it.
+
+        History acquires a gap whenever a higher-numbered pull request merges
+        before a lower-numbered one, and on this repository's cadence that is
+        routine rather than exceptional: #12 landed before #11, #30 before
+        #27, #47 before #46. Every one of those opened a gap that closed when
+        the lower number merged.
+
+        So the span is closed instead. **#1 to #16 is settled history**: the
+        span §1's mapping table covers, every number in it long since merged
+        or not, no gap inside it able to open or close again. The ceiling is
+        read off `MAPPING_ROWS` rather than written down, so it moves with the
+        table it is the span of. Over that span the gap set is frozen, #4 is
+        the whole of it, and the assertion can never be falsified by a merge.
+
+        **The span is closed because the table describes SETTLED history, not
+        merely because it is a table.** `era` inherits that property and
+        nothing else: a row added for a number above a pull request still in
+        flight would re-open the original defect verbatim. Two things keep
+        that narrow rather than theoretical.
+        `test_the_row_names_a_merge_that_happened` refuses a row docs/10 does
+        not name on one line with its branch, and
+        `test_the_open_span_form_really_did_fail_and_the_closed_one_does_not`
+        fails outright for any `era >= 46`, because #46 is unmerged at the
+        commit it replays. The table is the spec series, which closed at #16;
+        if a row is ever added for a later pull request, read this paragraph
+        before trusting the span.
+
+        **The limit this accepts, stated rather than hidden.** A permanent gap
+        ABOVE the span -- a pull request number that is closed-unmerged and
+        never will merge -- is not detected. It cannot be, from inside a unit
+        test: git records that #4 never merged and that #46 had not merged
+        yet, and nothing in the object store tells those two apart. Answering
+        it needs GitHub, and a guard that reaches the network is a guard that
+        fails on a train. What is kept instead is the part that does not need
+        the network: `4 in gaps` over the whole log, below, and the document
+        naming exactly one gap and no other.
         """
-        highest = max(merges)
-        gaps = sorted(set(range(1, highest + 1)) - set(merges))
-        assert gaps == [4], gaps
+        era = max(number for number, _ in self.MAPPING_ROWS)
+        # Non-vacuity for the span itself: an empty or mis-parsed MAPPING_ROWS
+        # would make `range(1, era + 1)` a handful of numbers and the gap set
+        # trivially right.
+        assert era >= 16, era
+        gaps = sorted(set(range(1, era + 1)) - set(merges))
+        assert gaps == [4], (
+            f"over #1-#{era} -- the span docs/10 §1's mapping table covers, "
+            f"and closed history -- the gaps in the merge numbering are "
+            f"{gaps}, not [4]. A gap here is permanent: every number in this "
+            f"span is resolved. Either a merge subject stopped parsing or §1 "
+            f"is describing a history this repository does not have.")
         # A FLOOR, not a value. The quantity only increases, so a lower bound
         # never goes stale, and it is here only to keep the gap computation
         # above from being satisfied by a mis-parsed handful of merges.
         # `test_the_history_was_read` is the other half of that.
-        assert highest >= 16, highest
-        assert re.search(r"#%d does not appear" % gaps[0], _doc()), (
-            f"the only gap in the merge numbering is #{gaps[0]}; docs/10 §1 "
-            f"names a different one")
+        assert max(merges) >= era, max(merges)
+        # The one fact about the WHOLE log that is durable: #4 never merged,
+        # and a number once skipped is skipped forever. The complement -- that
+        # no OTHER gap is permanent -- is the part that needs the network, and
+        # is not asserted.
+        whole = sorted(set(range(1, max(merges) + 1)) - set(merges))
+        assert 4 in whole, whole
+        # §1 must name that gap, and must name no other. This is the half that
+        # still watches the whole document: an invented gap anywhere in it
+        # fails here even though the gap COMPUTATION stops at #16.
+        named = sorted(_numbers_called_absent(_doc()))
+        assert named == [4], (
+            f"docs/10 §1 names {named} as absent from the merge numbering; "
+            f"the gap over #1-#{era} is [4]")
         # And §1 must not reintroduce the figure that rotted. Checked as a
         # pattern rather than against today's number, because the defect is
         # any such claim and not one particular spelling of it.
@@ -2015,6 +2142,43 @@ class TestThePullRequestMappingMatchesTheHistory:
             f"docs/10 §1 names the highest merged pull request again "
             f"({stale.group(0)!r}). That figure goes stale on the next "
             f"merge; the mapping table carries the numbers instead.")
+
+    def test_the_open_span_form_really_did_fail_and_the_closed_one_does_not(
+            self):
+        """The commit where the old pin went red, replayed against both forms.
+
+        Not a hypothetical. `a695c6d` is #47's merge commit -- the tree as it
+        stood between 10:35 and 16:17 on 2026-10-21, with #47 merged and #46
+        still open. Replaying the two computations there is what makes "the
+        closed span is immune to the event that broke the open one" an
+        executable statement rather than a paragraph of reasoning.
+
+        Pinned to a sha, so it is frozen: the merge set reachable from
+        `a695c6d` cannot change, which is the same property the closed span
+        relies on one level up.
+
+        **THIS TEST, AND NOT THE ONE ABOVE, IS WHAT CARRIES THE FIX.** A
+        review measured it: reverting the test above to the open span passes
+        at HEAD, because #46 has since landed and the whole-log gap set is
+        `[4]` again. The regression it was written for is undetectable from
+        today's tree. That division of labour is deliberate and worth stating
+        plainly -- the closed span prevents recurrence and can never again
+        demonstrate the defect, so the demonstration has to live at a commit
+        where the defect was visible. Delete this test and the change becomes
+        a claim in a docstring.
+        """
+        merges = _merges_at("a695c6d")
+        # Non-vacuity: a parse that found nothing would make both gap sets
+        # whatever `range(1, 1)` is and both assertions below meaningless.
+        assert len(merges) >= 10, sorted(merges)
+        assert 47 in merges and 46 not in merges, sorted(merges)
+
+        open_span = sorted(set(range(1, max(merges) + 1)) - set(merges))
+        assert open_span == [4, 46], open_span
+
+        era = max(number for number, _ in self.MAPPING_ROWS)
+        closed_span = sorted(set(range(1, era + 1)) - set(merges))
+        assert closed_span == [4], closed_span
 
     def test_what_the_document_says_about_16_matches_the_tree(self):
         """Whether §1 calls #16 open has to match whether #16 is merged.
@@ -2058,6 +2222,19 @@ class TestThePullRequestMappingMatchesTheHistory:
             assert says_open, (
                 "#16 is not in origin/master; docs/10 §1 should say it is "
                 "still open, because §2's order waits on the merge")
+
+    def test_the_absence_vocabulary_accepts_a_legitimate_rewording(self):
+        """The half that keeps this guard usable. A check keyed to one
+        sentence reddens `master` on a correct rewrite, and the author who
+        pays for that twice deletes it."""
+        for wording, expected in ABSENCE_ACCEPTS:
+            assert sorted(_numbers_called_absent(wording)) == expected, wording
+
+    def test_the_absence_vocabulary_refuses_the_wrong_polarity(self):
+        """Non-vacuity: a pattern loose enough to accept its own negation
+        would report #4 as named by a document that said the opposite."""
+        for wording in ABSENCE_REFUSES:
+            assert _numbers_called_absent(wording) == set(), wording
 
     def test_t5a_landed_and_t5c_did_not(self):
         """The distinction §1 draws inside PR 5, which is what unblocks the

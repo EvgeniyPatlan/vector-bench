@@ -2109,11 +2109,33 @@ class TestTheReportKeepsTheTwoColumnsApart:
                           "storage": "storage_engine"}
 
     #: The one ops-unit axis that is NOT a loop in `_run_unit`, because the
-    #: pass axis sits above it: `cli.py:454` does `for resource_pass in
-    #: passes:` and calls `_run_unit` inside it, so a unit is already
+    #: pass axis sits above it: `cmd_run`'s `for resource_pass in passes:`
+    #: loop calls `_run_unit` from inside its body, so a unit is already
     #: single-pass by the time that function runs. The mapping from loops to
     #: fields is therefore deliberately not one-to-one, and this names the
     #: exception instead of the pin pretending otherwise.
+    #:
+    #: **BY SYMBOL BECAUSE THE LINE NUMBER WAS WRONG.** This carried a line
+    #: number until #47 moved the loop out from under it. At `c8de6a5` the
+    #: loop is `c8de6a5:orchestrator/cli.py:508`, and the line the comment
+    #: went on naming, `c8de6a5:orchestrator/cli.py:454`, holds
+    #: `print(f"engines   : ...")` -- a line that exists, is well inside the
+    #: file and says nothing about resource passes. Both numbers carry the
+    #: commit in front so that they stay true and `git show` can settle
+    #: them; the live reference is the name.
+    #:
+    #: That is the shape of this defect and the reason a range check cannot
+    #: find it: every line citation in this tree's comments resolves to a
+    #: real line, and the wrong ones are wrong about the *content*, not the
+    #: arithmetic. Checking content would need a table saying what each
+    #: citation claims is there -- which is what `CITED_IN_REPO` gives
+    #: `docs/09` and `docs/10`, and what a comment has nothing of.
+    #:
+    #: #47's commit body lists the citations it re-derived and names three
+    #: more it checked and found unmoved. This one it moved and listed in
+    #: neither, which is how a change whose subject was citation rot shipped
+    #: a new instance of it. The name survives the next such edit;
+    #: `tests/test_e16_citation_ratchet.py` refuses the next new number.
     PASS_LEVEL_AXIS = "resource_pass"
 
     def _looped_axes(self):

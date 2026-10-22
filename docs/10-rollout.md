@@ -55,9 +55,36 @@ history at all. The mapping, from the merge commits:
 This paragraph deliberately does **not** name the highest pull request merged
 so far. It used to, and that figure went stale within the hour of being
 written — the next merge was this document's own. A monotonically increasing
-fact about the repository cannot be stated in prose and stay true; the gap at
-#4 can, because history does not acquire new gaps. The table below carries the
-numbers that matter, and each row is checked against the merge commits.
+fact about the repository cannot be stated in prose and stay true. The table
+below carries the numbers that matter, and each row is checked against the
+merge commits.
+
+**The reason the gap at #4 *can* be stated is not the reason this paragraph
+used to give.** It said the gap holds "because history does not acquire new
+gaps". That is false. History acquires a gap the moment a higher-numbered
+pull request merges before a lower-numbered one, and on this repository's
+cadence that is routine: #12 landed before #11, #30 before #27, #47 before
+#46. Each of those opened a gap in the numbering that closed later, when the
+lower number merged. The claim put `master` red on 2026-10-21 — #47 merged at
+10:35 with #46 still open, the guard computed the gaps over the whole log and
+got #4 *and* #46, and it failed on a document that was correct. #46 merged at
+16:17 and it went green again by itself, which is worse than failing: a guard
+that repairs itself when an unrelated branch lands was not measuring its
+subject.
+
+What makes #4 statable is narrower and does not depend on that claim. **#1 to
+#16 is settled history** — the span the table below covers, every number in it
+long since resolved, so no gap inside it can open or close again. #4 is the
+whole of that gap set and always will be. `tests/test_e3_rollout_doc.py`
+therefore computes the gap over that span and not over the whole log, and
+replays both forms against #47's own merge commit so that the difference is
+executable rather than argued.
+
+One thing it cannot establish: whether some number *above* #16 is permanently
+skipped rather than merely in flight. Git records that #4 never merged and
+that #46 had not merged yet, and offers nothing that tells those two apart —
+only GitHub knows, and a guard that asks it stops working on a checkout with
+no network, which is where this suite has to pass.
 
 | Spec PR | Tasks | Landed as | State |
 |---|---|---|---|
@@ -640,7 +667,9 @@ asserts, against the repository rather than against prose:
   differently wrong rewrite fails too, and that neither still carries the
   `[8, 32]` claim;
 * that §1's PR mapping names merges that really happened, including the gap in
-  the numbering, read from `git log --merges` rather than from this table;
+  the numbering, read from `git log --merges` rather than from this table —
+  over #1–#16 only, because a gap further up may be a pull request still open
+  rather than a number never used, and nothing local can tell those apart;
 * that none of `docs/09` §3's figures has been copied into this page, with the
   parser that looks for them proved against `docs/09` itself;
 * that this document states no test count and no figure that the next merge
