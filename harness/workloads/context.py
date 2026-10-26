@@ -62,7 +62,18 @@ class RunContext:
             "resource_pass": self.resource_pass,
             "dataset": dataset.name,
             "metric_space": dataset.metric,
-            "storage_engine": index.storage_engine,
+            # Asked of the DRIVER, not read off the IndexSpec. The spec's
+            # `storage_engine` is a MySQL-family `ENGINE=` clause that arrives
+            # populated for every engine (`--storage-engine` defaults to
+            # InnoDB and the orchestrator passes InnoDB for everything that is
+            # not MariaDB), and stamping it here published an InnoDB for
+            # PostgreSQL, Valkey and Percona Search -- 268, 128 and 120
+            # records of it in `full-20261015-215006`, beside the same run's
+            # honest `heap`, `memory` and `wiredTiger` from the ann path. Only
+            # the driver knows whether it put the value in a CREATE TABLE;
+            # `EngineDriver.storage_engine_in_use` is where that is decided
+            # and where the evidence is written down.
+            "storage_engine": driver.storage_engine_in_use(index),
             "march": self.march,
             "m": index.m,
             "ef_construction": index.ef_construction,

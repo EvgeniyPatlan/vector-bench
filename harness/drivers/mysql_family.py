@@ -270,6 +270,25 @@ class MySQLFamilyDriver(EngineDriver):
         # rather than hidden — see docs/05-methodology.md.
         self._index = index
 
+    def storage_engine_in_use(self, index: IndexSpec) -> Optional[str]:
+        """The `ENGINE=` clause `_create_table_ddl` actually emitted.
+
+        This family is the only one in the set that has a storage engine to
+        report, and the only reason `IndexSpec.storage_engine` exists: the
+        value goes into the DDL two methods up and comes back out here, so a
+        record cannot name a storage engine the table was not created with.
+        Read off the `IndexSpec` rather than off `self._index` because the
+        record is written per measurement from the spec the workload is
+        holding, and `self._index` is set per driver clone -- the concurrency
+        pool builds several.
+
+        The base class returns None, which is correct for every other engine
+        here; the whole of the asymmetry is that this one line exists. See
+        `EngineDriver.storage_engine_in_use` for the records it was published
+        wrong on.
+        """
+        return index.storage_engine
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------

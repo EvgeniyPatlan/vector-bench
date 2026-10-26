@@ -1371,6 +1371,79 @@ class TestWorkloadsShareOneSchema:
         # every phase these workloads emit is in ALL_PHASES.
         assert set(phases) <= set(records.ALL_PHASES)
 
+    def test_no_phase_claims_a_storage_engine_the_engine_does_not_have(
+            self, ctx, dataset):
+        """The defect, reproduced over every phase one unit writes.
+
+        `FakeDriver` is not a MySQL-family driver and therefore has no
+        `ENGINE=` clause, exactly like `PostgresDriver`, `ValkeyDriver` and
+        `MongoDriver`. The `IndexSpec` it is handed still carries `InnoDB`,
+        because `harness/main.py` defaults `--storage-engine` to it and
+        `orchestrator/cli.py:_ops_storage_engines` passes it for every engine
+        that is not MariaDB -- so the value is present, unused, and was being
+        stamped on the record anyway. In `full-20261015-215006` that published
+        268 pgvector, 128 Valkey and 120 Percona Search records claiming
+        InnoDB, beside the same run's `heap`, `memory` and `wiredTiger` from
+        the ann path: one engine, two storage engines, one run.
+        * Honest: not one record carries the key.
+        * Mutant (`record_defaults` reading `index.storage_engine` again):
+          every record in the file carries `InnoDB`.
+
+        All five phases, not a sample, because the defect was in the shared
+        provenance dict and a per-phase check could pass against a workload
+        that happens to overwrite it.
+        """
+        # Imported here rather than in this module's header: the file is about
+        # the four measurement workloads, and calibration is in
+        # tests/test_calibrate.py. It is in this list because the archived run
+        # carries 139 `ef_calibration` records for Percona Server alone, and
+        # they were wrong in the same way.
+        from harness.workloads import calibrate as calibrate_workload
+
+        driver = FakeDriver(dim=dataset.dim, metric=dataset.metric,
+                            ef_half=16.0, ef_search=64)
+        driver.connect()
+        index = index_spec(dataset)
+        # The precondition that makes the rest of this non-vacuous: the spec
+        # really does carry the value the bug published. A fixture whose spec
+        # held None would pass this test against the unfixed code.
+        assert index.storage_engine == "InnoDB"
+
+        build_workload.run(ctx, driver, dataset, index)
+        indexed_rows = driver.count_rows()
+        calibrate_workload.run(ctx, driver, dataset, index, ef_grid=(64,),
+                               max_queries=N_QUERIES, warmup=1,
+                               indexed_rows=indexed_rows)
+        concurrency_workload.run(
+            ctx, driver.clone, dataset, index, ef_search=64,
+            client_counts=(1,), duration_s=0.05, warmup=1,
+            max_queries=N_QUERIES)
+        filtered_workload.run(
+            ctx, driver, dataset, index, ef_search=64, selectivities=(0.50,),
+            max_queries=N_QUERIES, warmup=2, indexed_rows=indexed_rows,
+            columns=(ds.FILTER_TAG,))
+        churn_workload.run(
+            ctx, driver, dataset, index, ef_search=64, fractions=(0.10,),
+            max_queries=N_QUERIES, indexed_rows=indexed_rows)
+
+        rows = written(ctx)
+        # Every phase a unit writes is represented, so "no record claims one"
+        # below is a statement about all of them.
+        assert {r["phase"] for r in rows} == {
+            records.PHASE_INGEST, records.PHASE_BUILD,
+            records.PHASE_CALIBRATION, records.PHASE_CONCURRENCY,
+            records.PHASE_FILTERED, records.PHASE_CHURN,
+        }, sorted({r["phase"] for r in rows})
+        claimed = [(r["phase"], r["storage_engine"]) for r in rows
+                   if "storage_engine" in r]
+        assert claimed == [], claimed
+        # And `Record.to_dict` dropped it rather than writing a null, which is
+        # what "absent" means on the wire and what keeps
+        # `report/loaders.py:memory_stem` taking InnoDB's unsuffixed branch.
+        raw = open(ctx.recorder.path).read()
+        assert "storage_engine" not in raw
+        assert "InnoDB" not in raw
+
 
 #: Warm-up queries per client for the bracketing test below, and the client
 #: count and window it uses. Large enough that the warm-up is a visible

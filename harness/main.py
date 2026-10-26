@@ -109,7 +109,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="comma-separated ef_search values the calibration "
                         "sweep measures, in any order")
     p.add_argument("--k", type=int, default=10)
-    p.add_argument("--storage-engine", default="InnoDB")
+    # The MySQL family's `ENGINE=` clause, and nothing else. The orchestrator
+    # emits it unconditionally -- `_ops_storage_engines` returns `["InnoDB"]`
+    # for every engine that is not MariaDB -- so the default stays `InnoDB`
+    # for the DDL that needs a value. It does NOT reach the record any more:
+    # `EngineDriver.storage_engine_in_use` decides what a record claims, so an
+    # engine with no storage engine claims none. See that docstring for the
+    # 516 records of InnoDB this flag used to put on PostgreSQL, Valkey and
+    # Percona Search.
+    p.add_argument("--storage-engine", default="InnoDB",
+                   help="the MySQL family's ENGINE= clause (InnoDB, MyISAM); "
+                        "ignored by every other engine, which records no "
+                        "storage engine at all")
     p.add_argument("--build-mode", default="post", choices=("post", "incremental"))
     # The engine's BULK vector index build, as its own config declares it.
     # Decided on the host and passed in, the way `--driver` above is, and for

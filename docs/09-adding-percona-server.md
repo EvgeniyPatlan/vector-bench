@@ -178,7 +178,7 @@ recall/QPS frontier, the calibration sweep has something to do, and
   value here is above 10, so the grid is taken verbatim and
   `effective_ef()`'s default pass-through is correct. **But** the harness
   already has a hook for exactly this shape — `EngineDriver.effective_ef(ef, k)`
-  at `harness/drivers/base.py:374`, which exists because MongoDB clamps
+  at `harness/drivers/base.py:460`, which exists because MongoDB clamps
   `numCandidates` up to `limit`. If a profile ever sweeps `ef_search` below `k`,
   Percona clamps the same way MongoDB does and the driver must say so. The
   follow-on task should implement `effective_ef` as `max(ef, k)` and not leave
@@ -655,7 +655,7 @@ Two consequences, and they pull in opposite directions:
 vector index may run online, because the new table has no graph to maintain.
 The replace keeps one.
 
-So, hook by hook (`harness/drivers/base.py:325-371`):
+So, hook by hook (`harness/drivers/base.py:411-457`):
 
 | Hook | Percona | Why |
 |---|---|---|
@@ -1186,7 +1186,7 @@ its own:
 258                   "/opt/percona/.march"):
 ```
 
-consumed at `:331` as `march=args.march or _detect_march()`. That runs in the
+consumed at `:342` as `march=args.march or _detect_march()`. That runs in the
 **harness container**, which mounts `harness/` and not `overlay/`, so no
 override in an ann-benchmarks module can affect it. `orchestrator/ops_pass.py`
 contains the string `march` zero times, so nothing passes `--march` in and the
@@ -1504,7 +1504,7 @@ creates.** The guard on §1's first rider demanded the literal `should
 implement`, and it fired on rewordings that preserve every fact and both
 conclusions — `should **override**` (if anything the more precise verb, since
 `effective_ef` is an inherited concrete method with a default at
-`base.py:374`, so overriding is literally what happens) and `**must**
+`base.py:460`, so overriding is literally what happens) and `**must**
 implement` (a strictly stronger instruction). A second ban on `needs no edit`
 was subject-blind: it fired on a true sentence about a different subject, and
 that phrase recurs in a change-list document by nature.

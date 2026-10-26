@@ -503,14 +503,14 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", 'repair_path: str = "none"'),
     "harness/drivers/base.py:254-257":
         ("harness/drivers/base.py", "Valkey and Percona Search inherit"),
-    "harness/drivers/base.py:340-353":
+    "harness/drivers/base.py:426-439":
         ("harness/drivers/base.py", "def wait_index_synced"),
     "harness/drivers/postgres.py:172":
         ("harness/drivers/postgres.py", 'repair_path = "vacuum_analyze"'),
     # The second repair path, added when Percona Server landed. Cited beside
     # pgvector's so §4 item 4's "two engines" is a pointer and not a count a
     # reader has to take on trust.
-    "harness/drivers/mysql_family.py:751":
+    "harness/drivers/mysql_family.py:770":
         ("harness/drivers/mysql_family.py", 'repair_path = "index-replace"'),
     "harness/datasets.py:456-468":
         ("harness/datasets.py", "1.04%-3.47% of the rows (median 1.43%)"),

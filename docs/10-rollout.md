@@ -381,7 +381,7 @@ corpus a run would use.
 default and `harness/drivers/base.py:254-257` names the inheritors; the two
 overrides in the tree are `harness/drivers/postgres.py:172`,
 `repair_path = "vacuum_analyze"`, and
-`harness/drivers/mysql_family.py:751`, `repair_path = "index-replace"`.
+`harness/drivers/mysql_family.py:770`, `repair_path = "index-replace"`.
 MongoDB inherits `"none"`. The draft of this
 page said pgvector and MongoDB were both non-trivial here; they are not, and a
 before/after maintenance panel for MongoDB would be an empty comparison
@@ -416,7 +416,7 @@ stops for the duration).
 > Percona to the `repair_path: none` branch until the capability is flipped.
 
 What MongoDB has instead is the index-sync wait, a different hook:
-`harness/drivers/base.py:340-353` returns `0.0` by default and MongoDB and
+`harness/drivers/base.py:426-439` returns `0.0` by default and MongoDB and
 Valkey override it. So spec step 4's "where the new hooks do something" is
 correct about which two engines to run first, and this checklist item is about a
 different hook than that step is.

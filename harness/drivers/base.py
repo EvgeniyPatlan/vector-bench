@@ -290,6 +290,92 @@ class EngineDriver(abc.ABC):
     def create_index(self, index: IndexSpec) -> None:
         """Create the vector index. No-op where create_schema already did it."""
 
+    def storage_engine_in_use(self, index: IndexSpec) -> Optional[str]:
+        """The storage engine this driver's records should name, or None.
+
+        `IndexSpec.storage_engine` is a MySQL-family `ENGINE=` clause and
+        nothing else. `harness/main.py` defaults `--storage-engine` to
+        `InnoDB` and `orchestrator/cli.py:_ops_storage_engines` passes
+        `InnoDB` for every engine that is not MariaDB, so the field arrives
+        populated whether or not the driver has anywhere to put it. Only the
+        MySQL family does: `MySQLFamilyDriver._create_table_ddl` ends its
+        CREATE TABLE with `) ENGINE={index.storage_engine}`, and every other
+        driver here ignores the field completely.
+
+        `RunContext.record_defaults` used to stamp the raw field, so the ops
+        records claimed an InnoDB for PostgreSQL, Valkey and Percona Search --
+        three engines that have no storage engines at all, let alone that one.
+        Measured over the seven-engine run `full-20261015-215006`, by
+        (engine, storage_engine):
+
+            pgvector     InnoDB      268      pgvector     heap     200
+            valkey       InnoDB      128      valkey       memory   100
+            mongodb      InnoDB      120      mongodb      wiredTiger 37
+
+        The honest halves of those three pairs are the `recall_qps` records,
+        which the ann overlay modules write and which name what the engine
+        actually stores in; every other phase is this harness, and it
+        overwrote all three with the same wrong default. So one engine
+        reported two different storage engines inside a single run, and the
+        half a reader is most likely to trust -- the ops half, which is where
+        build cost, concurrency, filtered search and churn live -- was the
+        false one.
+
+        Returning None is what makes the field ABSENT: `Record.to_dict` drops
+        every None, which is the schema's own convention for a field the
+        engine has no answer for (`ef_construction` is already absent for
+        MHNSW and VIDX, which expose no such knob). A reader that wants a
+        display name for PostgreSQL's heap has one in
+        `report/render.py:_STORAGE_OVERRIDES`, keyed on the engine, which is
+        where a presentation name belongs; a measurement record saying nothing
+        is not the same claim as a measurement record saying InnoDB.
+
+        **Why absent rather than the honest name, which is the obvious
+        alternative and would make the ops half agree with the ann half
+        verbatim.** `report/loaders.py:memory_stem` reconstructs the filename
+        the orchestrator gave this unit's `mem-*.jsonl` sampler, and that name
+        suffixes the storage engine only when it is not InnoDB
+        (`orchestrator/cli.py`: `if storage.lower() != "innodb"`). The
+        orchestrator names the file from ITS value, which is `InnoDB` for all
+        three engines, so the file on disk is unsuffixed -- in that run,
+        `mem-pgvector-...-m16-post.jsonl`. A record saying `heap` would make
+        `memory_stem` ask for `...-m16-post-heap`, match nothing, and drop the
+        sampled peak RSS for three of seven engines out of the report. An
+        absent field takes the same `or ""` branch InnoDB takes and keeps that
+        join intact, so this is the one spelling that corrects the claim
+        without moving a second number. Naming the real engine here is a
+        change to `report/` as well, and is not this one.
+
+        That join is not theoretical and the cost is not small: in
+        `full-20261015-215006` EVERY index_build record for those three
+        engines carries `extra.peak_rss_source: "sampled"`, so
+        `_attach_sampled_peaks` is the only thing that ever gave them a
+        `peak_rss_bytes` at all. A stem that stopped matching would not
+        publish a wrong peak memory figure, it would publish none.
+
+        WHAT THIS DOES NOT FIX, because it cannot be fixed from inside
+        `harness/`: `webui/static/fields.js` declares `storage_engine` as a
+        FILTER on all six ops views, and
+        `tests/test_c2_webui_phases.py` asserts for the ingest and
+        calibration views that every declared filter is a facet every record
+        of that phase carries. That assertion held only because this method's
+        predecessor lied -- it is a guard that depended on the defect. With
+        the claim withdrawn, an engine with no storage engine carries no such
+        facet, and the declaration is the half that is now wrong. Whether the
+        six views drop the filter, or `explore.js` learns to hide a facet no
+        record in the current view carries, is a decision about the Explore
+        tab and belongs with it.
+
+        A method rather than a class attribute beside `incremental_index` and
+        `repair_path`, which is where an engine's fixed properties live,
+        because the MySQL family's answer is not fixed: MariaDB's
+        InnoDB-versus-MyISAM sweep is a real within-engine comparison
+        (`orchestrator/cli.py:_ops_storage_engines`, `docs/05-methodology.md`),
+        and both values have to reach the record for the report to keep the
+        two curves apart.
+        """
+        return None
+
     # -- data -----------------------------------------------------------
 
     @abc.abstractmethod
