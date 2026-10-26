@@ -510,6 +510,25 @@ def _grouped(records: List[Dict[str, Any]]
 #: of the seven. A 64,730-pixel strip is not a chart in any document: placed
 #: in a 6.5-inch text column it is 0.08 inches tall.
 #:
+#: **And past a certain series count it stops being a presentation problem.**
+#: Measured against `acaf032`, the revision before this fix, by rendering its
+#: own `charts.churn` with seven engines over nine graph degrees -- 63 units,
+#: 126 legend entries:
+#:
+#:     ValueError: Image size of 67288x792 pixels is too large.
+#:     It must be less than 2^16 in each direction.
+#:
+#: raised from `_RendererAgg(int(width), int(height), dpi)` inside `savefig`.
+#: The same revision renders 21 series fine at 22,494 x 792, so this is the
+#: same defect one sweep further along, not a separate one. The failure lands
+#: at REPORT GENERATION, after the measurement work is already spent: the run
+#: has done its hours and comes away with no report at all. That is the real
+#: severity here, and it is why `_require_matplotlib` further up refuses to
+#: draw rather than draw nothing -- it would be a poor trade to protect the
+#: report from a missing dependency and then lose it to a legend.
+#: `tests/test_chart_aspect_ratio.py::TestTheWideShapeDoesNotDestroyTheReport`
+#: pins that shape.
+#:
 #: **Why 4.0 rather than something nearer 3.** The widest FIXED layout in this
 #: module is `build_cost`'s four side-by-side panels, `figsize=(20, 4.6)`,
 #: which saves at 3.8:1 -- and the single-engine versions of the very charts

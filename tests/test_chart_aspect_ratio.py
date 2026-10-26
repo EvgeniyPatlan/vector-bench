@@ -566,6 +566,59 @@ def draw_measuring_canvas(name, shape, draw_chart, records):
     return _MEASURED[(name, shape)]
 
 
+#: matplotlib's Agg backend refuses a canvas of 2^16 pixels in either
+#: direction. A legend row long enough takes a figure past it.
+AGG_PIXEL_LIMIT = 2 ** 16
+
+
+@needs_matplotlib
+class TestTheWideShapeDoesNotDestroyTheReport:
+    """At 63 series the pre-fix churn chart did not draw a strip. It RAISED.
+
+    Measured against `acaf032`, this branch's base, by rendering that
+    revision's own `report/charts.py` with seven engines over nine graph
+    degrees -- 63 units, 126 legend entries:
+
+        ValueError: Image size of 67288x792 pixels is too large.
+        It must be less than 2^16 in each direction.
+
+    from `_RendererAgg(int(width), int(height), dpi)` inside `savefig`. The
+    same revision renders 21 series fine, at 22,494 x 792.
+
+    **That is a different severity from everything else in this file, and it
+    is the true one.** A chart too wide to use is a presentation problem a
+    reader works around. This is `generate.py` raising at report time, after
+    the measurement work is already spent -- the run has done its hours and
+    has nothing to show for them. This module already refuses to draw rather
+    than draw nothing, for exactly that reason; it should not then lose the
+    report to a legend.
+
+    **Why this is its own test when the sweep already renders this shape.**
+    It would indeed go red: a raise turns those into errors. But it would
+    report as "the aspect ratio test errored", which names the wrong defect,
+    and the protection would be incidental -- it survives only as long as
+    `63s` stays in `SHAPES`, and `SHAPES` is a runtime/coverage trade-off
+    someone will reasonably revisit. The one failure mode that DESTROYS
+    output rather than degrading it should not depend on a list that exists
+    for another purpose. So it is pinned here, by name, with the shape
+    spelled out.
+    """
+
+    def test_sixty_three_series_still_renders(self):
+        units = tuple((engine, m) for engine in ENGINES
+                      for m in (4, 8, 16, 24, 32, 48, 64, 96, 128))
+        assert len(units) == 63, len(units)
+        # `draw` asserts the chart produced files at all; reaching this line
+        # already means `savefig` did not raise.
+        width, height = draw(
+            lambda records, out: charts_mod.churn(
+                records, DATASET, out, "churn"),
+            churn_records(units))
+        assert max(width, height) < AGG_PIXEL_LIMIT, (
+            f"churn came out {width} x {height}, which the Agg backend "
+            f"refuses -- this is the shape that used to raise")
+
+
 @needs_matplotlib
 @pytest.mark.parametrize("shape,units", SHAPES)
 @pytest.mark.parametrize("name,draw_chart,make_records", ALL_CHARTS)
