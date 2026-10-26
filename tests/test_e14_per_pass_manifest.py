@@ -152,7 +152,15 @@ def _manifest(passes: Sequence[Tuple[str, Optional[str], Dict[str, Any]]],
         "host": ({"cpu": {}} if hostname is None
                  else {"cpu": {}, "hostname": hostname}),
         "engines": {}, "warnings": [],
-        "phases": [{"phase": "ann", "engine": "percona", "dataset": "d1",
+        # The corpus the records below carry, not a placeholder. `phases[]`
+        # is one of the two things `report/scope.py` reads to decide which
+        # corpora a run measured, so a phase log naming `d1` beside records
+        # naming `glove-100-angular` describes a run that measured neither --
+        # and the report then correctly excludes every record this file
+        # builds. A fixture has to be self-consistent on an axis another
+        # reader keys off.
+        "phases": [{"phase": "ann", "engine": "percona",
+                    "dataset": "glove-100-angular",
                     "status": "completed", "resource_pass": name}
                    for name in names],
         "config": config,
@@ -766,7 +774,8 @@ class TestARunWhoseSecondPassNeverStarted:
         manifest["run_id"] = "run-stopped"
         manifest.setdefault("phases", []).append(
             {"phase": "ann", "resource_pass": "normalized",
-             "status": "completed", "engine": "percona", "dataset": "d1"})
+             "status": "completed", "engine": "percona",
+             "dataset": "glove-100-angular"})
         root = _trees(tmp_path, f"normalized/{NORMALIZED_FP}",
                       f"tuned/{TUNED_FP}")
         code, capture = _run_report(tmp_path, manifest, root, monkeypatch)

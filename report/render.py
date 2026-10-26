@@ -19,6 +19,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from report import scope as _scope
+
 # Defaults; the manifest's per-engine `presentation.label` overrides them, so an
 # engine added after this file was written names itself correctly.
 ENGINE_LABEL = {
@@ -517,6 +519,24 @@ def _fmt_age(run_started: Any, measured_at: Any) -> str:
     return f"{delta / 86400:.1f} days"
 
 
+#: Prose for each code `report/scope.py` files an excluded recall record
+#: under. Keyed off that module's constants rather than off three retyped
+#: literals, because a sentinel spelled in two files is a sentinel that
+#: drifts, and the drift here would be silent: an unknown code falls through
+#: to the generic phrase below and the row still renders.
+#:
+#: Three codes rather than two, and the third is the one that matters. In the
+#: reference bundle percona's own gist and glove curves were the IN-SCOPE
+#: engine on an out-of-scope corpus; filing those rows under "engine" would
+#: send a reader looking for an engine nobody ran, and under "dataset" would
+#: hide that an engine can be in scope and still contribute nothing here.
+_OUT_OF_SCOPE_REASON = {
+    _scope.OUT_OF_SCOPE_ENGINE: "this run did not measure this engine",
+    _scope.OUT_OF_SCOPE_DATASET: "this run did not measure this corpus",
+    _scope.OUT_OF_SCOPE_BOTH: "neither this engine nor this corpus",
+}
+
+
 def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
@@ -742,6 +762,79 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             rows.append([_label(c.get("engine", "?")), c.get("dataset", "?"),
                          _fmt_age(c.get("run_started"), c.get("measured_at"))])
         parts.append(_md_table(["Engine", "Dataset", "Measured before this run by"], rows))
+
+    if summary.get("out_of_scope_ann"):
+        # Deliberately NEXT to the staleness notice above, and deliberately
+        # not merged into it. Both are facts about the same shared tree and
+        # they need opposite remedies.
+        #
+        # A STALE row is a configuration this run asked for and ann-benchmarks
+        # served from cache, because it skips any configuration that already
+        # has a result file and reports that as success. `--force` recomputes
+        # it, and in the reference bundle percona's own `ef_construction`
+        # sweep was exactly that -- a legitimate cache hit from the previous
+        # day, correctly flagged.
+        #
+        # A row HERE is a measurement of something this run never asked for.
+        # There is no `--force` that makes MariaDB part of a percona-only run,
+        # and offering one would send an operator to re-measure six engines to
+        # fix a report that is now correct. Before this notice existed the
+        # rows below appeared in the staleness table instead -- "MariaDB 12.3,
+        # measured before this run by 1.8 days" -- which reads as a refreshable
+        # cache hit and is the wrong instruction twice over.
+        rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+                 str(c.get("files") or c.get("records") or 0),
+                 _OUT_OF_SCOPE_REASON.get(c.get("reason"),
+                                          "not part of this run")]
+                for c in summary["out_of_scope_ann"][:30]]
+        files = sum(c.get("files") or 0 for c in summary["out_of_scope_ann"])
+        records_dropped = sum(c.get("records") or 0
+                              for c in summary["out_of_scope_ann"])
+        # The file count where there is one, the record count otherwise. A
+        # record with no `extra.source_file` came from a hand-assembled or
+        # third-party records file rather than out of the tree, and counting
+        # it as a file would name a path nobody can go and look at.
+        held = (f"**{files} result files**" if files != 1
+                else "**1 result file**")
+        if not files:
+            held = (f"**{records_dropped} recall records**"
+                    if records_dropped != 1 else "**1 recall record**")
+        # Named, not pointed at. An earlier wording said "the engines and
+        # corpora named in §1", and §1 names the engines only -- there is no
+        # corpus anywhere in it, so half of the sentence sent a reader to a
+        # table that could not answer. These come off the summary, which is
+        # what the report actually carries after the narrowing, so the claim
+        # cannot be wider than the document it introduces.
+        in_scope_engines = ", ".join(
+            _label(e) for e in (summary.get("engines") or [])) or "no engine"
+        in_scope_datasets = ", ".join(
+            f"`{d}`" for d in (summary.get("datasets") or [])) or "no corpus"
+        covers = f"{in_scope_engines} on {in_scope_datasets}"
+        parts.append(
+            "\n### Recall results from other runs in the shared tree\n\n"
+            "Recall results live in a tree shared across runs at "
+            "`results/annb/<pass>/<fingerprint>/`. That is deliberate: the "
+            "fingerprint keys on the resource pass's declared limits and is "
+            "engine-invariant, so every engine measured at one budget lands "
+            "in one tree and one chart compares them. The cost is that the "
+            "tree is not a record of any single run.\n"
+            f"\nThis report covers {covers}. The tree also held {held} for "
+            f"the combinations below, which this run did not measure, and "
+            f"**they are excluded from every chart and table in this "
+            f"report** and from the `records.jsonl` beside it.\n"
+            "\n_This is not the staleness notice above, and `--force` is not "
+            "the remedy. A stale result is a measurement this run asked for "
+            "and ann-benchmarks served from cache. A row below was never part "
+            "of this run at all, so there is nothing here to recompute: to "
+            "report on it, report the run that measured it, or widen this "
+            "profile's `engines:` and `datasets:` and measure it here._\n"
+        )
+        parts.append(_md_table(
+            ["Engine", "Dataset", "Result files",
+             "Why it is not part of this run"], rows))
+        more = len(summary["out_of_scope_ann"]) - 30
+        if more > 0:
+            parts.append(f"\n_…and {more} more._\n")
 
     if summary.get("passes_without_a_tree"):
         # The notice that has to be IN the document. `full-20261015-215006`

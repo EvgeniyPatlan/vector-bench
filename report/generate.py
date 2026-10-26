@@ -26,7 +26,7 @@ for candidate in (VB_ROOT, "/opt", os.path.dirname(os.path.abspath(__file__))):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from report import charts, loaders  # noqa: E402
+from report import charts, loaders, scope  # noqa: E402
 from report import measurement_versions as versions  # noqa: E402
 from report.render import (adopt_presentation as render_adopt_presentation,  # noqa: E402
                            render_html, render_markdown)
@@ -1213,6 +1213,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[report] {exc}", file=sys.stderr)
         return 2
 
+    # The shared ann results tree is not a record of any one run, so narrow
+    # what came out of it to the engines and corpora the manifest says this
+    # run measured. See `report/scope.py` for the whole argument, including
+    # why the manifest is the only source and why the ops records are never
+    # narrowed. Before `--datasets`, so that flag's refusal message is about
+    # what this run measured rather than about what the machine has ever
+    # measured, and before `records.jsonl` is written, because that file is
+    # what the web UI prefers over the raw ops records and a mixed set
+    # persisted there is inherited by every later reader.
+    measured_engines = scope.measured_engines(manifest)
+    measured_datasets = scope.measured_datasets(manifest)
+    records, out_of_scope = scope.narrow_to_measured_scope(records, manifest)
+    for axis, named in (("engines", measured_engines),
+                        ("datasets", measured_datasets)):
+        if named:
+            print(f"[report] this run's {axis}: {', '.join(named)}")
+            continue
+        # The legacy class, and the same bargain `_warn_about_unrecorded_passes`
+        # strikes: stdout, not a Validity notice. An archived manifest can
+        # record neither the engines it configured nor the corpora it asked
+        # for, and a scope derived from it would be empty -- which, applied,
+        # deletes the entire recall half of the report. Reading too much is
+        # the defect; reading nothing is worse, so that axis is left alone and
+        # §2's staleness notice stays the guard, exactly as it was before this
+        # change.
+        print(f"[report] WARNING: this manifest records no {axis} for the "
+              f"run, so this report cannot narrow the shared ann results "
+              f"tree by {axis[:-1]}. Whatever that tree holds for another "
+              f"run at this resource pass is read as though this run had "
+              f"measured it, and §2 Validity flags any of it that predates "
+              f"this run. A run directory written by a current "
+              f"./run-benchmark.sh run records both.")
+    if out_of_scope:
+        print(f"[report] excluded {scope.excluded_record_count(out_of_scope)} "
+              f"recall record(s) from "
+              f"{scope.excluded_file_count(out_of_scope)} result file(s) that "
+              f"another run wrote into the shared tree; §2 Validity names "
+              f"them.")
+
     if args.datasets:
         wanted = {d.strip() for d in args.datasets.split(",") if d.strip()}
         present = {r.get("dataset") for r in records if r.get("dataset")}
@@ -1230,6 +1269,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not records:
         print("[report] no records found — nothing to report", file=sys.stderr)
+        # The one state in which the exclusion census has nowhere else to go.
+        # No records means no report, so §2 is never rendered and the only
+        # account of what was dropped is this. It is reachable: an ann-only
+        # profile whose own phase wrote nothing leaves a run directory with no
+        # ops records and a shared tree full of other runs' results, and
+        # before the narrowing that published seven engines under a one-engine
+        # manifest. Exiting 1 is right -- there is nothing of THIS run to
+        # report -- but exiting 1 without saying why reads as a broken tree.
+        if out_of_scope:
+            print(f"[report] every recall result under the shared ann tree "
+                  f"belonged to another run "
+                  f"({scope.excluded_record_count(out_of_scope)} record(s) "
+                  f"across "
+                  f"{len(out_of_scope)} engine/corpus combination(s)), and "
+                  f"this run produced none of its own. Report the run that "
+                  f"measured them, or re-run this one's ann phase.",
+                  file=sys.stderr)
         return 1
 
     # Only now, with records in hand and every refusal behind us, is the output
@@ -1269,6 +1325,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[report] merged records -> {merged_path}")
 
     summary = summarize(records, manifest, memory)
+    # Set here rather than built inside `summarize`, because `summarize`'s
+    # inputs cannot produce it: by the time it is called the excluded records
+    # are gone, and a census of them is exactly the thing the remaining
+    # records cannot describe. Passing it through as an argument would make
+    # `summarize` a courier for a value it neither derives nor uses. §2 reads
+    # it with `.get`, like every other optional notice, so a summary built by
+    # hand -- several tests build one -- simply has nothing to say.
+    summary["out_of_scope_ann"] = out_of_scope
     chart_paths: Dict[str, Dict[str, str]] = {}
 
     for dataset in summary["datasets"]:
