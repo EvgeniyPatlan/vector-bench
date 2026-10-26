@@ -217,7 +217,11 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
         note = (f"Regenerating reads every ann result on this machine "
                 f"({tree_files} files), because the tree keyed to this run's "
                 f"resource configuration is not here. It would publish only "
-                f"{_scope_phrase(scope)} and name the rest in its Validity "
+                # The comma is load-bearing: `_scope_phrase` returns a noun
+                # phrase that can end in an "it asked for" or a parenthesis,
+                # and without it the splice read "... on the 1 corpus(es) it
+                # asked for and name the rest in its Validity section."
+                f"{_scope_phrase(scope)}, and name the rest in its Validity "
                 f"section. "
                 # Still said, and still the more serious half. The scope
                 # narrows by engine and corpus, not by machine, so a foreign
@@ -282,26 +286,68 @@ def _scope_phrase(scope: Any) -> str:
     it claimed 7 x 4 = 28 combinations where the scope admits 10 -- in the
     function that computes the scope and then used it only for a boolean.
 
-    Three shapes, because the scope has three. A phase log gives pairs; an
-    engine block with no phase log gives engines and the corpora the profile
-    asked for; and neither gives corpora alone, which is the state where the
-    engine axis narrows nothing and the corpus axis still does.
+    FOUR shapes, one per state of the two axes `Scope.admits` narrows on,
+    because either axis can be silent and **a silent axis narrows nothing**.
+    Three of the four shapes used to be spelled from one `corpora` string
+    that read "no corpus it names" when the corpus axis was silent, and in
+    the one of those three the call site can reach, that produced:
+
+        the 1 engine(s) this run configured, on the no corpus it names it
+        asked for
+
+    -- mangled, and wrong in exactly the way this surface exists to prevent.
+    `Scope.admits` for an engine with no pair is
+    `engine in unpaired and (not datasets_known or dataset in datasets)`, so
+    with `datasets` empty that engine is admitted on EVERY corpus in the
+    tree, including corpora the run never asked for. The sentence promised
+    the corpus narrowing in the single state where it is not applied.
+
+    Reachable, if narrowly, which is why it is a defect and not a typo: all
+    ten profiles in `config/profiles/` declare `datasets:` and
+    `webui/profiles.py` requires the key of any profile edited here, so
+    `measured_datasets`' declared-corpora fallback is normally non-empty. It
+    takes a hand-edited, truncated or imported manifest -- one whose phase
+    log is empty beside an `engines` block, the same shape
+    `Scope.engines_known` is documented for.
+
+    Every return is a NOUN PHRASE, because the only call site splices it into
+    "It would publish only {phrase}, and name the rest in its Validity
+    section." The no-engine shape used to return a whole clause and spliced
+    into a run-on: "... so every engine in the tree is read for them and name
+    the rest in its Validity section."
     """
-    corpora = (f"{len(scope.datasets)} corpus(es)" if scope.datasets
-               else "no corpus it names")
     if scope.pairs:
         phrase = (f"the {len(scope.pairs)} engine/corpus combination(s) this "
                   f"run's phase log records")
         if scope.unpaired:
+            # `datasets` is necessarily non-empty wherever `pairs` is -- a
+            # pair comes from a phase entry and so do the corpora -- which is
+            # the same implication `Scope.admits` reasons from, so this count
+            # is never zero and the clause never claims a bare restriction.
             phrase += (f", plus the {len(scope.unpaired)} engine(s) it "
                        f"configured and recorded no unit for, on those "
-                       f"{corpora}")
+                       f"{len(scope.datasets)} corpus(es)")
         return phrase
     if scope.unpaired:
-        return (f"the {len(scope.unpaired)} engine(s) this run configured, on "
-                f"the {corpora} it asked for")
-    return (f"the {corpora} this run asked for -- it records no engine, so "
-            f"every engine in the tree is read for them")
+        engines = f"the {len(scope.unpaired)} engine(s) this run configured"
+        if scope.datasets:
+            return (f"{engines}, on the {len(scope.datasets)} corpus(es) it "
+                    f"asked for")
+        return (f"{engines}, on every corpus the tree holds (it names no "
+                f"corpus, so the corpus axis narrows nothing)")
+    if scope.datasets:
+        return (f"every engine the tree holds, on the {len(scope.datasets)} "
+                f"corpus(es) this run asked for (it records no engine, so "
+                f"the engine axis narrows nothing)")
+    # Neither axis says anything. Unreachable through `report_inputs`, the
+    # only caller: its `elif scope.known:` arm is false in precisely this
+    # state, which falls to the `unnarrowed` arm and its own note. Guarded
+    # rather than left to fall through, because the line that used to stand
+    # here is the one that said "the no corpus it names" -- prose inherited
+    # from a state the scope is not in is the defect itself, so a direct
+    # caller gets the truth instead of a narrowing nothing applies.
+    return ("every engine and corpus the tree holds (this run names neither, "
+            "so neither axis narrows anything)")
 
 
 def _count_hdf5(path: str) -> int:

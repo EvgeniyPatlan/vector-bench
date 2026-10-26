@@ -414,6 +414,75 @@ class TestReportRegenerationRisk:
         assert found["regenerate_risk"] == "unnarrowed_resources"
         assert "nor the corpora it measured" not in found["regenerate_note"]
         assert "it records no engine" in found["regenerate_note"]
+        # And it splices into ONE sentence. The phrase used to be a complete
+        # clause -- "... so every engine in the tree is read for them" --
+        # dropped into "It would publish only {phrase} and name the rest ...",
+        # which ran the two together.
+        assert ("It would publish only every engine the tree holds, on the 1 "
+                "corpus(es) this run asked for (it records no engine, so the "
+                "engine axis narrows nothing), and name the rest in its "
+                "Validity section.") in found["regenerate_note"]
+
+    def test_a_run_with_engines_and_no_corpora_promises_no_corpus_narrowing(
+            self, tmp_path):
+        """The note promised a corpus restriction `Scope.admits` never applies.
+
+        An `engines` block, an empty phase log and a profile declaring no
+        `datasets:` -- a hand-edited, truncated or imported manifest, which
+        is the shape `Scope.engines_known` is documented for. The corpus axis
+        is then silent, and `admits` for an engine with no pair reads
+        `engine in unpaired and (not datasets_known or ...)`: that engine is
+        admitted on EVERY corpus in the tree. The note said the opposite, in
+        mangled English -- "on the no corpus it names it asked for" -- which
+        is the corpus axis claim PR #49 exists to stop, made by the surface
+        that reports PR #49's narrowing.
+
+        Untested until now because the fixture next door pops the declared
+        corpora AND empties the engines block, so it leaves `scope.known`
+        false and takes the `unnarrowed` arm instead of this phrase.
+        """
+        from report.scope import scope_of
+        manifest = basic_manifest("r1")
+        manifest["phases"] = []
+        manifest["config"]["profile"].pop("datasets")
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             manifest=manifest)
+        assert found["scope_engines"] == ["mariadb", "pgvector"]
+        assert found["scope_datasets"] == []
+        assert found["scope_narrowed"] is True
+        assert found["regenerate_risk"] == "unnarrowed_resources"
+        note = found["regenerate_note"]
+        # The mangled wording, in the form a revert would restore.
+        assert "no corpus it names" not in note
+        assert ("It would publish only the 2 engine(s) this run configured, "
+                "on every corpus the tree holds (it names no corpus, so the "
+                "corpus axis narrows nothing), and name the rest in its "
+                "Validity section.") in note
+        # And the sentence is held against the predicate it describes rather
+        # than against itself: a corpus this run never named is admitted, so
+        # any note restricting the corpus axis here is false.
+        scope = scope_of(manifest)
+        assert scope.admits("mariadb", "gist-960-euclidean") is True
+        assert scope.datasets == frozenset()
+
+    def test_the_phrase_for_a_scope_that_says_nothing_claims_nothing(self):
+        """The fourth shape, which no call site reaches, said it too.
+
+        `report_inputs` guards it -- `elif scope.known:` is false when neither
+        axis says anything, and that state takes the `unnarrowed` arm -- so
+        this is `_scope_phrase` tested directly, the way the repo keeps a
+        guarded branch honest rather than letting it rot. It read "the no
+        corpus it names this run asked for", a corpus restriction over a
+        scope that restricts nothing at all.
+        """
+        from report.scope import scope_of
+        scope = scope_of({"engines": {}, "phases": [], "config": {}})
+        assert scope.known is False
+        assert scope.admits("mariadb", "gist-960-euclidean") is True
+        phrase = runs_mod._scope_phrase(scope)
+        assert "no corpus it names" not in phrase
+        assert phrase == ("every engine and corpus the tree holds (this run "
+                          "names neither, so neither axis narrows anything)")
 
     def test_a_run_that_records_no_scope_still_says_it_cannot_narrow(
             self, tmp_path):
