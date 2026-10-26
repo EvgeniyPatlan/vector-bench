@@ -40,12 +40,31 @@ def _logged_datasets(manifest: Dict[str, Any]) -> List[str]:
 
     Deduplicated rather than counted: one corpus appears once per
     (engine, phase, pass) that touched it.
+
+    **First-seen order, deliberately, and pinned by a test.** This diverges
+    from `report/scope.py::_ordered`, which sorts: its axes are compared
+    against each other and against fixtures, where sorting is what makes two
+    reads equal, and this is prose for a human reading one line. Run order
+    tells that reader which corpus the run got to before it stopped, which
+    alphabetical order destroys. Changing `return out` to `return
+    sorted(out)` is a one-word mutant that passed the whole suite until
+    `test_the_log_order_is_the_run_order_and_not_the_alphabet` existed, and
+    it would have taken `full-20261015-215006`'s README line off
+    byte-identical with the version this replaced -- `full` declares
+    fashion, glove, sift, gist, which is not sorted. That byte-identical
+    result on all 12 archived bundles is the measurement this whole term
+    order was justified by, so the property it rests on gets a test.
+
+    `str()` for the same reason `_accumulate_datasets` uses it: a
+    hand-edited manifest with a non-string corpus name would otherwise reach
+    `", ".join(...)` and raise, and `readme_text` is called from the export
+    path and from `webui/server.py`, where a traceback is user-visible.
     """
     out: List[str] = []
     for phase in (manifest.get("phases") or []):
         name = phase.get("dataset") if isinstance(phase, dict) else None
-        if name and name not in out:
-            out.append(name)
+        if name and str(name) not in out:
+            out.append(str(name))
     return out
 
 

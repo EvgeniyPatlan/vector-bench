@@ -2817,9 +2817,12 @@ class TestTheCorpusListIsResolvedAndNotSupplied:
         wrong, and the mutation run that proved it is why this paragraph
         exists. So: mutant that kills this is deleting the
         `config["resolved_datasets"] = resolved_datasets` assignment, after
-        which the splatted value is simply what the block keeps. The pop is
-        what covers the EMPTY case, where there is no assignment to overwrite
-        anything -- the test above.
+        which the pop is the whole story and the key is absent; the splatted
+        value survives only if the pop goes too, which is a different mutant
+        and kills seven tests rather than six. The pop is what covers the
+        EMPTY case, where there is no assignment to overwrite anything -- the
+        test above. Measured in all three configurations, because this
+        docstring has now been wrong once already about which line holds.
         """
         m = Manifest(str(tmp_path / "run-smuggle-2"), "run-smuggle-2")
         m.set_config({"name": "full"}, "tuned", TUNED_LIMITS,
@@ -2839,8 +2842,11 @@ class TestTheCorpusListIsResolvedAndNotSupplied:
         Refused loudly instead, before any measurement: nothing can reach it
         today, and a manifest is read years later.
 
-        Mutant: delete the `isinstance` refusal and this records 18 corpora
-        of one character each.
+        Mutant: delete the `isinstance` refusal and this records fifteen
+        corpora of one character each -- fifteen and not eighteen, because
+        `"sift-128-euclidean"` repeats three of its characters and the
+        function the refusal lives in deduplicates. Counted, after a first
+        version of this note said eighteen.
         """
         m = Manifest(str(tmp_path / "run-str"), "run-str")
         with pytest.raises(TypeError) as caught:
@@ -2974,3 +2980,39 @@ class TestTheBundleReadmeSaysWhatWasMeasured:
                     "sift-128-euclidean"])
         assert self._line(manifest) == \
             "  datasets        glove-100-angular, sift-128-euclidean"
+
+    def test_the_log_order_is_the_run_order_and_not_the_alphabet(self):
+        """The property the "0 of 12 differ" measurement rests on.
+
+        `full` declares fashion, glove, sift, gist -- not sorted -- so a
+        completed `full` run's log is in that order and the README line
+        matched the declaration-only line it replaced byte for byte. Sort the
+        log and that bundle's line changes, which is the one thing the term
+        order was justified by not doing.
+
+        Mutant: `return sorted(out)` in `_logged_datasets`. It survived the
+        whole suite before this test, including
+        `test_a_log_that_names_one_corpus_many_times_names_it_once`, whose
+        fixture is glove, glove, sift -- first-seen and sorted agree there,
+        so it looks like an order test and is not. This fixture is the
+        declaration's own order, where they disagree on three of four names.
+        """
+        manifest = self._manifest(phases=list(self.DECLARED))
+        assert self._line(manifest) == (
+            "  datasets        fashion-mnist-784-euclidean, "
+            "glove-100-angular, sift-128-euclidean, gist-960-euclidean")
+        assert sorted(self.DECLARED) != list(self.DECLARED), \
+            "the fixture must be an order the alphabet would change"
+
+    def test_a_hand_edited_corpus_name_does_not_crash_the_readme(self):
+        """`readme_text` is reached from the export path and from
+        `webui/server.py`, so a traceback here is user-visible. A manifest is
+        a JSON file somebody may have edited, and a non-string corpus name
+        would otherwise reach `", ".join(...)` and raise TypeError.
+
+        Mutant: drop the `str()` in `_logged_datasets` and this raises.
+        """
+        manifest = self._manifest()
+        manifest["phases"] = [{"phase": "ann", "engine": "pgvector",
+                               "dataset": 128, "status": "completed"}]
+        assert self._line(manifest) == "  datasets        128"
