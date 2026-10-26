@@ -15,7 +15,7 @@ import platform
 import socket
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 # Imported, never re-declared. The constant lives in the harness because ops
 # records are written from inside the harness container, which mounts harness/
@@ -185,7 +185,7 @@ def _accumulate_passes(prior: Dict[str, Any], resource_pass: str,
 
 
 def _accumulate_datasets(prior: Dict[str, Any], phases: Any,
-                         datasets: Optional[Sequence[str]]) -> List[str]:
+                         datasets: Optional[List[str]]) -> List[str]:
     """The corpora this run directory resolved to measure, as a new list.
 
     Why the key exists at all. `--datasets` narrows a run and leaves the
@@ -223,10 +223,25 @@ def _accumulate_datasets(prior: Dict[str, Any], phases: Any,
     Absent stays absent. A caller that resolves no corpora -- which is every
     caller but `cmd_run`, and every archived manifest reopened without being
     re-run -- gets no key rather than a list invented from the declaration.
-    Inventing one would re-state the very claim this exists to stop making,
-    and `report/scope.py` reads a missing corpus axis as "this manifest does
-    not say" rather than as "nothing was measured".
+    Inventing one would re-state the very claim this exists to stop making:
+    the declaration is already in the file, under `config.profile`, and
+    copying it up here would dress it as a resolution nobody performed. What
+    a reader does with the absence is their business -- `export.py` falls
+    back to the declaration and says so -- and nothing in `report/` reads
+    this key at all today, so no claim is made here about what the report
+    would do with it.
     """
+    if isinstance(datasets, str):
+        # `Sequence[str]` admits `str`, which is how the annotation used to
+        # read, and a bare one would union character by character into a
+        # manifest claiming corpora named "s", "i", "f". `cmd_run` splits
+        # the flag before this is reached, so nothing can reach it today --
+        # but a manifest is read years later and a loud refusal before any
+        # measurement costs nothing, where the record it would otherwise
+        # write is absurd without being obviously anybody's mistake.
+        raise TypeError(
+            f"datasets must be a list of corpus names, not the raw "
+            f"--datasets string {datasets!r}: split it first")
     out: List[str] = []
     for source in (prior.get("resolved_datasets") or (),
                    [p.get("dataset") for p in (phases or [])
@@ -304,7 +319,7 @@ class Manifest:
 
     def set_config(self, profile: Dict[str, Any], resource_pass: str,
                    resolved: Any, extra: Optional[Dict[str, Any]] = None,
-                   datasets: Optional[Sequence[str]] = None) -> None:
+                   datasets: Optional[List[str]] = None) -> None:
         # Carried forward from whatever this directory already said, never
         # re-stamped, and never invented for a manifest that does not have it.
         #

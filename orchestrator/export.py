@@ -15,7 +15,7 @@ import json
 import os
 import tarfile
 import tempfile
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 README_NAME = "README.txt"
 
@@ -35,6 +35,20 @@ def _fmt_bytes(value: Optional[int]) -> str:
     return f"{value} B"
 
 
+def _logged_datasets(manifest: Dict[str, Any]) -> List[str]:
+    """Corpora the phase log names, in the order the run reached them.
+
+    Deduplicated rather than counted: one corpus appears once per
+    (engine, phase, pass) that touched it.
+    """
+    out: List[str] = []
+    for phase in (manifest.get("phases") or []):
+        name = phase.get("dataset") if isinstance(phase, dict) else None
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def readme_text(run_id: str, manifest: Dict[str, Any]) -> str:
     """What the recipient is looking at, and what they can trust it for."""
     host = manifest.get("host") or {}
@@ -43,13 +57,32 @@ def readme_text(run_id: str, manifest: Dict[str, Any]) -> str:
     profile = config.get("profile") or {}
     engines = manifest.get("engines") or {}
 
-    # The run's own corpus list, not the profile's declaration: `--datasets`
-    # narrows a run without touching the profile, so a narrowed bundle's
-    # README named corpora it holds no measurement for -- the recipient's
-    # first and often only description of what they were sent. A bundle
-    # archived before `resolved_datasets` was recorded has nothing but the
-    # declaration, which is why the fallback stays.
-    datasets = config.get("resolved_datasets") or profile.get("datasets") or []
+    # Three terms in decreasing order of evidence, under a heading that says
+    # WHAT WAS MEASURED, because that is what the line has to be true of.
+    #
+    # The phase log first. `add_phase` is appended after a unit returns -- a
+    # failed one included -- so it is the only term that records measurement
+    # rather than intent. `config.resolved_datasets` is written by
+    # `set_config`, which `cmd_run` calls *above* the dataset loop, so a run
+    # that dies in its first unit resolved four corpora and measured one, and
+    # this line would otherwise name four under that heading.
+    # `report/scope.py` and `webui/runs.py` prefer the log for the same
+    # reason, and `scope.py` states the cost of doing so: a corpus whose unit
+    # never returned is excluded, and the report names it in its Validity
+    # census rather than publishing it.
+    #
+    # Then the resolved list, which is what a run killed before its first
+    # unit returned has instead of a log -- and which, unlike the
+    # declaration, is narrowed by `--datasets`. Then the declaration, which
+    # is all a bundle archived before `resolved_datasets` existed has.
+    #
+    # Measured on all 12 archived run dirs under `ALL_RESULTS/results/`: the
+    # line is byte-identical under this order and under the declaration
+    # alone, including `percona-20261015-213817`, whose log is empty, and
+    # `percona-20261015-183321`, whose one unit failed and is logged.
+    datasets = (_logged_datasets(manifest)
+                or list(config.get("resolved_datasets") or ())
+                or list(profile.get("datasets") or ()))
 
     engine_lines = []
     for name, info in sorted(engines.items()):

@@ -435,15 +435,25 @@ class TestTheManifestRecordsEveryPassThatWasConfigured:
         """`extra` comes from a caller and describes one pass; the list is the
         run's whole history and is not a caller's to supply.
 
-        What makes that hold is the unconditional assignment at
-        `orchestrator/manifest.py:269-277`: `_accumulate_passes` reads `prior`
-        -- what the directory already said -- rather than `config`, and its
-        result overwrites whatever the splat put there. There is no pop, and
-        this docstring used to say there was one, describing a mechanism the
-        commit that added this test later removed as dead code. The
-        `ops_measurement_version` pop one line above is NOT the same case: its
-        follow-up assignment is conditional, so a smuggled value survives on a
-        manifest that declares nothing, which is every archived run.
+        What makes that hold is the unconditional `config["passes"]`
+        assignment in `Manifest.set_config`: `_accumulate_passes` reads
+        `prior` -- what the directory already said -- rather than `config`,
+        and its result overwrites whatever the splat put there. There is no
+        pop, and this docstring used to say there was one, describing a
+        mechanism the commit that added this test later removed as dead code.
+        The `ops_measurement_version` pop just above it is NOT the same case:
+        its follow-up assignment is conditional, so a smuggled value survives
+        on a manifest that declares nothing, which is every archived run.
+
+        This paragraph cited that assignment by line range until the change
+        that added `resolved_datasets`, which inserted 54 lines above it and
+        left the citation pointing into `Manifest.__init__` -- at a line that
+        neither reads `prior` nor assigns `passes`. Nothing went red:
+        `tests/test_e16_citation_ratchet.py` COUNTS line citations and
+        refuses an increase, and cannot check that one still resolves. The
+        sibling citation in `docs/10-rollout.md` is content-checked and did
+        go red. So the names, which die only to a rename -- and the file's
+        ratchet entry goes with them.
         """
         m = Manifest(str(tmp_path / "run-3"), "run-3")
         m.set_config({}, "tuned", TUNED_LIMITS,
@@ -2608,8 +2618,18 @@ class TestADatasetsNarrowedRunRecordsTheCorporaItMeasured:
         un-narrowed run is unchanged in meaning and a reader never has to
         know which of the two produced the value.
 
-        Mutant: record `args.datasets` rather than the resolved list and this
-        run records nothing while the one above still passes.
+        Mutant that kills this one alone: record
+        `args.datasets.split(",") if args.datasets else None` -- the flag
+        rather than the resolution -- after which a bare run records nothing
+        while the narrowed run above still passes.
+
+        Recording the RAW `args.datasets` kills four instead, because it is
+        the un-split comma string: it reaches the bare-string refusal in
+        `_accumulate_datasets` and raises. Before that refusal existed it was
+        worse and quieter -- `Sequence[str]` admits `str`, so the string was
+        unioned character by character and the manifest claimed corpora
+        named "s", "i", "f". Measured, not assumed: the first version of this
+        note named the raw form and claimed one failure.
         """
         from orchestrator.config import load_profile as _load_profile
         written, measured = self._run(monkeypatch, tmp_path)
@@ -2743,3 +2763,214 @@ class TestAManifestWithoutAResolvedCorpusListStillWorks:
         # order is its business, not this change's.
         assert (sorted(scope_mod.measured_datasets(self._archived()))
                 == sorted(self.DECLARED))
+
+
+class TestTheCorpusListIsResolvedAndNotSupplied:
+    """`config.resolved_datasets` is the orchestrator's resolution of which
+    corpora to measure, and nothing else may write it.
+
+    The sibling of `test_extra_cannot_hand_write_the_list`, for the same
+    reason and against the same hazard: `extra` is a caller's dict, splatted
+    into the config block, so every key the block owns has to be established
+    after the splat. `set_config` pops this one and then sets it only when
+    there is something to say, because the empty case is where a conditional
+    assignment lets a smuggled value through -- which is exactly how
+    `ops_measurement_version` needs its own pop, and `passes`, whose
+    assignment is unconditional, does not.
+
+    The first version of this change shipped the pop with no test. Deleting
+    it left the whole suite green at `3858 passed, 5 skipped`, which is the
+    figure that change quoted as its gate, so the suite could not tell the
+    fix from the fix minus the guard -- the state the comment three lines
+    above the pop describes for the one that was deleted as dead code: "a pop
+    here looked prudent and was dead code: deleting it changed no test."
+    """
+
+    def test_extra_cannot_hand_write_the_corpus_list(self, tmp_path):
+        """The empty case, which is the one the pop exists for: nothing is
+        resolved, so nothing may be claimed, however the caller asks.
+
+        Mutant: delete `config.pop("resolved_datasets", None)` and the
+        fabricated list is what the manifest says this run measured.
+        """
+        m = Manifest(str(tmp_path / "run-smuggle"), "run-smuggle")
+        m.set_config({"name": "full", "datasets": ["glove-100-angular"]},
+                     "tuned", TUNED_LIMITS,
+                     extra={"ann_fingerprint": TUNED_FP,
+                            "resolved_datasets": ["fabricated"]})
+        assert "resolved_datasets" not in m.data["config"]
+        # On disk too: the pop has to beat the save, not just the dict.
+        with open(tmp_path / "run-smuggle" / manifest_mod.MANIFEST_NAME) as fh:
+            assert "resolved_datasets" not in json.load(fh)["config"]
+
+    def test_a_smuggled_list_cannot_displace_the_resolved_one(self, tmp_path):
+        """The non-empty case. The resolution wins and the fabrication is
+        gone, rather than the two being merged.
+
+        **A different guard holds here, and measurement is what says so.**
+        Deleting the pop does NOT reach this case: `_accumulate_datasets`
+        reads `prior` -- the config block as it was on disk -- not the
+        `config` dict the splat has already polluted, so its result still
+        comes back as the resolved list and the assignment below it
+        overwrites the smuggled value. That is the `passes` mechanism
+        exactly. The first draft of this docstring claimed the pop, which was
+        wrong, and the mutation run that proved it is why this paragraph
+        exists. So: mutant that kills this is deleting the
+        `config["resolved_datasets"] = resolved_datasets` assignment, after
+        which the splatted value is simply what the block keeps. The pop is
+        what covers the EMPTY case, where there is no assignment to overwrite
+        anything -- the test above.
+        """
+        m = Manifest(str(tmp_path / "run-smuggle-2"), "run-smuggle-2")
+        m.set_config({"name": "full"}, "tuned", TUNED_LIMITS,
+                     extra={"ann_fingerprint": TUNED_FP,
+                            "resolved_datasets": ["fabricated"]},
+                     datasets=["sift-128-euclidean"])
+        assert (m.data["config"]["resolved_datasets"]
+                == ["sift-128-euclidean"])
+
+    def test_a_bare_flag_string_is_refused_not_recorded_by_character(
+            self, tmp_path):
+        """`--datasets` arrives as one comma-separated string and `cmd_run`
+        splits it. A caller that forgets to would be recorded character by
+        character -- a manifest claiming corpora named "s", "i", "f" -- back
+        when the parameter was annotated `Sequence[str]`, which admits `str`.
+
+        Refused loudly instead, before any measurement: nothing can reach it
+        today, and a manifest is read years later.
+
+        Mutant: delete the `isinstance` refusal and this records 18 corpora
+        of one character each.
+        """
+        m = Manifest(str(tmp_path / "run-str"), "run-str")
+        with pytest.raises(TypeError) as caught:
+            m.set_config({"name": "full"}, "tuned", TUNED_LIMITS,
+                         datasets="sift-128-euclidean")
+        assert "split it first" in str(caught.value)
+
+    def test_the_recorded_list_is_carried_forward_across_invocations(
+            self, tmp_path):
+        """The `prior` term, in the case where only it can carry the record:
+        a directory whose key is set and whose phase log is EMPTY.
+
+        That case is not academic -- it is the one the key matters most for.
+        A run killed before its first unit returned has no phase log, so the
+        key is the only record of what it set out to measure, and
+        `report/scope.py` has nothing else to narrow by either. Resuming it
+        narrowed to one corpus must not shrink that record, for the reason
+        `_accumulate_passes` never rewrites a pass.
+
+        Mutant: drop `prior.get("resolved_datasets")` from
+        `_accumulate_datasets` and this records `["gist-960-euclidean"]`
+        alone. The resume test in the class above does NOT catch that, because
+        its fixture has a phase log and the log term carries it there.
+        """
+        run_dir = tmp_path / "killed-20260101-000000"
+        os.makedirs(run_dir, exist_ok=True)
+        with open(run_dir / manifest_mod.MANIFEST_NAME, "w") as fh:
+            json.dump({"run_id": "killed-20260101-000000",
+                       "host": {"hostname": "bench"}, "engines": {},
+                       "phases": [],
+                       "config": {"profile": {"name": "full"},
+                                  "resource_pass": "tuned",
+                                  "resolved_resources": TUNED_LIMITS,
+                                  "resolved_datasets": [
+                                      "fashion-mnist-784-euclidean",
+                                      "glove-100-angular"]}}, fh)
+        resumed = Manifest(str(run_dir), "killed-20260101-000000")
+        assert not resumed.data["phases"], "the fixture must have no log"
+        resumed.set_config({"name": "full"}, "tuned", TUNED_LIMITS,
+                           datasets=["gist-960-euclidean"])
+        assert resumed.data["config"]["resolved_datasets"] == [
+            "fashion-mnist-784-euclidean", "glove-100-angular",
+            "gist-960-euclidean"]
+
+
+class TestTheBundleReadmeSaysWhatWasMeasured:
+    """`export.py`'s `WHAT WAS MEASURED` heading binds the line under it.
+
+    `config.resolved_datasets` states intent, not measurement: `cmd_run`
+    calls `set_config` *above* the dataset loop, so a run that dies in its
+    first unit resolved four corpora and measured one. Honest as a key --
+    it is named for what it is -- and wrong under that heading, which is why
+    the README reads three terms in decreasing order of evidence: the phase
+    log, then the resolved list, then the declaration. `report/scope.py` and
+    `webui/runs.py` prefer the log for the same reason.
+
+    Measured on all 12 archived run dirs: the line is byte-identical to the
+    declaration-only one it replaced, including the bundle whose log is empty
+    and the one whose single unit failed. So the order costs nothing on the
+    archive and is only visible on a run that stopped early. Those dirs are
+    not read from here -- they are gitignored and machine-specific -- so the
+    cases are built as fixtures.
+    """
+
+    DECLARED = ["fashion-mnist-784-euclidean", "glove-100-angular",
+                "sift-128-euclidean", "gist-960-euclidean"]
+
+    def _manifest(self, **config):
+        base = {"run_id": "full-20261015-215006",
+                "host": {"hostname": "bench", "cpu": {}},
+                "engines": {}, "phases": [],
+                "config": {"profile": {"name": "full", "description": "x",
+                                       "datasets": list(self.DECLARED)},
+                           "resource_pass": "tuned",
+                           "resolved_resources": TUNED_LIMITS}}
+        phases = config.pop("phases", None)
+        if phases is not None:
+            base["phases"] = [
+                {"phase": "ann", "engine": "pgvector", "dataset": name,
+                 "status": "completed", "resource_pass": "tuned"}
+                for name in phases]
+        base["config"].update(config)
+        return base
+
+    @staticmethod
+    def _line(manifest):
+        from orchestrator import export
+        return [line for line
+                in export.readme_text("full-20261015-215006",
+                                      manifest).splitlines()
+                if line.startswith("  datasets ")][0]
+
+    def test_the_phase_log_wins_over_an_intent_that_outran_it(self):
+        """The case the order is for: four corpora resolved, one measured.
+
+        Mutant: prefer `resolved_datasets` and the README tells the recipient
+        four corpora were measured when the bundle holds one.
+        """
+        manifest = self._manifest(resolved_datasets=list(self.DECLARED),
+                                  phases=["fashion-mnist-784-euclidean"])
+        assert self._line(manifest) == \
+            "  datasets        fashion-mnist-784-euclidean"
+
+    def test_a_failed_unit_still_counts_as_measured(self):
+        """`add_phase` records a failure, and the corpus was loaded and
+        queried to produce it. `report/scope.py` keeps failed units for the
+        same reason, and the archived `percona-20261015-183321` is this case:
+        status `failed`, one logged phase, and a README naming that corpus.
+        """
+        manifest = self._manifest(resolved_datasets=list(self.DECLARED))
+        manifest["phases"] = [{"phase": "ann", "engine": "percona",
+                               "dataset": "sift-128-euclidean",
+                               "status": "failed", "resource_pass": "tuned"}]
+        assert self._line(manifest) == "  datasets        sift-128-euclidean"
+
+    def test_the_resolved_list_carries_a_run_with_no_log(self):
+        """A run killed before its first unit returned has no log, and the
+        resolved list is narrowed where the declaration is not.
+
+        Mutant: drop the `resolved_datasets` term and this prints all four.
+        """
+        manifest = self._manifest(resolved_datasets=["sift-128-euclidean"],
+                                  phases=[])
+        assert self._line(manifest) == "  datasets        sift-128-euclidean"
+
+    def test_a_log_that_names_one_corpus_many_times_names_it_once(self):
+        """One corpus appears in the log per (engine, phase, pass) that
+        touched it, and the line is a corpus list, not a unit count."""
+        manifest = self._manifest(
+            phases=["glove-100-angular", "glove-100-angular",
+                    "sift-128-euclidean"])
+        assert self._line(manifest) == \
+            "  datasets        glove-100-angular, sift-128-euclidean"
