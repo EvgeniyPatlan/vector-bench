@@ -329,10 +329,14 @@ Two things can then go wrong, and they are opposites:
 | What the tab says | What would happen |
 | --- | --- |
 | *Regenerating would drop the recall section* | There are no ann results here at all, so the new report would have the ops measurements and no recall curves |
-| *Regenerating would not use only this run's data* | There are ann results here, but nothing ties them to this run — so it would read every ann result on this machine. If the run was measured elsewhere, the tab names the host and says plainly that those are somebody else's measurements |
+| *Regenerating would not use only this run's data* | There are ann results here but not the tree keyed to this run's resource configuration, so it would read every ann result on this machine. It publishes only the engines and corpora the manifest says this run measured and names the rest in its Validity section; what that cannot separate is the same engine and corpus measured under a **different** memory or CPU budget. If the run was measured elsewhere, the tab names the host and says plainly that those are somebody else's measurements — the scope narrows by engine and corpus, not by machine |
+| *…and the manifest records no scope either* | An archived manifest with no `engines` block and no phase log says nothing about what the run measured, so nothing can narrow those results to it at all |
 
 A run that recorded its own `ann_fingerprint` and whose tree is present gets no
-warning, because the generator can narrow to exactly its own results.
+warning, because the generator can narrow to exactly its own resource
+configuration — and then to its own engines and corpora within it, since the
+fingerprint is deliberately engine-invariant and one tree is shared by every
+run at that budget.
 
 ## Running it on a machine you connect to
 

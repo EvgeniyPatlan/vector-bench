@@ -14,7 +14,7 @@ report read all of it. Measured on `percona-20261021-134142`, a run whose
 manifest holds exactly one key under `engines`, whose `phases` are two
 `percona` entries both `completed`, whose profile declares
 `engines: [percona]` and `datasets: [fashion-mnist-784-euclidean]`, and which
-finished in 112 seconds:
+whose two phases took 2.1 s and 110.6 s against a 113 s wall clock:
 
 * `report/records.jsonl` carried **396 records across seven engines and three
   corpora** -- alisql 18, mariadb 18, mariadb123 18, mongodb 26, percona 91,
@@ -84,6 +84,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.metrics import records as records_mod  # noqa: E402
 from report import charts, generate, loaders, render  # noqa: E402
 
+VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 #: Skips the one test that reads the chart directory. `report/charts.py`
 #: guards its matplotlib import and the stack lives in the bench images, so a
 #: host built from the documented prerequisites draws nothing -- and an empty
@@ -103,13 +105,30 @@ FASHION = "fashion-mnist-784-euclidean"
 GIST = "gist-960-euclidean"
 GLOVE = "glove-100-angular"
 
+SIFT = "sift-128-euclidean"
+
 ALL_SEVEN = ("alisql", "mariadb", "mariadb123", "mongodb", "percona",
              "pgvector", "valkey")
+
+#: `new/full-20261015-215006`'s phase log, in shape: percona over four
+#: corpora beside six engines over fashion-mnist alone. 10 `(engine, corpus)`
+#: pairs where the product of the two axes is 7 x 4 = 28, which is the only
+#: archived bundle where the two readings of "what this run measured" differ
+#: at all -- and the reason the scope is the pairs and not the product.
+NEW_FULL_PHASES = tuple(
+    [("percona", corpus, "completed")
+     for corpus in (FASHION, GLOVE, SIFT, GIST)]
+    + [(engine, FASHION, "completed")
+       for engine in ALL_SEVEN if engine != "percona"])
 
 #: Epoch seconds, before the run below starts. Every file in the shared tree
 #: in the reference bundle was older than the run that reported it, which is
 #: what the pre-existing staleness notice is for.
 MEASURED_EARLIER = 1_760_000_000.0
+#: After the run started, so the staleness notice cannot see it. A file a
+#: profile running beside this one -- or after it -- left in the same
+#: fingerprint tree looks exactly like this.
+MEASURED_LATER = 1_800_000_000.0
 RUN_STARTED_AT = "2026-10-21T13:41:42Z"
 RUN_ID = "percona-20261021-134142"
 
@@ -483,6 +502,33 @@ class TestANarrowedRunIsReportedNarrow:
         assert sum(d["files"] for d in dropped) == 2
         assert sum(d["records"] for d in dropped) == 2
 
+    def test_the_phase_name_is_the_harness_constant_and_not_a_copy(
+            self, monkeypatch):
+        """A second spelling of `PHASE_RECALL` here would turn the narrowing
+        OFF silently if the harness renamed it: `admits` would stop
+        recognising a single record, and every fixture in this file writes the
+        literal itself, so the suite would stay green over a report that had
+        gone back to publishing seven engines.
+
+        Proved by moving the constant rather than by comparing two strings: a
+        stale copy survives an equality assertion against a value a test also
+        hardcodes, and does not survive this.
+        """
+        from report import scope
+        assert scope.phase_recall() == records_mod.PHASE_RECALL
+        monkeypatch.setattr(records_mod, "PHASE_RECALL", "recall_renamed")
+        assert scope.phase_recall() == "recall_renamed"
+        manifest = _manifest(["percona"])
+        renamed = dict(_recall("mariadb", FASHION), phase="recall_renamed")
+        kept, dropped = scope.narrow_to_measured_scope([renamed], manifest)
+        assert kept == [] and len(dropped) == 1
+        # and the old literal is now just another ops phase, kept whatever it
+        # names -- which is what makes the assertion above about the import
+        # and not about the predicate.
+        kept, dropped = scope.narrow_to_measured_scope(
+            [_recall("mariadb", FASHION)], manifest)
+        assert len(kept) == 1 and dropped == []
+
     def test_the_runs_own_ops_records_are_never_narrowed(self, tmp_path,
                                                          monkeypatch):
         """Path B has no shared tree. Every `ops-*.jsonl` is inside the run
@@ -570,6 +616,37 @@ class TestAWideRunIsStillReportedWide:
         assert scope.measured_engines(narrow) == ["percona"]
         assert scope.measured_engines(wide) == sorted(ALL_SEVEN)
 
+    def test_the_orchestrator_still_records_the_resolved_engine_list(self):
+        """Why `orchestrator/` needs no change at all, pinned.
+
+        The whole case for reading the scope out of the manifest rather than
+        taking a flag is that `Manifest.set_engine` is called once per engine
+        in the RESOLVED list -- the one `--engines` narrowed -- and before any
+        unit of that engine runs. Nothing asserted either half, and both are
+        load-bearing: move the call below the unit loops and a run that failed
+        early stops recording the engines it configured; derive it from
+        `KNOWN_ENGINES` instead of the loop variable and a narrowed run
+        records seven.
+
+        Written the way `tests/test_config.py`'s
+        `test_cli_still_calls_set_config_before_the_checkpoint_skip` is, and
+        for the same stated reason: `orchestrator/manifest.py` already carries
+        a comment saying a call moving below the unit loop would make a notice
+        useless with no test to say so. This is that test for `set_engine`.
+        """
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "cli.py")).read()
+        resolved = source.index('engines = [e.strip() for e in')
+        loop = source.index("for engine in engines:")
+        call = source.index("manifest.set_engine(")
+        checkpoint = source.index("[skip]")
+        # Resolved first, then the loop, then the call, then the unit skip.
+        assert resolved < loop < call < checkpoint, (resolved, loop, call,
+                                                     checkpoint)
+        # And the call takes the loop variable, not a list of its own.
+        signature = source[call:call + 60]
+        assert "set_engine(\n                engine," in signature, signature
+
     def test_an_engine_whose_every_unit_failed_stays_in_scope(self):
         """`full-20261015-215006` has 16 percona phases, 9 of them failed and
         nothing else started. `add_phase` records a unit whatever its exit
@@ -581,6 +658,141 @@ class TestAWideRunIsStillReportedWide:
                              phases=[("percona", FASHION, "failed")])
         manifest["engines"] = {}
         assert scope.measured_engines(manifest) == ["percona"]
+
+
+# ---------------------------------------------------------------------------
+# Pairs, not the product of the axes
+# ---------------------------------------------------------------------------
+
+class TestTheScopeIsPairsAndNotTheProduct:
+    """The one shape where "what this run measured" has two readings.
+
+    `new/full-20261015-215006` ran percona over four corpora and six other
+    engines over fashion-mnist alone: 10 `(engine, corpus)` pairs against a
+    product of 7 x 4 = 28. Every one of the four archived bundles reads the
+    same tree, `annb/tuned/a9349676`, because the fingerprint keys on the
+    resource pass and not on the profile -- so a second profile depositing a
+    `pgvector x gist-960-euclidean` file beside this run's results is this
+    host's normal state rather than a hypothesis.
+
+    The product admits that file. It would be drawn on a chart as this run's
+    own, with **no §2 row** -- both of its halves are in scope -- and with no
+    staleness row either when the file postdates the run, which a file written
+    by a profile running concurrently or afterwards does.
+    """
+
+    def _manifest_new_full(self, engines: Sequence[str] = ALL_SEVEN):
+        return _manifest(engines,
+                         profile_engines=None,
+                         profile_datasets=(FASHION, GLOVE, SIFT, GIST),
+                         phases=list(NEW_FULL_PHASES))
+
+    def _own(self):
+        """The ten pairs the run really measured, three ef points each."""
+        return [_recall(engine, corpus, ef_search=ef, qps=300.0 - 50.0 * i,
+                        recall=0.90 + 0.01 * i)
+                for engine, corpus, _status in NEW_FULL_PHASES
+                for i, ef in enumerate((10, 40, 160))]
+
+    def test_the_two_readings_really_do_differ_here(self):
+        """Non-vacuity. Without this the class could be asserting a
+        distinction that no manifest in the tree can express."""
+        from report import scope
+        manifest = self._manifest_new_full()
+        found = scope.scope_of(manifest)
+        assert len(found.pairs) == 10
+        assert len(found.engines) * len(found.datasets) == 28
+        assert found.unpaired == frozenset()
+
+    def test_an_intruder_inside_the_product_is_excluded(self, tmp_path,
+                                                        monkeypatch):
+        """Honest: pgvector on gist is not a pair this run measured, so it
+        goes. Mutant -- scope on the two axes independently -- it is admitted,
+        drawn on gist's chart as this run's, and §2 says nothing because both
+        halves pass."""
+        intruder = _recall("pgvector", GIST, mtime=MEASURED_EARLIER)
+        _code, _markdown, written = _report(
+            tmp_path, self._manifest_new_full(), self._own() + [intruder],
+            monkeypatch)
+        assert ("pgvector", GIST) not in {
+            (r.get("engine"), r.get("dataset")) for r in written}
+        # and every pair the run did measure survives: 10 x 3 points.
+        assert len([r for r in written
+                    if r.get("phase") == "recall_qps"]) == 30
+
+    def test_the_intruder_is_named_with_the_reason_that_fits_it(
+            self, tmp_path, monkeypatch):
+        """Not "did not measure this engine" and not "this corpus" -- the run
+        measured both. A row claiming either would contradict §1."""
+        _code, markdown, _written = _report(
+            tmp_path, self._manifest_new_full(),
+            self._own() + [_recall("pgvector", GIST)], monkeypatch)
+        rows = _table_rows(markdown, OUT_OF_SCOPE_HEADER)
+        assert [[r[0], r[1], r[3]] for r in rows] == [
+            [_label("pgvector"), GIST, "not this engine on this corpus"]]
+
+    def test_both_halves_of_the_intruder_are_individually_in_scope(self):
+        """What makes the exclusion specifically about the pair: the mutant
+        this test guards against is not a typo, it is a whole design."""
+        from report import scope
+        manifest = self._manifest_new_full()
+        assert "pgvector" in scope.measured_engines(manifest)
+        assert GIST in scope.measured_datasets(manifest)
+        assert not scope.scope_of(manifest).admits("pgvector", GIST)
+
+    def test_the_staleness_notice_would_not_have_caught_it(self, tmp_path,
+                                                           monkeypatch):
+        """The second half of why the product is unsafe. A file written after
+        this run started -- by a profile running beside it or after it -- is
+        not stale, so §2's pre-existing notice is silent about it and the
+        exclusion census is the only thing that can speak."""
+        fresh = _recall("pgvector", GIST, mtime=MEASURED_LATER)
+        _code, markdown, _written = _report(
+            tmp_path, self._manifest_new_full(), self._own() + [fresh],
+            monkeypatch)
+        # By PAIR, not by engine: pgvector's own fashion-mnist results are in
+        # scope and are themselves cache hits, so the engine is in the stale
+        # table for a different and entirely correct reason. Asserting on the
+        # engine alone would be asserting the wrong thing and would pass only
+        # by accident of which rows the fixture happens to carry.
+        stale = {(row[0], row[1])
+                 for row in _table_rows(markdown, STALE_HEADER)}
+        assert (_label("pgvector"), GIST) not in stale
+        assert (_label("pgvector"), FASHION) in stale
+        assert (_label("pgvector"), GIST) in {
+            (row[0], row[1])
+            for row in _table_rows(markdown, OUT_OF_SCOPE_HEADER)}
+
+    def test_an_engine_the_log_never_reached_gets_the_runs_corpora(
+            self, tmp_path, monkeypatch):
+        """The union term. An engine the orchestrator configured and whose
+        units the phase log does not record -- a run that died before the
+        first one returned, or a truncated manifest -- has no pair to be had,
+        and the corpora it would have been measured on are this run's own."""
+        from report import scope
+        manifest = self._manifest_new_full()
+        manifest["engines"]["mariadb"] = {"source": {}, "build": {}}
+        manifest["phases"] = [p for p in manifest["phases"]
+                              if p["engine"] != "mariadb"]
+        found = scope.scope_of(manifest)
+        assert found.unpaired == frozenset({"mariadb"})
+        assert found.admits("mariadb", GIST)
+        assert found.admits("mariadb", FASHION)
+        # and it is still bounded by the run's corpora, not by anything.
+        assert not found.admits("mariadb", "dbpedia-openai-100k-angular")
+
+    def test_the_union_term_does_not_relax_a_paired_engine(self):
+        """It is a union of the pairs with ONE engine's row, not a promotion
+        of every engine to the product. pgvector has pairs, so it keeps
+        them."""
+        from report import scope
+        manifest = self._manifest_new_full()
+        manifest["engines"]["mariadb"] = {"source": {}, "build": {}}
+        manifest["phases"] = [p for p in manifest["phases"]
+                              if p["engine"] != "mariadb"]
+        found = scope.scope_of(manifest)
+        assert found.admits("pgvector", FASHION)
+        assert not found.admits("pgvector", GIST)
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,8 @@ here may: the narrowing belongs in the report's *record selection*.
 The price of the shared tree is that it is not a record of any one run, and
 the report read all of it. Measured on `percona-20261021-134142`, a run whose
 manifest holds one key under `engines`, whose two `phases` entries are both
-`percona` and both `completed`, and which finished in 112 seconds:
+`percona` and both `completed`, and whose two phases took 2.1 s and 110.6 s
+against a 113 s wall clock:
 `report/records.jsonl` carried 396 records across seven engines and three
 corpora -- alisql 18, mariadb 18, mariadb123 18, mongodb 26, percona 91,
 pgvector 150, valkey 75. 388 of them came out of HDF5 files written on
@@ -54,23 +55,52 @@ that belongs to more than one run.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Dict, FrozenSet, Iterable, List, NamedTuple,
+                    Optional, Sequence, Tuple)
 
-#: The phase read out of the shared tree. Spelled rather than imported from
-#: `harness.metrics.records`, in the voice `generate.summarize` uses for the
-#: same literal: this module is pure logic over records and stays importable
-#: on a host with nothing installed.
-PHASE_RECALL = "recall_qps"
 
-#: Why a record was left out, as a code the renderer turns into prose. Three
-#: values rather than two, because an out-of-scope engine measured on an
-#: out-of-scope corpus is not evidence of either on its own -- percona's own
-#: gist and glove curves in the reference bundle are the in-scope engine on an
-#: out-of-scope corpus, and naming that row "engine" would send a reader
-#: looking for an engine nobody ran.
+def phase_recall() -> str:
+    """The phase name the shared tree's records carry.
+
+    Imported from the harness rather than respelled here, the way
+    `measurement_versions._is_ops_record` and `loaders.load_annb_results`
+    already do it, and for the reason `render._OUT_OF_SCOPE_REASON` gives
+    next door: a sentinel spelled in two files is a sentinel that drifts, and
+    this drift would be silent in the worst possible way. If the constant were
+    renamed and this module kept a stale copy, `Scope.admits` would stop
+    recognising a single recall record, the narrowing would switch off
+    entirely, and the test fixtures -- which write the literal themselves --
+    would stay green.
+
+    Deferred to call time, not imported at module scope, so this module stays
+    importable with nothing installed: `harness.metrics.records` imports only
+    the standard library, and both `harness/__init__.py` and
+    `harness/metrics/__init__.py` are one-line docstrings, so this costs
+    nothing but still never runs during a bare `import report.scope`.
+    """
+    from harness.metrics.records import PHASE_RECALL
+
+    return PHASE_RECALL
+
+
+#: Why a record was left out, as a code the renderer turns into prose. Four
+#: values, and each one sends a reader somewhere different:
+#:
+#: * ENGINE -- nothing in this run ran it. Six of the seven engines in the
+#:   reference bundle.
+#: * DATASET -- the run never loaded that corpus. Percona's own gist and glove
+#:   curves there, which are the IN-SCOPE engine; filing them under "engine"
+#:   would send a reader looking for an engine nobody ran.
+#: * BOTH -- neither, so neither alone is the evidence.
+#: * PAIR -- the run ran that engine, and it ran that corpus, but never the
+#:   two together. `new/full-20261015-215006` is the shape: percona over four
+#:   corpora beside six engines over fashion-mnist only, so a pgvector curve
+#:   for gist in the same tree is a combination the run never measured even
+#:   though both of its halves are in scope.
 OUT_OF_SCOPE_ENGINE = "engine"
 OUT_OF_SCOPE_DATASET = "dataset"
 OUT_OF_SCOPE_BOTH = "both"
+OUT_OF_SCOPE_PAIR = "pair"
 
 
 def _phase_pairs(manifest: Dict[str, Any]) -> List[Tuple[Any, Any]]:
@@ -194,12 +224,112 @@ def measured_datasets(manifest: Dict[str, Any]) -> List[str]:
     return _ordered(profile.get("datasets") or ())
 
 
-def _reason(engine_ok: bool, dataset_ok: bool) -> str:
-    if engine_ok:
-        return OUT_OF_SCOPE_DATASET
-    if dataset_ok:
-        return OUT_OF_SCOPE_ENGINE
-    return OUT_OF_SCOPE_BOTH
+class Scope(NamedTuple):
+    """What a run measured, as the pairs it measured them in.
+
+    **A hybrid, not the product of the two axes, and the difference is
+    reachable.** `new/full-20261015-215006`'s phase log holds 10
+    `(engine, corpus)` pairs: percona over four corpora beside six engines
+    over fashion-mnist alone. The product of its axes is 7 x 4 = 28, so a
+    `pgvector x gist-960-euclidean` file that another run left in the same
+    fingerprint tree would be published as that run's own -- no §2 row, and
+    no staleness flag either if the file postdates the run's start. That is
+    not hypothetical: all four archived bundles read `annb/tuned/a9349676`,
+    so two profiles sharing a resource pass is this host's normal state.
+
+        pairs(phases) | {(e, d) : e in engines_block - engines_in_phases,
+                                  d in measured_datasets}
+
+    The union term is for an engine the orchestrator configured and whose
+    units the phase log does not record -- a run that died before the first
+    one returned, or a truncated or hand-edited manifest. There is then no
+    pair to be had for it, and the corpora it would have been measured on are
+    the run's own corpora, so it gets those. It needs the union rather than
+    the whole product precisely because the product is what admits the
+    intruder above.
+
+    **What the hybrid trades.** It closes cross-run contamination inside one
+    fingerprint tree, and it pays for that by excluding the partial files of a
+    unit that was hard-killed before `add_phase` recorded it -- per engine now
+    rather than only per corpus. That is the same cost `measured_datasets`
+    already accepts for the corpus axis, applied consistently rather than
+    inconsistently, and §2 NAMES what it excluded with the count and the
+    reason. Publishing another run's curve silently is the worse of the two,
+    because nothing in the tree carries a run id to tell the two apart.
+
+    Measured: on all four archived bundles every engine in the `engines`
+    block also appears in that bundle's phase log, so `unpaired` is empty,
+    the scope is exactly `pairs`, and the census is identical to the product's.
+    """
+
+    #: (engine, corpus) the phase log records, whatever the unit's exit code.
+    pairs: FrozenSet[Tuple[str, str]]
+    #: Engines known to have run for which no pair can be formed.
+    unpaired: FrozenSet[str]
+    #: Every engine this run is known to have configured or run.
+    engines: FrozenSet[str]
+    #: Every corpus this run is known to have measured or asked for.
+    datasets: FrozenSet[str]
+
+    @property
+    def known(self) -> bool:
+        """Whether the manifest says anything about what the run measured.
+
+        False for an archived manifest that records neither an `engines` block
+        nor a phase log. Reading too much is the defect this module is for;
+        reading nothing would delete the whole recall half of such a report,
+        which is worse, so an unknown scope admits everything and
+        `generate.main` says so on stdout.
+        """
+        return bool(self.pairs or self.unpaired)
+
+    def admits(self, engine: Any, dataset: Any) -> bool:
+        """Whether a recall record for this pair belongs to this run."""
+        if not self.known:
+            return True
+        # Unattributable, so kept: this module's companion requirement is that
+        # nothing leaves the report unnamed, and a record naming no engine or
+        # no corpus cannot be named in §2's table.
+        if not engine or not dataset:
+            return True
+        if (str(engine), str(dataset)) in self.pairs:
+            return True
+        return (str(engine) in self.unpaired
+                and (not self.datasets or str(dataset) in self.datasets))
+
+    def reason(self, engine: Any, dataset: Any) -> str:
+        """Which of the four exclusions this pair is, for §2's last column."""
+        engine_known = str(engine) in self.engines
+        dataset_known = not self.datasets or str(dataset) in self.datasets
+        if not engine_known and not dataset_known:
+            return OUT_OF_SCOPE_BOTH
+        if not engine_known:
+            return OUT_OF_SCOPE_ENGINE
+        if not dataset_known:
+            return OUT_OF_SCOPE_DATASET
+        return OUT_OF_SCOPE_PAIR
+
+
+def scope_of(manifest: Optional[Dict[str, Any]]) -> Scope:
+    """The `Scope` a manifest describes.
+
+    `unpaired` is every engine known to have run for which the phase log
+    offers no `(engine, corpus)` pair -- which is not the same as "absent from
+    the phase log": a phase entry carrying an engine and no corpus (a
+    malformed or hand-edited manifest) would otherwise leave that engine in
+    scope with no pair to admit it and so exclude all of its records.
+    """
+    manifest = manifest or {}
+    pairs = frozenset(
+        (str(engine), str(dataset))
+        for engine, dataset in _phase_pairs(manifest) if engine and dataset)
+    engines = frozenset(measured_engines(manifest))
+    return Scope(
+        pairs=pairs,
+        unpaired=engines - {engine for engine, _dataset in pairs},
+        engines=engines,
+        datasets=frozenset(measured_datasets(manifest)),
+    )
 
 
 def narrow_to_measured_scope(
@@ -211,30 +341,19 @@ def narrow_to_measured_scope(
     Nothing is mutated: both lists hold the record objects as handed in, and
     the census is built fresh.
 
-    A `recall_qps` record is dropped when its engine or its corpus is outside
-    what the manifest says this run measured. Every other phase is kept
-    whatever it names, because every other phase comes out of the run
-    directory. A record naming no engine or no corpus is kept too: it cannot
-    be attributed, and this function's companion requirement is that nothing
-    leaves the report unnamed.
+    A `recall_qps` record is dropped when `Scope.admits` says this run never
+    measured that engine on that corpus -- see `Scope` for the predicate and
+    for why it is the phase log's pairs rather than the product of the two
+    axes. Every other phase is kept whatever it names, because every other
+    phase comes out of the run directory. A record naming no engine or no
+    corpus is kept too: it cannot be attributed, and this function's companion
+    requirement is that nothing leaves the report unnamed.
 
-    An axis the manifest cannot describe is not narrowed. Reading too much is
+    A scope the manifest cannot describe narrows nothing. Reading too much is
     the defect; reading nothing would delete the whole recall half of a report
     for every archived manifest written before the `engines` block carried the
     resolved list, which is worse. `generate.main` says so on stdout when it
     happens, and §2's staleness notice is the guard that still fires there.
-
-    **Two independent axes, not the set of (engine, corpus) pairs the phase
-    log holds.** Pairs would be tighter -- a run that measured A on X and B on
-    Y does not vouch for A on Y -- and they are not available: the declared
-    `datasets:` list is per run and not per engine, so half the evidence
-    cannot form a pair at all, and a pair taken from the phase log alone
-    reintroduces exactly the interruption hole `measured_datasets` exists to
-    close, once per engine. The product is the widest reading both sources can
-    express, and it is still narrow enough to empty the shared tree of every
-    other run: on the two bundles behind this change it drops 353 of 396
-    records and 48 of 446 respectively, and leaves both reports describing
-    only what their own run did.
 
     The census is aggregated per (engine, corpus) and counts FILES as well as
     records: `extra.source_file` is the result file's path inside the tree, so
@@ -258,8 +377,8 @@ def narrow_to_measured_scope(
     measurements, and a file the loader could not read for want of ground
     truth is a different fact with a different remedy.
     """
-    engines = set(measured_engines(manifest or {}))
-    datasets = set(measured_datasets(manifest or {}))
+    scope = scope_of(manifest)
+    recall = phase_recall()
     kept: List[Dict[str, Any]] = []
     # Keyed by the pair, so one row per (engine, corpus) rather than one per
     # result file: the reference bundle would otherwise print 353 rows.
@@ -270,17 +389,15 @@ def narrow_to_measured_scope(
     for record in records:
         engine = record.get("engine")
         dataset = record.get("dataset")
-        engine_ok = not engines or not engine or str(engine) in engines
-        dataset_ok = not datasets or not dataset or str(dataset) in datasets
-        if (record.get("phase") != PHASE_RECALL
-                or (engine_ok and dataset_ok)):
+        if (record.get("phase") != recall
+                or scope.admits(engine, dataset)):
             kept.append(record)
             continue
         key = (str(engine), str(dataset))
         row = census.setdefault(key, {
             "engine": str(engine), "dataset": str(dataset),
             "records": 0, "files": 0,
-            "reason": _reason(engine_ok, dataset_ok),
+            "reason": scope.reason(engine, dataset),
         })
         row["records"] += 1
         source = (record.get("extra") or {}).get("source_file")

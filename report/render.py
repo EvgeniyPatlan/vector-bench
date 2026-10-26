@@ -525,15 +525,19 @@ def _fmt_age(run_started: Any, measured_at: Any) -> str:
 #: drifts, and the drift here would be silent: an unknown code falls through
 #: to the generic phrase below and the row still renders.
 #:
-#: Three codes rather than two, and the third is the one that matters. In the
-#: reference bundle percona's own gist and glove curves were the IN-SCOPE
-#: engine on an out-of-scope corpus; filing those rows under "engine" would
-#: send a reader looking for an engine nobody ran, and under "dataset" would
-#: hide that an engine can be in scope and still contribute nothing here.
+#: Four codes rather than one, and each sends a reader somewhere different.
+#: In the reference bundle percona's own gist and glove curves were the
+#: IN-SCOPE engine on an out-of-scope corpus; filing those under "engine"
+#: would send a reader looking for an engine nobody ran. And a run can measure
+#: an engine, measure a corpus, and never put the two together --
+#: `new/full-20261015-215006` is percona over four corpora beside six engines
+#: over fashion-mnist alone -- so that case needs saying too, or the row reads
+#: as a contradiction of §1.
 _OUT_OF_SCOPE_REASON = {
     _scope.OUT_OF_SCOPE_ENGINE: "this run did not measure this engine",
     _scope.OUT_OF_SCOPE_DATASET: "this run did not measure this corpus",
     _scope.OUT_OF_SCOPE_BOTH: "neither this engine nor this corpus",
+    _scope.OUT_OF_SCOPE_PAIR: "not this engine on this corpus",
 }
 
 
@@ -771,9 +775,13 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         # A STALE row is a configuration this run asked for and ann-benchmarks
         # served from cache, because it skips any configuration that already
         # has a result file and reports that as success. `--force` recomputes
-        # it, and in the reference bundle percona's own `ef_construction`
-        # sweep was exactly that -- a legitimate cache hit from the previous
-        # day, correctly flagged.
+        # it, and in the reference bundle percona's own in-scope sweep was
+        # exactly that: all 35 of its fashion-mnist files predate the run, 24
+        # written on 2026-10-16 and 11 on 2026-10-20 against a run that
+        # started on the 21st. The table above dedupes to one row per
+        # (engine, corpus) and keeps the first it meets, which there was a
+        # 10-16 file, so the published row read 5.0 days. A legitimate cache
+        # hit, correctly flagged, and this notice must not take it over.
         #
         # A row HERE is a measurement of something this run never asked for.
         # There is no `--force` that makes MariaDB part of a percona-only run,
@@ -826,8 +834,12 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             "the remedy. A stale result is a measurement this run asked for "
             "and ann-benchmarks served from cache. A row below was never part "
             "of this run at all, so there is nothing here to recompute: to "
-            "report on it, report the run that measured it, or widen this "
-            "profile's `engines:` and `datasets:` and measure it here._\n"
+            "report on it, report the run that measured it, or edit this "
+            "profile's `engines:` and `datasets:` and measure it here. "
+            "`--engines` will not do it — the orchestrator refuses a name "
+            "outside the profile's own list, because a grid, a corpus size "
+            "and a set of resource extras belong to the engines the profile "
+            "names._\n"
         )
         parts.append(_md_table(
             ["Engine", "Dataset", "Result files",
