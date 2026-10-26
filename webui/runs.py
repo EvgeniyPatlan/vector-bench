@@ -286,11 +286,16 @@ def _scope_phrase(scope: Any) -> str:
     it claimed 7 x 4 = 28 combinations where the scope admits 10 -- in the
     function that computes the scope and then used it only for a boolean.
 
-    FOUR shapes, one per state of the two axes `Scope.admits` narrows on,
-    because either axis can be silent and **a silent axis narrows nothing**.
-    Three of the four shapes used to be spelled from one `corpora` string
-    that read "no corpus it names" when the corpus axis was silent, and in
-    the one of those three the call site can reach, that produced:
+    FIVE returns over four states of the two axes `Scope.admits` narrows on.
+    Either axis can be silent and **a silent axis narrows nothing**; the
+    state where both speak splits by where the engines came from, because a
+    phase log gives `pairs` while an engines block with no phase log gives
+    `unpaired` beside the corpora the profile declared -- two different
+    sentences for two different narrowings, and the corpus axis restricts in
+    both. All three of the returns this replaced were spelled from one
+    `corpora` string that read "no corpus it names" when the corpus axis was
+    silent, and in the one state the call site can reach where that string
+    went in empty, it produced:
 
         the 1 engine(s) this run configured, on the no corpus it names it
         asked for
