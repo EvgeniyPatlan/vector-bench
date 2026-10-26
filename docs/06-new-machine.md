@@ -264,8 +264,10 @@ To regenerate the report locally from copied results:
 > than part of it, and scoring them needs the dataset file. Neither is included
 > by the rsync above. Without them the regenerated report loses its recall
 > section. With unrelated ann results present it reads the whole tree but
-> publishes only the engines and corpora the manifest says this run measured,
-> naming the rest in its Validity section — what no engine list can separate
+> publishes only the engine-and-corpus combinations the manifest's phase log
+> says this run measured — not every engine in it crossed with every corpus in
+> it, which is wider — naming the rest in its Validity section. What no such
+> list can separate
 > is the same engine and corpus measured under a *different* memory or CPU
 > budget, which is what `ann_fingerprint` keys and why the warning remains.
 > The web UI's Report tab checks both and warns before the button does

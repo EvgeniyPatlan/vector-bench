@@ -272,35 +272,81 @@ class Scope(NamedTuple):
     datasets: FrozenSet[str]
 
     @property
-    def known(self) -> bool:
-        """Whether the manifest says anything about what the run measured.
+    def engines_known(self) -> bool:
+        """Whether anything here says which engines the run ran.
 
-        False for an archived manifest that records neither an `engines` block
-        nor a phase log. Reading too much is the defect this module is for;
-        reading nothing would delete the whole recall half of such a report,
-        which is worse, so an unknown scope admits everything and
-        `generate.main` says so on stdout.
+        **Separate from `datasets_known`, and that separation is the whole
+        point.** One collapsed flag over "the manifest says something" loses a
+        narrowing: an archived manifest can carry an empty `engines` block and
+        an empty phase log beside a profile that declares its corpora, and
+        with one flag that state admits everything -- including another run's
+        curve for a corpus this one never asked for, which the corpus axis
+        alone would have excluded and named. Measured on exactly that
+        manifest: one flag keeps `(percona, gist)` and reports nothing, two
+        flags exclude it and name it, and the generator's own stdout line
+        prints a corpus scope it then does not apply.
+
+        Reachable without a hand-edited file: `Manifest.set_config` saves, so
+        a run that died between it and the first `set_engine` leaves that
+        shape, as does a truncated copy or an imported third-party bundle.
         """
         return bool(self.pairs or self.unpaired)
 
+    @property
+    def datasets_known(self) -> bool:
+        """Whether anything here says which corpora the run measured."""
+        return bool(self.datasets)
+
+    @property
+    def known(self) -> bool:
+        """Whether EITHER axis can be narrowed.
+
+        What `generate.main` and the web UI report as "this run records what
+        it measured". False only when neither axis says anything, which is the
+        one state that admits every record in the tree -- reading too much is
+        the defect this module is for, and reading nothing would delete the
+        whole recall half of such a report, which is worse.
+        """
+        return self.engines_known or self.datasets_known
+
     def admits(self, engine: Any, dataset: Any) -> bool:
         """Whether a recall record for this pair belongs to this run."""
-        if not self.known:
-            return True
         # Unattributable, so kept: this module's companion requirement is that
         # nothing leaves the report unnamed, and a record naming no engine or
         # no corpus cannot be named in §2's table.
         if not engine or not dataset:
             return True
+        if not self.engines_known:
+            # No engine knowledge, so no pair can be formed and the engine
+            # axis narrows nothing -- but the corpus axis is independent and
+            # still does. Narrowing on both here is NOT the alternative: with
+            # nothing in `pairs` or `unpaired` the pair test refuses
+            # everything, which deletes the recall half of the report.
+            return not self.datasets_known or str(dataset) in self.datasets
         if (str(engine), str(dataset)) in self.pairs:
             return True
+        # An engine with no pair of its own gets the run's own corpora. With
+        # `pairs` non-empty `datasets_known` is necessarily true -- a pair
+        # comes from a phase entry, which is also where the corpora come from
+        # -- so the open case here is the one where the phase log is empty
+        # altogether and the engines came from the block.
         return (str(engine) in self.unpaired
-                and (not self.datasets or str(dataset) in self.datasets))
+                and (not self.datasets_known or str(dataset) in self.datasets))
 
     def reason(self, engine: Any, dataset: Any) -> str:
-        """Which of the four exclusions this pair is, for §2's last column."""
-        engine_known = str(engine) in self.engines
-        dataset_known = not self.datasets or str(dataset) in self.datasets
+        """Which of the four exclusions this pair is, for §2's last column.
+
+        Each clause asks whether the axis KNOWS the value, so an axis that
+        knows nothing never accuses a record. Keyed off `engines_known` for
+        the same reason `admits` is: with no engine knowledge every exclusion
+        is the corpus's doing, and a row reading "this run did not measure
+        this engine" there would send a reader after an engine the manifest
+        never mentioned either way.
+        """
+        engine_known = (not self.engines_known
+                        or str(engine) in self.engines)
+        dataset_known = (not self.datasets_known
+                         or str(dataset) in self.datasets)
         if not engine_known and not dataset_known:
             return OUT_OF_SCOPE_BOTH
         if not engine_known:

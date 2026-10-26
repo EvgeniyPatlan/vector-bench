@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -641,11 +642,17 @@ class TestAWideRunIsStillReportedWide:
         call = source.index("manifest.set_engine(")
         checkpoint = source.index("[skip]")
         # Resolved first, then the loop, then the call, then the unit skip.
+        # This half is the load-bearing one and is robust to formatting.
         assert resolved < loop < call < checkpoint, (resolved, loop, call,
                                                      checkpoint)
-        # And the call takes the loop variable, not a list of its own.
-        signature = source[call:call + 60]
-        assert "set_engine(\n                engine," in signature, signature
+        # And the call takes the loop variable, not a list of its own. Matched
+        # on any whitespace: the first version of this pinned the exact
+        # 16-space continuation indent, so a reformat or a rename of the loop
+        # variable would have reddened `master` for no defect at all -- which
+        # is the brittleness `tests/test_e16_citation_ratchet.py` spends its
+        # preamble arguing against, in a test written to prevent one.
+        assert re.match(r"manifest\.set_engine\(\s*engine\s*,",
+                        source[call:call + 80]), source[call:call + 80]
 
     def test_an_engine_whose_every_unit_failed_stays_in_scope(self):
         """`full-20261015-215006` has 16 percona phases, 9 of them failed and
@@ -731,6 +738,56 @@ class TestTheScopeIsPairsAndNotTheProduct:
         assert [[r[0], r[1], r[3]] for r in rows] == [
             [_label("pgvector"), GIST, "not this engine on this corpus"]]
 
+    def test_the_notice_does_not_claim_the_pair_it_is_excluding(
+            self, tmp_path, monkeypatch):
+        """§2's opening sentence, and the defect it was shipped with.
+
+        It was built as "every engine in the report ON every corpus in the
+        report" -- the PRODUCT of the two axes -- while the narrowing two
+        paragraphs below it is the phase log's PAIRS. On this shape the
+        product is 28 and the report carries 10, so the sentence claimed
+        pgvector on gist directly above its own table row saying the run never
+        measured pgvector on gist. In the published report, and rendering only
+        when something was excluded -- which is exactly when a reader is
+        checking the claim against the table.
+
+        Honest: the sentence names pgvector on fashion-mnist and no other
+        pgvector pair. Mutant -- build it from `summary["engines"]` and
+        `summary["datasets"]` -- it names gist beside pgvector and contradicts
+        the row below.
+        """
+        _code, markdown, _written = _report(
+            tmp_path, self._manifest_new_full(),
+            self._own() + [_recall("pgvector", GIST)], monkeypatch)
+        sentence = [line for line in _section(
+            markdown, OUT_OF_SCOPE_HEADING).splitlines()
+            if "recall results in this report" in line]
+        assert len(sentence) == 1, markdown
+        covers = sentence[0]
+        # The pair count, and every pair, in a claim a reader can check
+        # against the table below it.
+        assert "10 engine/corpus combinations" in covers
+        assert f"{_label('pgvector')} on `{FASHION}`" in covers
+        assert f"{_label('percona')} on `{FASHION}`, `{GIST}`" in covers
+        # And the claim the product made and this must not.
+        assert f"{_label('pgvector')} on `{GIST}`" not in covers
+
+    def test_the_sentence_is_exactly_as_wide_as_the_tables(self, tmp_path,
+                                                           monkeypatch):
+        """The property, rather than one spelling of it: every pair §4 draws
+        is claimed, and nothing else is."""
+        _code, markdown, written = _report(
+            tmp_path, self._manifest_new_full(),
+            self._own() + [_recall("pgvector", GIST)], monkeypatch)
+        drawn = {(r["engine"], r["dataset"]) for r in written
+                 if r.get("phase") == "recall_qps"}
+        section = _section(markdown, OUT_OF_SCOPE_HEADING)
+        covers = [line for line in section.splitlines()
+                  if "recall results in this report" in line][0]
+        for engine, corpus in drawn:
+            assert f"`{corpus}`" in covers and _label(engine) in covers
+        assert f"{len(drawn)} engine/corpus combinations" in covers
+
     def test_both_halves_of_the_intruder_are_individually_in_scope(self):
         """What makes the exclusion specifically about the pair: the mutant
         this test guards against is not a typo, it is a whole design."""
@@ -755,6 +812,15 @@ class TestTheScopeIsPairsAndNotTheProduct:
         # table for a different and entirely correct reason. Asserting on the
         # engine alone would be asserting the wrong thing and would pass only
         # by accident of which rows the fixture happens to carry.
+        #
+        # WHICH ASSERTION DOES THE WORK. The first one is satisfied before the
+        # mtime is ever consulted -- the scope excludes the pair, so no stale
+        # row for it can exist whatever its age -- so on its own it argues the
+        # claim rather than establishing it. The census assertion at the end is
+        # the discriminating one: it is what fails when the pair is admitted,
+        # which is why mutant G (the product of the axes instead of the pairs)
+        # kills this test. The middle assertion is the positive control that
+        # keeps the first from being vacuous about the table existing at all.
         stale = {(row[0], row[1])
                  for row in _table_rows(markdown, STALE_HEADER)}
         assert (_label("pgvector"), GIST) not in stale
@@ -780,6 +846,38 @@ class TestTheScopeIsPairsAndNotTheProduct:
         assert found.admits("mariadb", FASHION)
         # and it is still bounded by the run's corpora, not by anything.
         assert not found.admits("mariadb", "dbpedia-openai-100k-angular")
+
+    def test_an_engine_in_the_log_with_no_corpus_beside_it_is_unpaired(self):
+        """The widening in the union term, which had no probe.
+
+        The term is `engines - {e : (e, d) in pairs}` and not
+        `engines - engines_in_phases`. The difference is one shape: a phase
+        entry carrying an engine and NO corpus. The narrower form leaves that
+        engine out of `unpaired` because the log mentions it, while no pair
+        can be formed for it either -- so every one of its records is
+        excluded, which is the over-narrowing this whole change must not
+        cause.
+
+        Unreachable from today's orchestrator, and deliberately guarded
+        anyway: `add_phase` has one production caller, inside
+        `for dataset: for phase:`, so a corpus is always in hand. What this
+        covers is a hand-edited, truncated or imported manifest -- and
+        substituting the narrower formula passed the entire suite, so the
+        decision was argued in a docstring and asserted nowhere.
+        """
+        from report import scope
+        manifest = self._manifest_new_full()
+        manifest["phases"] = [p for p in manifest["phases"]
+                              if p["engine"] != "pgvector"]
+        manifest["phases"].append(
+            {"phase": "ann", "engine": "pgvector", "status": "completed",
+             "resource_pass": PASS})
+        found = scope.scope_of(manifest)
+        assert found.unpaired == frozenset({"pgvector"})
+        assert found.admits("pgvector", FASHION) is True
+        assert found.admits("pgvector", GIST) is True
+        # Still bounded by the run's own corpora rather than by nothing.
+        assert found.admits("pgvector", "dbpedia-openai-100k-angular") is False
 
     def test_the_union_term_does_not_relax_a_paired_engine(self):
         """It is a union of the pairs with ONE engine's row, not a promotion
@@ -903,6 +1001,76 @@ class TestTheCorpusHasTheSameDefect:
 
 
 # ---------------------------------------------------------------------------
+# The four reasons
+# ---------------------------------------------------------------------------
+
+class TestEveryReasonSendsTheReaderToTheRightPlace:
+    """All four §2 reason codes, because three of them were unguarded.
+
+    Only the `pair` phrase was asserted anywhere, and swapping
+    `OUT_OF_SCOPE_ENGINE` with `OUT_OF_SCOPE_DATASET` passed the whole suite.
+    Under that mutant percona's own gist curves read "this run did not measure
+    this engine" -- sending a reader after an engine that plainly ran, since
+    §1 lists it -- and MariaDB on the run's own corpus read "did not measure
+    this corpus", which §1 contradicts just as plainly. Those are the two
+    misdirections the codes exist to prevent, so each phrase is pinned to the
+    shape that produces it.
+
+    One manifest produces all four: a run whose phase log is
+    `percona x fashion-mnist` and `pgvector x gist`.
+    """
+
+    MANIFEST_PHASES = [("percona", FASHION, "completed"),
+                       ("pgvector", GIST, "completed")]
+
+    def _manifest(self):
+        return _manifest(["percona", "pgvector"],
+                         profile_datasets=(FASHION, GIST),
+                         phases=list(self.MANIFEST_PHASES))
+
+    #: (engine, corpus, the code, the phrase §2 must print for it).
+    CASES = (
+        # Neither the engine nor the corpus appears in the run.
+        ("mariadb", SIFT, "both", "neither this engine nor this corpus"),
+        # The corpus ran; the engine never did.
+        ("mariadb", FASHION, "engine", "this run did not measure this engine"),
+        # The engine ran; the corpus never did.
+        ("percona", SIFT, "dataset", "this run did not measure this corpus"),
+        # Both ran, never together.
+        ("pgvector", FASHION, "pair", "not this engine on this corpus"),
+    )
+
+    @pytest.mark.parametrize("engine,corpus,code,phrase", CASES)
+    def test_the_reason_is_the_one_that_fits(self, engine, corpus, code,
+                                             phrase, tmp_path, monkeypatch):
+        from report import scope
+        manifest = self._manifest()
+        assert scope.scope_of(manifest).reason(engine, corpus) == code
+        _code, markdown, _written = _report(
+            tmp_path, manifest,
+            [_recall(e, d) for e, d, _s in self.MANIFEST_PHASES]
+            + [_recall(engine, corpus)], monkeypatch)
+        rows = [row for row in _table_rows(markdown, OUT_OF_SCOPE_HEADER)
+                if row[1] == corpus and row[0] == _label(engine)]
+        assert [row[3] for row in rows] == [phrase], markdown
+
+    def test_the_four_cases_really_are_four(self):
+        """Non-vacuity: a parametrisation whose cases collapsed to one code
+        would assert the same thing four times."""
+        assert len({code for _e, _d, code, _p in self.CASES}) == 4
+        assert len({phrase for _e, _d, _c, phrase in self.CASES}) == 4
+
+    def test_every_code_the_module_defines_has_a_phrase(self):
+        """The mapping must be total, or an unmatched code falls through to a
+        generic phrase and the row still renders -- a silent regression."""
+        from report import scope
+        codes = {scope.OUT_OF_SCOPE_ENGINE, scope.OUT_OF_SCOPE_DATASET,
+                 scope.OUT_OF_SCOPE_BOTH, scope.OUT_OF_SCOPE_PAIR}
+        assert set(render._OUT_OF_SCOPE_REASON) == codes
+        assert len(set(render._OUT_OF_SCOPE_REASON.values())) == 4
+
+
+# ---------------------------------------------------------------------------
 # Two notices, two facts
 # ---------------------------------------------------------------------------
 
@@ -1002,10 +1170,15 @@ class TestAnUnnarrowableManifestIsNotNarrowedToNothing:
         _report(tmp_path, self._blank(), _shared_tree("percona"), monkeypatch)
         assert "cannot narrow" in capsys.readouterr().out
 
-    def test_a_scope_on_one_axis_alone_is_still_applied(self, tmp_path,
-                                                        monkeypatch):
+    def test_engines_alone_still_narrow_the_engines(self, tmp_path,
+                                                    monkeypatch):
         """Half a manifest is not no manifest. A block naming the engines with
-        nothing saying which corpora must still narrow the engines."""
+        nothing saying which corpora must still narrow the engines.
+
+        One of a pair; the corpus direction is the next test, and the two have
+        to be asserted separately because a single "does the manifest say
+        anything" flag satisfies this one and fails that one.
+        """
         manifest = _manifest(["percona"])
         manifest["phases"] = []
         manifest["config"]["profile"].pop("datasets")
@@ -1015,6 +1188,67 @@ class TestAnUnnarrowableManifestIsNotNarrowedToNothing:
             monkeypatch)
         assert _engines_in(written, "recall_qps") == ["percona"]
         assert _datasets_in(written, "recall_qps") == [FASHION, GIST]
+
+    def test_corpora_alone_still_narrow_the_corpora(self, tmp_path,
+                                                    monkeypatch):
+        """The mirror, and the one a collapsed flag loses.
+
+        An archived manifest can carry an empty `engines` block and an empty
+        phase log beside a profile that still declares its corpora -- a run
+        that died between `set_config`, which saves, and the first
+        `set_engine`; a truncated copy; an imported third-party bundle. With
+        one "the manifest says something" flag that state admits EVERYTHING,
+        including another run's curve for a corpus this one never asked for.
+
+        Measured across the two commits of this change on these very inputs:
+        two independent axes keep `(percona, fashion)` and exclude
+        `(percona, gist)` as a corpus exclusion; one flag keeps both and
+        reports nothing -- while the generator's own stdout still prints the
+        corpus scope it has stopped applying.
+        """
+        manifest = _manifest(["percona"])
+        manifest["engines"] = {}
+        manifest["phases"] = []
+        manifest["config"]["profile"]["datasets"] = [FASHION]
+        _code, markdown, written = _report(
+            tmp_path, manifest,
+            _shared_tree("percona", "mariadb", datasets=(FASHION, GIST)),
+            monkeypatch)
+        # The corpus axis narrows, and the engine axis -- which knows nothing
+        # -- narrows nothing, so mariadb's fashion-mnist records stay.
+        assert _datasets_in(written, "recall_qps") == [FASHION]
+        assert _engines_in(written, "recall_qps") == ["mariadb", "percona"]
+        # Named, and named as a CORPUS exclusion: with no engine knowledge
+        # every exclusion here is the corpus's doing, and a row blaming the
+        # engine would accuse one the manifest never mentioned either way.
+        assert [[row[1], row[3]] for row in
+                _table_rows(markdown, OUT_OF_SCOPE_HEADER)] == [
+            [GIST, "this run did not measure this corpus"],
+            [GIST, "this run did not measure this corpus"]]
+
+    def test_the_two_axes_are_known_independently(self):
+        """The flag behind both tests above, asserted directly so a collapse
+        is a failure here rather than a surprise two surfaces away."""
+        from report import scope
+        engines_only = _manifest(["percona"])
+        engines_only["phases"] = []
+        engines_only["config"]["profile"].pop("datasets")
+        corpora_only = _manifest(["percona"])
+        corpora_only["engines"] = {}
+        corpora_only["phases"] = []
+        neither = _manifest(["percona"])
+        neither["engines"] = {}
+        neither["phases"] = []
+        neither["config"]["profile"].pop("datasets")
+
+        first = scope.scope_of(engines_only)
+        assert (first.engines_known, first.datasets_known) == (True, False)
+        second = scope.scope_of(corpora_only)
+        assert (second.engines_known, second.datasets_known) == (False, True)
+        assert second.known is True
+        third = scope.scope_of(neither)
+        assert (third.engines_known, third.datasets_known) == (False, False)
+        assert third.known is False
 
 
 # ---------------------------------------------------------------------------

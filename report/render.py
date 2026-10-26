@@ -541,6 +541,81 @@ _OUT_OF_SCOPE_REASON = {
 }
 
 
+def _recall_pairs(summary: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The `(engine, corpus)` combinations this report's recall half carries.
+
+    Read off `per_dataset`, which `summarize` builds one entry per
+    `(dataset, pass, engine)` with at least one recall point -- so this is the
+    set of pairs the charts and §4 actually draw, not a product derived from
+    two separate lists.
+
+    That distinction is the defect this function exists for. §2's opening
+    sentence was built as "every engine in the report ON every corpus in the
+    report", which is the PRODUCT of the axes, and the narrowing beside it is
+    the phase log's PAIRS. On a run that measured percona over four corpora
+    and six other engines over one -- `new/full-20261015-215006`'s shape --
+    the product is 28 and the report carries 10, so the sentence claimed
+    pgvector on gist two paragraphs above its own table row saying the run
+    never measured pgvector on gist. The comment here used to assert that
+    could not happen "because these come off the summary"; they did, and off
+    the wrong two keys of it.
+    """
+    pairs = {(engine, dataset)
+             for dataset, by_pass in (summary.get("per_dataset") or {}).items()
+             for per_engine in (by_pass or {}).values()
+             for engine in (per_engine or {})}
+    return sorted(pairs)
+
+
+def _covered_phrase(pairs: List[Tuple[str, str]]) -> str:
+    """`pairs` as prose, grouped by engine, naming every one of them.
+
+    Grouped only for length -- one clause per engine listing its corpora is
+    the same set of pairs, rendered so that ten of them read as a sentence
+    rather than as a list of twenty names. It must stay exhaustive: the whole
+    point is that the reader can check it against the table below, and a
+    truncated claim is the vague one this replaced.
+    """
+    if not pairs:
+        return "none: no engine produced a recall measurement here"
+    by_engine: Dict[str, List[str]] = {}
+    for engine, dataset in pairs:
+        by_engine.setdefault(engine, []).append(dataset)
+    clauses = [f"{_label(engine)} on "
+               + ", ".join(f"`{d}`" for d in sorted(datasets))
+               for engine, datasets in sorted(by_engine.items())]
+    count = (f"the {len(pairs)} engine/corpus combinations" if len(pairs) > 1
+             else "the one engine/corpus combination")
+    return f"{count} " + "; ".join(clauses)
+
+
+def _widening_note(manifest: Dict[str, Any]) -> str:
+    """How to bring an excluded combination into scope, per profile.
+
+    Conditional, because the answer is not the same for all seven profiles
+    and the unconditional version was false for six of them. `--engines` is
+    refused only when the profile DECLARES an engine list:
+    `config.engines_outside_profile` returns nothing when there is none --
+    "there is nothing to be outside of" -- and `profile_engines`' own
+    docstring records that every shipped profile but `percona` declares none.
+    So `run --profile full --engines pgvector --datasets gist-960-euclidean`
+    is accepted, and `full` is the profile behind the bundle this notice was
+    written for. A sentence calling that refused would send an operator to
+    edit a file they did not need to touch, in the one section of the report
+    whose job is to be exact.
+    """
+    declared = (((manifest.get("config") or {}).get("profile") or {})
+                .get("engines") or [])
+    if not declared:
+        return (" `--engines` and `--datasets` widen this profile, which "
+                "declares no engine list of its own.")
+    named = ", ".join(f"`{e}`" for e in declared)
+    return (f" `--engines` will not do it: this profile declares {named} and "
+            f"the orchestrator refuses a name outside that list, because a "
+            f"grid, a corpus size and a set of resource extras belong to the "
+            f"engines a profile names. Widening means editing the profile.")
+
+
 def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
@@ -807,17 +882,8 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
         if not files:
             held = (f"**{records_dropped} recall records**"
                     if records_dropped != 1 else "**1 recall record**")
-        # Named, not pointed at. An earlier wording said "the engines and
-        # corpora named in §1", and §1 names the engines only -- there is no
-        # corpus anywhere in it, so half of the sentence sent a reader to a
-        # table that could not answer. These come off the summary, which is
-        # what the report actually carries after the narrowing, so the claim
-        # cannot be wider than the document it introduces.
-        in_scope_engines = ", ".join(
-            _label(e) for e in (summary.get("engines") or [])) or "no engine"
-        in_scope_datasets = ", ".join(
-            f"`{d}`" for d in (summary.get("datasets") or [])) or "no corpus"
-        covers = f"{in_scope_engines} on {in_scope_datasets}"
+        covered = _recall_pairs(summary)
+        covers = _covered_phrase(covered)
         parts.append(
             "\n### Recall results from other runs in the shared tree\n\n"
             "Recall results live in a tree shared across runs at "
@@ -826,20 +892,16 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             "engine-invariant, so every engine measured at one budget lands "
             "in one tree and one chart compares them. The cost is that the "
             "tree is not a record of any single run.\n"
-            f"\nThis report covers {covers}. The tree also held {held} for "
-            f"the combinations below, which this run did not measure, and "
-            f"**they are excluded from every chart and table in this "
-            f"report** and from the `records.jsonl` beside it.\n"
+            f"\nThe recall results in this report are {covers}. The tree "
+            f"also held {held} for the combinations below, which this run did "
+            f"not measure, and **they are excluded from every chart and table "
+            f"in this report** and from the `records.jsonl` beside it.\n"
             "\n_This is not the staleness notice above, and `--force` is not "
             "the remedy. A stale result is a measurement this run asked for "
             "and ann-benchmarks served from cache. A row below was never part "
             "of this run at all, so there is nothing here to recompute: to "
-            "report on it, report the run that measured it, or edit this "
-            "profile's `engines:` and `datasets:` and measure it here. "
-            "`--engines` will not do it — the orchestrator refuses a name "
-            "outside the profile's own list, because a grid, a corpus size "
-            "and a set of resource extras belong to the engines the profile "
-            "names._\n"
+            "report on it, report the run that measured it, or measure it "
+            f"here.{_widening_note(manifest)}_\n"
         )
         parts.append(_md_table(
             ["Engine", "Dataset", "Result files",

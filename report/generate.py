@@ -1222,11 +1222,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     # measured, and before `records.jsonl` is written, because that file is
     # what the web UI prefers over the raw ops records and a mixed set
     # persisted there is inherited by every later reader.
-    measured_engines = scope.measured_engines(manifest)
-    measured_datasets = scope.measured_datasets(manifest)
+    measured = scope.scope_of(manifest)
     records, out_of_scope = scope.narrow_to_measured_scope(records, manifest)
-    for axis, named in (("engines", measured_engines),
-                        ("datasets", measured_datasets)):
+    # The PAIRS first, because that is the unit the narrowing works in. The
+    # two axis lists are printed under it as the sets the pairs are drawn
+    # from and as what each unrecorded-axis warning is about -- printing only
+    # the axes described a product this no longer applies, and a reader
+    # comparing stdout against §2 would have found two different claims.
+    if measured.pairs:
+        print(f"[report] this run measured {len(measured.pairs)} "
+              f"engine/corpus combination(s): "
+              + "; ".join(f"{engine} on {dataset}"
+                          for engine, dataset in sorted(measured.pairs)))
+    if measured.unpaired:
+        print(f"[report] this run configured but recorded no unit for: "
+              f"{', '.join(sorted(measured.unpaired))}; "
+              f"those are read on whichever of its corpora the tree holds")
+    for axis, named in (("engines", sorted(measured.engines)),
+                        ("datasets", sorted(measured.datasets))):
         if named:
             print(f"[report] this run's {axis}: {', '.join(named)}")
             continue

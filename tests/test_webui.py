@@ -356,6 +356,64 @@ class TestReportRegenerationRisk:
         assert "rather than only this run's" not in found["regenerate_note"]
         # And the claim that replaced them.
         assert "DIFFERENT memory or CPU budget" in found["regenerate_note"]
+        # In PAIRS, which is the unit the scope narrows on. This fixture has
+        # two engines and one corpus, so the product is 2 and the phase log
+        # records 1 -- enough to tell the two apart.
+        assert "1 engine/corpus combination(s)" in found["regenerate_note"]
+        assert "plus the 1 engine(s) it configured and recorded no unit for" \
+            in found["regenerate_note"]
+
+    def test_the_note_counts_pairs_and_not_engines_times_corpora(self,
+                                                                 tmp_path):
+        """`new/full-20261015-215006`'s shape, where the two readings differ
+        most: percona over four corpora beside six engines over fashion-mnist
+        alone. The note claimed 7 x 4 = 28 combinations where the scope admits
+        10 -- in the function that computes the scope and then used it only
+        for a boolean."""
+        manifest = basic_manifest("r1")
+        manifest["engines"] = {e: {} for e in (
+            "alisql", "mariadb", "mariadb123", "mongodb", "percona",
+            "pgvector", "valkey")}
+        corpora = ["fashion-mnist-784-euclidean", "glove-100-angular",
+                   "sift-128-euclidean", "gist-960-euclidean"]
+        manifest["config"]["profile"]["datasets"] = corpora
+        manifest["phases"] = (
+            [{"phase": "ann", "engine": "percona", "dataset": c,
+              "resource_pass": "normalized", "status": "completed"}
+             for c in corpora]
+            + [{"phase": "ann", "engine": e,
+                "dataset": "fashion-mnist-784-euclidean",
+                "resource_pass": "normalized", "status": "completed"}
+               for e in ("alisql", "mariadb", "mariadb123", "mongodb",
+                         "pgvector", "valkey")])
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/m/a.hdf5"],
+                             manifest=manifest)
+        assert found["regenerate_risk"] == "unnarrowed_resources"
+        assert len(found["scope_engines"]) == 7
+        assert len(found["scope_datasets"]) == 4
+        assert "10 engine/corpus combination(s)" in found["regenerate_note"]
+        assert "28" not in found["regenerate_note"]
+
+    def test_a_run_that_records_only_its_corpora_does_not_claim_otherwise(
+            self, tmp_path):
+        """The payload contradicted its own note in this state.
+
+        An empty `engines` block and an empty phase log beside a profile that
+        still declares its corpora: `scope_narrowed` was False and the note
+        read "records neither the engines it configured nor the corpora it
+        measured", directly beside a `scope_datasets` field listing one. The
+        corpus axis is known there and does narrow, so neither half was true.
+        """
+        manifest = basic_manifest("r1")
+        manifest["engines"] = {}
+        manifest["phases"] = []
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             manifest=manifest)
+        assert found["scope_datasets"] == ["tiny-16-euclidean"]
+        assert found["scope_narrowed"] is True
+        assert found["regenerate_risk"] == "unnarrowed_resources"
+        assert "nor the corpora it measured" not in found["regenerate_note"]
+        assert "it records no engine" in found["regenerate_note"]
 
     def test_a_run_that_records_no_scope_still_says_it_cannot_narrow(
             self, tmp_path):

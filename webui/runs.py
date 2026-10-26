@@ -217,9 +217,8 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
         note = (f"Regenerating reads every ann result on this machine "
                 f"({tree_files} files), because the tree keyed to this run's "
                 f"resource configuration is not here. It would publish only "
-                f"the {len(scope_engines)} engine(s) on the "
-                f"{len(scope_datasets)} corpus(es) this run measured and name "
-                f"the rest in its Validity section. "
+                f"{_scope_phrase(scope)} and name the rest in its Validity "
+                f"section. "
                 # Still said, and still the more serious half. The scope
                 # narrows by engine and corpus, not by machine, so a foreign
                 # run regenerated here publishes THIS machine's numbers for
@@ -271,6 +270,38 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
         "regenerate_risk": risk,
         "regenerate_note": note,
     }
+
+
+def _scope_phrase(scope: Any) -> str:
+    """What regenerating would publish, in the units the scope narrows on.
+
+    `(engine, corpus)` PAIRS, not engines times corpora. This read "the N
+    engine(s) on the M corpus(es)" and was numerically wrong for the one
+    manifest shape the two differ on: `new/full-20261015-215006` measured
+    percona over four corpora beside six engines over fashion-mnist alone, so
+    it claimed 7 x 4 = 28 combinations where the scope admits 10 -- in the
+    function that computes the scope and then used it only for a boolean.
+
+    Three shapes, because the scope has three. A phase log gives pairs; an
+    engine block with no phase log gives engines and the corpora the profile
+    asked for; and neither gives corpora alone, which is the state where the
+    engine axis narrows nothing and the corpus axis still does.
+    """
+    corpora = (f"{len(scope.datasets)} corpus(es)" if scope.datasets
+               else "no corpus it names")
+    if scope.pairs:
+        phrase = (f"the {len(scope.pairs)} engine/corpus combination(s) this "
+                  f"run's phase log records")
+        if scope.unpaired:
+            phrase += (f", plus the {len(scope.unpaired)} engine(s) it "
+                       f"configured and recorded no unit for, on those "
+                       f"{corpora}")
+        return phrase
+    if scope.unpaired:
+        return (f"the {len(scope.unpaired)} engine(s) this run configured, on "
+                f"the {corpora} it asked for")
+    return (f"the {corpora} this run asked for -- it records no engine, so "
+            f"every engine in the tree is read for them")
 
 
 def _count_hdf5(path: str) -> int:
