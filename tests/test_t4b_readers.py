@@ -1758,13 +1758,18 @@ class TestTheProseSaysWhatTheCodeDoes:
         claim it makes is checkable: no archived record carries a version at
         all.
 
-        **The constant is 7, and this docstring once said 5 two lines above
-        an assertion that it was 6.** G3 bumped it to 6 and the one-client
-        scaling status bumped it to 7; what this test is about is unchanged
-        either time, because the question is whether the VERSION 5 BLOCK
-        still states PR 4's three facts, not what the harness stamps today.
-        Twice now the tail assertion has had to move with a bump, which is
-        what makes it a tripwire rather than decoration.
+        **The constant is 8, and this docstring once said 5 two lines above
+        an assertion that it was 6.** G3 bumped it to 6, the one-client
+        scaling status bumped it to 7, and version 8 -- the ops harness
+        withdrawing a storage engine from the engines that have none --
+        bumped it again; what this test is about is unchanged every time,
+        because the question is whether the VERSION 5 BLOCK still states
+        PR 4's three facts, not what the harness stamps today. Three times
+        now the tail assertion has had to move with a bump, which is what
+        makes it a tripwire rather than decoration: it is what brings
+        whoever bumps the constant back here to re-read that block, and the
+        three substring assertions above are what they confirm. Loosening it
+        to `>=` would be the one change that silently retires it.
 
         **And the end of the block was being found by a string that no longer
         occurs.** It split on `"OPS_MEASUREMENT_VERSION = 5"`, which the bump
@@ -1787,7 +1792,7 @@ class TestTheProseSaysWhatTheCodeDoes:
         assert "during_writes" in block
         assert "reinsert_rows_per_s" in block
         assert "2,134 ops records" in block
-        assert records.OPS_MEASUREMENT_VERSION == 7
+        assert records.OPS_MEASUREMENT_VERSION == 8
 
     def test_a_version_5_figure_is_still_refused_against_an_older_one(self):
         """The guard the "no archived record carries a 5" argument rests on.
@@ -1809,7 +1814,7 @@ class TestTheProseSaysWhatTheCodeDoes:
         start loading beside reader-contended version 5 ones and the argument
         in the block would be wrong rather than merely unverified here.
         """
-        assert records.OPS_MEASUREMENT_VERSION == 7
+        assert records.OPS_MEASUREMENT_VERSION == 8
         assert 5 not in records.OPS_MEASUREMENT_EQUIVALENT_VERSIONS
         assert not records.ops_versions_measure_the_same_thing([1, 5])
         # And the pair the archive actually contains stays comparable.

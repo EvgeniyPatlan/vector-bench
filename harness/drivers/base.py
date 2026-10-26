@@ -349,9 +349,18 @@ class EngineDriver(abc.ABC):
         That join is not theoretical and the cost is not small: in
         `full-20261015-215006` EVERY index_build record for those three
         engines carries `extra.peak_rss_source: "sampled"`, so
-        `_attach_sampled_peaks` is the only thing that ever gave them a
-        `peak_rss_bytes` at all. A stem that stopped matching would not
-        publish a wrong peak memory figure, it would publish none.
+        `report/generate.py:attach_peak_rss` is the only thing that ever gave
+        them a `peak_rss_bytes` at all -- and it is every engine, not only
+        these three: all 54 of that run's index_build records are sampled. A
+        stem that stopped matching would not publish a wrong peak memory
+        figure, it would publish none.
+
+        Withdrawing the claim carries an `OPS_MEASUREMENT_VERSION` bump to 8,
+        even though no measured quantity moves, because this field is an
+        identity component of `OPS_UNIT_FIELDS`, `build_signature` and
+        `memory_stem` rather than a label: see the version 8 block in
+        `harness/metrics/records.py` for the legend it otherwise publishes
+        across the boundary.
 
         WHAT THIS DOES NOT FIX, because it cannot be fixed from inside
         `harness/`: `webui/static/fields.js` declares `storage_engine` as a

@@ -410,7 +410,100 @@ SCHEMA_VERSION = 1
 # reproduce under any counting, and a figure nobody can re-derive is worse
 # than no figure. The old behaviour at n=1 was never intended by anything
 # that wrote a test.
-OPS_MEASUREMENT_VERSION = 7
+#
+# VERSION 8 -- `storage_engine` STOPPED NAMING AN ENGINE THAT HAS NONE.
+# `RunContext.record_defaults` stamped `IndexSpec.storage_engine` on every ops
+# record. That field is a MySQL-family `ENGINE=` clause:
+# `harness/main.py` defaults `--storage-engine` to `InnoDB` and
+# `orchestrator/cli.py:_ops_storage_engines` passes `InnoDB` for every engine
+# that is not MariaDB, so it arrived populated for all seven while only three
+# of them put it in a CREATE TABLE. `EngineDriver.storage_engine_in_use` now
+# decides, `MySQLFamilyDriver` overrides it with the clause its DDL emitted,
+# and `Record.to_dict` drops the None -- so for pgvector, Valkey and Percona
+# Search the field is ABSENT rather than false.
+#
+# WHAT MOVES, by record field: one, and it is not a measurement.
+#
+#     every ops phase     storage_engine   "InnoDB" -> absent
+#                                          (pgvector, valkey, mongodb only)
+#
+# NOTHING ELSE. No `qps`, no recall, no percentile, no byte count, no ingest
+# rate, no status. The workloads, the grids, the predicates, the ef policy and
+# every number any of them records are unchanged, and the three MySQL-family
+# engines' records are unchanged too -- `InnoDB`, or `MyISAM` where MariaDB's
+# extra curve was swept.
+#
+# Measured on `full-20261015-215006`: 516 of its 1,168 ops records carried the
+# false value, against the same run's honest `heap` (200), `memory` (100) and
+# `wiredTiger` (37) on the `recall_qps` records the ann overlay modules write.
+# So one engine reported two different storage engines inside one run.
+#
+# WHY A BUMP IS OWED ANYWAY, which is the whole difficulty: no measured
+# quantity moves, and that is true and insufficient. `storage_engine` is not a
+# label, it is an IDENTITY COMPONENT -- of `OPS_UNIT_FIELDS` in
+# `report/generate.py`, `OPS_UNIT_KEYS` in `workloads/churn_readers.py`,
+# `report/loaders.py`'s
+# `build_signature` and `memory_stem`, and through the first of those
+# `charts.series_key`. Changing it re-partitions the record set, and the
+# charter at the top of this block is "any change that alters what an ops
+# number MEANS", which a re-partitioning does: the number keeps its value and
+# changes which series it belongs to.
+#
+# WHAT THAT PRODUCES WITHOUT A BUMP, measured on two records of ONE pgvector
+# configuration differing only in the pre/post spelling of this field:
+#
+#     refuse_mixed_measurement_versions -> no refusal; both stamp version 7
+#     build_signature pre  (..., 16, 'post', 'InnoDB', 200, None)
+#     build_signature post (..., 16, 'post',  None,    200, None)
+#     charts._grouped      -> 2 series, legend
+#                             ['PostgreSQL (pgvector)',
+#                              'PostgreSQL (pgvector) / InnoDB']
+#
+# The published legend reads `PostgreSQL (pgvector) / InnoDB`: the exact claim
+# this change exists to withdraw, reproduced across the version boundary, with
+# nothing in the data to attribute it to. And a reader cannot discount it,
+# because for MariaDB a second storage-engine series IS a real within-engine
+# comparison.
+#
+# THE PATH IS ORDINARY, NOT CONTRIVED. `--profile full` is ~1,066 h, so
+# resumption is the norm, and `report/measurement_versions.py` names this
+# hazard in its own words -- "a resumed run that appended to a file written by
+# older code". A run whose pgvector M=8 unit completed before this change and
+# whose M=16 unit runs after it puts both spellings in one run directory;
+# `Manifest.set_config` carries the existing version forward, so without a
+# bump no refusal fires and `series_key` splits pgvector on every chart that
+# groups through it.
+#
+# THE PRECEDENT IS VERSION 7, directly above: "The value of a published field
+# changes for records that already exist, with no change in any engine, so a
+# reader putting a version-6 Validity section beside a version-7 one would see
+# one-client points move ... and have nothing to attribute it to." That is
+# this shape exactly, and the block beside it records what shipping such a
+# change late cost -- "There is no repair for the records already written."
+#
+# WHY VERSION 5's `selectivity` DECLINATION DOES NOT APPLY, since it is the
+# closest-looking escape and it was used to argue for one. That note declines
+# a bump OF ITS OWN, and rests on a second leg this change does not have:
+# version 5 was introduced by T3b inside that same change set, so nothing had
+# ever been measured at a version 5 lacking the correction. There was a bump
+# in that change; the label correction simply rode it. This change set
+# proposed none, so there is nothing for this correction to ride.
+#
+# AND WHY `_ops_iterative_scan`'s "lands beside rather than on top of" ARGUES
+# THE OTHER WAY, which is the second escape. There, two values of
+# `extra.iterative_scan` are two genuinely different measurements, so landing
+# beside each other is the SAFETY property. Here the two values are one
+# measurement of one configuration, so landing beside each other is precisely
+# the harm.
+#
+# THE COST, stated rather than discovered later: `report/generate.py` prints
+# and returns 2 for a directory holding both versions, and
+# `orchestrator/manifest.py` warns on a resume of an archived run. An
+# archived single-version run still reports -- the refusal compares the
+# records against their OWN manifest, not against this constant -- so
+# `full-20261015-215006` regenerates unchanged. What needs a report per
+# version is a directory this change's harness appended to.
+OPS_MEASUREMENT_VERSION = 8
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.

@@ -127,10 +127,10 @@ being wrong.
 There is no previous smoke run to compare against **through the report**, and
 the obstacle is a deliberate one.
 
-`OPS_MEASUREMENT_VERSION` is 7 (`harness/metrics/records.py:413`). Records
+`OPS_MEASUREMENT_VERSION` is 8 (`harness/metrics/records.py:506`). Records
 written before the constant existed carry no version key at all and are
 version 1 by definition, not "unknown"
-(`harness/metrics/records.py:420`). The archived corpus is entirely version 1:
+(`harness/metrics/records.py:513`). The archived corpus is entirely version 1:
 `harness/metrics/records.py:240-246` records a count of it, and that count was
 re-taken independently for this document — 239 ops record files, 2,134 ops
 records, `extra.ops_measurement_version` absent from every one, every record in
@@ -146,7 +146,7 @@ versions are present, so a version 1 record and a version 5 record in one
 report raise `MixedMeasurementVersions`, and so do a version 1 and a version 2
 — which `report/measurement_versions.py:187-191` says **denote the same
 measurement**. The equivalence set
-(`harness/metrics/records.py:451`) changes the *wording* of the refusal,
+(`harness/metrics/records.py:544`) changes the *wording* of the refusal,
 dropping the advice to re-measure; it does not change the decision. And the
 refusal is not a caveat on a chart: `report/generate.py:1213-1214` prints the
 message and returns 2, so there is no report.
@@ -237,7 +237,7 @@ below says why that matters.
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
 report** (`report/render.py:3397`), computed by
-`report/crosscheck.py:327`'s `consistency_checks`. §4 item 5 says what to look
+`report/crosscheck.py:335`'s `consistency_checks`. §4 item 5 says what to look
 at and what the coverage table means.
 
 **Step F — only then `main`.** Spec step 6. On `main` the cross-check is no
@@ -416,7 +416,7 @@ stops for the duration).
 > Percona to the `repair_path: none` branch until the capability is flipped.
 
 What MongoDB has instead is the index-sync wait, a different hook:
-`harness/drivers/base.py:426-439` returns `0.0` by default and MongoDB and
+`harness/drivers/base.py:435-448` returns `0.0` by default and MongoDB and
 Valkey override it. So spec step 4's "where the new hooks do something" is
 correct about which two engines to run first, and this checklist item is about a
 different hook than that step is.
@@ -430,7 +430,7 @@ is still true.
 
 ### 5. "Consistency checks pass, or each failure is explained"
 
-**This section now exists.** `report/crosscheck.py:327`'s `consistency_checks`
+**This section now exists.** `report/crosscheck.py:335`'s `consistency_checks`
 matches ops calibration points to ann recall points, and the report renders it
 as section 10 (`report/render.py:3397`). It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
@@ -447,7 +447,7 @@ What to read, in the order it matters:
   `max(0.01, 2 × the ops 95% CI half-width)` — one recall point is allowed
   unconditionally because the two paths score different query subsets, and a
   record with no usable interval gets exactly the floor
-  (`report/crosscheck.py:105`). A failure at a wide interval and a failure at
+  (`report/crosscheck.py:113`). A failure at a wide interval and a failure at
   the floor are different findings.
 * **The QPS inversions, which are flagged and never failed.** The ops path pays
   a TCP round trip per query that the in-process path does not, so two engines
