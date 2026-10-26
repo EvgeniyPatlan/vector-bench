@@ -318,6 +318,65 @@ class TestEveryFigsizeGoesThroughTheBound:
         path = os.path.join(VB_ROOT, "report", "charts.py")
         return ast.parse(open(path).read()), ast
 
+    @classmethod
+    def _chart_functions(cls):
+        """Every top-level function in the module that writes a chart file.
+
+        `_save` is the one way a chart reaches disk, so calling it is what
+        makes a function a chart rather than a helper -- derived from the
+        module instead of listed, because a list is the thing being checked.
+        """
+        tree, ast = cls._tree()
+        drawn = set()
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and getattr(inner.func, "id", None) == "_save"):
+                    drawn.add(node.name)
+                    break
+        return drawn
+
+    def test_the_sweep_covers_every_chart_the_module_draws(self):
+        """`ALL_CHARTS` is hand-maintained, and a chart missing from it is
+        bounded by nothing.
+
+        **This is the third time in this change's history that a
+        forward-looking generalisation turned out to be false**, and the first
+        two were both caught by measurement rather than by reading: "the first
+        round number above every intrinsic panel layout" (it was not --
+        `latency_percentiles` was at 4.07:1) and "every data-dependent figsize
+        passes through a helper" (it did not -- `pass_comparison` did its own
+        arithmetic). The sweep above made the first executable and the AST
+        guard made the second; the completeness of `ALL_CHARTS` is the same
+        shape of claim, so it gets the same treatment rather than a third
+        assertion.
+
+        It also closes the residual hole in the guard above. That guard
+        catches inline arithmetic -- the historical defect shape -- but a
+        figsize can still evade it, through a local under another name,
+        `set_size_inches`, a positional `Figure((w, h))` or a `**kwargs`
+        splat. None of those is exploitable while the chart is swept, because
+        the rendering tests measure the artifact rather than the source. They
+        become exploitable only for a chart that is BOTH written evasively and
+        absent from this registry. This test removes the second condition.
+        """
+        drawn = self._chart_functions()
+        covered = set()
+        for _name, draw_chart, _make_records in ALL_CHARTS:
+            # Each entry's lambda names exactly one `charts_mod.<fn>`, and the
+            # attribute lands in the code object's names.
+            covered |= set(draw_chart.__code__.co_names)
+        missing = drawn - covered
+        assert not missing, (
+            f"{sorted(missing)} call `_save` but are not in ALL_CHARTS, so "
+            f"nothing measures their aspect ratio or their canvas width at "
+            f"any shape. Add an entry with a fixture builder.")
+        assert len(drawn) >= 12, (
+            f"only {len(drawn)} chart functions found; this guard has lost "
+            f"its grip on the module")
+
     def test_every_figsize_argument_is_a_literal_or_a_helper(self):
         tree, ast = self._tree()
         seen = 0

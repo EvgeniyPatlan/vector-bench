@@ -593,9 +593,13 @@ def grid_figsize(columns: int, rows: int, per_column: float, per_row: float,
     3.1, which saves at 4.07:1 -- over the bound. Three engines is the
     project's headline MariaDB/AliSQL/pgvector comparison and
     `--engines mariadb,alisql,pgvector` is a first-class invocation, so this
-    was not a corner. It needs 3.3 inches of height instead of 3.1, and that
-    is the whole of the change: every other engine count already clears the
-    bound and comes out of here untouched.
+    was not a corner. It needs 3.3 inches of height instead of 3.1, and every
+    other engine count clears the bound without a height raise.
+
+    That is not the same as "every other engine count comes out untouched",
+    which is what this sentence used to say and which the very next paragraph
+    contradicts: ONE engine also moves, from 4.4 inches wide to 8.0, through
+    `minimum` below. Two shapes change here, n=3 by height and n=1 by width.
 
     `minimum` is a FLOOR on the width and it is there for the opposite
     problem. At one engine the grid asked for 4.4 inches -- narrower than any
@@ -606,6 +610,15 @@ def grid_figsize(columns: int, rows: int, per_column: float, per_row: float,
     `latency-gist-960-euclidean.png` and `latency-glove-100-angular.png` in
     the 2026-10-15 run are 837 and 835 pixels on a 660-pixel canvas for that
     reason, and they are single-engine charts.
+
+    **The two helpers are duals in RATIO only, and this one does not bound
+    absolute size.** `bar_chart_figsize` caps width outright, so its output is
+    always placeable; this one caps nothing -- `grid_figsize(100, 1, 4.4,
+    3.1)` is 440 x 110 inches at a perfect 4.00:1, which is past matplotlib's
+    own pixel limit. That is latent rather than live: both call sites cap
+    their own column count (`min(3, ...)` and a literal list of four), so
+    `columns` cannot grow without an edit here. A caller that lets its column
+    count follow the data needs a ceiling as well as a ratio.
     """
     width = max(minimum, per_column * columns)
     return (width, max(per_row * rows, width / MAX_ASPECT_RATIO))
