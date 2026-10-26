@@ -28,6 +28,23 @@ These tests do not read that bundle -- `results/` is gitignored and a test
 that needs a 126 MB archive is not a test. They rebuild its shape: seven
 engines over three graph degrees, which is 21 plotted series, and for churn a
 maintenance state on top of that, which is 42 legend entries.
+
+**And then they sweep DOWNWARD, which is the part that was missing.** The
+first version of this file swept 21 series and then 63, and every chart
+passed. `latency_percentiles` was over the bound the whole time, at 4.07:1 --
+but only at exactly THREE engines, where `columns = min(3, len(engines))`
+makes it one row of three panels. At 21 and 63 series the same chart is a 3x3
+grid at 1.41:1, comfortably inside. The violating shape was smaller than
+anything being tested, so making the input bigger could never find it, and
+the chart that broke was the project's headline MariaDB/AliSQL/pgvector
+comparison. `SHAPES` now runs one engine through seven as well.
+
+The same sweep, once it existed, found a second overhang the aspect ratio
+cannot see at all: a `fig.text` CAPTION wider than a narrow figure.
+`latency-gist-960-euclidean.png` in that run is 837 pixels on a 660-pixel
+canvas at 1.73:1 -- inside the bound, 27% too wide for its own figure. That
+is why `test_the_saved_image_is_no_wider_than_the_canvas` exists beside the
+ratio test rather than instead of it.
 """
 from __future__ import annotations
 
@@ -118,9 +135,50 @@ def filtered_records(units=MANY):
             for selectivity in (0.01, 0.1, 0.5)]
 
 
+def recall_qps_records(units=MANY):
+    return [_record(engine, m, phase="recall_qps", ef_search=ef, clients=1,
+                    recall_at_k=0.90 + 0.0003 * ef, qps=3000.0 / ef,
+                    latency_p50_ms=0.4 * ef, latency_p99_ms=1.0 * ef)
+            for engine, m in units
+            for ef in (16, 64, 256)]
+
+
+def memory_series(units=MANY):
+    return {f"{engine}-m{m}-ops": [
+        {"t": float(t), "rss_bytes": 10 ** 8 + t * 10 ** 6}
+        for t in range(10)] for engine, m in units}
+
+
+def pareto_by_engine(units=MANY):
+    return {(engine, "tuned", m): [
+        _record(engine, m, phase="recall_qps", recall_at_k=0.9 + 0.003 * i,
+                qps=2000.0 - 40 * i) for i in range(12)]
+        for engine, m in units}
+
+
+def calibration_sweep_records(units=MANY):
+    """`PHASE_CALIBRATION` is spelled `ef_calibration`, which is worth a
+    helper: a fixture that wrote `phase="calibration"` makes
+    `loaders.calibration_records` return nothing and `calibration_curves`
+    return None, and a chart that drew nothing would have sat in the sweep
+    below looking like a pass."""
+    return [_record(engine, m, phase="ef_calibration", ef_search=ef,
+                    clients=1, recall_at_k=0.90 + 0.0003 * ef,
+                    qps=3000.0 / ef, extra={"target_recall": 0.95})
+            for engine, m in units
+            for ef in (16, 64, 256)]
+
+
+def qps_summary(units=MANY):
+    return {"per_dataset": {DATASET: {"tuned": {
+        engine: {"qps_at_recall_90": 1500.0, "qps_at_recall_95": 900.0,
+                 "qps_at_recall_99": 300.0} for engine, _m in units}}}}
+
+
 #: `(name, how to draw it, how to build its records)` for every chart that
 #: carries a figure legend or sizes itself from its series count -- which is
-#: exactly the set of charts the run produced a strip for.
+#: exactly the set of charts the 2026-10-15 run produced a strip for, and the
+#: set the legend and bar-width fixes touch.
 WIDENING_CHARTS = (
     ("churn", lambda records, out: charts_mod.churn(
         records, DATASET, out, "churn"), churn_records),
@@ -132,6 +190,52 @@ WIDENING_CHARTS = (
         records, DATASET, out, "filtered", column="tag"), filtered_records),
     ("storage", lambda records, out: charts_mod.storage_breakdown(
         records, DATASET, out, "storage"), storage_records),
+)
+
+#: `(name, how to draw it from a set of units)` for EVERY chart this module
+#: draws, not only the five the legend broke.
+#:
+#: Restricting the bound to the five was how `latency_percentiles` reached
+#: review at 4.07:1. It is sized `(4.4 * columns, 3.1 * rows)` with
+#: `columns = min(3, len(engines))`, so it passes through neither the bar
+#: helper nor a fixed panel count, and at exactly three engines -- the
+#: project's headline MariaDB/AliSQL/pgvector comparison -- that is one row of
+#: three panels, over the bound. The bound is a property of the module, so the
+#: module is what gets swept.
+ALL_CHARTS = WIDENING_CHARTS + (
+    ("pareto", lambda records, out: charts_mod.pareto(
+        records, DATASET, 10, out, "pareto"), pareto_by_engine),
+    ("memory_timeline", lambda records, out: charts_mod.memory_timeline(
+        records, out, "memory"), memory_series),
+    ("qps_at_recall", lambda records, out: charts_mod.qps_at_recall(
+        records, DATASET, out, "qps"), qps_summary),
+    ("pass_comparison", lambda records, out: charts_mod.pass_comparison(
+        records, DATASET, out, "passcompare"),
+     lambda units=MANY: (concurrency_records(units) + build_records(units)
+                         + filtered_records(units)
+                         + recall_qps_records(units))),
+    ("latency_percentiles", lambda records, out: charts_mod.latency_percentiles(
+        records, DATASET, out, "latency"), recall_qps_records),
+    ("churn_impact", lambda records, out: charts_mod.churn_impact(
+        records, DATASET, out, "churnimpact"), churn_records),
+    ("calibration_curves", lambda records, out: charts_mod.calibration_curves(
+        records, DATASET, out, "calibration"), calibration_sweep_records),
+)
+
+#: Engine counts ONE THROUGH SEVEN, then the two high series counts.
+#:
+#: The downward half is the half that was missing. The first version of this
+#: suite swept 21 series and then 63, and `latency_percentiles` is a 3x3 grid
+#: at 1.41:1 at both -- comfortably inside the bound. Its violating shape is
+#: three engines, which is SMALLER than anything that was measured. A bound
+#: that is only ever tested by making the input bigger is not tested.
+SHAPES = tuple(
+    (f"{n}e", tuple((engine, 16) for engine in ENGINES[:n]))
+    for n in range(1, len(ENGINES) + 1)
+) + (
+    ("21s", MANY),
+    ("63s", tuple((engine, m) for engine in ENGINES
+                  for m in (4, 8, 16, 24, 32, 48, 64, 96, 128))),
 )
 
 
@@ -187,6 +291,121 @@ class TestTheBarChartWidthIsCapped:
         for count in (0, 1, 13, 14, 42, 500, 5000):
             width, height = charts_mod.bar_chart_figsize(count, 1.5, 8.0, 5.2)
             assert width / height <= charts_mod.MAX_ASPECT_RATIO, count
+
+
+class TestEveryFigsizeGoesThroughTheBound:
+    """The module-wide claim, made executable instead of asserted.
+
+    `latency_percentiles` reached review at 4.07:1 because `MAX_ASPECT_RATIO`
+    was referenced in exactly ONE place -- `bar_chart_figsize` -- while three
+    other call sites did their own arithmetic inline. Inline arithmetic in a
+    `figsize` is the shape of every instance of this defect:
+    `(4.4 * columns, 3.1 * rows)`, `(max(8, 1.5 * len(labels)), 5.2)`,
+    `(4.0 * len(panels), 4.8)`. So the rule is that a figsize is either a
+    tuple of literal numbers or the return of one of the two helpers, and
+    nothing in between.
+
+    Source-level, so it needs no matplotlib and no rendering, and it fails on
+    the NEXT chart that grows a dimension rather than on the next run that
+    happens to have the shape that exposes it.
+    """
+
+    HELPERS = {"bar_chart_figsize", "grid_figsize"}
+
+    @staticmethod
+    def _tree():
+        import ast
+        path = os.path.join(VB_ROOT, "report", "charts.py")
+        return ast.parse(open(path).read()), ast
+
+    def test_every_figsize_argument_is_a_literal_or_a_helper(self):
+        tree, ast = self._tree()
+        seen = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "figsize":
+                    continue
+                seen += 1
+                value = keyword.value
+                where = f"line {value.lineno}"
+                if isinstance(value, ast.Tuple):
+                    assert all(isinstance(e, ast.Constant) for e in value.elts), (
+                        f"{where}: figsize does arithmetic inline. Route it "
+                        f"through {sorted(self.HELPERS)} so the bound applies.")
+                elif isinstance(value, ast.Call):
+                    name = getattr(value.func, "id",
+                                   getattr(value.func, "attr", None))
+                    assert name in self.HELPERS, (
+                        f"{where}: figsize comes from {name!r}, which does not "
+                        f"enforce MAX_ASPECT_RATIO")
+                else:
+                    assert isinstance(value, ast.Name), (
+                        f"{where}: unrecognised figsize expression")
+        assert seen >= 10, (
+            f"only found {seen} figsize arguments; this guard has lost its "
+            f"grip on the module")
+
+    def test_every_figsize_variable_is_assigned_from_a_helper(self):
+        """The `ast.Name` escape above, closed. `_new_axes` takes a `figsize`
+        parameter and `storage_breakdown` binds one, so a bare name is legal
+        -- but only when what was bound to it came from a helper."""
+        tree, ast = self._tree()
+        assignments = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "figsize"
+                       for t in node.targets):
+                continue
+            assignments += 1
+            assert isinstance(node.value, ast.Call), node.lineno
+            name = getattr(node.value.func, "id",
+                           getattr(node.value.func, "attr", None))
+            assert name in self.HELPERS, (
+                f"line {node.lineno}: `figsize` is bound from {name!r}, which "
+                f"does not enforce MAX_ASPECT_RATIO")
+        assert assignments >= 1, "no `figsize = ...` left; update this guard"
+
+
+class TestThePanelGridMeetsTheBound:
+    """`latency_percentiles`' sizing, the one the first round missed.
+
+    `grid_figsize` raises the HEIGHT where `bar_chart_figsize` caps the width,
+    and the asymmetry is deliberate: a bar chart's width grows with the data
+    and has no limit, so height cannot save it; a panel grid's width is
+    already capped by its column count, so only the ratio is wrong.
+    """
+
+    def test_three_panels_in_a_row_are_raised_to_the_bound(self):
+        """13.2 x 3.1 saves at 4.07:1. It needs 3.3 inches of height."""
+        assert 4.4 * 3 / 3.1 > charts_mod.MAX_ASPECT_RATIO, (
+            "the fixture no longer describes an over-wide row")
+        assert charts_mod.grid_figsize(3, 1, 4.4, 3.1) == pytest.approx(
+            (13.2, 3.3))
+
+    def test_a_grid_that_already_fits_is_untouched(self):
+        """Four engines upward are two or three rows and were always fine;
+        raising those would move charts that had nothing wrong with them."""
+        assert charts_mod.grid_figsize(3, 2, 4.4, 3.1) == pytest.approx(
+            (13.2, 6.2))
+        assert charts_mod.grid_figsize(3, 3, 4.4, 3.1) == pytest.approx(
+            (13.2, 9.3))
+
+    def test_one_panel_gets_the_modules_usual_width_floor(self):
+        """A 4.4-inch figure is narrower than anything else here and cannot
+        hold its own suptitle, which is why the single-engine latency charts
+        in the run are 837 and 835 pixels on a 660-pixel canvas."""
+        assert charts_mod.grid_figsize(1, 1, 4.4, 3.1) == (8.0, 3.1)
+
+    def test_no_grid_shape_can_exceed_the_bound(self):
+        for columns in range(1, 5):
+            for rows in range(1, 6):
+                width, height = charts_mod.grid_figsize(
+                    columns, rows, 4.4, 3.1)
+                assert width / height <= charts_mod.MAX_ASPECT_RATIO, (
+                    columns, rows, width, height)
 
 
 class TestTextBelowTheAxesClearsWhatIsAlreadyThere:
@@ -249,54 +468,78 @@ class TestTheFixtureReallyDoesStretch:
             f"passing vacuously")
 
 
+#: Memo for the sweep below, keyed by `(chart, shape)`.
+#:
+#: The two properties are asserted by two tests so that a failure names which
+#: one broke, but they are two statements about ONE rendering, and the sweep
+#: is 11 charts x 9 shapes. Rendering each cell twice doubled this file's
+#: share of the suite for nothing. Sound because
+#: `test_the_wrapped_layout_is_still_byte_deterministic` pins that a second
+#: render of the same records gives the same file.
+_MEASURED = {}
+
+
+def draw_measuring_canvas(name, shape, draw_chart, records):
+    """`(width, height, canvas_width_px)` for one rendered chart.
+
+    The canvas is read off the figure at `savefig` time, because the whole
+    mechanism is that the two can disagree: `bbox_inches="tight"` grows the
+    SAVED image past the canvas to hold anything that overhangs it.
+    """
+    import matplotlib.pyplot as plt
+
+    if (name, shape) in _MEASURED:
+        return _MEASURED[(name, shape)]
+
+    canvases = []
+    real = plt.Figure.savefig
+
+    def record_canvas(self, *args, **kwargs):
+        canvases.append(self.get_size_inches()[0] * 150)
+        return real(self, *args, **kwargs)
+
+    plt.Figure.savefig = record_canvas
+    try:
+        width, height = draw(draw_chart, records)
+    finally:
+        plt.Figure.savefig = real
+    _MEASURED[(name, shape)] = (width, height, max(canvases))
+    return _MEASURED[(name, shape)]
+
+
 @needs_matplotlib
+@pytest.mark.parametrize("shape,units", SHAPES)
+@pytest.mark.parametrize("name,draw_chart,make_records", ALL_CHARTS)
 class TestNoChartBecomesAStrip:
-    """The bound itself, which is the thing a reader cares about."""
+    """The bound itself, over EVERY chart and EVERY shape.
 
-    @pytest.mark.parametrize("name,draw_chart,make_records", WIDENING_CHARTS)
+    One render per cell, two assertions on it. Swept from one engine upward
+    rather than only from twenty-one series: see `SHAPES`.
+    """
+
     def test_the_aspect_ratio_stays_within_the_bound(
-            self, name, draw_chart, make_records):
-        width, height = draw(draw_chart, make_records())
+            self, name, draw_chart, make_records, shape, units):
+        width, height, _canvas = draw_measuring_canvas(
+            name, shape, draw_chart, make_records(units))
         assert width / height <= charts_mod.MAX_ASPECT_RATIO, (
-            f"{name} came out {width} x {height} = "
-            f"{width / height:.1f} : 1")
+            f"{name} at {shape} came out {width} x {height} = "
+            f"{width / height:.2f} : 1")
 
-    @pytest.mark.parametrize("name,draw_chart,make_records", WIDENING_CHARTS)
     def test_the_saved_image_is_no_wider_than_the_canvas(
-            self, name, draw_chart, make_records):
-        """The sharper statement, and the one that names the mechanism: the
-        legend must stop being able to decide the width at all. A bound on the
-        ratio alone could be met by a figure that grew in both directions."""
-        import matplotlib.pyplot as plt
-
-        widths = []
-        real = plt.Figure.savefig
-
-        def record_canvas(self, *args, **kwargs):
-            widths.append(self.get_size_inches()[0] * 150)
-            return real(self, *args, **kwargs)
-
-        plt.Figure.savefig = record_canvas
-        try:
-            width, _height = draw(draw_chart, make_records())
-        finally:
-            plt.Figure.savefig = real
-        assert width <= max(widths), (
-            f"{name}'s PNG is {width}px wide but its canvas is only "
-            f"{max(widths):.0f}px: something is hanging off the side and "
-            f"`bbox_inches=\"tight\"` is paying for it in width")
-
-    @pytest.mark.parametrize("name,draw_chart,make_records", WIDENING_CHARTS)
-    def test_a_far_larger_series_count_still_holds(
-            self, name, draw_chart, make_records):
-        """Seven engines over nine degrees -- 63 units, and 126 legend entries
-        on the churn chart. The bound is a property of the layout, not a
-        number that happens to work at the size the run happened to be."""
-        units = tuple((engine, m) for engine in ENGINES
-                      for m in (4, 8, 16, 24, 32, 48, 64, 96, 128))
-        width, height = draw(draw_chart, make_records(units))
-        assert width / height <= charts_mod.MAX_ASPECT_RATIO, (
-            f"{name} came out {width} x {height} = {width / height:.1f} : 1")
+            self, name, draw_chart, make_records, shape, units):
+        """The sharper statement, and the one that names the mechanism:
+        nothing may decide the width except the figure itself. A bound on the
+        ratio alone could be met by a figure that grew in both directions, and
+        this is also the assertion that catches an over-wide CAPTION, which
+        the ratio does not -- `latency-gist-960-euclidean.png` in the
+        2026-10-15 run is 837 pixels on a 660-pixel canvas at 1.73:1, inside
+        the bound and still 27% too wide for its own figure."""
+        width, _height, canvas = draw_measuring_canvas(
+            name, shape, draw_chart, make_records(units))
+        assert width <= canvas, (
+            f"{name} at {shape} is {width}px wide on a {canvas:.0f}px canvas "
+            f"(+{100 * (width / canvas - 1):.0f}%): something is hanging off "
+            f"the side and `bbox_inches=\"tight\"` is paying for it in width")
 
 
 #: The largest engine count at which each chart's legend still fits on ONE
@@ -421,3 +664,136 @@ class TestTheFixCostsNothingItDidNotHaveTo:
             f"{name} drew {len(entries)} legend entries for {expected} "
             f"series")
         assert len(set(entries)) == len(entries), "legend entries collided"
+
+
+@needs_matplotlib
+class TestTheBarChartOnlyCrowdsWhenItRanOutOfWidth:
+    """`crowded` has to be a statement about having hit the cap.
+
+    Nothing pinned that. `ONE_ROW_FITS` covers the four figure-legend charts
+    and excludes `storage_breakdown`, which has no figure legend, so a mutant
+    that turned `crowded` on for EVERY storage chart -- `figsize[0] <= 1.5 *
+    len(labels)` instead of `<` -- rotated every caption on every run and the
+    whole suite stayed green. The four arithmetic tests above cannot see it:
+    `bar_chart_figsize` is correct in that mutant, and only its caller reads
+    the answer wrongly.
+    """
+
+    @staticmethod
+    def _rotations(units):
+        """Rotation of the bar captions and of the per-bar totals."""
+        import matplotlib.pyplot as plt
+
+        seen = {"captions": [], "totals": []}
+        real_ticks = plt.Axes.set_xticklabels
+        real_text = plt.Axes.text
+
+        def spy_ticks(self, labels, **kwargs):
+            seen["captions"].append(kwargs.get("rotation", 0))
+            return real_ticks(self, labels, **kwargs)
+
+        def spy_text(self, x, y, s, **kwargs):
+            seen["totals"].append(kwargs.get("rotation", 0))
+            return real_text(self, x, y, s, **kwargs)
+
+        plt.Axes.set_xticklabels = spy_ticks
+        plt.Axes.text = spy_text
+        try:
+            with tempfile.TemporaryDirectory() as out:
+                charts_mod.storage_breakdown(
+                    storage_records(units), DATASET, out, "storage")
+        finally:
+            plt.Axes.set_xticklabels = real_ticks
+            plt.Axes.text = real_text
+        return seen
+
+    def test_a_chart_under_the_cap_keeps_everything_horizontal(self):
+        """Three engines is six bars, nine inches -- nowhere near the cap."""
+        units = tuple((engine, 16) for engine in ENGINES[:3])
+        assert 1.5 * 2 * len(units) < charts_mod.MAX_ASPECT_RATIO * 5.2, (
+            "the fixture is no longer under the cap")
+        seen = self._rotations(units)
+        assert seen["captions"] == [0], seen["captions"]
+        assert set(seen["totals"]) == {0}, set(seen["totals"])
+
+    def test_a_chart_over_the_cap_turns_upright(self):
+        """Non-vacuity for the test above: the rotation must actually be
+        reachable, or `== [0]` would be passing on a branch that never runs."""
+        seen = self._rotations(MANY)
+        assert seen["captions"] == [90], seen["captions"]
+        assert set(seen["totals"]) == {90}, set(seen["totals"])
+
+
+@needs_matplotlib
+class TestTheFootnoteClearsTheWrappedLegend:
+    """`concurrency` places two things in figure fractions below the canvas.
+
+    Unit-tested and integration-untested is how this one hid: `_below` keeps
+    all three of its unit tests under a mutant that simply stops CALLING it
+    with the legend's position -- `legend_bottom = _series_legend(...) and
+    None` -- and the calibration footnote then lands on top of the wrapped
+    legend at exactly the seven-engine run the code comment says it is there
+    for. The helper being right is not the property anyone wants; the two
+    artists not colliding is.
+    """
+
+    @staticmethod
+    def _placed(units):
+        import matplotlib.pyplot as plt
+
+        records = concurrency_records(units)
+        # `calibration_targets` non-empty plus points carrying no
+        # `calibration_status` is what earns every engine the uncalibrated
+        # mark, which is what makes `_calibration_footnote` return a sentence.
+        records[0]["extra"] = dict(records[0]["extra"], target_recall=0.95)
+
+        seen = {"texts": []}
+        real_legend = plt.Figure.legend
+        real_text = plt.Figure.text
+
+        def spy_legend(self, *args, **kwargs):
+            legend = real_legend(self, *args, **kwargs)
+            seen["ncol"] = kwargs.get("ncol")
+            seen["handles"] = len(args[0])
+            extent = legend.get_window_extent(self.canvas.get_renderer())
+            seen["legend_bottom"] = extent.y0 / (
+                self.get_size_inches()[1] * self.dpi)
+            return legend
+
+        def spy_text(self, x, y, s, **kwargs):
+            seen["texts"].append((y, s))
+            return real_text(self, x, y, s, **kwargs)
+
+        plt.Figure.legend = spy_legend
+        plt.Figure.text = spy_text
+        try:
+            with tempfile.TemporaryDirectory() as out:
+                charts_mod.concurrency(records, DATASET, out, "concurrency")
+        finally:
+            plt.Figure.legend = real_legend
+            plt.Figure.text = real_text
+        # Only what was placed BELOW the canvas: the suptitle sits at y=1.14
+        # and the width probes `_legend_columns` makes sit at y=0.
+        seen["below"] = [t for t in seen["texts"] if t[0] < 0]
+        return seen
+
+    def test_the_footnote_sits_under_the_legend_at_seven_engines(self):
+        seen = self._placed(tuple((engine, 16) for engine in ENGINES))
+        assert seen["ncol"] < seen["handles"], (
+            "the legend did not wrap, so there is nothing for the footnote "
+            "to collide with and this test asserts nothing")
+        assert len(seen["below"]) == 1, seen["below"]
+        footnote_y, footnote = seen["below"][0]
+        assert footnote.strip(), "the fixture produced no footnote text"
+        assert footnote_y <= seen["legend_bottom"], (
+            f"the calibration footnote is at y={footnote_y:.3f} and the "
+            f"wrapped legend reaches down to y={seen['legend_bottom']:.3f}: "
+            f"they are drawn on top of each other")
+
+    def test_a_footnote_with_no_wrapped_legend_keeps_its_old_place(self):
+        """The other half of `_below`: where nothing came down here, the
+        footnote must not drift from the -0.04 it always used."""
+        seen = self._placed(tuple((engine, 16) for engine in ENGINES[:3]))
+        assert seen["ncol"] == seen["handles"], "the legend wrapped after all"
+        assert len(seen["below"]) == 1, seen["below"]
+        assert seen["below"][0][0] == -0.04
