@@ -19,6 +19,8 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from report import scope as _scope
+
 # Defaults; the manifest's per-engine `presentation.label` overrides them, so an
 # engine added after this file was written names itself correctly.
 ENGINE_LABEL = {
@@ -517,6 +519,103 @@ def _fmt_age(run_started: Any, measured_at: Any) -> str:
     return f"{delta / 86400:.1f} days"
 
 
+#: Prose for each code `report/scope.py` files an excluded recall record
+#: under. Keyed off that module's constants rather than off three retyped
+#: literals, because a sentinel spelled in two files is a sentinel that
+#: drifts, and the drift here would be silent: an unknown code falls through
+#: to the generic phrase below and the row still renders.
+#:
+#: Four codes rather than one, and each sends a reader somewhere different.
+#: In the reference bundle percona's own gist and glove curves were the
+#: IN-SCOPE engine on an out-of-scope corpus; filing those under "engine"
+#: would send a reader looking for an engine nobody ran. And a run can measure
+#: an engine, measure a corpus, and never put the two together --
+#: `new/full-20261015-215006` is percona over four corpora beside six engines
+#: over fashion-mnist alone -- so that case needs saying too, or the row reads
+#: as a contradiction of §1.
+_OUT_OF_SCOPE_REASON = {
+    _scope.OUT_OF_SCOPE_ENGINE: "this run did not measure this engine",
+    _scope.OUT_OF_SCOPE_DATASET: "this run did not measure this corpus",
+    _scope.OUT_OF_SCOPE_BOTH: "neither this engine nor this corpus",
+    _scope.OUT_OF_SCOPE_PAIR: "not this engine on this corpus",
+}
+
+
+def _recall_pairs(summary: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The `(engine, corpus)` combinations this report's recall half carries.
+
+    Read off `per_dataset`, which `summarize` builds one entry per
+    `(dataset, pass, engine)` with at least one recall point -- so this is the
+    set of pairs the charts and §4 actually draw, not a product derived from
+    two separate lists.
+
+    That distinction is the defect this function exists for. §2's opening
+    sentence was built as "every engine in the report ON every corpus in the
+    report", which is the PRODUCT of the axes, and the narrowing beside it is
+    the phase log's PAIRS. On a run that measured percona over four corpora
+    and six other engines over one -- `new/full-20261015-215006`'s shape --
+    the product is 28 and the report carries 10, so the sentence claimed
+    pgvector on gist two paragraphs above its own table row saying the run
+    never measured pgvector on gist. The comment here used to assert that
+    could not happen "because these come off the summary"; they did, and off
+    the wrong two keys of it.
+    """
+    pairs = {(engine, dataset)
+             for dataset, by_pass in (summary.get("per_dataset") or {}).items()
+             for per_engine in (by_pass or {}).values()
+             for engine in (per_engine or {})}
+    return sorted(pairs)
+
+
+def _covered_phrase(pairs: List[Tuple[str, str]]) -> str:
+    """`pairs` as prose, grouped by engine, naming every one of them.
+
+    Grouped only for length -- one clause per engine listing its corpora is
+    the same set of pairs, rendered so that ten of them read as a sentence
+    rather than as a list of twenty names. It must stay exhaustive: the whole
+    point is that the reader can check it against the table below, and a
+    truncated claim is the vague one this replaced.
+    """
+    if not pairs:
+        return "none: no engine produced a recall measurement here"
+    by_engine: Dict[str, List[str]] = {}
+    for engine, dataset in pairs:
+        by_engine.setdefault(engine, []).append(dataset)
+    clauses = [f"{_label(engine)} on "
+               + ", ".join(f"`{d}`" for d in sorted(datasets))
+               for engine, datasets in sorted(by_engine.items())]
+    count = (f"the {len(pairs)} engine/corpus combinations" if len(pairs) > 1
+             else "the one engine/corpus combination")
+    return f"{count} " + "; ".join(clauses)
+
+
+def _widening_note(manifest: Dict[str, Any]) -> str:
+    """How to bring an excluded combination into scope, per profile.
+
+    Conditional, because the answer is not the same for all seven profiles
+    and the unconditional version was false for six of them. `--engines` is
+    refused only when the profile DECLARES an engine list:
+    `config.engines_outside_profile` returns nothing when there is none --
+    "there is nothing to be outside of" -- and `profile_engines`' own
+    docstring records that every shipped profile but `percona` declares none.
+    So `run --profile full --engines pgvector --datasets gist-960-euclidean`
+    is accepted, and `full` is the profile behind the bundle this notice was
+    written for. A sentence calling that refused would send an operator to
+    edit a file they did not need to touch, in the one section of the report
+    whose job is to be exact.
+    """
+    declared = (((manifest.get("config") or {}).get("profile") or {})
+                .get("engines") or [])
+    if not declared:
+        return (" `--engines` and `--datasets` widen this profile, which "
+                "declares no engine list of its own.")
+    named = ", ".join(f"`{e}`" for e in declared)
+    return (f" `--engines` will not do it: this profile declares {named} and "
+            f"the orchestrator refuses a name outside that list, because a "
+            f"grid, a corpus size and a set of resource extras belong to the "
+            f"engines a profile names. Widening means editing the profile.")
+
+
 def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
@@ -742,6 +841,74 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
             rows.append([_label(c.get("engine", "?")), c.get("dataset", "?"),
                          _fmt_age(c.get("run_started"), c.get("measured_at"))])
         parts.append(_md_table(["Engine", "Dataset", "Measured before this run by"], rows))
+
+    if summary.get("out_of_scope_ann"):
+        # Deliberately NEXT to the staleness notice above, and deliberately
+        # not merged into it. Both are facts about the same shared tree and
+        # they need opposite remedies.
+        #
+        # A STALE row is a configuration this run asked for and ann-benchmarks
+        # served from cache, because it skips any configuration that already
+        # has a result file and reports that as success. `--force` recomputes
+        # it, and in the reference bundle percona's own in-scope sweep was
+        # exactly that: all 35 of its fashion-mnist files predate the run, 24
+        # written on 2026-10-16 and 11 on 2026-10-20 against a run that
+        # started on the 21st. The table above dedupes to one row per
+        # (engine, corpus) and keeps the first it meets, which there was a
+        # 10-16 file, so the published row read 5.0 days. A legitimate cache
+        # hit, correctly flagged, and this notice must not take it over.
+        #
+        # A row HERE is a measurement of something this run never asked for.
+        # There is no `--force` that makes MariaDB part of a percona-only run,
+        # and offering one would send an operator to re-measure six engines to
+        # fix a report that is now correct. Before this notice existed the
+        # rows below appeared in the staleness table instead -- "MariaDB 12.3,
+        # measured before this run by 1.8 days" -- which reads as a refreshable
+        # cache hit and is the wrong instruction twice over.
+        rows = [[_label(c.get("engine", "?")), c.get("dataset", "?"),
+                 str(c.get("files") or c.get("records") or 0),
+                 _OUT_OF_SCOPE_REASON.get(c.get("reason"),
+                                          "not part of this run")]
+                for c in summary["out_of_scope_ann"][:30]]
+        files = sum(c.get("files") or 0 for c in summary["out_of_scope_ann"])
+        records_dropped = sum(c.get("records") or 0
+                              for c in summary["out_of_scope_ann"])
+        # The file count where there is one, the record count otherwise. A
+        # record with no `extra.source_file` came from a hand-assembled or
+        # third-party records file rather than out of the tree, and counting
+        # it as a file would name a path nobody can go and look at.
+        held = (f"**{files} result files**" if files != 1
+                else "**1 result file**")
+        if not files:
+            held = (f"**{records_dropped} recall records**"
+                    if records_dropped != 1 else "**1 recall record**")
+        covered = _recall_pairs(summary)
+        covers = _covered_phrase(covered)
+        parts.append(
+            "\n### Recall results from other runs in the shared tree\n\n"
+            "Recall results live in a tree shared across runs at "
+            "`results/annb/<pass>/<fingerprint>/`. That is deliberate: the "
+            "fingerprint keys on the resource pass's declared limits and is "
+            "engine-invariant, so every engine measured at one budget lands "
+            "in one tree and one chart compares them. The cost is that the "
+            "tree is not a record of any single run.\n"
+            f"\nThe recall results in this report are {covers}. The tree "
+            f"also held {held} for the combinations below, which this run did "
+            f"not measure, and **they are excluded from every chart and table "
+            f"in this report** and from the `records.jsonl` beside it.\n"
+            "\n_This is not the staleness notice above, and `--force` is not "
+            "the remedy. A stale result is a measurement this run asked for "
+            "and ann-benchmarks served from cache. A row below was never part "
+            "of this run at all, so there is nothing here to recompute: to "
+            "report on it, report the run that measured it, or measure it "
+            f"here.{_widening_note(manifest)}_\n"
+        )
+        parts.append(_md_table(
+            ["Engine", "Dataset", "Result files",
+             "Why it is not part of this run"], rows))
+        more = len(summary["out_of_scope_ann"]) - 30
+        if more > 0:
+            parts.append(f"\n_…and {more} more._\n")
 
     if summary.get("passes_without_a_tree"):
         # The notice that has to be IN the document. `full-20261015-215006`

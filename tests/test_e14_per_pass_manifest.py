@@ -152,7 +152,15 @@ def _manifest(passes: Sequence[Tuple[str, Optional[str], Dict[str, Any]]],
         "host": ({"cpu": {}} if hostname is None
                  else {"cpu": {}, "hostname": hostname}),
         "engines": {}, "warnings": [],
-        "phases": [{"phase": "ann", "engine": "percona", "dataset": "d1",
+        # The corpus the records below carry, not a placeholder. `phases[]`
+        # is one of the two things `report/scope.py` reads to decide which
+        # corpora a run measured, so a phase log naming `d1` beside records
+        # naming `glove-100-angular` describes a run that measured neither --
+        # and the report then correctly excludes every record this file
+        # builds. A fixture has to be self-consistent on an axis another
+        # reader keys off.
+        "phases": [{"phase": "ann", "engine": "percona",
+                    "dataset": "glove-100-angular",
                     "status": "completed", "resource_pass": name}
                    for name in names],
         "config": config,
@@ -766,7 +774,8 @@ class TestARunWhoseSecondPassNeverStarted:
         manifest["run_id"] = "run-stopped"
         manifest.setdefault("phases", []).append(
             {"phase": "ann", "resource_pass": "normalized",
-             "status": "completed", "engine": "percona", "dataset": "d1"})
+             "status": "completed", "engine": "percona",
+             "dataset": "glove-100-angular"})
         root = _trees(tmp_path, f"normalized/{NORMALIZED_FP}",
                       f"tuned/{TUNED_FP}")
         code, capture = _run_report(tmp_path, manifest, root, monkeypatch)
@@ -1813,27 +1822,36 @@ class TestEveryFileParsesOnTheInterpreterThatWillParseIt:
         **The membership is pinned**, which is the only thing that catches a
         package being REMOVED from `_PARSED_ELSEWHERE`. Deriving the loop from
         the tuple does not: a tuple with `webui` gone is a loop that never
-        looks for `webui`. The total does not either -- `webui` is 12 files
-        and `scripts` is 2, against a walk of 122, so both removals sit well
-        inside any sane floor. The set is a fact about where this repo's code
-        is parsed, so it is written down with a reason per member in the tuple's
-        own comment.
+        looks for `webui`. The total does not either -- `webui` and `scripts`
+        are the two smallest packages and together are well under the slack
+        between the floor below and the walk, so both removals sit inside it.
+        The set is a fact about where this repo's code is parsed, so it is
+        written down with a reason per member in the tuple's own comment.
 
         **The loop is derived** from the tuple rather than hand-listed, which
         catches a package being ADDED without being found. The hand-written
         version named four of the then-five members and left `webui`
         unasserted.
 
-        **The total is a deliberate backstop, not a pin.** The walk finds 122
-        files (report 8, harness 29, orchestrator 11, overlay 10, scripts 2,
-        tests 50, webui 12), which is every tracked `.py` in the repo. `> 100`
-        is kept rather than raised to just under 122 on purpose: pinned tight
-        it would go red every time someone deletes a test file, which is a
-        guard that cries wolf, and the two assertions above already catch
-        every way the SCOPE can change. What the total is for is the walk
-        itself silently finding nothing -- a wrong `VB_ROOT`, a renamed
+        **The total is a deliberate backstop, not a pin**, and the figure is
+        deliberately a MAGNITUDE. The walk finds every tracked `.py` in the
+        repo across those seven packages -- on the order of 130, with `tests`
+        and `harness` the largest contributors by a wide margin. `> 100` is
+        kept rather than raised to just under the current count on purpose:
+        pinned tight it would go red every time someone deletes a test file,
+        which is a guard that cries wolf, and the two assertions above already
+        catch every way the SCOPE can change. What the total is for is the
+        walk itself silently finding nothing -- a wrong `VB_ROOT`, a renamed
         package, an `os.walk` that stops recursing -- and 100 is far enough
-        below 122 to tolerate ordinary churn while still catching that.
+        below to tolerate ordinary churn while still catching that.
+
+        An exact breakdown stood here and rotted, which is the drift class
+        this whole file is about: it read "122 files (report 8, … tests 50)"
+        against a tree that by then held 128 with 9 in `report` and 55 in
+        `tests`. Nothing caught it, because the assertion is `> 100` and the
+        breakdown was prose. A count nobody maintains is worse than a
+        magnitude, which is the same argument `CLAUDE.md` makes for the test
+        count in its own commands table.
         """
         assert set(_PARSED_ELSEWHERE) == {
             # bind-mounted into the bench images

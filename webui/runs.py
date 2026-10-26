@@ -147,6 +147,19 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
     # before the fingerprint was introduced. Checking only the keyed path
     # reported "recall will be lost" for legacy runs whose recall is right
     # there.
+    #
+    # There are now TWO narrowings to mirror and they are independent, which
+    # is why `narrowed` alone can no longer describe the outcome. The path
+    # above narrows by resource configuration; `report/scope.py` then narrows
+    # the records by the engines and corpora the manifest says this run
+    # measured. A tree can be keyed to this run and still hold six other
+    # engines -- the fingerprint is deliberately engine-invariant -- and a
+    # whole un-narrowed `annb/` root can still yield a report of only this
+    # run's measurements. This surface claimed the opposite of both for a
+    # round: that a run "does not record which ann results are its own" and
+    # that regenerating "reads every ann result on this machine" rather than
+    # only this run's. The manifest does record it, and the reference bundle
+    # reads 396 records and publishes 43.
     annb_root = os.path.join(results_dir, "annb")
     tree = None
     narrowed = False
@@ -157,6 +170,15 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
     if tree is None:
         tree = annb_root
     tree_files = _count_hdf5(tree)
+
+    # The second narrowing, read from the same place the generator reads it.
+    # `webui/` runs on the host and already imports `orchestrator.ann_pass`
+    # above, so there is no mount constraint here -- the one place that must
+    # not import the orchestrator is `report/`.
+    from report.scope import measured_datasets, measured_engines, scope_of
+    scope = scope_of(manifest)
+    scope_engines = measured_engines(manifest)
+    scope_datasets = measured_datasets(manifest)
 
     records = _records_summary(run_dir)
     missing_datasets = sorted(
@@ -183,11 +205,38 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
                 f"ops measurements and no recall curves.")
     elif tree_files == 0:
         risk, note = "none", ""
+    elif scope.known:
+        # The tree is not keyed to this run's resource configuration, but the
+        # manifest does say which engines on which corpora this run measured,
+        # so regenerating reads the whole root and publishes only those. What
+        # is left is the narrower caveat the fingerprint exists for and the
+        # scope cannot reach: two resource budgets for the SAME engine on the
+        # SAME corpus are two different measurements with one name, and no
+        # engine list separates them.
+        risk = "unnarrowed_resources"
+        note = (f"Regenerating reads every ann result on this machine "
+                f"({tree_files} files), because the tree keyed to this run's "
+                f"resource configuration is not here. It would publish only "
+                f"{_scope_phrase(scope)} and name the rest in its Validity "
+                f"section. "
+                # Still said, and still the more serious half. The scope
+                # narrows by engine and corpus, not by machine, so a foreign
+                # run regenerated here publishes THIS machine's numbers for
+                # the engines that run happened to measure.
+                + (f"This run was measured on {measured_on}, not here, so "
+                   f"those are somebody else's measurements: the scope "
+                   f"narrows by engine and corpus, not by machine. "
+                   if elsewhere else "")
+                + f"What it cannot separate either way is the same engine and "
+                  f"corpus measured under a DIFFERENT memory or CPU budget, "
+                  f"which is what the fingerprint keys and why this is "
+                  f"flagged at all.")
     else:
         risk = "unnarrowed"
-        note = (f"This run does not record which ann results are its own, so "
-                f"regenerating reads every ann result on this machine "
-                f"({tree_files} files) rather than only this run's. "
+        note = (f"This run records neither the engines it configured nor the "
+                f"corpora it measured, so regenerating reads every ann result "
+                f"on this machine ({tree_files} files) and can narrow none of "
+                f"them to this run. "
                 + (f"This run was measured on {measured_on}, not here, so those "
                    f"are somebody else's measurements. "
                    if elsewhere else "")
@@ -203,7 +252,15 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
 
     return {
         "ann_tree": tree,
+        # Narrowed by resource configuration -- the path. Kept under its
+        # original name because it means what it always meant.
         "ann_tree_narrowed": narrowed,
+        # Narrowed by what the run measured -- the records. A separate fact,
+        # exposed separately, because a flag that could not see this one went
+        # from true to false without reddening once already.
+        "scope_narrowed": scope.known,
+        "scope_engines": scope_engines,
+        "scope_datasets": scope_datasets,
         "ann_results_present": tree_files,
         "recall_records": records["recall"],
         "recall_datasets": sorted(records["recall_datasets"]),
@@ -213,6 +270,38 @@ def report_inputs(results_dir: str, datasets_dir: str, run_dir: str,
         "regenerate_risk": risk,
         "regenerate_note": note,
     }
+
+
+def _scope_phrase(scope: Any) -> str:
+    """What regenerating would publish, in the units the scope narrows on.
+
+    `(engine, corpus)` PAIRS, not engines times corpora. This read "the N
+    engine(s) on the M corpus(es)" and was numerically wrong for the one
+    manifest shape the two differ on: `new/full-20261015-215006` measured
+    percona over four corpora beside six engines over fashion-mnist alone, so
+    it claimed 7 x 4 = 28 combinations where the scope admits 10 -- in the
+    function that computes the scope and then used it only for a boolean.
+
+    Three shapes, because the scope has three. A phase log gives pairs; an
+    engine block with no phase log gives engines and the corpora the profile
+    asked for; and neither gives corpora alone, which is the state where the
+    engine axis narrows nothing and the corpus axis still does.
+    """
+    corpora = (f"{len(scope.datasets)} corpus(es)" if scope.datasets
+               else "no corpus it names")
+    if scope.pairs:
+        phrase = (f"the {len(scope.pairs)} engine/corpus combination(s) this "
+                  f"run's phase log records")
+        if scope.unpaired:
+            phrase += (f", plus the {len(scope.unpaired)} engine(s) it "
+                       f"configured and recorded no unit for, on those "
+                       f"{corpora}")
+        return phrase
+    if scope.unpaired:
+        return (f"the {len(scope.unpaired)} engine(s) this run configured, on "
+                f"the {corpora} it asked for")
+    return (f"the {corpora} this run asked for -- it records no engine, so "
+            f"every engine in the tree is read for them")
 
 
 def _count_hdf5(path: str) -> int:
