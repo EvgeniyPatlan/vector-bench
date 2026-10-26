@@ -43,6 +43,14 @@ def readme_text(run_id: str, manifest: Dict[str, Any]) -> str:
     profile = config.get("profile") or {}
     engines = manifest.get("engines") or {}
 
+    # The run's own corpus list, not the profile's declaration: `--datasets`
+    # narrows a run without touching the profile, so a narrowed bundle's
+    # README named corpora it holds no measurement for -- the recipient's
+    # first and often only description of what they were sent. A bundle
+    # archived before `resolved_datasets` was recorded has nothing but the
+    # declaration, which is why the fallback stays.
+    datasets = config.get("resolved_datasets") or profile.get("datasets") or []
+
     engine_lines = []
     for name, info in sorted(engines.items()):
         build = info.get("build") or {}
@@ -81,7 +89,7 @@ THE NUMBERS ARE SCOPED TO THIS MACHINE
 WHAT WAS MEASURED
   profile         {profile.get('name', '?')} — {profile.get('description', '')}
   resource pass   {config.get('resource_pass', '?')}
-  datasets        {', '.join(profile.get('datasets') or []) or '?'}
+  datasets        {', '.join(datasets) or '?'}
   started         {manifest.get('started_at', '?')}
   status          {manifest.get('status', '?')}
 

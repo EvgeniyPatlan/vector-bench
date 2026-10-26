@@ -519,9 +519,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             # harness/, so it cannot compute this itself — an earlier version
             # imported orchestrator.ann_pass from the report and crashed the
             # whole run at the last step, after 20 hours of measurement.
+            #
+            # `datasets` is the RESOLVED list, which is `--datasets` when the
+            # flag narrowed the run and the profile's own list otherwise. The
+            # profile dict goes in beside it verbatim, so the manifest holds
+            # both the declaration and the run -- and recording only the
+            # former is what left `--datasets fashion-mnist-784-euclidean`
+            # runs declaring four corpora they never touched. Same reason
+            # `resolved` and `ann_fingerprint` are recorded rather than the
+            # declared resource block: this is the host, and this is where
+            # the narrowing is known.
             manifest.set_config(
                 profile, resource_pass, resolved,
                 extra={"ann_fingerprint": ann_pass.ann_fingerprint(resolved)},
+                datasets=datasets,
             )
             manifest.set_engine(
                 engine, paths["sources"],

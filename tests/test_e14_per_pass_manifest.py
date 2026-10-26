@@ -2470,3 +2470,276 @@ class TestTheFingerprintIsRecordedAndNeverRecomputedByTheReport:
             assert os.path.basename(written) == entry["ann_fingerprint"]
         prints = {e["ann_fingerprint"] for e in m.data["config"]["passes"]}
         assert len(prints) == 2, "the two passes must key different trees"
+
+
+class TestADatasetsNarrowedRunRecordsTheCorporaItMeasured:
+    """A run narrowed with `--datasets` recorded the profile's whole list.
+
+    THE DEFECT. `cmd_run` resolves the corpus list itself --
+    `args.datasets.split(",") if args.datasets else profile["datasets"]` --
+    and hands `set_config` the profile dict unchanged. So
+    `run --profile full --datasets fashion-mnist-784-euclidean` measured one
+    corpus of the four `config/profiles/full.yml` declares, and left behind a
+    manifest whose only statement about corpora, `config.profile.datasets`,
+    named all four. Nothing crashed: the run was correct and its description
+    of itself was not, which is this repository's signature failure.
+
+    The orchestrator already records the resolved form of everything else it
+    decides on the host -- `resolved_resources` beside the profile's own
+    `resources:` block, `ann_fingerprint` beside the pass whose tree it keys,
+    the `engines` block beside `config.profile.engines`.
+    `config.resolved_datasets` is the corpus axis joining them.
+
+    These drive `cmd_run` itself rather than calling `set_config` directly,
+    because the defect was in the call and not in the writer: a probe that
+    hands `set_config` a narrowed list proves nothing about the orchestrator
+    that never handed it one. Every container is stubbed -- `_run_unit`
+    records the corpus it was given and returns 0 -- and `paths_for` is
+    rerooted into `tmp_path`, so nothing reads or writes `results/`, which is
+    gitignored, and no image, server or benchmark can start.
+    """
+
+    #: One of `full`'s four, and deliberately not the first: a fix that
+    #: recorded `datasets[:1]` or the profile's head would pass on the first.
+    NARROWED_TO = "sift-128-euclidean"
+
+    @staticmethod
+    def _args(**kw):
+        import argparse
+        spec = dict(profile="full", engines="pgvector", datasets=None,
+                    resource_pass="normalized", phases="ann",
+                    run_id="probe-20260101-000000", resume=False, force=False,
+                    fail_fast=False, no_report=True)
+        spec.update(kw)
+        return argparse.Namespace(**spec)
+
+    def _run(self, monkeypatch, tmp_path, **kw):
+        """`(manifest as written to disk, corpora the unit loop was given)`.
+
+        The second half is what makes the first an assertion about a run
+        rather than about a string: the manifest's claim is compared against
+        the corpora `_run_unit` was actually called for.
+        """
+        from orchestrator import cli as cli_mod
+        from orchestrator.config import load_profile as _load_profile
+
+        args = self._args(**kw)
+        root = str(tmp_path / "vb")
+        real_paths = cli_mod.paths_for
+
+        def _paths(run_id):
+            # Substituted rather than rebuilt, so a key added to `paths_for`
+            # lands here instead of making this harness quietly stale.
+            return {key: value.replace(VB_ROOT, root)
+                    if isinstance(value, str) else value
+                    for key, value in real_paths(run_id).items()}
+
+        monkeypatch.setattr(cli_mod, "paths_for", _paths)
+        paths = _paths(args.run_id)
+        os.makedirs(paths["datasets"], exist_ok=True)
+        # All four present, so the missing-dataset refusal cannot be what
+        # narrows the run: the flag has to be.
+        for dataset in _load_profile("full")["datasets"]:
+            open(os.path.join(paths["datasets"], f"{dataset}.hdf5"),
+                 "wb").close()
+
+        measured: List[str] = []
+
+        def _unit(phase, engine, dataset, *rest, **kw_):
+            measured.append(dataset)
+            return 0
+
+        monkeypatch.setattr(cli_mod.docker_ctl, "docker_available",
+                            lambda: True)
+        monkeypatch.setattr(cli_mod.docker_ctl, "image_id",
+                            lambda image: "sha256:stub")
+        monkeypatch.setattr(cli_mod.docker_ctl, "image_exists",
+                            lambda image: False)
+        monkeypatch.setattr(cli_mod, "print_load_estimate",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "_check_free_disk", lambda *a, **k: False)
+        monkeypatch.setattr(cli_mod, "_run_unit", _unit)
+
+        assert cli_mod.cmd_run(args) == 0
+        with open(os.path.join(paths["run_dir"], "run-manifest.json")) as fh:
+            return json.load(fh), measured
+
+    def test_the_subject_of_this_class_is_still_what_it_says(self):
+        """Non-vacuity. If `full` stopped declaring several corpora, or
+        stopped declaring the one these narrow to, every assertion below
+        would be trivially true and would stay green proving nothing."""
+        from orchestrator.config import load_profile as _load_profile
+        declared = _load_profile("full")["datasets"]
+        assert len(declared) >= 3, declared
+        assert self.NARROWED_TO in declared
+        assert declared[0] != self.NARROWED_TO, declared
+
+    def test_a_narrowed_run_records_the_corpus_it_measured(
+            self, monkeypatch, tmp_path):
+        """The regression itself.
+
+        Mutant: drop `datasets=datasets` from `cli.py`'s `set_config` call
+        and the key is absent -- KeyError here. Mutant: pass
+        `profile.get("datasets")` instead and it holds four names.
+        """
+        written, measured = self._run(monkeypatch, tmp_path,
+                                      datasets=self.NARROWED_TO)
+        assert written["config"]["resolved_datasets"] == [self.NARROWED_TO]
+        assert measured == [self.NARROWED_TO], measured
+
+    def test_the_declaration_is_still_recorded_beside_it(
+            self, monkeypatch, tmp_path):
+        """Both facts, not one replacing the other. `config.profile` stays a
+        verbatim copy of the profile as loaded -- it is the answer to "what
+        does this profile ask for", which `webui/runs.py` and the estimator
+        read -- and `resolved_datasets` answers "what did this run resolve to
+        measure". The bug was having only the first.
+        """
+        from orchestrator.config import load_profile as _load_profile
+        written, _ = self._run(monkeypatch, tmp_path,
+                               datasets=self.NARROWED_TO)
+        assert (written["config"]["profile"]["datasets"]
+                == _load_profile("full")["datasets"])
+        assert len(written["config"]["profile"]["datasets"]) > 1
+
+    def test_a_bare_run_records_the_profiles_whole_list(
+            self, monkeypatch, tmp_path):
+        """The resolved list IS the profile's when no flag narrows it, so an
+        un-narrowed run is unchanged in meaning and a reader never has to
+        know which of the two produced the value.
+
+        Mutant: record `args.datasets` rather than the resolved list and this
+        run records nothing while the one above still passes.
+        """
+        from orchestrator.config import load_profile as _load_profile
+        written, measured = self._run(monkeypatch, tmp_path)
+        declared = _load_profile("full")["datasets"]
+        assert written["config"]["resolved_datasets"] == declared
+        assert measured == declared, measured
+
+    def test_the_manifest_claims_exactly_what_the_unit_loop_ran(
+            self, monkeypatch, tmp_path):
+        """The two readings of a narrowed run, taken from one run and
+        required to agree: the corpora `_run_unit` was called for, and the
+        corpora the phase log and the new key name. A manifest that claims
+        more than the loop ran is the defect; one that claims less would hide
+        measurement.
+        """
+        written, measured = self._run(monkeypatch, tmp_path,
+                                      datasets=self.NARROWED_TO)
+        logged = [p["dataset"] for p in written["phases"]]
+        assert logged == measured == written["config"]["resolved_datasets"]
+
+
+class TestAManifestWithoutAResolvedCorpusListStillWorks:
+    """Every archived manifest lacks the key, and nothing may require it.
+
+    `run-manifest.json` is mandatory -- the report generator refuses a run
+    directory without one -- so a key that an older manifest cannot have must
+    be additive at every reader. The four archived bundles were written by
+    code that had no `resolved_datasets`, and a report generated from them
+    today has to be the report it was yesterday.
+    """
+
+    #: `full`'s declaration, as its manifests carry it.
+    DECLARED = ["fashion-mnist-784-euclidean", "glove-100-angular",
+                "sift-128-euclidean", "gist-960-euclidean"]
+
+    def _archived(self) -> Dict[str, Any]:
+        """The archived config shape: a declaration and nothing resolved."""
+        return {
+            "run_id": "full-20261015-215006",
+            "host": {"hostname": "bench", "cpu": {}},
+            "engines": {}, "phases": [],
+            "config": {"profile": {"name": "full",
+                                   "description": "every engine",
+                                   "datasets": list(self.DECLARED)},
+                       "resource_pass": "tuned",
+                       "resolved_resources": TUNED_LIMITS,
+                       "ann_fingerprint": TUNED_FP},
+        }
+
+    def test_set_config_invents_no_corpus_list_from_the_declaration(
+            self, tmp_path):
+        """A caller that resolved no corpora gets no claim about them.
+
+        Absent stays absent, for the reason `ops_measurement_version`'s
+        absence does: a run recorded before the key existed resolved its
+        corpora under code that never wrote them down, and restating the
+        declaration as the resolution would make exactly the claim this
+        change exists to stop making. `report/scope.py` reads a missing
+        corpus axis as "this manifest does not say".
+
+        Mutant: fall back to `profile.get("datasets")` in
+        `_accumulate_datasets` and this fails with the four declared names.
+        """
+        m = Manifest(str(tmp_path / "run-nd"), "run-nd")
+        m.set_config({"name": "full", "datasets": list(self.DECLARED)},
+                     "tuned", TUNED_LIMITS)
+        assert "resolved_datasets" not in m.data["config"]
+        assert m.data["config"]["profile"]["datasets"] == self.DECLARED
+
+    def test_a_narrowing_resume_does_not_delete_what_was_measured(
+            self, tmp_path):
+        """`cli.py` calls `set_config` per (pass, engine) *above* the
+        checkpoint skip, so `run --resume --run-id <old-run> --datasets one`
+        reaches it holding one name for a directory that measured four. The
+        key accumulates for the same reason `passes` does: appending is
+        additive, overwriting deletes three corpora of real measurement from
+        the manifest -- the corpus-side twin of the engine-declaration hazard
+        `report/scope.py::measured_engines` describes.
+
+        Mutant: drop the phase-log term from `_accumulate_datasets` and this
+        records `["sift-128-euclidean"]` alone.
+        """
+        run_dir = tmp_path / "full-20261015-215006"
+        os.makedirs(run_dir, exist_ok=True)
+        archived = self._archived()
+        archived["phases"] = [
+            {"phase": "ann", "engine": "percona", "dataset": name,
+             "status": "completed", "resource_pass": "tuned"}
+            for name in self.DECLARED]
+        with open(run_dir / manifest_mod.MANIFEST_NAME, "w") as fh:
+            json.dump(archived, fh)
+
+        resumed = Manifest(str(run_dir), "full-20261015-215006")
+        resumed.set_config(archived["config"]["profile"], "tuned",
+                           TUNED_LIMITS, datasets=["sift-128-euclidean"])
+        assert resumed.data["config"]["resolved_datasets"] == self.DECLARED
+
+    def test_the_export_readme_falls_back_to_the_declaration(self):
+        """An archived bundle has only the declaration, so that is what its
+        README says. Mutant: read `resolved_datasets` alone in `export.py`
+        and this prints `?` for every bundle ever archived.
+        """
+        from orchestrator import export
+        text = export.readme_text("full-20261015-215006", self._archived())
+        assert f"datasets        {', '.join(self.DECLARED)}" in text
+
+    def test_the_export_readme_describes_the_run_and_not_the_profile(self):
+        """The counterpart, and the reason the line changed: the README is
+        the recipient's first description of what they were sent, and a
+        narrowed bundle's named three corpora it holds no measurement for.
+
+        Mutant: read `profile.get("datasets")` alone and this fails while the
+        fallback test above still passes.
+        """
+        from orchestrator import export
+        narrowed = self._archived()
+        narrowed["config"]["resolved_datasets"] = ["sift-128-euclidean"]
+        text = export.readme_text("full-20261015-215006", narrowed)
+        assert "datasets        sift-128-euclidean\n" in text
+        assert "glove-100-angular" not in text
+
+    def test_the_reports_corpus_axis_is_unchanged_without_the_key(self):
+        """Read-only: `report/scope.py` prefers the phase log and falls back
+        to the declaration, and this change adds a key rather than moving
+        that narrowing. A manifest with neither a phase log nor the new key
+        still narrows to what the profile declared, which is what every
+        archived bundle relies on.
+        """
+        from report import scope as scope_mod
+        # Compared as a set: `scope.py` orders its axes canonically and the
+        # order is its business, not this change's.
+        assert (sorted(scope_mod.measured_datasets(self._archived()))
+                == sorted(self.DECLARED))
