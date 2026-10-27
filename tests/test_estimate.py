@@ -158,21 +158,36 @@ class TestTheIngestEstimateDidNotMove:
     "Consistency checks" section is empty by construction on the profile the
     human actually runs. `config/profiles/main.yml` therefore went from
     `ann.m_values: [8, 32]` to `[8, 16, 32]`, which is a third full reload of
-    both corpora per engine: all six engines went from 69.77 h to 93.06 h of
-    ingest. Every other profile is untouched, `full` included, which is why
-    `CLAUDE.md`'s standing figure does not move with it.
+    both corpora per engine: all six engines with a rate went from 69.77 h to
+    93.06 h of ingest. Every other profile is untouched, `full` included.
+
+    **And once more, for the opposite reason: a rate was MEASURED.** Percona
+    was the seventh engine with no entry in either rate table, so it was named
+    in `engines_without_ingest_rate` and contributed nothing to any figure
+    here. B1's census of the archived ops records supplied the M=16
+    incremental rate -- 339 / 275 / 427 rows/s on fashion-mnist / glove-100 /
+    sift-128, from `full-20261015-215006` -- and every total below therefore
+    ROSE: `main` 93.06 -> 100.44, `full` at both passes 726.45 -> 796.28.
+    `CLAUDE.md`'s standing figure moves with that one, because it is the
+    seven-engine figure and the seventh engine is now in it.
 
     Nothing else may move them. A diff that changes a number here without
-    changing a profile is the drift this class exists to catch.
+    changing a profile, or without a new measurement in the rate tables, is
+    the drift this class exists to catch.
     """
 
     def test_main_one_pass(self):
         e = est("main")
-        assert e["total_hours"] == 93.06
+        assert e["total_hours"] == 100.44
+        # Seven keys, not six. Percona's 7.38 h is 60,000 rows at the measured
+        # 339 rows/s plus 1.18M at 275, over three ann M values and one ops M,
+        # and it is the whole of the 7.38 h this profile's total rose by.
         assert e["per_engine_hours"] == {
             "mariadb": 17.54, "alisql": 49.66, "pgvector": 0.91,
             "mariadb123": 24.83, "mongodb": 0.05, "valkey": 0.07,
+            "percona": 7.38,
         }
+        assert e["engines_without_ingest_rate"] == []
         # Three ann M values now, one ops M. The pair is the whole point of
         # the change: `ops_m_values` is still 1 and `ann.m_values` contains
         # it, which is what makes §5.2's match key able to meet.
@@ -182,17 +197,23 @@ class TestTheIngestEstimateDidNotMove:
         assert e["long_run"] is True
 
     def test_main_both_passes_is_exactly_double(self):
-        assert est("main", passes=("normalized", "tuned"))["total_hours"] == 186.1
+        assert est("main", passes=("normalized", "tuned"))["total_hours"] == 200.87
 
     def test_main_ops_only(self):
         """Dropping the recall phase drops the ann M grid from the estimate."""
-        assert est("main", phases=["ops"])["total_hours"] == 23.26
+        assert est("main", phases=["ops"])["total_hours"] == 25.11
 
     def test_smoke(self):
-        assert est("smoke")["total_hours"] == 0.49
+        assert est("smoke")["total_hours"] == 0.59
 
     def test_full_two_passes(self):
-        assert est("full", passes=("normalized", "tuned"))["total_hours"] == 726.45
+        e = est("full", passes=("normalized", "tuned"))
+        assert e["total_hours"] == 796.28
+        # The published 726.45 h was six engines of seven. Percona's own
+        # 69.83 h is the amount CLAUDE.md used to describe as the one "nothing
+        # here knows", and it is now a figure rather than a floor.
+        assert e["per_engine_hours"]["percona"] == 69.83
+        assert round(796.28 - 69.83, 2) == 726.45
 
     def test_a_dataset_with_no_measured_rate_is_still_named_not_guessed(self):
         e = est("dev")
@@ -203,7 +224,125 @@ class TestTheIngestEstimateDidNotMove:
         """`total_hours` keeps its published meaning; `ingest_hours` is the
         unambiguous name for the same figure, for code written from now on."""
         e = est("main")
-        assert e["ingest_hours"] == e["total_hours"] == 93.06
+        assert e["ingest_hours"] == e["total_hours"] == 100.44
+
+
+class TestPerconasMeasuredIngestRateReachesTheEstimator:
+    """The seventh engine's rate, and the three decisions behind each figure.
+
+    Percona was measured seventeen times across six runs and modelled nowhere:
+    both rate tables omitted it, `_effective_rate` returned `None` for every
+    dataset, and `--profile percona` printed an estimate with no hour figure
+    for the only engine it runs. The entries below close that, and every one of
+    them is a record from `full-20261015-215006` rather than a model.
+
+    **The three axes the key cannot express, resolved once.** The table is
+    keyed `(engine, dataset)` and the archive is indexed by
+    `(run_id, dataset, M, resource_pass, build_mode, rows)`:
+
+    * *M* is 16, the mid-grid value this table's own comment sets as its
+      convention, and a dataset with no M=16 incremental record is OMITTED
+      rather than interpolated -- which is why gist-960-euclidean, measured at
+      M=32 alone, has no entry.
+    * *rows* is the 60,000-row full-corpus load, not the 20,000-row
+      `ops.subset_rows` one, because `estimate_load_hours` multiplies by
+      `_DATASET_ROWS`. The 20k loads ran 13% faster.
+    * *build_mode* is `incremental`, Percona's default at this pin. The `post`
+      record's 2653.0 rows/s is in neither table.
+
+    The figures are asserted against the census SPAN rather than restated,
+    which is what makes the `post` figure fail here: 2653.0 is 4.2x the top of
+    the incremental range, so an entry taken from it cannot pass.
+    """
+
+    #: The incremental min and max of B1's census: gist-960 tuned M=32 at
+    #: 48.17 rows/s and sift-128 normalized M=8 at 638.11.
+    #: `config/profiles/percona.yml` prints both.
+    CENSUS_SPAN = (48.17, 638.11)
+    #: The seventeenth record -- a `post` plain load with no graph being built.
+    #: Here so the span assertion below has something it demonstrably rejects.
+    POST_RATE = 2653.0
+    #: The datasets with an M=16 incremental record, and the one without.
+    MEASURED = ("fashion-mnist-784-euclidean", "glove-100-angular",
+                "sift-128-euclidean")
+    NO_MID_GRID = "gist-960-euclidean"
+
+    def test_the_profile_gets_an_hour_figure_and_names_no_gap(self):
+        """A10's acceptance criterion, on the returned dict.
+
+        NOT on the printed block: `--profile percona` is one engine on one
+        60,000-row corpus at one M, so its worst case is 0.27 h and
+        `print_load_estimate` returns before printing anything at all under
+        its 1 h gate. The hour figure reaching the dict is what the CLI and
+        the web UI both read, and `main` below is where the printed form is
+        checked.
+        """
+        profile = load_profile("percona")
+        e = estimate_load_hours(profile, list(profile["engines"]),
+                                list(profile["datasets"]), ["normalized"],
+                                BOTH_PHASES)
+        assert e["engines_without_ingest_rate"] == []
+        assert e["per_engine_hours"]["percona"] > 0
+        assert e["total_hours"] > 0
+
+    def test_the_printed_block_no_longer_announces_the_gap(self):
+        """The other half of the acceptance criterion, on a profile above the
+        gate. `main` runs all seven engines, so the `! No measured ingest
+        rate` line fired there before this change and must not now."""
+        out = printed("main")
+        assert "percona ~" in out
+        assert "No measured ingest rate" not in out
+
+    def test_every_entry_is_inside_the_census_span(self):
+        lo, hi = self.CENSUS_SPAN
+        for dataset in self.MEASURED:
+            rate = est_mod._MEASURED_ROWS_PER_S[("percona", dataset)]
+            assert lo <= rate <= hi, (dataset, rate)
+        assert lo <= est_mod._INGEST_ROWS_PER_S["percona"] <= hi
+        # Non-vacuity: the span is what rejects the `post` figure, which is
+        # the mutant this assertion exists for. Without this line a span of
+        # (0, inf) would pass the loop above.
+        assert not lo <= self.POST_RATE <= hi
+
+    def test_the_reference_rate_is_the_reference_corpus(self):
+        """`_INGEST_ROWS_PER_S` is scaled from `_REFERENCE_DIMS` 100 and
+        `_REFERENCE_ROWS` 1,000,000, so the entry has to be the rate measured
+        on a ~100-dim ~1M-row corpus. That is glove-100-angular, at 275.04
+        rows/s. This is MariaDB's precedent exactly: its 150 is its glove-100
+        measurement of 147, nudged to a round number."""
+        assert (est_mod._INGEST_ROWS_PER_S["percona"]
+                == est_mod._MEASURED_ROWS_PER_S[("percona",
+                                                 "glove-100-angular")])
+        assert est_mod._DATASET_DIMS["glove-100-angular"] == est_mod._REFERENCE_DIMS
+
+    def test_the_dataset_with_no_mid_grid_record_is_omitted_not_interpolated(self):
+        """gist-960 was measured at one M -- 32, at 48.17 rows/s, the
+        pessimistic extreme of the whole census -- so an entry for it would be
+        a figure mislabelled as mid-grid. The formula fallback serves it
+        instead and is honest about being a model: 70.79 rows/s against an
+        implied ~100 at M=16 (the M16/M32 ratio is 2.07-2.09 where it was
+        measured), i.e. 1.41x pessimistic rather than 2.08x and dressed as a
+        measurement."""
+        assert ("percona", self.NO_MID_GRID) not in est_mod._MEASURED_ROWS_PER_S
+        rate = est_mod._effective_rate("percona", self.NO_MID_GRID)
+        # Served, and by the model: below the measured M=32 figure's 48.17
+        # would be worse than the formula, above the M=16 entries would mean
+        # the penalty had stopped applying.
+        assert rate is not None
+        assert 48.17 < rate < min(est_mod._MEASURED_ROWS_PER_S[("percona", d)]
+                                  for d in self.MEASURED)
+
+    def test_no_dataset_is_left_without_a_rate_for_this_engine(self):
+        """`_effective_rate` returns `None` only for an engine absent from
+        `_INGEST_ROWS_PER_S`, so one entry there empties the gap list for
+        every profile in the repository -- including the datasets Percona has
+        never loaded, which the formula serves."""
+        for dataset in sorted(est_mod._DATASET_ROWS):
+            assert est_mod._effective_rate("percona", dataset) is not None, dataset
+        # Non-vacuity: the None path is still reachable, and
+        # `tests/test_config.py` keeps it covered with the same probe.
+        assert est_mod._effective_rate("e2-no-such-engine",
+                                       "glove-100-angular") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1127,13 +1266,16 @@ class TestTheWholeQueryEstimateForMain:
         assert [t["name"] for t in e["query_terms"]] == [
             "concurrency windows", "filtered search", "churn re-insert",
             "churn reader baseline"]
-        # `churn re-insert`'s TYPICAL does not move with the seventh engine,
-        # and that is the whole estimate.py repair visible in one figure:
-        # Percona has no measured ingest rate, so it contributes no modelled
-        # duration at all rather than a guessed one. Its WORST does move,
-        # because the budget is a ceiling the profile sets per step and
-        # applies to every engine whether or not anyone has measured it.
-        assert term(e, "churn re-insert")["typical_hours"] == 4.77
+        # `churn re-insert`'s TYPICAL moved with the seventh engine's RATE,
+        # and this is the one place the ingest table reaches the query
+        # estimate: the typical figure is rows divided by the engine's load
+        # rate, so Percona went from contributing no modelled duration at all
+        # -- the honest reading while nothing had measured it -- to 0.46 h,
+        # which is 10%+15% of 1,183,514 rows at 275 rows/s plus 10%+15% of
+        # 1,000,000 at 427, one ops unit each. Its WORST did not move: the
+        # budget is a ceiling the profile sets per step and has always applied
+        # to every engine whether or not anyone had measured it.
+        assert term(e, "churn re-insert")["typical_hours"] == 5.23
         assert term(e, "churn re-insert")["worst_hours"] == 16.00
         assert term(e, "filtered search")["typical_hours"] == 0.0
         # 10.0 and not 8.00 because the iterative-scan modes now reach the
@@ -1154,16 +1296,17 @@ class TestTheWholeQueryEstimateForMain:
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 7.04
+        assert e["query_hours"] == 7.50
         assert e["query_hours_worst"] == 28.27
         # The totals move with the ENGINE LIST as well as with the ann M
         # grid. Over six engines these were 100.16 and 116.39, before the
-        # iterative-scan modes added 2.0 h to pgvector alone; the INGEST
-        # half of both is unchanged at 93.06, because Percona is named in
-        # `engines_without_ingest_rate` and contributes nothing to it -- so
-        # every hour of the difference is query time.
-        assert e["typical_total_hours"] == 100.10
-        assert e["worst_case_total_hours"] == 121.33
+        # iterative-scan modes added 2.0 h to pgvector alone. The INGEST half
+        # of both used to be 93.06 over six engines, because Percona was named
+        # in `engines_without_ingest_rate` and contributed nothing to it; it
+        # is 100.44 over seven now that its rate is measured, and the 7.38 h
+        # of the difference is ingest and not query time.
+        assert e["typical_total_hours"] == 107.94
+        assert e["worst_case_total_hours"] == 128.71
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1174,17 +1317,28 @@ class TestTheWholeQueryEstimateForMain:
 
     def test_the_per_engine_split_mirrors_the_ingest_one(self):
         e = est("main")
-        # Percona IS here, with a figure, while it is absent from
-        # `per_engine_hours` above -- and that asymmetry is the point. Query
-        # terms are spans the profile puts a clock on and need no engine
-        # rate; the ingest figure is rows divided by a rate, and needs one.
+        # The asymmetry this test was named for is gone, and that is worth
+        # recording rather than quietly deleting: Percona used to appear here
+        # with a query figure while being absent from `per_engine_hours`,
+        # because query terms are spans the profile puts a clock on and need
+        # no engine rate, while the ingest figure is rows divided by a rate
+        # and needs one. It now has a rate, so both splits name all seven.
         assert e["query_per_engine_hours"] == {
             "mariadb": 1.38, "alisql": 2.28, "pgvector": 0.68,
             "mariadb123": 1.84, "mongodb": 0.29, "valkey": 0.29,
-            "percona": 0.28,
+            "percona": 0.74,
         }
-        assert "percona" not in e["per_engine_hours"]
-        assert e["engines_without_ingest_rate"] == ["percona"]
+        assert set(e["per_engine_hours"]) == set(e["query_per_engine_hours"])
+        assert e["engines_without_ingest_rate"] == []
+        # The mechanism that made the asymmetry possible is still there, and
+        # an engine nothing has measured still falls out of the ingest split
+        # alone. This is the non-vacuous half: `tests/test_config.py` injects
+        # the same probe engine for the same reason -- a guard that needs some
+        # real engine to be unmeasured fires on the day one stops being.
+        probe = est("main", engines=ALL + ["e2-no-such-engine"])
+        assert probe["engines_without_ingest_rate"] == ["e2-no-such-engine"]
+        assert "e2-no-such-engine" not in probe["per_engine_hours"]
+        assert "e2-no-such-engine" in probe["query_per_engine_hours"]
 
     def test_ops_disabled_means_no_ops_terms(self):
         e = est("m-sweep")
@@ -1336,8 +1490,9 @@ class TestTheExtensionPoint:
                             tuple(est_mod._QUERY_TERMS) + (lambda plan: None,))
         # Unchanged by a term that declines: `main`'s query subtotal over all
         # seven engines. It was 6.76 over six; Percona adds one ops unit per
-        # dataset and 0.28 h of it.
-        assert est("main")["query_hours"] == 7.04
+        # dataset, 0.28 h of it while its ingest rate was unmeasured and
+        # 0.74 h now that `churn re-insert` can model a duration for it.
+        assert est("main")["query_hours"] == 7.50
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 8 ops units per dataset x 2 datasets = 16 per pass.
@@ -1436,8 +1591,9 @@ class TestThePrintedOutput:
         out = printed("main")
         assert ("\nestimated ingest time (loading only, before any queries):\n"
                 "  mariadb ~17.5 h  |  alisql ~49.7 h  |  pgvector ~0.9 h  |  "
-                "mariadb123 ~24.8 h  |  mongodb ~0.1 h  |  valkey ~0.1 h\n"
-                "  total ~93.1 h across 1 pass(es), 3 M value(s)\n") in out
+                "mariadb123 ~24.8 h  |  mongodb ~0.1 h  |  valkey ~0.1 h  |  "
+                "percona ~7.4 h\n"
+                "  total ~100.4 h across 1 pass(es), 3 M value(s)\n") in out
         assert "! This is a long run." in out
 
     def test_query_time_is_a_separate_block_with_both_figures(self):
@@ -1449,7 +1605,7 @@ class TestThePrintedOutput:
         # this block is asserted against the whole printed output, and it
         # moved with the ann grid where the two query figures below did not.
         assert "pgvector ~0.9 h" in out
-        assert "~4.8 h typical" in out
+        assert "~5.2 h typical" in out
         assert "~16.0 h worst case" in out
 
     def test_a_term_with_a_ceiling_but_no_duration_prints_both(self):
@@ -1471,8 +1627,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~121.3 h worst case" in out
-        assert "~100.1 h typical" in out
+        assert "~128.7 h worst case" in out
+        assert "~107.9 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
@@ -1546,18 +1702,23 @@ class TestThePrintedOutput:
         assert printed("dev") == ""
 
     def test_a_profile_whose_cost_is_query_time_is_no_longer_silent(self):
-        """smoke is 0.49 h of ingest — under the old 1 h gate, so it printed
+        """smoke is 0.59 h of ingest — under the old 1 h gate, so it printed
         nothing at all — against a 4.0 h churn ceiling across seven engines.
 
-        0.49 h is six engines' ingest out of the seven the gate runs: Percona
-        has no measured rate and is named rather than modelled, so the figure
-        here is a floor and the printed block says so on its own line. The
-        worst case was ~5.2 h over six engines."""
+        It was 0.49 h while that was six engines' ingest out of the seven the
+        gate runs: Percona had no measured rate, was named rather than
+        modelled, and the printed block carried a line saying the figure was a
+        floor. The rate is measured now, so the figure covers all seven and
+        that line is correctly absent — asserted below, because its
+        disappearance is the published consequence of this change on the
+        profile a reader is most likely to run. The worst case was ~5.2 h over
+        six engines and ~5.9 h before Percona's ingest joined it."""
         out = printed("smoke")
         assert "estimated ingest time" in out
         assert "churn re-insert" in out
-        assert "~5.9 h worst case" in out
-        assert "No measured ingest rate for percona" in out
+        assert "~6.0 h worst case" in out
+        assert "No measured ingest rate" not in out
+        assert est("smoke")["engines_without_ingest_rate"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1626,10 +1787,16 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
         It fired again when Percona became the seventh engine: the worst case
         over `full` at both passes went from ~1,006 h to ~1,046 h, because an
         engine in the registry is an engine that command runs. The INGEST
-        figure did not move -- 726 h over the six engines with a measured
-        rate, with Percona named rather than modelled -- so the sentence now
-        has to say which of its two numbers covers which engines, and the
-        assertions below pin both."""
+        figure did not move then -- it was 726 h over the six engines with a
+        measured rate, with Percona named rather than modelled -- so the
+        sentence had to say which of its two numbers covered which engines.
+
+        It moved when the seventh rate was measured. Both numbers now cover
+        all seven, the scope split is gone, and the sentence says ~796 h and
+        ~1,135 h. The assertions below pin both against the estimator AND
+        against the six-engine figure, so the old 726 h cannot satisfy them:
+        a revert of the rate table reddens this test rather than agreeing
+        with a document nobody re-ran."""
         path = os.path.join(VB_ROOT, "CLAUDE.md")
         with open(path) as fh:
             claude = fh.read()
@@ -1653,11 +1820,22 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
         # with their own accepts and rejects asserted beside them.
         from tests.test_e2_percona_wiring import _prose
         _prose("the engine count is seven", claude)
-        # And the ingest half is labelled with the engines it actually covers,
-        # because it is a six-engine figure sitting in a seven-engine
-        # sentence. Without this the two numbers read as the same scope.
-        assert e["engines_without_ingest_rate"] == ["percona"]
-        _prose("the ingest figure covers six of the seven", claude)
+        # The ingest half covers the same seven engines as the worst case
+        # now, which is why the sentence no longer carries a scope caveat and
+        # why the "six of those seven" vocabulary was deleted from
+        # `tests/test_e2_percona_wiring.py` rather than reworded.
+        assert e["engines_without_ingest_rate"] == []
+        assert "percona" in e["per_engine_hours"]
+        # Non-vacuity, and the guard that replaces the deleted claim: the
+        # document's figure must be the SEVEN-engine one. `abs=0.5` above is
+        # loose enough that the published six-engine 726 h would satisfy it
+        # if the rate table were reverted and the document were not, so the
+        # two figures are asserted to be different quantities.
+        six = est("full", engines=[x for x in ALL if x != "percona"],
+                  passes=("normalized", "tuned"))
+        assert round(e["ingest_hours"] - six["ingest_hours"], 2) == 69.83
+        assert float(sentence.group("ingest").replace(",", "")) != pytest.approx(
+            six["ingest_hours"], abs=0.5)
 
     #: README's profile table claims "measured ingest only, the original
     #: three engines", which is docs/07 §1's hand method: the flat per-engine
