@@ -35,8 +35,9 @@ is how the rot below was found at all.** **Both documents have since been
 converted**, so this is no longer a departure from anything: symbol citations
 are the repository's only citation form for a document, and those two guards
 now check symbols with the same mechanism this page's does. But the rot
-kept happening while they did not: line citations in those two documents went stale twice in two
-days and put `master` red both times, repaired in pull requests #41 and #43.
+kept happening while they did not: line citations in those two documents
+went stale twice in two days and put `master` red both times, repaired in
+pull requests #41 and #43.
 Neither failure was somebody editing a document carelessly. In both cases a
 later round of edits *inside the same change* moved lines below the point where
 the citations had been derived, and the guard — correctly — fired on the
@@ -81,7 +82,8 @@ somewhere in the tree. It also asserts that **this document contains no
 statement, and it runs the same pattern against a frozen fixture made of
 them to prove the detector can see one. That fixture used to be
 `docs/10-rollout.md`, which was full of them; it is not any more, and a
-non-vacuity fixture must not be something another document can stop being. Its parsers each carry a floor on what they found, so
+non-vacuity fixture must not be something another document can stop being.
+Its parsers each carry a floor on what they found, so
 a parser that silently matched nothing fails instead of passing over an empty
 set — one guard in this series shipped green because it scanned zero files, and
 that failure mode is worth more care than the thing being guarded.

@@ -207,10 +207,28 @@ Warning 1292  Truncated incorrect innodb_hnsw_ef_search value: '0'
 
 (The gutter numbers this excerpt used to carry are gone, and the `...` lines
 are what is left of them: they mark where the recording was elided, which is
-the only thing the numbers were doing that the reader needed. A gutter number
-is a line citation that the ratchet's pattern cannot see, because it is not in
-code font — so it is the one form of the rot a guard cannot catch and only the
-author can.)
+the only thing the numbers were doing that the reader needed. **A gutter number
+is a line citation that the ratchet cannot see**, because the ratchet is a
+pattern over code-font spans and a fenced block is not one, so it has a check
+of its own in `tests/test_e1_percona_design.py`, which walks every fence in
+this document and refuses a line that opens with a bare number. That check
+exists because leaving the class to the author failed on the first attempt —
+eight of this document's ten gutter-bearing blocks were cleared, a commit
+message said all of them were, and four vendor line numbers survived in the
+excerpt below this paragraph, which asserts they are gone. The hand scan missed
+them because it anchored the fence at the start of a line and that block is
+indented inside a bullet. Three lines here still open with a number inside a
+fence and are **not** gutters — two recorded `SELECT` result rows and one
+EXPLAIN `id` column — and the guard names each one with what its number is,
+asserting both that it is exempt and that it is still present.
+
+The check is pointed at by file and not by the names of its own tests, and that
+is the self-poisoning rule rather than vagueness: the three document guards
+exclude all three of themselves from the symbol index they resolve citations
+against, because a guard whose index contains the guard can certify a name that
+exists nowhere else. So a symbol living only in a test file is deliberately
+uncitable from here, and the file is the finest pointer this document is
+allowed.)
 
 So: **default 40, range 1..100000, clamped with a warning outside it, integers
 only** (`1.1`, `1e1` and `'AUTO'` are all *ER_WRONG_TYPE_FOR_VAR*, in the same
@@ -221,10 +239,10 @@ It is genuinely **per query and not per index**. Two independent sources:
 - the *percona_vector* suite's *search.test*, inside a test of the search path
   itself, in the block it heads `# ef_search is a session knob.`:
   ```
-  127  --echo # ef_search is a session knob.
-  128  SET SESSION innodb_hnsw_ef_search = 200;
-  129  SELECT id FROM t1 ORDER BY DISTANCE(v, STRING_TO_VECTOR('[0,0]'), 'EUCLIDEAN') LIMIT 3;
-  130  SET SESSION innodb_hnsw_ef_search = default;
+  --echo # ef_search is a session knob.
+  SET SESSION innodb_hnsw_ef_search = 200;
+  SELECT id FROM t1 ORDER BY DISTANCE(v, STRING_TO_VECTOR('[0,0]'), 'EUCLIDEAN') LIMIT 3;
+  SET SESSION innodb_hnsw_ef_search = default;
   ```
 - *percona-hnsw.md*, in its *ef_search* paragraph: "`ef_search` comes from the session variable
   `innodb_hnsw_ef_search` (default 40); the effective width is
@@ -573,10 +591,10 @@ An earlier revision of this section reached the same conclusion by a method that
 could not support it: a recursive tree listing matching *innodb_hnsw*, which
 returned the four test and result paths of the two *sys_vars* tests. That was
 wrong twice over — it searched **path names, not file contents**, so a variable
-with no `sys_vars` test would not have appeared; and the GitHub recursive tree
+with no *sys_vars* test would not have appeared; and the GitHub recursive tree
 API returns `truncated: true` at this SHA, so the listing was not even complete
 on its own terms. The same truncation is why that revision said the
-`percona_vector` suite had 65 tests when it has 91. A truncated listing is not
+*percona_vector* suite had 65 tests when it has 91. A truncated listing is not
 an enumeration, and it does not announce itself in the part you read.
 
 `Innodb_hnsw_memory_used` is a status variable worth recording for its own sake —
@@ -1547,7 +1565,7 @@ So the citations are symbols now, and the guard has three layers instead of one:
   strictly stronger about the thing that was rotting. The pattern is widened
   past the old one at four points, three of which the old one was blind to: it
   takes any extension, so it sees MTR result and test paths and the one `.yy`
-  grammar (31 occurrences); any extensionless file rather than `Dockerfile`
+  grammar (32 occurrences); any extensionless file rather than `Dockerfile`
   alone, which was the one special case the old pattern carried; a bare `:N`
   continuation (97 occurrences, the single largest class); and a span carrying
   several ranges. It is proved against a frozen fixture carrying one of each

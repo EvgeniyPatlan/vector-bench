@@ -2128,8 +2128,12 @@ class TestTheReportKeepsTheTwoColumnsApart:
     #: find it: every line citation in this tree's comments resolves to a
     #: real line, and the wrong ones are wrong about the *content*, not the
     #: arithmetic. Checking content would need a table saying what each
-    #: citation claims is there -- which is what `CITED_IN_REPO` gives
-    #: `docs/09` and `docs/10`, and what a comment has nothing of.
+    #: citation claims is there -- which is what `CITED_IN_REPO` gave
+    #: `docs/09` and `docs/10` until both were converted to symbol citations,
+    #: and what a comment has nothing of either way. Those two documents cite
+    #: symbols now and their guards key on `(path, symbol)`; a comment still
+    #: has nowhere to put the claim, which is why this one is a prose note and
+    #: not a row.
     #:
     #: #47's commit body lists the citations it re-derived and names three
     #: more it checked and found unmoved. This one it moved and listed in

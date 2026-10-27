@@ -573,7 +573,8 @@ CITED_SYMBOLS = {
         "the grids meet, so an empty section there is the fault case",
     ("docs/05-methodology.md", "5. Reproducibility"):
         "config.ops_measurement_version",
-    ("docs/09-adding-percona-server.md", "is not a cache, and that is a fairness problem"):
+    ("docs/09-adding-percona-server.md",
+     "is not a cache, and that is a fairness problem"):
         "This is the finding most likely to change what gets run",
     ("docs/09-adding-percona-server.md",
      "What the default costs, with the inputs named"):
@@ -603,6 +604,13 @@ PATHS_WITHOUT_A_CLAIM = {
         "about provenance, not about its contents.",
     "tests/test_stats.py":
         "named in §1 as the test that landed beside `bootstrap_ci`.",
+    "tests/test_e2_percona_wiring.py":
+        "named in \u00a75 item 2, after #62 landed, as one of the two files "
+        "that "
+        "exercise the gap list with a probe engine nothing could ever have "
+        "measured. A claim about what a test covers, not about its contents "
+        "-- and this entry is here because the forward check demanded it on "
+        "the rebase onto #62 rather than because anyone remembered to look.",
     "tests/test_estimate.py":
         "named in §5 item 3 as what pins both cost bases; "
         "TestTheDecisionD1IsDecidedAndItsCostIsRecomputed recomputes the "
@@ -956,7 +964,7 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
                 f"docs/10 cites {path}'s {symbol!r} for {anchor!r}; that "
                 f"symbol now reads: {body.strip()[:160]!r}")
 
-    def test_every_repo_file_the_document_names_is_accounted_for(self):
+    def test_every_repo_code_file_the_document_names_is_accounted_for(self):
         """Completeness, forward."""
         named = cited_repo_files(_doc())
         with_rows = {path for path, _symbol in CITED_SYMBOLS}
@@ -965,6 +973,27 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
             if path not in with_rows
             and path not in PATHS_WITHOUT_A_CLAIM
             and not path.startswith("docs/")
+            # THE CARVE-OUT, AND WHY IT IS NARROWER THAN IT LOOKS. The old
+            # forward check was keyed on CITATIONS and had no exemption: every
+            # `path:line` into this repo needed a row. This one is keyed on
+            # FILES, so it needs one, because both documents name sibling
+            # documents and the root files constantly -- `CLAUDE.md` for an
+            # invariant, `README.md` for a profile table, `docs/05` and
+            # `docs/07` for a figure's provenance -- and requiring a contents
+            # row for each would force a row for every passing reference.
+            #
+            # What the exemption does NOT do is leave those uncovered. The rows
+            # that matter are still here: this guard carries three `.md`
+            # rows and docs/09's carries one, each opening a named section of
+            # a sibling document and matching the sentence quoted from it.
+            # The exemption
+            # only removes the REQUIREMENT, and it removes it for the class of
+            # reference that is a pointer rather than a claim.
+            #
+            # The honest cost: a contents claim about a `docs/` path with no row
+            # is not detected, exactly as a contents claim about a file in
+            # PATHS_WITHOUT_A_CLAIM is not. Both are the same limit and it
+            # is the one this check cannot close.
             and path != "CLAUDE.md"
             and path != "README.md")
         assert not unaccounted, (
@@ -982,7 +1011,7 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
             "these rows cite files docs/10 no longer names: "
             + ", ".join(stale))
 
-    def test_every_identifier_shaped_row_names_a_symbol_the_document_cites(self):
+    def test_every_identifier_row_names_a_symbol_the_document_cites(self):
         """The other half of reverse completeness, at symbol granularity.
 
         Scoped to identifier-shaped symbols. A `.md` row's symbol is a section
@@ -1014,6 +1043,34 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
         assert path in cited_repo_files(_doc()), (
             f"{path} is listed as named-without-a-claim and docs/10 no longer "
             f"names it; delete the entry")
+
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_anchors_are_not_empty(self, key):
+        """`CITED_SYMBOLS`'s values ARE the assertions, and nothing checked
+        that one existed.
+
+        `assert "" in body` is true of every body, so a row whose anchor was
+        an empty string -- or a tuple containing one, which is the likelier
+        typo -- would pass against anything the symbol happened to contain and
+        read as coverage. Every other escape hatch in this file is asserted
+        non-empty (`VOCABULARY`, `ABSENT_PATHS`, `PATHS_WITHOUT_A_CLAIM` all
+        check their reasons); this was the table it was missing from, and it
+        is the table that matters most. Inherited from the line-citation
+        version, which had it too.
+
+        A floor on LENGTH as well as on emptiness, because a one- or
+        two-character anchor is the same defect slightly diluted: `"("` is in
+        most function bodies.
+        """
+        anchors = CITED_SYMBOLS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
+        assert anchors, f"{key} has no anchor at all"
+        for anchor in anchors:
+            assert isinstance(anchor, str), (key, anchor)
+            assert len(anchor.strip()) >= 6, (
+                f"{key}'s anchor {anchor!r} is too short to be evidence; an "
+                f"anchor this small is satisfied by most bodies")
 
     def test_the_symbol_locator_can_fail(self):
         """Proved able to come back empty, from this file as well, because

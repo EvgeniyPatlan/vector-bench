@@ -141,12 +141,71 @@ _SYMBOL_RE = re.compile(
 
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 
-#: The citation form docs/11 bans. The same pattern `tests/test_e3_rollout_doc.py`
-#: uses to FIND citations in docs/10, kept deliberately identical so that
-#: "docs/11 makes none of the citations docs/10 is made of" is one statement
-#: about one pattern rather than two patterns that might disagree.
+#: The citation form every document in this repository bans, and THE ONLY
+#: COPY OF IT. It used to be one of three: this one, and one each in
+#: `tests/test_e1_percona_design.py` and `tests/test_e3_rollout_doc.py`, with
+#: a comment here saying it was "kept deliberately identical" to one of them.
+#: Three patterns that must agree are three chances to disagree, and they did
+#: disagree -- the other two were narrower than they needed to be, and the
+#: narrow form could not see MTR `.result`/`.test` paths, `.yy` grammars,
+#: extensionless files, bare `:N` continuations or a span carrying several
+#: ranges. On `8a82da8` that was 130 of docs/09's 199 line references
+#: invisible, so a ratchet built on the narrow form would have certified a
+#: document carrying 130 live citations.
+#:
+#: It lives HERE, in the guard for the document that states the policy, and
+#: the other two import it. The direction matters and is forced: those two
+#: already import `classify` from this module, so a pattern defined there and
+#: imported here would be a circular import between test modules.
+#:
+#: WIDENED AT FOUR POINTS, and docs/11 is now ratcheted over all of them
+#: rather than over the narrow form alone:
+#:
+#:   * any extension, not a fixed list;
+#:   * any extensionless file, not `Dockerfile` alone;
+#:   * a bare `:N` continuation of a path named earlier in the sentence;
+#:   * a span carrying several ranges (`foo.result:3-5, :13-17`).
+#:
+#: Deliberately generous: `max(ef, k)` and `p50/p95` do not match, because the
+#: tail must be a colon and digits at the end of the span or before a comma,
+#: but `tag:12` would. A false positive costs one reworded sentence; a false
+#: negative costs the whole guard. `CITATION_FIXTURE` is what proves it still
+#: sees each form.
 _LINE_CITATION_RE = re.compile(
-    r"`([A-Za-z0-9_./-]+\.(?:py|sh|js|yml|md|cc|h|txt)):(\d+)(?:-(\d+))?`")
+    r"`([^`\n]*?):(\d+)(?:-(\d+))?((?:\s*,\s*:\d+(?:-\d+)?)*)\s*`")
+
+
+def line_citations(text):
+    """Every line citation in `text`, as the text spells it.
+
+    The WHOLE text, fences included: a gutter number inside a fenced block is
+    not in a code-font span and this pattern cannot see one -- that class has
+    its own check in `tests/test_e1_percona_design.py` -- but a backticked
+    citation smuggled into a fence is visible here, and docs/09 §4.10's own
+    history is why that matters.
+    """
+    return ["%s:%s%s" % (m.group(1), m.group(2),
+                         ("-" + m.group(3) if m.group(3) else "") + m.group(4))
+            for m in _LINE_CITATION_RE.finditer(text)]
+
+
+#: The frozen fixture the pattern is proved against, carrying ONE OF EACH form
+#: above plus spans that must NOT match. A literal and not a slice of a
+#: document, and that is the correction of a real defect rather than a
+#: preference: this file used to prove its detector by running it against
+#: `docs/10-rollout.md` and asserting at least thirty matches, which was true
+#: and was a dependency on another document's citation style. Converting
+#: docs/10 under this page's own policy would have reddened this guard for no
+#: defect at all. A fixture must not be something another document can stop
+#: being.
+CITATION_FIXTURE = (
+    "a `foo.py:12` and a `bar/baz.result:13-15` and a `sql_yacc.yy:9` "
+    "and a `docker/percona/Dockerfile:725` and a bare `:701-707` "
+    "and a multi `r/x.result:3-5, :13-17, :23-26` "
+    "but not `max(ef, k)` and not `harness/main.py` and not `p50/p95/max`"
+)
+
+CITATION_FIXTURE_EXPECTED = 6
 
 
 def _doc() -> str:
@@ -554,12 +613,21 @@ class TestTheDocumentMakesNoLineCitation:
         done exactly what this page asks for. A fixture cannot be converted
         out from under a test.
         """
-        found = _LINE_CITATION_RE.findall(
-            "as `harness/metrics/records.py:413` has it, and "
-            "`config/profiles/main.yml:110-112`, and `run-benchmark.sh:7`")
-        assert len(found) == 3, found
-        assert found[0][0] == "harness/metrics/records.py"
-        assert found[1][1:] == ("110", "112")
+        found = line_citations(CITATION_FIXTURE)
+        assert len(found) == CITATION_FIXTURE_EXPECTED, found
+        joined = " ".join(found)
+        # One assertion per widening, so a pattern that lost ONE of them fails
+        # naming the form it lost.
+        assert "foo.py:12" in joined
+        assert "bar/baz.result:13-15" in joined           # any extension
+        assert "sql_yacc.yy:9" in joined                  # a grammar
+        assert "docker/percona/Dockerfile:725" in joined  # no extension
+        assert ":701-707" in joined                       # bare continuation
+        assert "r/x.result:3-5, :13-17, :23-26" in joined  # several ranges
+        # And it must not fire on correct prose, which is the other failure
+        # mode: a guard that reddens a correct document gets deleted.
+        assert not line_citations(
+            "`max(ef, k)` `p50/p95/max` `harness/main.py` `x86-64-v3`")
 
     def test_the_policy_is_stated_in_the_document(self):
         """The reason, not just the rule. A rule whose reason is only in a test

@@ -1256,9 +1256,13 @@ class TestTheDocument:
         `EngineDriver.effective_ef` in `harness/drivers/base.py` is the hook
         that has to be overridden; the attack carried neither. Requiring the
         quoted forms is the same technique that already works for the bounds.
-        The hook used to be required as `base.py:469`; it is required by name
-        now, and by the name of the file it is in, so the pair survives an
-        edit above it.
+        The hook used to be required as `8a82da8:harness/drivers/base.py:469`;
+        it is required by name now, and by the name of the file it is in, so
+        the pair survives an edit above it. That superseded number is written
+        in the revision-scoped form `tests/test_e16_citation_ratchet.py`
+        prescribes for a dead citation -- it is the spelling `git show` takes,
+        so it names a line that cannot move rather than one that already
+        has.
         """
         assert "effective_ef" in section1
         assert "max(ef, LIMIT)" in section1, (
@@ -1288,7 +1292,7 @@ class TestTheDocument:
             **must** implement `effective_ef` as `max(ef, k)`    -> FAILED
 
         `override` is if anything the more precise verb -- `effective_ef` is an
-        inherited concrete method with a default at `base.py:469`, so
+        inherited concrete method with a default on `EngineDriver`, so
         overriding is literally what happens -- and `must` is strictly stronger
         than `should`. A guard that fires on correct prose teaches the next
         author to weaken or delete it, which is how the vacuity shapes reached
@@ -1323,8 +1327,8 @@ class TestTheDocument:
         banned `needs no edit` anywhere in §1, and that is subject-blind: it
         fires on a true sentence about something else, for instance
 
-            "`base.py:469`'s inherited default is correct for every other
-             engine here and **needs no edit**"
+            "`EngineDriver.effective_ef`'s inherited default is correct for
+             every other engine here and **needs no edit**"
 
         which is correct prose about a different subject, and "needs no edit"
         is exactly the phrase that recurs in a change-list document. A ban has
@@ -1602,7 +1606,7 @@ class TestTheDocument:
     def test_no_mysql_family_branch_in_ann_pass_emits_ef_construction(self,
                                                                       doc):
         """§4.10 says Percona needs a branch of its own because the MySQL-family
-        branch cannot emit `efConstruction`. Checked, not asserted."""  # noqa: E501
+        branch cannot emit `efConstruction`. Checked, not asserted."""
         source = open(os.path.join(VB_ROOT, "orchestrator",
                                    "ann_pass.py")).read()
         body = source.split("def render_config", 1)[1]
@@ -1743,8 +1747,9 @@ class TestTheDocument:
 #: one citation policy, and three copies of the classifier would be three
 #: chances for them to disagree about what a path is.
 from .test_e15_methodology_roadmap_doc import (  # noqa: E402
-    INDEXED_SUFFIXES, ROOT_SOURCES, SOURCE_DIRS,
-    _YAML_KEY_RE, _WORD_RE, _declared_in_python, classify)
+    CITATION_FIXTURE, CITATION_FIXTURE_EXPECTED, INDEXED_SUFFIXES,
+    ROOT_SOURCES, SOURCE_DIRS, _LINE_CITATION_RE, _YAML_KEY_RE, _WORD_RE,
+    _declared_in_python, classify, line_citations)
 
 #: Generated and gitignored, per CLAUDE.md -- not walked for the index and not
 #: searched for a path. A file under one of these does not exist on a fresh
@@ -1872,52 +1877,48 @@ def doc_spans(text):
 
 
 # -- the line-citation ratchet ----------------------------------------------
+#
+# THE PATTERN AND ITS FIXTURE ARE IMPORTED, NOT DEFINED HERE. They used to be
+# defined here and in `tests/test_e15_methodology_roadmap_doc.py`, which
+# carried a comment saying its copy was "kept deliberately identical" to
+# `tests/test_e3_rollout_doc.py`'s -- three copies of one policy, and they
+# were not identical: the other two were narrow enough to miss 130 of this
+# document's 199 line references on `8a82da8`. There is one definition now,
+# in the guard for the document that states the policy, and this file and
+# docs/10's guard both use it. The direction is forced: this file already
+# imports `classify` from there, so defining the pattern here and importing
+# it back would be a circular import between two test modules.
 
-#: A backticked span that ends in a line reference, in every form this
-#: repository has written one. Wider than the pattern it replaces at four
-#: points, each of which hid live citations in docs/09:
+#: A line inside a fenced block that opens with a bare number, which is the
+#: shape of a reproduced source gutter.
 #:
-#:   * any extension, not a fixed list -- `.result`, `.test` and `.yy` were 32
-#:     occurrences the old one could not see;
-#:   * an extensionless file, which `Dockerfile` is;
-#:   * a bare `:N` continuation of a path named earlier in the sentence, which
-#:     was 97 occurrences and the single largest class;
-#:   * a span carrying several ranges (`foo.result:3-5, :13-17`).
-#:
-#: It is deliberately generous: `max(ef, k)` and `p50/p95` do not match it
-#: because the tail must be a colon followed by digits at the end of the span
-#: or before a comma, but a span like `tag:12` would. A false positive here
-#: costs one reworded sentence; a false negative costs the whole guard.
-_LINE_CITATION_RE = re.compile(
-    r"`([^`\n]*?):(\d+)(?:-(\d+))?((?:\s*,\s*:\d+(?:-\d+)?)*)\s*`")
+#: Fences are matched with `lstrip()` and not anchored at column 0, and that is
+#: the whole reason this guard exists rather than a hand scan. The hand scan
+#: this change first used anchored `^```, and docs/09 §1's `search.test`
+#: excerpt sits inside a bullet, so its fence is indented two spaces and the
+#: entire block was invisible. Four vendor line numbers survived a commit whose
+#: message said all the blocks were clean, eleven lines under a sentence saying
+#: the numbers were gone, and the citation directly above them had been
+#: converted in the same change.
+_GUTTER_LINE_RE = re.compile(r"^\s*\d+(\s\s|\s*$)")
 
-#: The frozen fixture the ratchet is proved against, carrying ONE OF EACH FORM
-#: above plus two spans that must NOT match. It is a literal and not a slice of
-#: a document on purpose: a fixture read out of the tree can go empty, and an
-#: empty fixture turns this into the vacuity it exists to catch.
-CITATION_FIXTURE = (
-    "a `foo.py:12` and a `bar/baz.result:13-15` and a `sql_yacc.yy:9` "
-    "and a `docker/percona/Dockerfile:725` and a bare `:701-707` "
-    "and a multi `r/x.result:3-5, :13-17, :23-26` "
-    "but not `max(ef, k)` and not `harness/main.py` and not `p50/p95/max`"
-)
-
-CITATION_FIXTURE_EXPECTED = 6
-
-
-def line_citations(text):
-    """Every line citation in `text`, as the text spells it.
-
-    The WHOLE text, fences included: a gutter number inside a fenced block is
-    not a citation this pattern can see, but a backticked one smuggled into a
-    fence is, and §4.10's own history is why that matters -- three of its
-    claims lived in a fence as bare numbers for two revisions, one of them
-    labelled with the wrong engine.
-    """
-    return ["%s:%s%s" % (m.group(1), m.group(2),
-                         ("-" + m.group(3) if m.group(3) else "") + m.group(4))
-            for m in _LINE_CITATION_RE.finditer(text)]
-
+#: Lines that open with a number inside a fence and are NOT gutters, each with
+#: what the number is. Spelled as the whole line so an entry cannot widen into
+#: a licence: a reproduced result row and an EXPLAIN row both legitimately
+#: begin with a value, and a scan that refused them would push the document
+#: into paraphrasing recorded output, which is the one thing §0 says a
+#: `.result` file is preferred FOR.
+RECORDED_VALUE_LINES = {
+    "40  40":
+        "§1's sysvar result: the global and session columns of a SELECT, both "
+        "reading 40. The document's point is that number.",
+    "40  200":
+        "§1's sysvar result, after SET SESSION: global 40, session 200.",
+    "1  SIMPLE      t1    NULL       ALL  v1            NULL NULL    NULL X    "
+    "100.00   Using filesort":
+        "§4.1's EXPLAIN row. The leading 1 is the `id` column, and the row is "
+        "the full-table-scan plan that defeats a name-only index check.",
+}
 
 # -- locating a symbol's declaration ----------------------------------------
 
@@ -2078,7 +2079,8 @@ def _generic_symbol_body(source, symbol):
     out = []
     for i, line in enumerate(lines):
         if pattern.match(line):
-            out.append("\n".join(lines[_preceding_comments(lines, i + 1):i + 1]))
+            lo = _preceding_comments(lines, i + 1)
+            out.append("\n".join(lines[lo:i + 1]))
     return "\n".join(out) if out else None
 
 
@@ -2330,7 +2332,8 @@ PATHS_WITHOUT_A_CLAIM = {
     "overlay/ann-benchmarks/ann_benchmarks/algorithms/valkey/module.py":
         "as above.",
     "docker/percona/init.sql":
-        "\u00a74.7 marks it done and \u00a77 item 2 says what it does NOT contain. The "
+        "\u00a74.7 marks it done and \u00a77 item 2 says what it does NOT contain. "
+        "The "
         "claims are negative -- no `mysql_native_password` line, no "
         "measurement parameter -- and a negative claim about a file is not a "
         "quotation from a symbol in it. "
@@ -2338,7 +2341,8 @@ PATHS_WITHOUT_A_CLAIM = {
         "check them against the file, each paired with a positive assertion "
         "that the needle is findable.",
     "docker/alisql/init.sql":
-        "named in \u00a77 item 2 as the file whose line must NOT be copied; the "
+        "named in \u00a77 item 2 as the file whose line must NOT be copied; "
+        "the "
         "same negative claim, checked the same way.",
     "tests/test_c1_engine_sql.py":
         "§4.3 names it as the test a new `sql:` block would fail. That is a "
@@ -2581,8 +2585,8 @@ class TestTheDocumentMakesNoLineCitation:
             "docs/09 §0 must justify the policy with the two pull requests "
             "that repaired the rot; without them it is a style preference")
         assert re.search(r"invalidated by \*\*any\*\* edit", doc)
-        assert re.search(r"only by a\s*\*\*rename\*\*|\*\*only by a\s*rename\*\*",
-                         doc)
+        assert re.search(
+            r"only by a\s*\*\*rename\*\*|\*\*only by a\s*rename\*\*", doc)
 
     def test_the_illustration_of_the_banned_form_is_not_in_code_font(self):
         """The one place docs/09 has to SHOW a line citation is the paragraph
@@ -2607,6 +2611,79 @@ class TestTheDocumentMakesNoLineCitation:
             "the sentence is an impression")
         assert re.search(r"cannot go red", doc, re.I)
 
+    def test_no_fenced_block_prints_a_gutter_number(self):
+        """The form the ratchet cannot see, with its own check.
+
+        A gutter number is not inside a code-font span, so `_LINE_CITATION_RE`
+        -- which is deliberately a pattern over code-font spans -- cannot see
+        one. That left the whole class to the author, and the author got it
+        wrong: this change cleared eight of the ten blocks that carried
+        gutters, said in a commit message that all of them were clean, and
+        left four vendor line numbers in §1 eleven lines below a sentence
+        asserting they were gone. The hand scan missed them because it
+        anchored the fence at column 0 and that block is indented inside a
+        bullet.
+
+        So the class is closed here instead of trusted. Reproducing a source
+        with its gutters is citing it by line with extra steps: the numbers go
+        stale at a re-pin exactly as a citation does, and nothing about a
+        fenced block makes them easier to check.
+        """
+        fenced = False
+        offenders = []
+        blocks = 0
+        for n, line in enumerate(_doc_09().splitlines(), 1):
+            if line.lstrip().startswith("```"):
+                if not fenced:
+                    blocks += 1
+                fenced = not fenced
+                continue
+            if not fenced or not _GUTTER_LINE_RE.match(line):
+                continue
+            if line.strip() in RECORDED_VALUE_LINES:
+                continue
+            offenders.append(f"{n}: {line.strip()[:70]}")
+        # Non-vacuity: the scan has to have read the document's fences at all.
+        assert blocks >= 18, blocks
+        assert not offenders, (
+            "docs/09 reproduces source gutter numbers inside a fenced block. "
+            "They are line citations the ratchet cannot see and they rot at a "
+            "re-pin like any other. Delete the prefixes and keep the lines:\n  "
+            + "\n  ".join(offenders))
+
+    def test_the_recorded_value_lines_are_named_and_still_there(self):
+        """The escape hatch, in both directions.
+
+        An entry that no longer appears is dead allowance -- the next line to
+        open with that number would be waved through -- and an entry with no
+        reason is an exemption nobody can audit. Both are checked, which is
+        the shape `VOCABULARY` and `ABSENT_PATHS` use for the same reason.
+        """
+        doc = _doc_09()
+        for line, reason in RECORDED_VALUE_LINES.items():
+            assert reason.strip(), line
+            assert any(raw.strip() == line for raw in doc.splitlines()), (
+                f"RECORDED_VALUE_LINES carries {line!r} and docs/09 no longer "
+                f"has that line; delete the entry rather than leaving an "
+                f"allowance behind")
+
+    def test_the_gutter_scan_sees_an_indented_fence(self):
+        """The defect that let the four through, as a test rather than a note.
+
+        The scan that missed them anchored the fence at column 0. This asserts
+        the opposite behaviour on a fence indented inside a bullet, which is
+        exactly where docs/09 §1's excerpt lives.
+        """
+        indented = "- a bullet:\n  ```\n  127  --echo # knob\n  ```\n"
+        fenced = False
+        seen = []
+        for line in indented.splitlines():
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced and _GUTTER_LINE_RE.match(line):
+                seen.append(line.strip())
+        assert seen == ["127  --echo # knob"], seen
 
 class TestEverySymbolAndPathResolves:
     """The existence layer: coarser than the table below, over everything."""
@@ -2619,7 +2696,8 @@ class TestEverySymbolAndPathResolves:
                 continue
             resolved, hits = resolve_path(path)
             if resolved is None:
-                bad.append(f"{path}: {'ambiguous, ' + str(hits) if hits else 'no such file'}")
+                why = f"ambiguous, {hits}" if hits else "no such file"
+                bad.append(f"{path}: {why}")
         assert not bad, (
             "docs/09 cites these paths and this tree cannot resolve them. A "
             "vendor path belongs in prose, not in code font -- §0 says so:\n  "
@@ -2748,6 +2826,27 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
             if path not in with_rows
             and path not in PATHS_WITHOUT_A_CLAIM
             and not path.startswith("docs/")
+            # THE CARVE-OUT, AND WHY IT IS NARROWER THAN IT LOOKS. The old
+            # forward check was keyed on CITATIONS and had no exemption: every
+            # `path:line` into this repo needed a row. This one is keyed on
+            # FILES, so it needs one, because both documents name sibling
+            # documents and the root files constantly -- `CLAUDE.md` for an
+            # invariant, `README.md` for a profile table, `docs/05` and
+            # `docs/07` for a figure's provenance -- and requiring a contents
+            # row for each would force a row for every passing reference.
+            #
+            # What the exemption does NOT do is leave those uncovered. The rows
+            # that matter are still here: this guard carries three `.md`
+            # rows and docs/09's carries one, each opening a named section of
+            # a sibling document and matching the sentence quoted from it.
+            # The exemption
+            # only removes the REQUIREMENT, and it removes it for the class of
+            # reference that is a pointer rather than a claim.
+            #
+            # The honest cost: a contents claim about a `docs/` path with no row
+            # is not detected, exactly as a contents claim about a file in
+            # PATHS_WITHOUT_A_CLAIM is not. Both are the same limit and it
+            # is the one this check cannot close.
             and path != "CLAUDE.md")
         assert not unaccounted, (
             "docs/09 names these repository files and nothing says whether it "
@@ -2766,7 +2865,7 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
             "these rows cite files docs/09 no longer names: "
             + ", ".join(stale))
 
-    def test_every_identifier_shaped_row_names_a_symbol_the_document_cites(self):
+    def test_every_identifier_row_names_a_symbol_the_document_cites(self):
         """The other half of reverse completeness, at symbol granularity.
 
         Scoped to identifier-shaped symbols, and the scope is the honest part:
@@ -2798,6 +2897,34 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
         assert path in cited_repo_files(_doc_09()), (
             f"{path} is listed as named-without-a-claim and docs/09 no longer "
             f"names it; delete the entry")
+
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_anchors_are_not_empty(self, key):
+        """`CITED_SYMBOLS`'s values ARE the assertions, and nothing checked
+        that one existed.
+
+        `assert "" in body` is true of every body, so a row whose anchor was
+        an empty string -- or a tuple containing one, which is the likelier
+        typo -- would pass against anything the symbol happened to contain and
+        read as coverage. Every other escape hatch in this file is asserted
+        non-empty (`VOCABULARY`, `ABSENT_PATHS`, `PATHS_WITHOUT_A_CLAIM` all
+        check their reasons); this was the table it was missing from, and it
+        is the table that matters most. Inherited from the line-citation
+        version, which had it too.
+
+        A floor on LENGTH as well as on emptiness, because a one- or
+        two-character anchor is the same defect slightly diluted: `"("` is in
+        most function bodies.
+        """
+        anchors = CITED_SYMBOLS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
+        assert anchors, f"{key} has no anchor at all"
+        for anchor in anchors:
+            assert isinstance(anchor, str), (key, anchor)
+            assert len(anchor.strip()) >= 6, (
+                f"{key}'s anchor {anchor!r} is too short to be evidence; an "
+                f"anchor this small is satisfied by most bodies")
 
     def test_the_symbol_locator_can_fail(self):
         """The locator is what every row above rests on, so it is proved able

@@ -275,9 +275,14 @@ unimplemented).
 09, 10 and 11 are guarded: `tests/test_e1_percona_design.py`, `tests/test_e3_rollout_doc.py`
 and `tests/test_e15_methodology_roadmap_doc.py` fail when the document drifts from the tree.
 12 is not guarded yet, and its own phase 0 says so. **All three cite symbols only — never a
-line number — and each guard ratchets its document to zero line citations.** If you are adding
-a document, copy 11; `docs/11-methodology-roadmap.md` §0 is where the policy and its reasoning
-live. 09 and 10 cited `file:line` until they were converted, and those citations rotted twice
+line number — and each guard ratchets its document to zero, over one shared pattern.** That
+pattern and the frozen fixture that proves it still sees every form live in
+`tests/test_e15_methodology_roadmap_doc.py`, and the other two guards import them: there were
+three near-copies before, they were not identical, and the narrow ones could not see MTR
+`.result`/`.test` paths, `.yy` grammars, extensionless files or bare `:N` continuations. A
+gutter number reproduced inside a fenced block is the one form no pattern over code-font spans
+can see, so it has a separate check. If you are adding a document, copy 11;
+`docs/11-methodology-roadmap.md` §0 is where the policy and its reasoning live. 09 and 10 cited `file:line` until they were converted, and those citations rotted twice
 in two days and put `master` red both times (#41, #43), both times because a later round of
 edits in the same change moved lines after the citations were derived. A line number dies to
 any edit above it; a symbol name dies only to a rename. The vendor half was worse and nothing
