@@ -17,14 +17,69 @@ longest lead time in the whole addition.
 
 | Kind of claim | How it is sourced | Example |
 |---|---|---|
-| Percona behaviour | `file:line` on the pinned SHA | `sql/field.cc:7097` |
-| This repo's behaviour | `file:line` in this checkout, value quoted | `vb_mysql.py:96` |
+| Percona behaviour | a named symbol or MTR test on the pinned SHA, in prose | *field.cc*'s *Field_vector::store* |
+| This repo's behaviour | a symbol in this checkout, value quoted | `vb_mysql.py`'s `Dialect.create_table` |
 | A number | its inputs listed, each marked measured or supplied | [§3](#3-innodb_hnsw_max_memory-is-not-a-cache) |
 
-MTR `.result` files are preferred over `Docs/percona-hnsw.md` wherever both say
-the same thing: a `.result` file is the server's own recorded output, a design
-document is an intention. Where only the design document says something, it is
-cited as such and marked.
+MTR result files are preferred over the vendor design document
+*percona-hnsw.md* wherever both say the same thing: a recorded result is the
+server's own output, a design document is an intention. Where only the design
+document says something, it is cited as such and marked.
+
+### How this document cites code, and why it cites no line numbers
+
+**Every citation here names a symbol or a file — a function, a class, a
+constant, a config key, an MTR test, a path — and never a line number.**
+`to_binary_f32`, `_driver_classes`, `harness/workloads/build.py`: never
+*some/file.py:123*.
+
+This document used to cite `path`-colon-line, and
+`tests/test_e1_percona_design.py` re-opened every cited line in this
+repository and compared it against what the document claimed was there. **That
+mechanism worked, and it is how the rot below was found at all.** But the rot
+kept happening: line citations in this document and in `docs/10-rollout.md`
+went stale twice in two days and put `master` red both times, repaired in pull
+requests #41 and #43. Neither failure was somebody editing a document
+carelessly — in both cases a later round of edits *inside the same change*
+moved lines below the point where the citations had been derived, and the
+guard, correctly, fired on the document rather than on the code.
+
+A line number is invalidated by **any** edit above it, including an edit that
+changes nothing the citation is about. A symbol name is invalidated **only by a
+rename**, which is a deliberate act a reader can follow.
+`docs/11-methodology-roadmap.md` §0 is where this policy is set out and
+`CLAUDE.md` says to copy it; this document now does.
+
+Two consequences that follow from the policy rather than from taste, and they
+are the reason the conversion is not merely cosmetic here:
+
+* **A citation here is coarser.** `_detect_march` names a function, not the
+  three lines of its path tuple that §4.8 quotes. Where the exact passage
+  matters, this document quotes it and says which symbol it sits in, so the
+  quotation is checkable by search rather than by line arithmetic.
+* **Vendor material is named in prose, never in code font.** *ha_innodb.cc*,
+  the *percona_vector* suite's *index_build.test*, *percona-hnsw.md*: a
+  backticked path in this document means a path in **this** repository, and a
+  guard enforces that. The pinned Percona tree is not in this checkout —
+  `sources/` is generated and gitignored, and it holds no Percona tree — so a
+  backticked path into it would be a citation nobody reviewing this document
+  could check. **That was already true of the line numbers**, and it is the
+  half of the rot nothing reported: the guard's deny-list skipped every vendor
+  path by name, so the vendor line references in this document's previous
+  revision — 70 vendor path citations plus the 93 bare continuations the old
+  guard's own note attributed to Percona sources, **164** line references
+  between them — were checked by nothing at all and
+  would have rotted silently at the re-pin, in a document whose provenance
+  table above commits it to having been read against a specific tree. A vendor
+  symbol citation still cannot be verified by any test in this repository.
+  What changes is that it now **names** something a reader holding the tree can
+  find, instead of a line number that is wrong.
+
+One piece of typography that is not typography: the illustration of the banned
+form at the top of this subsection is in *italics* rather than code font, for the reason
+`docs/11` §0 gives — the guard bans that form as a pattern over code-font
+spans, and an allowlist carving out one citation would make this the one
+document permitted to make the citation it forbids.
 
 ### The pin
 
@@ -64,9 +119,9 @@ error:
 |---|---|---|
 | `1d62ab22bc75` | 2026-10-13 | PS-11612: store resolved HNSW parameters in the DD |
 | `5c30ac32877a` | 2026-10-12 | PS-11673: debug assertion in `Dictionary_client::acquire` on cross-schema `RENAME TABLE` after restart |
-| `a86503214416` | 2026-10-12 | PS-11615: assertion `!other->is_vector()` in `vec_index_of()` when a vector search runs during an in-place index replace |
+| `a86503214416` | 2026-10-12 | PS-11615: assertion `!other->is_vector()` in *vec_index_of* when a vector search runs during an in-place index replace |
 | `af72e2c0fa40` | 2026-10-12 | PS-11591: assertion `inserted.second` in `HNSW::insert()` — crash on INSERT after an **unclean restart** |
-| `eebc427aab7b` | 2026-10-02 | PS-11623: assertion in `ddl0loader.cc:273` when an index build aborts on `innodb_hnsw_max_memory` exhaustion |
+| `eebc427aab7b` | 2026-10-02 | PS-11623: assertion in *ddl0loader.cc* when an index build aborts on `innodb_hnsw_max_memory` exhaustion |
 | `d436bb1c77d7` | 2026-10-09 | PS-11618: COSINE distance support for vector indexes |
 
 Read as a group that is a branch under daily development whose *recent* failures
@@ -83,7 +138,7 @@ cut against over-reading it:
   were, not where they are.
 - Two are explicitly debug-build assertions (`a86503214416`, `5c30ac32877a` say
   "debug"). `config/engines/percona.yml` will build `RelWithDebInfo` with
-  `NDEBUG`, as every other engine here does, so those two cannot fire in a
+  *NDEBUG* defined, as every other engine here does, so those two cannot fire in a
   benchmark build. They still matter, because an assertion marks a state the
   author did not expect, and in a release build that state is reached silently.
 - Nothing in a commit log shows what is still open. This is a survey of fixed
@@ -94,8 +149,9 @@ cut against over-reading it:
 **Yes.** `innodb_hnsw_ef_search` is a real, documented, tested system variable
 with both SESSION and GLOBAL scope, and it is read per query.
 
-The primary source is the declaration itself, `ha_innodb.cc:1205-1209`, which
-carries the scope, the default and both bounds in five lines:
+The primary source is the declaration itself, the *hnsw_ef_search*
+*MYSQL_THDVAR_ULONG* block in *ha_innodb.cc*, which carries the scope, the
+default and both bounds in five lines:
 
 ```c
 static MYSQL_THDVAR_ULONG(
@@ -105,10 +161,11 @@ static MYSQL_THDVAR_ULONG(
     nullptr, nullptr, 40, 1, 100000, 0);
 ```
 
-`MYSQL_THDVAR_*` is the session-variable macro, and the trailing arguments are
-default `40`, minimum `1`, maximum `100000`. It is registered in
-`innobase_system_variables[]` at `ha_innodb.cc:25112`. The engine reads it
-through `THDVAR` on the query path — `ha_innodb.cc:12297-12300`:
+*MYSQL_THDVAR_ULONG* is the session-variable macro, and the trailing arguments
+are default `40`, minimum `1`, maximum `100000`. It is registered in
+*ha_innodb.cc*'s *innobase_system_variables* array, as
+*MYSQL_SYSVAR(hnsw_ef_search)*. The engine reads it through *THDVAR* on the
+query path, in the *vec_ann_open* call the scan's open makes:
 
 ```c
   const dberr_t err = vec_ann_open(
@@ -117,13 +174,13 @@ through `THDVAR` on the query path — `ha_innodb.cc:12297-12300`:
       m_user_thd, &m_vec_search);
 ```
 
-`THDVAR` is a per-session read taken inside the scan's open, which is what
+*THDVAR* is a per-session read taken inside the scan's open, which is what
 "per query" means mechanically rather than by assertion. Note also that the
 help text states the `max(ef, LIMIT)` clamp as part of the variable's own
 contract — see the riders below.
 
-The behaviour at the edges is in the server's own recorded output,
-`mysql-test/suite/sys_vars/r/innodb_hnsw_ef_search_basic.result`:
+The behaviour at the edges is in the server's own recorded output, the
+*sys_vars* suite's *innodb_hnsw_ef_search_basic.result*:
 
 ```
  1  SET @start_global_value = @@global.innodb_hnsw_ef_search;
@@ -149,19 +206,20 @@ The behaviour at the edges is in the server's own recorded output,
 ```
 
 So: **default 40, range 1..100000, clamped with a warning outside it, integers
-only** (`1.1`, `1e1` and `'AUTO'` are all `ER_WRONG_TYPE_FOR_VAR`, lines 52-57).
+only** (`1.1`, `1e1` and `'AUTO'` are all *ER_WRONG_TYPE_FOR_VAR*, in the same
+file's type-rejection block).
 
 It is genuinely **per query and not per index**. Two independent sources:
 
-- `mysql-test/suite/percona_vector/t/search.test:127-130`, inside a test of the
-  search path itself:
+- the *percona_vector* suite's *search.test*, inside a test of the search path
+  itself, in the block it heads `# ef_search is a session knob.`:
   ```
   127  --echo # ef_search is a session knob.
   128  SET SESSION innodb_hnsw_ef_search = 200;
   129  SELECT id FROM t1 ORDER BY DISTANCE(v, STRING_TO_VECTOR('[0,0]'), 'EUCLIDEAN') LIMIT 3;
   130  SET SESSION innodb_hnsw_ef_search = default;
   ```
-- `Docs/percona-hnsw.md:656-658`: "`ef_search` comes from the session variable
+- *percona-hnsw.md*, in its *ef_search* paragraph: "`ef_search` comes from the session variable
   `innodb_hnsw_ef_search` (default 40); the effective width is
   `max(ef_search, batch)`. It is per-query rather than per-index because the
   same index serves a dashboard wanting speed and a batch job wanting recall."
@@ -170,15 +228,15 @@ It is genuinely **per query and not per index**. Two independent sources:
 recall/QPS frontier, the calibration sweep has something to do, and
 `set_ef_search` is one `SET SESSION`. Two details change what the sweep means:
 
-- **The clamp is `max(ef, LIMIT)`**, stated in the variable's own help text
-  (`ha_innodb.cc:1208`) and visible in the call at `:12299`, where `ef_search`
-  is passed beside `std::max<size_t>(limit, 1)`; `Docs/percona-hnsw.md:656`
-  calls the same thing `max(ef_search, batch)`. So the effective width is never
+- **The clamp is `max(ef, LIMIT)`**, stated in the variable's own help text,
+  quoted above, and visible in the *vec_ann_open* call also quoted above, where
+  the *hnsw_ef_search* read is passed beside `std::max<size_t>(limit, 1)`;
+  *percona-hnsw.md* calls the same thing `max(ef_search, batch)`. So the effective width is never
   below `LIMIT k`. At `k = 10` every grid
   value here is above 10, so the grid is taken verbatim and
   `effective_ef()`'s default pass-through is correct. **But** the harness
-  already has a hook for exactly this shape — `EngineDriver.effective_ef(ef, k)`
-  at `harness/drivers/base.py:469`, which exists because MongoDB clamps
+  already has a hook for exactly this shape — `EngineDriver.effective_ef`
+  in `harness/drivers/base.py`, which exists because MongoDB clamps
   `numCandidates` up to `limit`. If a profile ever sweeps `ef_search` below `k`,
   Percona clamps the same way MongoDB does and the driver must say so. The
   follow-on task should implement `effective_ef` as `max(ef, k)` and not leave
@@ -201,20 +259,21 @@ as this repo already drives it.
 | | Percona Server | MariaDB MHNSW (for comparison) |
 |---|---|---|
 | Column | `v VECTOR(n) NOT NULL` | `v VECTOR(n) NOT NULL` |
-| Max `n` | 16383 — `vector-common/vector_constants.h:38`, `constexpr unsigned int max_dimensions = 16383` | n/a here |
-| Text constructor | `STRING_TO_VECTOR('[1,2]')`, alias `TO_VECTOR()` | `VEC_FromText()` |
-| Read-back | `VECTOR_TO_STRING(v)`; a bare `SELECT v` returns raw bytes | `VEC_ToText()` |
+| Max `n` | 16383 — *vector_constants.h*'s *max_dimensions*, `constexpr unsigned int max_dimensions = 16383` | n/a here |
+| Text constructor | `STRING_TO_VECTOR('[1,2]')`, alias *TO_VECTOR* | *VEC_FromText* |
+| Read-back | `VECTOR_TO_STRING(v)`; a bare `SELECT v` returns raw bytes | *VEC_ToText* |
 | Width helper | `VECTOR_DIM(v)` | n/a |
 | **Raw float32 bytes accepted?** | **Yes, if the parameter carries the binary charset** | Yes |
 
-`STRING_TO_VECTOR` and `TO_VECTOR` are the *same function* —
-`sql/item_create.cc:1656-1657` registers both names against
-`Item_func_to_vector`. `VECTOR_TO_STRING` is `:1659`, `VECTOR_DIM` is `:1660`.
+*STRING_TO_VECTOR* and *TO_VECTOR* are the *same function* —
+*item_create.cc*'s function registry registers both names against
+*Item_func_to_vector*. *VECTOR_TO_STRING* and *VECTOR_DIM* are the next two
+entries in the same registry.
 
 The binding question is the one that decides whether this repo's existing batched
-loader works unchanged, and it is settled by
-`Field_vector::store(const char *from, size_t length, const CHARSET_INFO *cs)`
-at `sql/field.cc:7094`:
+loader works unchanged, and it is settled by *field.cc*'s
+*Field_vector::store*, whose signature is
+`store(const char *from, size_t length, const CHARSET_INFO *cs)`:
 
 ```c
 7096  uint32 dimensions = get_dimensions(length, Field_vector::precision);
@@ -228,30 +287,33 @@ at `sql/field.cc:7094`:
 7130  return Field_blob::store(from, length, cs);
 ```
 
-with `Field_vector::precision = sizeof(float)` (`sql/field.h:3819`) and
-`get_dimensions` returning `UINT32_MAX` unless the length is a non-zero multiple
-of 4 (`vector-common/vector_constants.h:96-102`). On a little-endian host the
-bytes are then stored verbatim; the `WORDS_BIGENDIAN` branch at `:7117-7128`
-byte-swaps, so the wire format is **little-endian float32** either way.
+with *Field_vector::precision* declared `sizeof(float)` in *field.h*, and
+*get_dimensions* in *vector_constants.h* returning *UINT32_MAX* unless the
+length is a non-zero multiple of 4. On a little-endian host the bytes are then
+stored verbatim; the *WORDS_BIGENDIAN* branch of the same *store* byte-swaps,
+so the wire format is **little-endian float32** either way.
 
-So **`harness/drivers/mysql_family.py:58`'s `to_binary_f32()` produces exactly
-the right bytes**, and `overlay/.../vb_mysql.py:51`'s copy does too. Three
+So **`harness/drivers/mysql_family.py`'s `to_binary_f32()` produces exactly
+the right bytes**, and `vb_mysql.py`'s copy of `to_binary_f32` does too. Three
 caveats, in descending order of how likely they are to bite:
 
 1. **`cs != &my_charset_bin` is a hard refusal, not a conversion.** The
    parameter must reach the server as binary, not as utf8mb4. The repo passes
-   Python `bytes`, which MariaDB Connector/C sends as `MYSQL_TYPE_BLOB`, and
-   that is what makes this work today for AliSQL's `Field_vector`. It is
+   Python `bytes`, which MariaDB Connector/C sends as *MYSQL_TYPE_BLOB*, and
+   that is what makes this work today for AliSQL's *Field_vector*. It is
    *expected* to work identically here, and it is on the §7 list because
    "expected" is not "measured" and the failure mode is every INSERT erroring.
-2. NaN and Inf are refused per element (`:7107-7115`). The datasets are real
+2. NaN and Inf are refused per element, by the check *store* makes between
+   the two quoted hunks. The datasets are real
    embeddings and contain neither, but a synthetic corpus could.
 3. A length that is not `4 × n` for the declared `n` is refused. The repo always
    sends `4 × dim`.
 
 **Percona does not need the text path, so it must not use it.** That is the same
-argument `overlay/.../algorithms/alisql/module.py:22-24` makes for AliSQL:
-routing one engine through `STRING_TO_VECTOR()` while the others take binary
+argument the module docstring of
+`overlay/ann-benchmarks/ann_benchmarks/algorithms/alisql/module.py` makes for
+AliSQL:
+routing one engine through *STRING_TO_VECTOR* while the others take binary
 would charge Percona for text parsing that belongs to the client, and would show
 up as a Percona ingest penalty. Everything in this repo binds binary; Percona
 keeps doing so.
@@ -268,36 +330,36 @@ keeps doing so.
 | Indexes per table | **exactly one** | more than one allowed |
 | **Primary key** | **`BIGINT UNSIGNED`, single column** — explicit, or one MySQL promotes from a `UNIQUE NOT NULL` key | any |
 
-All three creation paths are exercised in
-`mysql-test/suite/percona_vector/t/cosine.test` — inline at `:9`, `CREATE VECTOR
-INDEX` at `:19`, `ALTER TABLE … ADD VECTOR KEY` at `:33` and `ADD VECTOR INDEX`
-at `:42`. `USING hnsw` is accepted as a synonym for `TYPE hnsw`
-(`…/t/index_syntax.test:173`). A second vector index on one table is
-`ER_NOT_SUPPORTED_YET` (`…/t/index_syntax.test:210-217`), and so is a second one
-on the same column (`:219-226`).
+All four creation paths are exercised in the *percona_vector* suite's
+*cosine.test*, which uses the inline form, `CREATE VECTOR INDEX`,
+`ALTER TABLE … ADD VECTOR KEY` and `ADD VECTOR INDEX` in that order.
+`USING hnsw` is accepted as a synonym for `TYPE hnsw`, recorded in the same
+suite's *index_syntax.test*. A second vector index on one table is
+*ER_NOT_SUPPORTED_YET* there too, and so is a second one on the same column.
 
 **The primary-key requirement is the single biggest difference, because it
-changes the schema rather than the index clause.** `index_syntax.result` records
-four refusals with one message:
+changes the schema rather than the index clause.** *index_syntax.result*
+records four refusals with one message:
 
 ```
-186  CREATE TABLE t1 ( id BIGINT PRIMARY KEY, …              -> refused (:190)
-192  CREATE TABLE t1 ( id INT UNSIGNED PRIMARY KEY, …        -> refused (:196)
-198  CREATE TABLE t1 ( id1 …, id2 …, PRIMARY KEY (id1,id2)…  -> refused (:204)
-284  ALTER TABLE t1 CHANGE id id INT UNSIGNED;               -> refused (:285)
+CREATE TABLE t1 ( id BIGINT PRIMARY KEY, …              -> refused
+CREATE TABLE t1 ( id INT UNSIGNED PRIMARY KEY, …        -> refused
+CREATE TABLE t1 ( id1 …, id2 …, PRIMARY KEY (id1,id2)…  -> refused
+ALTER TABLE t1 CHANGE id id INT UNSIGNED;               -> refused
 
 ERROR 42000: This version of MySQL doesn't yet support 'vector indexes on
 tables lacking a BIGINT UNSIGNED single column primary key'
 ```
 
-and `…/r/pk_combinations.result:16` records the same message for a table with no
-primary key at all, with `:4-5` calling it a "current temporary restriction".
+and *pk_combinations.result* records the same message for a table with no
+primary key at all, and calls it a "current temporary restriction".
 
 **Both of this repo's table definitions declared `id INT PRIMARY KEY`** —
-`overlay/.../vb_mysql.py:96`, which still does, and the ops driver, which no
-longer does. Percona refuses that column outright, so the Percona DDL must say
-`id BIGINT UNSIGNED PRIMARY KEY`, and §4.1's answer was to make the type a
-`Dialect` field: `harness/drivers/mysql_family.py:234` now reads
+`vb_mysql.py`'s `Dialect.create_table`, which still does, and the ops driver,
+which no longer does. Percona refuses that column outright, so the Percona DDL
+must say `id BIGINT UNSIGNED PRIMARY KEY`, and §4.1's answer was to make the
+type a `Dialect` field: `MySQLFamilyDriver._create_table_ddl` in
+`harness/drivers/mysql_family.py` now emits
 `id {self.dialect.pk_type} PRIMARY KEY` with `pk_type` defaulting to `"INT"`,
 so MariaDB and AliSQL emit exactly what they emitted before. The ann overlay
 needs no such field because `percona/module.py` overrides `create_table`
@@ -314,29 +376,29 @@ and someone will notice.
 
 | Option | Range | Default | Evidence |
 |---|---|---|---|
-| `M` | 2..200 | **25** | `storage/innobase/include/vec0vec.h:55`, `:64-65` |
-| `ef_construction` | 1..4096 | 200 | `vec0vec.h:56`, `:71-72` |
-| `metric` | `euclidean` \| `cosine` | `euclidean` | `vec0vec.h:57-58`; refusals at `index_syntax.result:789-808` |
+| `M` | 2..200 | **25** | *vec0vec.h*'s option name and bound constants |
+| `ef_construction` | 1..4096 | 200 | the same constants in *vec0vec.h* |
+| `metric` | `euclidean` \| `cosine` | `euclidean` | *vec0vec.h*, with the refusals recorded in *index_syntax.result* |
 
 "`M`, `metric` and `ef_construction` are settable, and they are all the
-parameters there are" — `Docs/percona-hnsw.md:1293`.
+parameters there are" — *percona-hnsw.md*, in its index-options section.
 
 Syntax rules, each with a recorded refusal:
 
 - An option value is **a bare identifier or an integer, never a quoted string**.
-  `metric = cosine` is right; `metric = 'cosine'` is a parse error
-  (`Docs/percona-hnsw.md:1305-1307`), and so are `M = 6.0`
-  (`…/t/index_syntax.test:356`) and `M = "6"` (`:363`).
-- An unknown option name is `ER_ILLEGAL_INDEX_CONSTRUCTION_PARAMETER`
-  (`…/t/index_syntax.test:377`); a bad value is
-  `ER_ILLEGAL_INDEX_CONSTRUCTION_PARAMETER_VALUE` (`:384`, `:391`), which prints
-  only the value and not which parameter it belonged to —
-  `dd_params_resolved.result:77` is `ERROR HY000: Illegal index construction
-  parameter value: 0.` That is why the overlay module range-checks `M` and
+  `metric = cosine` is right; `metric = 'cosine'` is a parse error, per
+  *percona-hnsw.md*, and so are `M = 6.0` and `M = "6"`, both recorded in
+  *index_syntax.test*.
+- An unknown option name is *ER_ILLEGAL_INDEX_CONSTRUCTION_PARAMETER* and a
+  bad value is *ER_ILLEGAL_INDEX_CONSTRUCTION_PARAMETER_VALUE*, both recorded
+  in *index_syntax.test*. The second prints only the value and not which
+  parameter it belonged to — *dd_params_resolved.result* has
+  `ERROR HY000: Illegal index construction parameter value: 0.` That is why the
+  overlay module range-checks `M` and
   `efConstruction` itself before the server sees them.
 - **Defaults are resolved at create time and stored.** An index created with no
   option list comes back from `SHOW CREATE TABLE` with the full canonical set:
-  `dd_params_resolved.result:8-19` creates `VECTOR KEY vk (v) TYPE hnsw` and
+  *dd_params_resolved.result* creates `VECTOR KEY vk (v) TYPE hnsw` and
   gets back `` VECTOR KEY `vk` (`v`) USING `hnsw` (`M`=25,
   `ef_construction`=200, `metric`=`euclidean`) ``. So the manifest can read the
   parameters a graph was actually built with out of `SHOW CREATE TABLE`, which
@@ -353,26 +415,26 @@ Syntax rules, each with a recorded refusal:
 | Inner product | `DISTANCE(v, q, 'DOT')` — **exact scan only, cannot be indexed** | — |
 | Manhattan | `DISTANCE(v, q, 'MANHATTAN')` — exact scan only | — |
 
-`sql/item_create.cc:1403` is `{"DISTANCE", SQL_FN(Item_func_vector_distance, 3)}`
-— the metric argument is mandatory. The five names are the table at
-`vector-common/vector_constants.h:63-69`, resolved case-insensitively through
-`my_strnncoll` on `my_charset_latin1` (`:73-82`), which is why the suite uses
-`'EUCLIDEAN'` (`…/t/search.test:24`) and `'euclidean'`
-(`…/t/index_build.test:79`) interchangeably.
+*item_create.cc*'s registry entry for it is
+`{"DISTANCE", SQL_FN(Item_func_vector_distance, 3)}` — the metric argument is
+mandatory. The five names are a table in *vector_constants.h*, resolved
+case-insensitively through *my_strnncoll* on *my_charset_latin1*, which is why
+the suite's *search.test* uses `'EUCLIDEAN'` and its *index_build.test* uses
+`'euclidean'` interchangeably.
 
 **A correction to the brief this task was given.** The brief said "L2 and
 inner-product kernels with AVX-512 paths", which is true of the *kernels* and
 not of the *index*. An HNSW index can only be built on `euclidean` or `cosine`:
 
 ```
-index_syntax.result:797-802
+index_syntax.result
   CREATE TABLE t ( … VECTOR KEY ( v1 ) TYPE hnsw ( metric = dot ) );
   ERROR 42000: This version of MySQL doesn't yet support 'HNSW indexes on
   anything but the EUCLIDEAN or COSINE metric'
 ```
 
-with the same message for `euclidean_squared` (`:789-791`) and `manhattan`
-(`:803-808`). `DISTANCE(…, 'DOT')` still works, as an exact full scan.
+with the same message recorded there for `euclidean_squared` and `manhattan`.
+`DISTANCE(…, 'DOT')` still works, as an exact full scan.
 
 This costs this benchmark nothing — the harness needs `angular` → `cosine` and
 `euclidean` → `euclidean`, both supported — but **the published report cannot
@@ -383,15 +445,15 @@ Two more rules the index enforces, both relevant to `query_filtered`:
 
 - **A cosine index serves only `'COSINE'`; an L2 index serves only
   `'EUCLIDEAN'` and `'EUCLIDEAN_SQUARED'` — never the cross product.**
-  `…/t/cosine.test:273-296` asserts both directions after a restart, and
-  `Docs/percona-hnsw.md:1312-1315` explains it: the optimizer reads
-  `KEY::vector_index_metric` from the stored option. So a dialect that built the
+  *cosine.test* asserts both directions after a restart, and
+  *percona-hnsw.md* explains it: the optimizer reads
+  *KEY::vector_index_metric* from the stored option. So a dialect that built the
   index with one metric and queried with another gets a silent full scan, not an
   error.
 - `ORDER BY` must be **ascending** and there must be a `LIMIT`. Both missing
   cases, plus `DESC`, plus `DISTANCE()` only in `WHERE`, plus both arguments
-  non-constant, are listed as "shapes that must NOT use the index" at
-  `…/t/search.test:44-68`.
+  non-constant, are listed as "shapes that must NOT use the index" in
+  *search.test*.
 
 ### 2.5 How the index is maintained: both ways, which is new here
 
@@ -401,19 +463,19 @@ Two more rules the index enforces, both relevant to `query_filtered`:
 | Separable bulk build | **yes** | no | yes |
 
 This is the second place Percona breaks a sentence in `CLAUDE.md`. It maintains
-the graph on every `INSERT` — `…/t/insert.test` loads rows and
-`…/t/insert_graph.test` checks the graph grew — *and* it has a real bulk path:
-`ALTER TABLE … ADD VECTOR KEY` builds the graph from one clustered scan.
-`…/t/index_build.test:20-23` names it:
+the graph on every `INSERT` — the *percona_vector* suite's *insert.test* loads rows
+and its *insert_graph.test* checks the graph grew — *and* it has a real bulk
+path: `ALTER TABLE … ADD VECTOR KEY` builds the graph from one clustered scan.
+*index_build.test* names it, in its first `--echo` block:
 
 ```
-20  --echo # First ADD, explicit INPLACE: rebuilds the table with the column and
-21  --echo # builds a node per row. An in-place rebuild that wrote the column and
-22  --echo # no graph is the case that used to give nodes=0.
-23  ALTER TABLE t1 ADD VECTOR KEY k1 (v) TYPE hnsw (M = 4), ALGORITHM=INPLACE;
+--echo # First ADD, explicit INPLACE: rebuilds the table with the column and
+--echo # builds a node per row. An in-place rebuild that wrote the column and
+--echo # no graph is the case that used to give nodes=0.
+ALTER TABLE t1 ADD VECTOR KEY k1 (v) TYPE hnsw (M = 4), ALGORITHM=INPLACE;
 ```
 
-and `Docs/percona-hnsw.md` contrasts the two build algorithms: "`INPLACE` builds
+and *percona-hnsw.md* contrasts the two build algorithms: "`INPLACE` builds
 the graph in memory and bulk-loads the aux (§15), so a COPY-built aux is correct
 but slower to build and larger."
 
@@ -422,8 +484,8 @@ So Percona is the **second** engine in this benchmark that can run both
 this document called it the first outright and the only one where "incremental
 versus bulk" is a within-engine comparison; both were wrong. **pgvector already
 does it**: `pgvector_build_modes` appears in eight profiles including `smoke`,
-`main`, `full` and `quick`, and `harness/workloads/build.py:12-16` was written
-for exactly that comparison —
+`main`, `full` and `quick`, and `harness/workloads/build.py`'s module
+docstring was written for exactly that comparison —
 
 > …so the report can say "pgvector's bulk build is N× cheaper than its own
 > incremental build" and "pgvector's incremental build costs X versus MHNSW's
@@ -437,8 +499,8 @@ MySQL here" cannot be separated. A second such curve, on a MySQL-family server,
 separates them. That is a
 genuinely valuable result for the report and it is worth a profile.
 
-**There is a defect in `harness/workloads/build.py` directly in the way.**
-Lines 93-95 are:
+**There is a defect in `harness/workloads/build.py` directly in the way**, in
+its `run`, which decides the build mode like this:
 
 ```python
     incremental = driver.capabilities().get("incremental_index", True)
@@ -448,9 +510,9 @@ Lines 93-95 are:
 
 `build_mode == "incremental"` forces the flag true; **`build_mode == "post"` has
 no counterpart that forces it false.** The flag then decides everything
-downstream: whether `driver.create_index(index)` is called at all (`:109`),
-and what `build_wall_s` means (`:120`,
-`effective_build = build_seconds if not incremental else load.wall_seconds`).
+downstream in the same function: whether `driver.create_index(index)` is called
+at all, and what `build_wall_s` means —
+`effective_build = build_seconds if not incremental else load.wall_seconds`.
 
 For every engine that exists today this is harmless, because `incremental_index`
 is a fixed property of the engine and the two never disagree. For Percona they
@@ -474,34 +536,35 @@ build accounting, and it is not this task's to change.
 
 | Variable | Scope | Default | Harness must | Evidence |
 |---|---|---|---|---|
-| `innodb_hnsw_ef_search` | SESSION + GLOBAL | 40 | **set** per session (calibration) | `sys_vars/r/innodb_hnsw_ef_search_basic.result` |
-| `innodb_hnsw_max_memory` | **GLOBAL only** | 1073741824 (1 GiB), `0` = unlimited | **set** from the resource pass — see §3 | `sys_vars/r/innodb_hnsw_max_memory_basic.result:3-5, :13-17, :23-26` |
-| `Innodb_hnsw_memory_used` | GLOBAL status | — | **record** | `percona_vector/r/hnsw_memory_used.result:13-15` |
-| `optimizer_switch` → `hypergraph_optimizer` | SESSION + GLOBAL | **unreachable in this build** | record only | `sys_vars.cc:232-234`, `:3435-3438`, `:3441-3452` |
+| `innodb_hnsw_ef_search` | SESSION + GLOBAL | 40 | **set** per session (calibration) | *sys_vars*' *innodb_hnsw_ef_search_basic.result* |
+| `innodb_hnsw_max_memory` | **GLOBAL only** | 1073741824 (1 GiB), `0` = unlimited | **set** from the resource pass — see §3 | *sys_vars*' *innodb_hnsw_max_memory_basic.result*, whose default, scope and bound blocks all record it |
+| `Innodb_hnsw_memory_used` | GLOBAL status | — | **record** | *percona_vector*'s *hnsw_memory_used.result* |
+| *optimizer_switch* → *hypergraph_optimizer* | SESSION + GLOBAL | **unreachable in this build** | record only | three gates in *sys_vars.cc*, below |
 
 **That table is complete, and it is now established from the registration array
 rather than from filenames.** InnoDB exposes a variable by listing it in
-`innobase_system_variables[]`, so that array is the authoritative enumeration.
+*innobase_system_variables*, so that array is the authoritative enumeration.
 At the pin it contains exactly two HNSW entries —
 
 ```
-ha_innodb.cc:25112      MYSQL_SYSVAR(hnsw_ef_search),
-ha_innodb.cc:25174      MYSQL_SYSVAR(hnsw_max_memory),
+MYSQL_SYSVAR(hnsw_ef_search),
+MYSQL_SYSVAR(hnsw_max_memory),
 ```
 
-declared at `:1205-1209` and `:23843-23844` respectively — and the status-variable
-array contains exactly one:
+declared earlier in the same file, the first as the *MYSQL_THDVAR_ULONG* block
+§1 quotes — and the status-variable array in the same file contains exactly
+one:
 
 ```
-ha_innodb.cc:1335       {"hnsw_memory_used", (char *)&export_vars.innodb_hnsw_memory_used,
+{"hnsw_memory_used", (char *)&export_vars.innodb_hnsw_memory_used,
 ```
 
 A grep of the whole file for `hnsw` returns no other variable of either kind.
 **There is no third.**
 
 An earlier revision of this section reached the same conclusion by a method that
-could not support it: a recursive tree listing matching `innodb_hnsw`, which
-returned the four `.test`/`.result` paths of the two `sys_vars` tests. That was
+could not support it: a recursive tree listing matching *innodb_hnsw*, which
+returned the four test and result paths of the two *sys_vars* tests. That was
 wrong twice over — it searched **path names, not file contents**, so a variable
 with no `sys_vars` test would not have appeared; and the GitHub recursive tree
 API returns `truncated: true` at this SHA, so the listing was not even complete
@@ -511,32 +574,32 @@ an enumeration, and it does not announce itself in the part you read.
 
 `Innodb_hnsw_memory_used` is a status variable worth recording for its own sake —
 it is the only engine here that reports its graph's live memory, and
-`hnsw_memory_used.result:13-15` shows it reading `0` after a restart (the graph
+*hnsw_memory_used.result* shows it reading `0` after a restart (the graph
 is loaded lazily) and rising on the first search.
 
 The **hypergraph optimizer** row is the one trap in this table that is a
-behaviour and not a knob. `Docs/percona-hnsw.md:1209-1210`: "The read path is the
+behaviour and not a knob. *percona-hnsw.md*, on the read path: "The read path is the
 old optimizer's, with no cost model. A session using the hypergraph optimizer
 plans scan-plus-sort, with correct results and no index." A session with
-`hypergraph_optimizer=ON` therefore gets **exact results at full-scan speed**,
+*hypergraph_optimizer=ON* therefore gets **exact results at full-scan speed**,
 which is this repo's canonical silent failure — "indistinguishable in output from
 'very accurate but slow'". `explain_uses_vector_index()` catches it, which is
 why that check must stay on for Percona even though, unlike AliSQL, Percona
 never declines the index for *cost* reasons (vector index access is priced at
 `prohibitive_cost = 1e100` specifically "so that it always loses against any
 other access method, since a vector index is only ever activated for ORDER BY
-... LIMIT" — `vector-common/vector_constants.h:40-47`).
+... LIMIT" — *vector_constants.h*'s *prohibitive_cost*).
 
 **In this build the hypergraph risk cannot occur, and that is now established
-rather than assumed.** Three gates in `sql/sys_vars.cc`, all keyed on CMake
+rather than assumed.** Three gates in *sys_vars.cc*, all keyed on CMake
 symbols `docker/percona/Dockerfile` does not define:
 
-- `:232-234` — the hypergraph bit is included in the default `optimizer_switch`
+- the default *optimizer_switch* string includes the hypergraph bit
   only `#if defined(ENABLE_HYPERGRAPH_OPTIMIZER)`, so it is **off by default**.
-- `:3435-3438` — `update_optimizer_switch()` masks the bit out of the global
+- *update_optimizer_switch* masks the bit out of the global
   value `#ifndef WITH_HYPERGRAPH_OPTIMIZER`, so it cannot survive startup.
-- `:3441-3452` — `check_optimizer_switch()` rejects an attempt to turn it on
-  with `ER_HYPERGRAPH_NOT_SUPPORTED_YET`, naming "this build configuration; to
+- *check_optimizer_switch* rejects an attempt to turn it on
+  with *ER_HYPERGRAPH_NOT_SUPPORTED_YET*, naming "this build configuration; to
   enable it, build with CMake option `WITH_HYPERGRAPH_OPTIMIZER=ON`".
 
 So a session cannot reach the hypergraph planner on this image even
@@ -550,50 +613,50 @@ and silent.
 
 | Operation | Percona Server | Evidence |
 |---|---|---|
-| `OPTIMIZE TABLE` | accepted, and **does compact** — it rebuilds the table in place and recreates the vector index from the copied rows | `handler0alter.cc:1393-1404`; `…/t/insert.test:57-60` |
-| Index replace in one `ALTER` | also compacts, **without rewriting the base table** | `…/t/index_build.test:52-59` |
-| `ALGORITHM=INSTANT`, `LOCK=NONE` | refused while a vector index exists | `Docs/percona-hnsw.md:181`, `:183`, `:1232-1233` |
-| Lock level of **any** ALTER leaving a vector index | **`LOCK=SHARED`** — never ONLINE, so **readers are not blocked, writers are** | `handler0alter.cc:1496-1500`, `:1509-1513`, `:1523-1524` |
-| `DELETE` | drops the row from results immediately; leaves a graph tombstone | `…/t/search.test:119-121`; `…/t/index_build.test:52-54` |
+| `OPTIMIZE TABLE` | accepted, and **does compact** — it rebuilds the table in place and recreates the vector index from the copied rows | *handler0alter.cc*'s in-place-rebuild comment, quoted below; *insert.test* |
+| Index replace in one `ALTER` | also compacts, **without rewriting the base table** | *index_build.test*'s index-replace block, quoted below |
+| `ALGORITHM=INSTANT`, `LOCK=NONE` | refused while a vector index exists | *percona-hnsw.md*, in its ALTER-support and lock sections |
+| Lock level of **any** ALTER leaving a vector index | **`LOCK=SHARED`** — never ONLINE, so **readers are not blocked, writers are** | *handler0alter.cc*'s *innobase_vector_exist* gate and the *HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE* return, both quoted below |
+| `DELETE` | drops the row from results immediately; leaves a graph tombstone | *search.test*; *index_build.test* |
 | Vacuum-like background process | **none** | no such test or variable on the tree |
 
 **`OPTIMIZE TABLE` does compact, and an earlier revision of this document said
-it did not.** The source is explicit — `handler0alter.cc:1393-1404`:
+it did not.** The source is explicit — *handler0alter.cc* carries this comment
+above the branch that clears *online* for an in-place rebuild:
 
 ```
-1393  /* A table with a vector index can be rebuilt in place. The rebuild
-1394  recreates every index on the new table, the vector index among them, so
-1395  the graph and a new aux are built from the copied rows, with their labels
-1396  intact and base_pk following the new primary key.
-1397
-1398  Such a rebuild is not ONLINE - the branch below clears `online` for it,
-1399  because the row log cannot maintain a graph while DML runs against it.
-1400  LOCK=SHARED it is.
-1401
-1402  percona_vector.alter_rebuild covers the shapes: FORCE, OPTIMIZE,
-1403  ENGINE=InnoDB, ROW_FORMAT, a primary key swap, ADD and DROP COLUMN, and
-1404  the AUTO_INCREMENT ones that need the label counter to survive. */
+/* A table with a vector index can be rebuilt in place. The rebuild
+recreates every index on the new table, the vector index among them, so
+the graph and a new aux are built from the copied rows, with their labels
+intact and base_pk following the new primary key.
+
+Such a rebuild is not ONLINE - the branch below clears `online` for it,
+because the row log cannot maintain a graph while DML runs against it.
+LOCK=SHARED it is.
+
+percona_vector.alter_rebuild covers the shapes: FORCE, OPTIMIZE,
+ENGINE=InnoDB, ROW_FORMAT, a primary key swap, ADD and DROP COLUMN, and
+the AUTO_INCREMENT ones that need the label counter to survive. */
 ```
 
-`OPTIMIZE` is named at `:1402`, the graph is rebuilt "from the copied rows"
-(`:1395`), and a DELETEd row is not among the copied rows — so the tombstones
-go.
+`OPTIMIZE` is named in that list, the graph is rebuilt "from the copied rows",
+and a DELETEd row is not among the copied rows — so the tombstones go.
 
 The error is worth recording because of how it happened, not just that it did.
-`…/t/index_build.test:52-54` writes `the first working "OPTIMIZE" for a vector
-index` **with scare quotes**, hedging to mean "the first thing that does what
+*index_build.test* writes `the first working "OPTIMIZE" for a vector index`
+**with scare quotes**, hedging to mean "the first thing that does what
 you would want of OPTIMIZE, at index level". The block quote below preserves
 them faithfully; the prose then re-rendered it as `` `OPTIMIZE` `` and read a
 hedge as a claim about the statement. A quoted hedge is not evidence for the
 unhedged version of itself.
 
 ```
-52  --echo # A DELETEd row is not collected by the build, so replacing the index
-53  --echo # compacts tombstones — the first working "OPTIMIZE" for a vector
-54  --echo # index. The labels are kept, so row 2's leaves a gap.
-55  DELETE FROM t1 WHERE id = 2;
-56  ALTER TABLE t1 DROP KEY k2, ADD VECTOR KEY k3 (v) TYPE hnsw (M = 4),
-57    ALGORITHM=INPLACE;
+--echo # A DELETEd row is not collected by the build, so replacing the index
+--echo # compacts tombstones — the first working "OPTIMIZE" for a vector
+--echo # index. The labels are kept, so row 2's leaves a gap.
+DELETE FROM t1 WHERE id = 2;
+ALTER TABLE t1 DROP KEY k2, ADD VECTOR KEY k3 (v) TYPE hnsw (M = 4),
+  ALGORITHM=INPLACE;
 ```
 
 **`maintain()` is still the index replace, for a different reason.** Both
@@ -602,7 +665,7 @@ the whole base table — every row, every secondary index — to reclaim graph
 tombstones, so its cost is dominated by work that has nothing to do with the
 vector index, and the churn phase would be measuring a table rebuild. The
 index replace touches only the aux and reuses each row's existing label, which
-`…/t/index_build.test:37-44` proves by asserting `TABLE_ID` is unchanged across
+*index_build.test* proves by asserting `TABLE_ID` is unchanged across
 it. That is the narrower repair and the one whose cost means something.
 
 Anyone sizing the churn phase should know `OPTIMIZE TABLE` is available, which
@@ -610,32 +673,33 @@ the previous wording would have wrongly ruled out.
 
 **The index replace takes a SHARED lock, so it blocks writers and not readers.**
 This was an open question in a previous revision's §7, on the reasoning that
-`handler0alter.cc:1398-1400`'s "LOCK=SHARED it is" was scoped to a table
-*rebuild* and the index replace is not one (`TABLE_ID` is unchanged,
-`…/t/index_build.test:37-44`). That scoping was right but the question was
-answerable anyway, about a hundred lines further on, from a rule that is not
-about rebuilds at all:
+the "LOCK=SHARED it is" in the rebuild comment above was scoped to a table
+*rebuild* and the index replace is not one (`TABLE_ID` is unchanged, per
+*index_build.test*). That scoping was right but the question was answerable
+anyway, further down the same *handler0alter.cc*, from a rule that is not about
+rebuilds at all — the *innobase_vector_exist* gate in
+*ha_innobase::check_if_supported_inplace_alter* and the return beneath it:
 
 ```
-1496  /* No ALTER that leaves a vector index on the table runs with LOCK=NONE,
-1497  whatever it changes. A rebuild applies concurrent DML through the row
-1498  log, and row_log_apply maintains neither the HNSW graph nor the aux
-1499  table, so a row written during the rebuild would reach the new table and
-1500  not the index. Same reason ADD VECTOR INDEX is offline above.
+/* No ALTER that leaves a vector index on the table runs with LOCK=NONE,
+whatever it changes. A rebuild applies concurrent DML through the row
+log, and row_log_apply maintains neither the HNSW graph nor the aux
+table, so a row written during the rebuild would reach the new table and
+not the index. Same reason ADD VECTOR INDEX is offline above.
 ...
-1509  if (online && innobase_vector_exist(altered_table)) {
-1510    ha_alter_info->unsupported_reason = innobase_get_err_msg(
-1511        ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_VECTOR_NOLOCK);
-1512    online = false;
-1513  }
+if (online && innobase_vector_exist(altered_table)) {
+  ha_alter_info->unsupported_reason = innobase_get_err_msg(
+      ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_VECTOR_NOLOCK);
+  online = false;
+}
 ...
-1523  return online ? HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE
-1524                : HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE;
+return online ? HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE
+              : HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE;
 ```
 
 `DROP KEY vi, ADD VECTOR KEY vi` leaves a vector index, so
-`innobase_vector_exist(altered_table)` holds, `online` is forced false, and the
-handler returns `HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE`. A shared metadata
+*innobase_vector_exist* holds, *online* is forced false, and the
+handler returns *HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE*. A shared metadata
 lock **permits concurrent reads and blocks writes** for the duration.
 
 Two consequences, and they pull in opposite directions:
@@ -646,23 +710,26 @@ Two consequences, and they pull in opposite directions:
   nothing to test. It does not, so a reader can be mid-scan while the graph is
   replaced under it, which is exactly the state that assertion marked.
 - **The churn phase's writers stop for the whole rebuild.** On a 1M-row corpus
-  that is on the order of a bulk build (§2.5), and `churn.py:525-526` times the
-  call, so the cost is recorded — but any concurrent write workload is paused,
+  that is on the order of a bulk build (§2.5), and `harness/workloads/churn.py`'s
+  `run` times the `driver.maintain()` call, so the cost is recorded — but any
+  concurrent write workload is paused,
   not slowed, and that belongs in `docs/07-planning-a-run.md` before anyone
   schedules it.
 
-`:1502-1504` notes one exception that does not apply here: dropping the **last**
-vector index may run online, because the new table has no graph to maintain.
-The replace keeps one.
+A comment a few lines below that gate notes one exception that does not apply
+here: dropping the **last** vector index may run online, because the new table
+has no graph to maintain. The replace keeps one.
 
-So, hook by hook (`harness/drivers/base.py:420-466`):
+So, hook by hook, over the churn hooks `EngineDriver` declares in
+`harness/drivers/base.py` — `prepare_churn`, `wait_index_synced`, `maintain`
+and `repair_path`:
 
 | Hook | Percona | Why |
 |---|---|---|
 | `prepare_churn()` | **no-op — inherit** | There is no autovacuum-equivalent to pin down. This hook exists for pgvector, whose autovacuum decides on its own schedule whether tombstones are still there when recall is re-measured; Percona has no background graph maintenance at all, so there is no knob whose state could differ between the baseline and the post-churn measurement. |
 | `wait_index_synced()` | **no-op — inherit `0.0`** | The graph is maintained on the write path, inside the `INSERT`. There is nothing to wait for and the honest value is zero, which is what the inherited method returns. Returning a small positive number "to be safe" would be a fabricated measurement in a field documented as a measurement. |
 | `maintain()` | **implement** — `ALTER TABLE t1 DROP KEY vi, ADD VECTOR KEY vi (v) TYPE hnsw (…), ALGORITHM=INPLACE`, returning `"ALTER TABLE (index replace)"` — **but it returns `None` at the pinned version; see the correction below** | This is the one hook Percona changes relative to MariaDB and AliSQL, both of which inherit `None`. Percona has a repair path, it is the only MySQL-family engine here that does, and `maintain()`'s contract is to run it and name it. |
-| `repair_path` | **`"index-replace"` on the class; `"none"` on the instance at the pinned version** | `base.py:239-258` is explicit that this is declared and not inferred, because the churn workload stamps it onto the record *before* maintenance runs. The class attribute still declares `"index-replace"` because that **is** this engine's repair mechanism; `PerconaDriver.declare_bulk_vector_index_build` shadows it with `"none"` per instance when the host says the bulk build is broken, which is what the records then carry. Note that `base.py:255-256` currently says "MariaDB, AliSQL, Valkey and Percona Search inherit `"none"`" — "Percona Search" there is the MongoDB engine, not this one, and the sentence stays true. |
+| `repair_path` | **`"index-replace"` on the class; `"none"` on the instance at the pinned version** | The comment over `EngineDriver.repair_path` is explicit that this is declared and not inferred, because the churn workload stamps it onto the record *before* maintenance runs. The class attribute still declares `"index-replace"` because that **is** this engine's repair mechanism; `PerconaDriver.declare_bulk_vector_index_build` shadows it with `"none"` per instance when the host says the bulk build is broken, which is what the records then carry. Note that the same comment says "MariaDB, AliSQL, Valkey and Percona Search inherit `"none"`" — "Percona Search" there is the MongoDB engine, not this one, and the sentence stays true. |
 
 > **CORRECTION, and it reverses the argument in the `maintain()` row above.**
 > That row said returning `None` "would lose the measurement this engine is
@@ -692,8 +759,9 @@ not a tidy-up:
   recall. Read the options back out of `SHOW CREATE TABLE` (§2.3) and re-send
   them rather than re-deriving them from the profile.
 - It rebuilds the whole graph, so on a 1M-row corpus it costs on the order of a
-  whole bulk build. `churn.py:525-526` times the call, so the cost is recorded
-  rather than hidden, but a churn phase that previously ran in minutes for the
+  whole bulk build. `harness/workloads/churn.py`'s `run` times the call, so the
+  cost is recorded rather than hidden, but a churn phase that previously ran in
+  minutes for the
   MySQL family will not for Percona. That belongs in `docs/07-planning-a-run.md`
   before anyone schedules it.
 
@@ -713,35 +781,37 @@ The two things are not the same kind of limit.
 
 - MariaDB's and AliSQL's are **caches**. A graph larger than the cache still
   works; it is read from the companion table and performance degrades.
-- Percona's is a **hard allocation ceiling**. `Docs/percona-hnsw.md:1537-1540`:
-  "`innodb_hnsw_max_memory` bounds, in bytes, the memory held by HNSW graphs
-  **across all tables and all indexes**." Exceeding it does not evict anything —
-  it **fails the statement**. `:1555` and `hnsw_memory_used.result:69-75`:
+- Percona's is a **hard allocation ceiling**. *percona-hnsw.md*, in its
+  memory-limit section: "`innodb_hnsw_max_memory` bounds, in bytes, the memory
+  held by HNSW graphs **across all tables and all indexes**." Exceeding it does
+  not evict anything — it **fails the statement**. The same section says so, and
+  the *percona_vector* suite's *hnsw_memory_used.result* records it, in the
+  block it heads "The limit is compared with this number":
 
 ```
-69  # The limit is compared with this number: at it, an insert is refused,
-70  # one byte above it, the insert goes through.
-71  SET GLOBAL innodb_hnsw_max_memory = @t1_loaded;
-72  INSERT INTO t1 VALUES (4, STRING_TO_VECTOR('[0,0,0,1]'));
-73  ERROR HY000: Memory capacity of N bytes for 'innodb_hnsw_max_memory' exceeded.
-    The vector index graph was left unchanged. Raise innodb_hnsw_max_memory and retry.
+# The limit is compared with this number: at it, an insert is refused,
+# one byte above it, the insert goes through.
+SET GLOBAL innodb_hnsw_max_memory = @t1_loaded;
+INSERT INTO t1 VALUES (4, STRING_TO_VECTOR('[0,0,0,1]'));
+ERROR HY000: Memory capacity of N bytes for 'innodb_hnsw_max_memory' exceeded.
+The vector index graph was left unchanged. Raise innodb_hnsw_max_memory and retry.
 ```
 
 There is **no per-node eviction**. The only way the counter goes down is a whole
-graph being freed: `:1562-1564` says "down by exactly a graph's bytes when that
-graph is freed (DROP, a rebuild, eviction of its table)", and the only eviction
-discussed anywhere on the tree is dictionary-cache eviction of a whole
-`dict_table_t` (§22, `:1453-1461`). So **the entire graph must fit** in
-`innodb_hnsw_max_memory`.
+graph being freed: *percona-hnsw.md* says the counter goes "down by exactly a
+graph's bytes when that graph is freed (DROP, a rebuild, eviction of its
+table)", and the only eviction discussed anywhere on the tree is
+dictionary-cache eviction of a whole *dict_table_t*, in its §22. So **the
+entire graph must fit** in `innodb_hnsw_max_memory`.
 
 **And "the load stops partway through" is not the only failure — it is not even
-the worst one.** `Docs/percona-hnsw.md:1555-1556`: "The limit is checked before
+the worst one.** *percona-hnsw.md*, in the same section: "The limit is checked before
 an insert or a load starts **and again as a cold search faults nodes in**." A
 *query* can therefore fail with `ER_CAPACITY_EXCEEDED`, not only an INSERT.
 
 Combine that with the lazy load §2.6 establishes — `Innodb_hnsw_memory_used`
 reads `0` after a restart and the graph is faulted in node by node
-(`hnsw_memory_used.result:11-15`, `Docs/percona-hnsw.md` §11) — and the
+(*hnsw_memory_used.result*, and *percona-hnsw.md* §11) — and the
 exposure is not a one-off at ingest. It **recurs at the start of every
 post-restart query phase**, because each one re-faults the graph from nothing
 and re-crosses the limit on the way up. A run that survived ingest can still
@@ -764,11 +834,11 @@ against a server. The chain is:
 
 | Input | Status |
 |---|---|
-| per-row floor formula `dims × 4 + 2 × M × 8` | **measured on Percona**, in the sense that it is the floor an MTR test asserts the server stays above — `hnsw_memory_used.result:63`, `SET @floor = 1000 * (64 * 4 + 2 * 16 * 8);` with `:64-67` asserting `actual >= floor` and `actual <= 2 × floor + 2 × 65536` |
-| row counts | **supplied** — from this repo (`harness/datasets.py:492` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md:505` calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
+| per-row floor formula `dims × 4 + 2 × M × 8` | **measured on Percona**, in the sense that it is the floor an MTR test asserts the server stays above — *hnsw_memory_used.result* sets `SET @floor = 1000 * (64 * 4 + 2 * 16 * 8);` and then asserts `actual >= floor` and `actual <= 2 × floor + 2 × 65536` |
+| row counts | **supplied** — from this repo (`harness/datasets.py`'s `tag_threshold_for` quotes "glove's 1,183,514 training rows"; `docs/07-planning-a-run.md` §8 calls fashion-mnist "a 60,000-row smoke run"; `config/profiles/smoke.yml` sets `subset_rows: 20000`) |
 | dimensionality | **supplied** — from the dataset names |
 | `M` | **supplied** — from the profiles |
-| 1 GiB default | **measured** — `innodb_hnsw_max_memory_basic.result:3-5` |
+| 1 GiB default | **measured** — *innodb_hnsw_max_memory_basic.result*'s default block |
 
 Because row counts, dims and `M` are all supplied, **none of the numbers below
 is a measurement.** They are what the server's own asserted floor implies for
@@ -830,13 +900,13 @@ paper over it.
    raise `ER_CAPACITY_EXCEEDED` as it faults the graph back in.
 
 **`Innodb_hnsw_memory_used` understates the graph, and policy (1) leans on it.**
-`Docs/percona-hnsw.md:1567-1568`: "It does not count the node map
-(`HNSW::m_nodes`), which uses the normal heap, roughly 30 to 50 bytes per node,
+*percona-hnsw.md*, on what the gauge omits: "It does not count the node map
+(*HNSW::m_nodes*), which uses the normal heap, roughly 30 to 50 bytes per node,
 or search scratch space."
 
 So the gauge is a floor on true graph memory, not a measurement of it. At
 glove-100's 1,183,514 rows that is **35.5 to 59.2 MB unreported** — inputs: the
-row count is **supplied** (`harness/datasets.py:492`) and the 30-to-50-bytes
+row count is **supplied** (`harness/datasets.py`'s `tag_threshold_for`) and the 30-to-50-bytes
 range is **Percona's own stated estimate**, so the figure is a projection from a
 range, not a measurement, and it is one node map per vector index. Small against
 a 16 GB container and not small against a 1 GiB ceiling: under policy (2) it is
@@ -866,7 +936,7 @@ artefacts this task wrote.
 
 ### 4.1 `harness/drivers/mysql_family.py` — the `Dialect`
 
-`MySQLDialect` (`:57-68`) is a flat dataclass of values, and three of Percona's
+`MySQLDialect` is a flat dataclass of values, and three of Percona's
 differences are not values today because `MySQLFamilyDriver` spells the
 statements out. Add these fields, each with its default set to what MariaDB and
 AliSQL already do so neither engine changes:
@@ -881,19 +951,21 @@ AliSQL already do so neither engine changes:
 
 Then:
 
-- `create_schema` (`:133-156`) interpolates `pk_type` and `index_clause` instead
-  of hard-coding `id INT PRIMARY KEY` and the MariaDB index clause.
-- `_select` (`:287-323`) interpolates `distance_expr` instead of hard-coding
+- `MySQLFamilyDriver._create_table_ddl` interpolates `pk_type` and
+  `index_clause` instead of hard-coding `id INT PRIMARY KEY` and the MariaDB
+  index clause, and `_index_clause` builds the clause itself.
+- `_select` interpolates `distance_expr` instead of hard-coding
   `vec_distance_{...}(v, %s)`. Note the **parameter order changes**: MariaDB's
   filtered form binds `(threshold, vector)` because the predicate precedes the
   `ORDER BY`; Percona's is the same order, because the metric is a literal and
   not a parameter. Keep it that way — making the metric a bound parameter would
   add a third placeholder and reorder every call site.
-- `explain_uses_vector_index` (`:337-373`) must test `plan_marker` when set.
-  **This is not cosmetic, and it is not a hypothetical.** `:362` is
-  `used = self.dialect.index_name in plan`, a substring test against the joined
-  EXPLAIN text. Percona's own recorded output contains a plan that defeats it —
-  `…/r/optimizer.result:491-492`:
+- `explain_uses_vector_index` must test `plan_marker` when set.
+  **This is not cosmetic, and it is not a hypothetical.** That method's verdict
+  starts as `used = self.dialect.index_name in plan`, a substring test against
+  the joined EXPLAIN text. Percona's own recorded output contains a plan that
+  defeats it — the *percona_vector* suite's *optimizer.result*, in its
+  filesort case:
 
   ```
   id select_type table partitions type possible_keys key  key_len ref  rows filtered Extra
@@ -905,21 +977,22 @@ Then:
   index name `v1` is right there in `possible_keys`, so
   `index_name in plan` returns True. That is the brute-force scan this repo
   guards against, published as an ANN search, demonstrated rather than argued.
-  `:610` is the second shape (`type=eq_ref, possible_keys=u,v, key=u` — the
-  vector index offered, a different one taken), and the optimizer trace at
-  `:471` gives the mechanism:
+  The same file's `eq_ref` case is the second shape
+  (`type=eq_ref, possible_keys=u,v, key=u` — the vector index offered, a
+  different one taken), and the optimizer trace it records gives the mechanism:
   `{"cause": "vector", "index": "v", "usable": false}` in
-  `potential_range_indexes`. A filtered query — `WHERE tag < ? ORDER BY
-  DISTANCE(…) LIMIT k`, which is what the ops harness runs — is exactly `:610`'s
-  shape.
+  *potential_range_indexes*. A filtered query — `WHERE tag < ? ORDER BY
+  DISTANCE(…) LIMIT k`, which is what the ops harness runs — is exactly that
+  `eq_ref` shape.
 
   `vector_ann` is the access type and appears only when the vector path was
-  taken (`:95-96`). This is the same vacuity shape this repo
+  taken, which *optimizer.result*'s own first case shows. This is the same vacuity shape this repo
   has already been bitten by ten times — a substring satisfied by a longer
   string — and it is worth noticing that `CLAUDE.md`'s own history records
   `index_plan_marker: "v"` having been wrong in `mariadb.yml` for exactly this
   reason.
-- **Issue `EXPLAIN FORMAT=TRADITIONAL`, not bare `EXPLAIN`** (`:356`). One free
+- **Issue `EXPLAIN FORMAT=TRADITIONAL`, not bare `EXPLAIN`** — the `EXPLAIN`
+  that `explain_uses_vector_index` executes. One free
   hardening while that method is open. `vector_ann` is a value in the `type`
   column, which only the tabular format has. `explain_format` defaults to
   TRADITIONAL so a bare `EXPLAIN` works today — but the variable is settable and
@@ -927,8 +1000,9 @@ Then:
   vanishes and the check records a **false negative about a server that did use
   the index**. That lands in the report's Validity section and sends someone
   hunting an engine bug that is not there. No MTR test could catch this, because
-  MTR output is always TRADITIONAL; the suite spells the keyword out anyway at
-  `…/r/optimizer.result:488`. `percona/module.py` already does this.
+  MTR output is always TRADITIONAL; the suite spells the keyword out anyway in
+  *optimizer.result*. `overlay/ann-benchmarks/ann_benchmarks/algorithms/percona/module.py`
+  already does this.
 
   **The risk this creates for the OTHER two engines is settled, and it was a
   real one rather than a theoretical one.** `explain_uses_vector_index` is
@@ -938,9 +1012,9 @@ Then:
   one** — every configuration reported as not using its index, the whole
   Validity section full, and the one engine the change was for the only one
   working. Established by reading the three parsers rather than by assuming
-  MySQL-family compatibility: MariaDB 11.8.8 `sql/sql_yacc.yy:14865-14874`,
-  MariaDB 12.3.2 `:15297-15308` and AliSQL 8.0.44 `:14163-14171` all accept
-  `FORMAT = TRADITIONAL` in the `describe` rule. Recorded here because "it is
+  MySQL-family compatibility: MariaDB 11.8.8's *sql_yacc.yy*, MariaDB 12.3.2's
+  and AliSQL 8.0.44's all accept `FORMAT = TRADITIONAL` in their *describe*
+  rule. Recorded here because "it is
   the default, so the keyword must be accepted" is the kind of inference this
   document is not allowed to make.
 
@@ -949,7 +1023,7 @@ Then:
   name-only, and an index name appears in `TREE` and `JSON` output too, so the
   keyword would buy it nothing. Only a check that reads the `type` column
   needs the format pinned.
-- `capabilities()` (`:438-439`) currently returns a constant
+- `MySQLFamilyDriver.capabilities` currently returns a constant
   `{"incremental_index": True, "ef_construction_tunable": False}`. For Percona
   both values change, and `incremental_index` must depend on
   `IndexSpec.build_mode` — see §2.5 for why, and for what `build.py` does if it
@@ -957,20 +1031,21 @@ Then:
 - `effective_ef(ef, k)` should become `max(ef, k)` for Percona — see §1.
 - `maintain()` and `repair_path` — see §2.7.
 - A `PerconaDriver(MySQLFamilyDriver)` class and a `PERCONA_DIALECT` beside
-  `MARIADB_DIALECT` and `ALISQL_DIALECT` (`:446-484`).
+  `MARIADB_DIALECT` and `ALISQL_DIALECT`.
 
 ### 4.2 `harness/drivers/postgres.py` — `_driver_classes()`
 
-`_driver_classes()` at **`postgres.py:689`** is the driver-class-name registry.
-Add one entry, `"PerconaDriver": PerconaDriver`, to the dict at `:701-713` and
-import it from `.mysql_family` at `:698`. Its docstring is explicit that this is
+`_driver_classes` in `harness/drivers/postgres.py` is the driver-class-name
+registry. Add one entry, `"PerconaDriver": PerconaDriver`, to the dict it
+returns, and import it from `.mysql_family` at the top of the same function.
+Its docstring is explicit that this is
 "one entry per architecture, not per engine" — Percona is a new architecture
 only because of the dialect gaps in §4.1; once those are `Dialect` fields it is
 arguably a variant, but it needs its own class for `capabilities()`,
 `maintain()`, `repair_path` and `effective_ef`.
 
-`_driver_table()` at `:710-730` maps engine name to class for "callers that
-still think in engines". Add `"percona"` there too, for symmetry — the
+`_driver_table`, beside it in the same module, maps engine name to class for
+"callers that still think in engines". Add `"percona"` there too, for symmetry — the
 orchestrator passes `--driver` by name so it is not load-bearing.
 
 ### 4.3 `config/engines/percona.yml`
@@ -992,11 +1067,12 @@ display_name: Percona Server
 family: mysql
 source:
   # The key is `tag` even though the value is a SHA, and that is not a
-  # cosmetic choice. `orchestrator/engines.py:84-86` is
+  # cosmetic choice. `_source_tag` in `orchestrator/engines.py` is
   # `return str(source.get("tag") or source.get("version") or "")` — there is
-  # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
+  # no `sha` key, so a `source: sha:` block would make `_source_tag` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `ops_pass.py:256` reads the same key
+  # hard-coded default for that engine. `OpsRun.run_harness` in
+  # `orchestrator/ops_pass.py` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
   tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
@@ -1036,6 +1112,15 @@ runtime:
   label: "Percona Server (InnoDB HNSW)"
 ```
 
+**Why the key is `tag` and not `sha`, in prose rather than only in that
+comment.** `_source_tag` in `orchestrator/engines.py` is
+`return str(source.get("tag") or source.get("version") or "")`. There is no
+`sha` key, so a `source: sha:` block would make it return the empty string and
+`scripts/prepare-sources.sh` fall back to its hard-coded default for that
+engine. `OpsRun.run_harness` in `orchestrator/ops_pass.py` reads the same key
+into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive` takes a
+SHA wherever it takes a tag, so the mechanism is unchanged.
+
 Two collisions the validator refuses, both named in `CLAUDE.md`: a duplicate
 `ann_constructor` and a duplicate image tag. `PerconaServer` collides with
 nothing — the six existing constructors are `MariaDB`, `AliSQL`, `PGVector`,
@@ -1054,18 +1139,21 @@ is relaxed. That is another task's; this one does not write the file.
 
 ### 4.4 `tests/test_engine_registry.py` — `GOLDEN` and `GOLDEN_ORDER`
 
-`GOLDEN` (`:24-46`) is a name → 12-tuple of `(driver, ann_constructor, port,
+`GOLDEN` is a name → 12-tuple of `(driver, ann_constructor, port,
 data_mount, server_data_mount, (user, password), group, colour, marker,
-linestyle, chart label, report label)`, read by four parametrized tests
-(`:63`, `:75`, `:85`) plus `test_every_engine_is_found` (`:58`). Add a
+linestyle, chart label, report label)`, read by the parametrized
+`test_runtime_matches_the_old_constants`,
+`test_presentation_matches_the_old_constants` and
+`test_every_engine_has_a_readiness_probe`, plus
+`test_every_engine_is_found`. Add a
 `"percona"` row matching the `runtime:` block above exactly.
 
-`GOLDEN_ORDER` (`:48`) is `("mariadb", "alisql", "pgvector", "mariadb123",
+`GOLDEN_ORDER` is `("mariadb", "alisql", "pgvector", "mariadb123",
 "mongodb", "valkey")` — "the original three, then the engines added later".
 Percona is appended: `(..., "valkey", "percona")`, with `order: 70` in the
 config to put it there.
 
-`test_groups` (`:96-100`) asserts the group membership tuples literally:
+`test_groups` asserts the group membership tuples literally:
 `engines_in_group("extra") == ("mariadb123", "mongodb", "valkey")`. With
 `group: extra` that assertion must gain `"percona"`. It is a value assertion and
 not a membership one, so it will fail rather than silently pass — which is the
@@ -1142,51 +1230,55 @@ build mode is a real axis — see §4.10.
 | `docker/percona/Dockerfile` | **done**, never built |
 | `docker/percona/entrypoint-percona.sh` | **done**, never run |
 | `docker/percona/init.sql` | **done**, never run |
-| `overlay/.../algorithms/percona/module.py` | **done**, never run |
-| `overlay/.../algorithms/percona/config.yml` | **done**, never rendered |
+| `algorithms/percona/module.py` | **done**, never run |
+| `algorithms/percona/config.yml` | **done**, never rendered |
 | `scripts/build-images.sh`, `scripts/prepare-sources.sh`, `scripts/lib.sh` | **not done** — see below |
 
 `scripts/lib.sh` needs one line too, and it is a safety line rather than a
-functional one. `:24-26` export `VB_REPO_MARIADB`, `VB_REPO_ALISQL` and
-`VB_REPO_ANNB`, and `assert_not_vendor_repo()` at `:65-76` loops over exactly
-those three to refuse writing inside a read-only vendor checkout (`:73`,
-`die "refusing to write inside read-only vendor repo: $canon"`). A Percona
+functional one. It exports `VB_REPO_MARIADB`, `VB_REPO_ALISQL` and
+`VB_REPO_ANNB`, and `assert_not_vendor_repo` loops over exactly
+those three to refuse writing inside a read-only vendor checkout, with
+`die "refusing to write inside read-only vendor repo: $canon"`. A Percona
 vendor checkout gets **no protection at all** until `VB_REPO_PERCONA` is
 exported beside them and added to the loop. `CLAUDE.md` names the vendor
 repositories as read-only inputs that must never be checked out, fetched into or
 modified; right now that rule is enforced for three of them and would not be for
 the fourth.
 
-Both build scripts need a `percona` case, and `build-images.sh` will say so loudly:
-its `case` ends at `:141` with `*) die "engine '$engine' has no known
-build-arg (alias_of=$base)"`, so a missing entry is an immediate, clear failure
-rather than a silent one. The entry follows the convention at `:129-131` —
+Both build scripts need a `percona` case, and `build-images.sh` will say so
+loudly: the `case` in its `build_engine` ends with
+`*) die "engine '$engine' has no known build-arg (alias_of=$base)"`, so a
+missing entry is an immediate, clear failure rather than a silent one. The
+entry follows the convention of the `mariadb` and `alisql` cases beside it —
 `percona) bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;` — and
-`docker/percona/Dockerfile:725` declares `ARG PERCONA_TAG` to receive it.
-`prepare-sources.sh` must ship a `git archive` of the pinned SHA (`:98` is the
-pattern) and must *not* try to carry submodules.
+`docker/percona/Dockerfile` declares `PERCONA_TAG` as a build `ARG` to
+receive it.
+`prepare-sources.sh` must ship a `git archive` of the pinned SHA, which is what
+its `prepare_percona` does, on the pattern `prepare_alisql` sets, and must
+*not* try to carry submodules.
 
 ### 4.8 The `march` field goes blank in **two** places, not one
 
 There are two independent `-march` readers, in two different containers, and
 only one of them is reachable from the overlay module.
 
-**The ann path.** `VBMySQLBase._image_march()` (`overlay/.../vb_mysql.py:538-564`)
+**The ann path.** `VBMySQLBase._image_march` in
+`overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py`
 read a fixed pair of paths, `/opt/mariadb/.march` and `/opt/alisql/.march`, and
 returned `"unknown"` otherwise. `percona/module.py` overrode it to try
 `/opt/percona/.march` first and then fall back, so **the ann path was already
 correct** in the file the design task wrote.
 
-**The ops path, which the override cannot reach.** `harness/main.py:248-266` has
-its own:
+**The ops path, which the override cannot reach.** `_detect_march` in
+`harness/main.py` has its own, and these three lines are the whole of it:
 
 ```python
-267      for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
-268                   "/opt/pgvector-artifacts/.march",
-269                   "/opt/percona/.march"):
+    for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
+                 "/opt/pgvector-artifacts/.march",
+                 "/opt/percona/.march"):
 ```
 
-consumed at `:342` as `march=args.march or _detect_march()`. That runs in the
+consumed in the same module's `main` as `march=args.march or _detect_march()`. That runs in the
 **harness container**, which mounts `harness/` and not `overlay/`, so no
 override in an ann-benchmarks module can affect it. `orchestrator/ops_pass.py`
 contains the string `march` zero times, so nothing passes `--march` in and the
@@ -1216,11 +1308,11 @@ This is not Percona's and not this task's, but it was found while matching the
 family's entrypoint and it should not be lost.
 
 `docker/percona/entrypoint-percona.sh` copies a two-line pattern from its
-siblings. The **call site** is byte-identical in all three —
-`docker/alisql/entrypoint-alisql.sh:94`,
-`docker/mariadb/entrypoint-mariadb.sh:95`, `entrypoint-percona.sh` — and
-`user_args()` behaves identically in all three though it is not byte-identical:
-alisql `:40` and percona `:99` are one-liners, mariadb `:40-44` spreads the same
+siblings. The **call site** is byte-identical in all three — it is in
+`start_server` in each of `docker/alisql/entrypoint-alisql.sh`,
+`docker/mariadb/entrypoint-mariadb.sh` and `entrypoint-percona.sh` — and
+`user_args` behaves identically in all three though it is not byte-identical:
+alisql's and percona's are one-liners, mariadb's spreads the same
 test over four lines with a comment. The behaviour that matters is the last
 command in the body, which is the same everywhere:
 
@@ -1230,7 +1322,8 @@ user_args() { [[ "$(id -u)" -eq 0 ]] && printf '%s' "--user=root"; }
   local u; u="$(user_args)"; [[ -n "$u" ]] && args+=( "$u" )
 ```
 
-Under `set -euo pipefail` (percona `:77`, alisql `:18`, mariadb `:16`), when
+Under the `set -euo pipefail` each of the three sets at the top of its own
+file, when
 the container does **not** run as root, `user_args` returns 1 — the status of
 its failed `[[ ]]` — and because the assignment is written as the separate
 command `u="$(user_args)"` rather than `local u="$(user_args)"`, that non-zero
@@ -1257,37 +1350,45 @@ together.
 
 ### 4.10 `orchestrator/ann_pass.py` — Percona hits its `raise`
 
-This file is the one that *renders* the overlay `config.yml` this task wrote,
+This file is the one that *renders* `algorithms/percona/config.yml`, which
+this task wrote,
 and the previous revision of this document never mentioned it.
 
-`render_config()` (from `:125`) dispatches on engine name and ends:
+`render_config` dispatches on engine name and ends:
 
 ```python
-301        raise ValueError(f"unknown engine: {engine}")
+        raise ValueError(f"unknown engine: {engine}")
 ```
 
-The branches are `:150` (`if engine in MARIADB_ENGINES + ("alisql",)`), `:167`
-(pgvector), `:186` (valkey) and `:278` (mongodb). **Percona matched none of
-them and landed on the `raise`.** Either add it to the MySQL-family condition at
-`:150` or give it a branch of its own, and a branch of its own is what the two
-things §4.6 proposes actually need:
+Its branches, in the order the function tests them, are
+`if engine in MARIADB_ENGINES + ("alisql",)`, then
+`elif engine == "pgvector":`, `elif engine == "valkey":`,
+`elif engine == "percona":` and `elif engine == "mongodb":`. **Percona matched
+none of them and landed on the `raise`.** Either add it to the MySQL-family
+condition or give it a branch of its own, and a branch of its own is what the
+two things §4.6 proposes actually need.
 
-The branch this section asked for is now `:206` (percona), and it was inserted
-at the position mongodb's branch used to occupy — which is why this list said
-`(mongodb)` against that line for two revisions, pointing at Percona's own
-branch while the sentence above it said Percona had none. Every `` `:N` ``
-below is a line of `orchestrator/ann_pass.py`; the labelled ones are checked
-against the branch they claim by
-`tests/test_e10_failures_explain_themselves.py`, which is what caught that.
+The branch this section asked for is the `elif engine == "percona":` one, and
+it was inserted at the position mongodb's branch used to occupy — which is why
+this list labelled that position `(mongodb)` for two revisions, pointing at
+Percona's own branch while the sentence above it said Percona had none. **That
+is the error this section's own citation form made possible**: the branch was
+named by a line number, the line number was right, and the label on it was
+wrong. Naming the branch condition instead makes the label and the thing it
+labels the same string. The branch conditions below are checked against
+`render_config`'s body by `tests/test_e10_failures_explain_themselves.py`,
+which is what caught it.
 
 - **`efConstruction`.** No existing MySQL-family branch emits it. The two that
-  did were `:180` (pgvector) and `:199` (valkey), and both sat inside a
-  build-mode loop. The MySQL-family branch at `:150` has no equivalent, so a
-  Percona `arg_groups` carrying `efConstruction` had nowhere to come from.
-  There are three such lines now; the third, `:271` (percona), is the one
-  this section asked for.
-- **`build_modes`.** `:176` reads `ann.get("pgvector_build_modes", ["post"])`
-  and `:195` reads `ann.get("valkey_build_modes", ["post"])`. A
+  did were pgvector's and valkey's, and both sat inside a build-mode loop —
+  `for build_mode in ann.get("pgvector_build_modes", ["post"]):` and
+  `for build_mode in ann.get("valkey_build_modes", ["post"]):`. The
+  MySQL-family branch has no equivalent, so a Percona `arg_groups` carrying
+  `efConstruction` had nowhere to come from. `"efConstruction": ef_constructions`
+  occurs three times in the function now; the third, in the percona branch, is
+  the one this section asked for.
+- **`build_modes`.** Those same two loops read `pgvector_build_modes` and
+  `valkey_build_modes` out of the profile's `ann` block. A
   `percona_build_modes` key needs the same treatment, and it is the key that
   makes §2.5's within-engine build comparison runnable.
 
@@ -1379,28 +1480,29 @@ AliSQL's `mysql_native_password` line nor sets a measurement parameter the
 orchestrator owns; that the graph-memory fallback is conditional; that the
 module's plan marker is not satisfiable by the index name alone and pins
 `FORMAT=TRADITIONAL`; that §1's stated default, maximum and scope match the
-declaration §1 itself quotes; that **every line number this document cites into
-this repo still points at what the document says it does**; that the line
-numbers this document quotes for
-`_driver_classes()`, `build.py`'s build-mode branch and `ann_pass`'s `raise`
-still point at those things; and that the §3 arithmetic reproduces from the MTR
-formula. It reads this document as a file where a claim here is the thing under
-test, so a figure edited in one place and not the other fails.
+declaration §1 itself quotes; that **this document makes no line citation at
+all**; that **every symbol it cites into this repository resolves, and every
+claim it makes about a named symbol's contents is checked by opening that
+symbol**; and that the §3 arithmetic reproduces from the MTR formula. It reads
+this document as a file where a claim here is the thing under test, so a figure
+edited in one place and not the other fails.
 
 What those guards deliberately do **not** do is assert anything about Percona's
 behaviour. Nothing in a test file in this repository can establish what a server
 does, and a test that asserted "Percona requires a BIGINT UNSIGNED primary key"
 would be asserting that this document contains a sentence.
 
-### Line numbers: the document reports its own rot
+### Why this document stopped citing line numbers
 
-This document makes about sixty `file:line` citations. Twenty-six point into
-this repo and the rest into the pinned Percona tree. For most of this
-document's life **two** of the twenty-six were checked, and the other
-twenty-four rotted silently.
+This document used to make about two hundred line citations — roughly a hundred
+naming a path and ninety-seven written as a bare `:N` continuation of a path
+named earlier in the sentence. **Thirty-one occurrences, twenty-seven of them
+distinct, pointed into this repository and were checked. Everything else was
+checked by nothing**, because the guard's classifier was a deny-list of vendor
+filenames and the vendor tree is not in this checkout.
 
-That is not a theoretical risk. Merging three PRs under this work invalidated
-several in a day:
+The checked ones still rotted. Merging three pull requests under this work
+invalidated several in a day:
 
 | file | was → is | cause |
 |---|---|---|
@@ -1410,39 +1512,61 @@ several in a day:
 | `harness/workloads/churn.py` | 310-311 → 484-485 | T4b moved `maintain()`'s timing |
 | `docs/07-planning-a-run.md` | 478 → 481 | unrelated edit |
 
-(The superseded numbers above are written as plain digits rather than in
-`file:line` form on purpose. A dead pointer typeset like a live one invites a
-reader to follow it — and the citation guard, correctly, counted them as live
-claims and failed until they were demoted. It caught its own document's prose
-within a minute of being written, which is the behaviour being paid for.)
+(The superseded numbers above are written as plain digits, not in code font, on
+purpose. A dead pointer typeset like a live one invites a reader to follow it —
+and the ratchet, correctly, counts a code-font one as a live claim and fails on
+it. It caught its own document's prose within a minute of being written, which
+is the behaviour being paid for.)
 
-The first was caught by the one guard that existed — which is the whole
+The first was caught by the one guard that existed — which was the whole
 argument for having the rest. **The last two were caught by nothing**, and were
-found only by walking every citation in the document against the files.
+found only by walking every citation in the document against the files. Each
+repair then moved other citations in the same commit, which is how line
+citations in this document and in `docs/10-rollout.md` put `master` red twice
+in two days (#41, #43).
 
-So every repo-side citation is now a row in a table in
-`tests/test_e1_percona_design.py`, keyed by the citation *as this document
-spells it* and carrying the string the document is pointing at. Both directions
-fail loudly: a number edited here without the table, and a number that no
-longer matches the file. The parser that finds them is itself asserted to find
-something, so an empty match cannot pass as full coverage.
+**The unchecked ones were the worse half, and nothing would ever have said so.**
+At a re-pin of the vendor SHA, on the order of 164 vendor line references go
+stale at once, in a document whose §0 provenance table commits it to having been
+read against a specific tree — and not one test in this repository would fail,
+because the deny-list said in its own docstring that it checked none of them.
+A citation that cannot go red is not a citation; it is a decoration that reads
+like one.
 
-Two things it deliberately does not do:
+So the citations are symbols now, and the guard has three layers instead of one:
 
-- **Percona citations are skipped, by name.** They are pinned by SHA and are
-  not in this checkout. Classification is a deny-list of filenames rather than
-  "whatever does not resolve locally", because resolving by existence would
-  silently check the document against a repo file that happened to share a
-  name with a Percona source — worse than not checking. The cost is that a
-  newly cited Percona file must be classified, and the completeness check is
-  what makes that cost visible: it is how `ddl0loader.cc:273`, cited in §0's
-  commit table, was caught unclassified the first time the guard ran.
-- **Bare `:N` continuations are covered but not discovered.** Where the
-  document writes "`postgres.py:689` … the dict at `:701-713`", the second
-  citation has no path inside its backticks, so the parser cannot see it. The
-  four such citations that point into this repo are checked explicitly. A
-  *new* one could be added without a row and nothing would notice. That is the
-  honest limit of the completeness claim.
+- **A ratchet.** The document must contain **zero** line citations of any form.
+  That is one assertion in place of twenty-seven parameterised ones and it is
+  strictly stronger about the thing that was rotting. The pattern is widened
+  past the old one at four points, three of which the old one was blind to: it
+  takes any extension, so it sees MTR result and test paths and the one `.yy`
+  grammar (31 occurrences); any extensionless file rather than `Dockerfile`
+  alone, which was the one special case the old pattern carried; a bare `:N`
+  continuation (97 occurrences, the single largest class); and a span carrying
+  several ranges. It is proved against a frozen fixture carrying one of each
+  form, because a ratchet whose pattern matched nothing would pass while the
+  document was full of citations. That is the same vacuity the old
+  parser's own note recorded being caught by.
+- **A symbol table.** Every claim this document makes about the *contents* of
+  something in this repository is a row keyed by `(path, symbol)` and carrying
+  the string the document is pointing at. The test opens the file, locates that
+  symbol's declaration, and asserts the string is inside it — the same strength
+  as the old line check, keyed by a name instead of a number, so it survives an
+  edit above it. Completeness runs both ways: a repository code file this
+  document cites with no row fails, and a row naming a symbol the document
+  stopped citing fails.
+- **An existence check over everything else.** Every code-font path resolves to
+  a file in this tree, and every code-font symbol appears somewhere in it.
+  `tests/test_e15_methodology_roadmap_doc.py`'s classifier is the one used, so
+  the three guarded documents agree about what a path is and what a symbol is.
+
+One thing it still cannot do, stated rather than implied: **a vendor symbol
+citation is checked by nothing.** It was checked by nothing before, too — what
+changed is that it now names a function, a class or an MTR test that a reader
+holding the pinned tree can find by searching for it, instead of a line number
+that is wrong. That is the whole of the improvement on the vendor side, and it
+is worth being precise about, because a guard that *appeared* to cover the
+vendor half would be worse than the line numbers it replaced.
 
 ### What a prose guard can and cannot do
 
@@ -1488,8 +1612,8 @@ recur:
   kept those three tokens — no citations, no bounds, neither rider — passed.
   It now asserts **polarity and placement**: the affirmative answer must
   precede the first citation, the negating phrasings must be absent, and the
-  section must carry at least four `file:line` citations and the quoted sysvar
-  declaration. *A guard that asserts prose contains certain strings does not
+  section must carry at least four distinct source citations and the quoted
+  sysvar declaration. *A guard that asserts prose contains certain strings does not
   guard the prose.*
 - The submodule-count guard compared the mapping's length against the **set** of
   number words anywhere in the Dockerfile note. The note's prose contains two,
@@ -1503,8 +1627,8 @@ recur:
 creates.** The guard on §1's first rider demanded the literal `should
 implement`, and it fired on rewordings that preserve every fact and both
 conclusions — `should **override**` (if anything the more precise verb, since
-`effective_ef` is an inherited concrete method with a default at
-`base.py:469`, so overriding is literally what happens) and `**must**
+`effective_ef` is an inherited concrete method with a default in
+`EngineDriver`, so overriding is literally what happens) and `**must**
 implement` (a strictly stronger instruction). A second ban on `needs no edit`
 was subject-blind: it fired on a true sentence about a different subject, and
 that phrase recurs in a change-list document by nature.
@@ -1534,9 +1658,10 @@ unknowns look less urgent.
    was **not entirely open** and treating it as one cost a real bug. The
    submodule half was readable, and the answer was **no**: the first revision
    of `docker/percona/Dockerfile` enumerated all four submodules, miscounted
-   them as two, and left `extra/libkmip` unmitigated. `CMakeLists.txt:2295-2297`
-   descends into it when **neither** `WITH_COMPONENT_KEYRING_KMIP` nor
-   `WITHOUT_COMPONENT_KEYRING_KMIP` is defined, and `prepare-sources.sh` ships
+   them as two, and left `extra/libkmip` unmitigated. The top-level
+   *CMakeLists.txt*
+   descends into it when **neither** *WITH_COMPONENT_KEYRING_KMIP* nor
+   *WITHOUT_COMPONENT_KEYRING_KMIP* is defined, and `prepare-sources.sh` ships
    a `git archive`, which omits submodule paths — so cmake configure would have
    failed on a directory that is not in the tarball. Fixed with
    `-DWITHOUT_COMPONENT_KEYRING_KMIP=1`; the Dockerfile now carries one flag per
@@ -1545,29 +1670,34 @@ unknowns look less urgent.
    What genuinely remains: whether a 9.7 tree builds clean with Ubuntu 24.04's
    GCC 13 (the branch recently made clang-23 its CI default — `ccb8bbd9f156`),
    and whether the apt list is complete. Out-of-source is required, not
-   optional: `CMakeLists.txt:583` defaults `FORCE_INSOURCE_BUILD` OFF.
+   optional: the same *CMakeLists.txt* defaults *FORCE_INSOURCE_BUILD* OFF.
 2. **Can MariaDB Connector/C authenticate over TCP?** This base has no
-   `mysql_native_password` — `mysql-test/r/mysql_native_password_removed.result:4-5`
+   `mysql_native_password` — the main MTR suite's
+   *mysql_native_password_removed.result*
    records `CREATE USER … IDENTIFIED WITH mysql_native_password BY 'abcd'`
    returning `ERROR HY000: Plugin 'mysql_native_password' is not loaded` — so
    copying `docker/alisql/init.sql`'s line would make the container fail to
    boot, and `docker/percona/init.sql` uses the server default
    `caching_sha2_password` instead. The **ann pass** connects over a unix socket
-   (`vb_mysql.py:237`, `unix_socket=`), where the cleartext exchange is allowed.
-   The **ops harness** connects over TCP (`mysql_family.py:162-172`, `host=`/`port=`),
+   (`VBMySQLBase._conn_kwargs`, which passes `unix_socket`), where the cleartext
+   exchange is allowed.
+   The **ops harness** connects over TCP (`MySQLFamilyDriver.connect`, which
+   passes `host=self.spec.host` and a port),
    where `caching_sha2_password` needs TLS or the server's RSA public key.
    `caching_sha2_password_auto_generate_rsa_keys` defaults ON so the key exists;
    whether Connector/C 3.3.x asks for it without an explicit option is untested.
    **This is the first thing to check, because it blocks every ops measurement.**
 3. **Does a `bytes` parameter arrive with the binary charset?** §2.1: `cs !=
-   &my_charset_bin` is a hard refusal at `sql/field.cc:7097`. Expected to work,
-   since AliSQL's `Field_vector` takes the same path today, but the failure mode
+   &my_charset_bin` is a hard refusal in *field.cc*'s *Field_vector::store*.
+   Expected to work,
+   since AliSQL's *Field_vector* takes the same path today, but the failure mode
    is every INSERT erroring and it costs one statement to check.
 4. **Does `information_schema.COLUMNS.CHARACTER_OCTET_LENGTH` populate for a
-   `VECTOR` column?** `vb_mysql.py:428-436` divides it by 4 and returns 1 if it
-   is NULL, which would make `_warm_cache` warm nothing and `_verify_plan`
-   report a false negative. `percona/module.py` prefers `VECTOR_DIM()`
-   (`sql/item_create.cc:1660`) and falls back, so it is covered either way — but
+   `VECTOR` column?** `VBMySQLBase._dim_from_table` divides it by 4 and returns
+   1 if it is NULL, which would make `_warm_cache` warm nothing and
+   `_verify_plan` report a false negative. `percona/module.py` prefers
+   `VECTOR_DIM()`, which *item_create.cc*'s registry carries beside
+   *Item_func_to_vector*, and falls back, so it is covered either way — but
    the shared path is still wrong for the next engine.
 5. **Actual graph memory against the §3 floor.** The projections use an MTR
    assertion's floor and its 2× ceiling, and §3 now also records that
@@ -1580,14 +1710,15 @@ unknowns look less urgent.
    `orchestrator/estimate.py` needs and must not be guessed.
 7. **Is `FORCE INDEX (vi)` accepted on a `VECTOR KEY`?** `Dialect.force_index_hint`
    is set for all three MySQL-family engines and is dead repo-wide today —
-   `vb_mysql.py:400` only uses it when `force_index=True` and no call site
+   `VBMySQLBase.hint` only uses it when `force_index=True` and no call site
    passes that — so this costs nothing right now. It is listed because Percona
    is the engine where it might not *parse*: the pin's own tip commit
    (`02a8b80c`, PS-11626) is about index hints and vector ANN queries, having
    just fixed `IGNORE INDEX … FOR ORDER BY (vk)` being ignored for them. If a
    future caller switches the hint on, a `FORCE INDEX` the parser rejects turns
    every plan check into an exception instead of a plan.
-8. **The ops path's `march` field.** §4.8: `harness/main.py:248-266` is a second
+8. **The ops path's `march` field.** §4.8: `_detect_march` in
+   `harness/main.py` is a second
    `-march` reader in a different container, which no overlay override can
    reach. Both tuples now carry `/opt/percona/.march`, so this should read the
    image's real value — but *nothing in this repository can prove that*, since
@@ -1603,20 +1734,22 @@ should not sit on an open-questions list implying doubt. Keeping a settled
 question open is not a conservative choice; it spends a smoke run's attention
 on something already known and makes the real unknowns look less urgent.
 
-- **`hypergraph_optimizer` cannot be enabled in this build.** Three gates in
-  `sql/sys_vars.cc` (`:232-234`, `:3435-3438`, `:3441-3452`) all key on CMake
+- ***hypergraph_optimizer* cannot be enabled in this build.** Three gates in
+  *sys_vars.cc* — the default *optimizer_switch* string,
+  *update_optimizer_switch* and *check_optimizer_switch* — all key on CMake
   symbols the Dockerfile does not define, and the last raises
-  `ER_HYPERGRAPH_NOT_SUPPORTED_YET` on an attempt. The silent-full-scan risk
+  *ER_HYPERGRAPH_NOT_SUPPORTED_YET* on an attempt. The silent-full-scan risk
   §2.6 described cannot occur here. Moved into §2.6.
-- **There is no third `innodb_hnsw_*` variable.** `innobase_system_variables[]`
-  registers exactly two (`ha_innodb.cc:25112`, `:25174`) and the status array
-  exactly one (`:1335`). §2.6's table is complete, established from the
+- **There is no third `innodb_hnsw_*` variable.** *innobase_system_variables*
+  in *ha_innodb.cc* registers exactly two — *MYSQL_SYSVAR(hnsw_ef_search)* and
+  *MYSQL_SYSVAR(hnsw_max_memory)* — and the status array in the same file
+  exactly one, *hnsw_memory_used*. §2.6's table is complete, established from the
   registration arrays rather than from the truncated tree listing the previous
   revision used. Moved into §2.6.
 - **The index replace does not block readers.** It takes a SHARED lock, which
   permits concurrent reads and blocks writes: any ALTER leaving a vector index
-  is forced offline (`handler0alter.cc:1496-1500`, `:1509-1513`) and the
-  handler returns `HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE` (`:1523-1524`).
+  is forced offline by *handler0alter.cc*'s *innobase_vector_exist* gate, and the
+  handler returns *HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE*.
   The previous revision kept this open because the "LOCK=SHARED it is" comment
   it had found was scoped to a table rebuild and the replace is not one — a
   correct refusal to generalise, but the answer was a hundred lines further on

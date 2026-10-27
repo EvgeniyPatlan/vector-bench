@@ -4,14 +4,16 @@ This file is the checkable half of that document, and it guards a DIFFERENT
 citation form from the two documents that came before it.
 
 WHY THE FORM CHANGED. `docs/09-adding-percona-server.md` and
-`docs/10-rollout.md` cite `path:line`, each under a guard that re-opens the
-cited line and compares it against what the document claims is there
-(`tests/test_e1_percona_design.py` and `tests/test_e3_rollout_doc.py`). Those
-guards work -- they are the reason the rot was found at all -- but the rot kept
-happening: line citations in this repository went stale twice in two days and
-put `master` red both times, repaired in #41 and #43. Neither was a careless
-edit to a document. In both cases a later round of edits inside the SAME change
-moved lines below the point where the citations had been derived.
+`docs/10-rollout.md` USED TO cite `path:line`, each under a guard that
+re-opened the cited line and compared it against what the document claimed was
+there (`tests/test_e1_percona_design.py` and `tests/test_e3_rollout_doc.py`).
+Those guards worked -- they are the reason the rot was found at all -- but the
+rot kept happening: line citations in this repository went stale twice in two
+days and put `master` red both times, repaired in #41 and #43. Neither was a
+careless edit to a document. In both cases a later round of edits inside the
+SAME change moved lines below the point where the citations had been derived.
+Both documents have since been converted, so this page's form is now the
+repository's only citation form rather than a departure from the other two.
 
 So docs/11 cites SYMBOLS. A line number is invalidated by any edit above it,
 including one that changes nothing the citation is about; a symbol name is
@@ -30,9 +32,12 @@ WHAT THIS FILE ESTABLISHES
   comment. The second floor is what keeps the first from being satisfied by
   prose.
 * docs/11 contains NO `path:line` citation at all. That is the policy itself,
-  executable -- and the same detector is run against docs/10, which is full of
-  them, so a regex that stopped matching fails here instead of certifying every
-  document in the repo as clean.
+  executable -- and the same detector is run against a frozen fixture that is
+  made of them, so a regex that stopped matching fails here instead of
+  certifying every document in the repo as clean. The fixture used to be
+  docs/10, which was "full of them"; it is not any more, because docs/09 and
+  docs/10 were converted to symbol citations under this page's policy. A
+  non-vacuity fixture must not be something another document can stop being.
 * docs/11 cites nothing under a generated, gitignored tree (`sources/`,
   `work/`, `results/`, `datasets/`, `state/`). A path under one of those does
   not exist on a fresh checkout, so it is a citation nobody but the author can
@@ -64,7 +69,6 @@ import pytest
 
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROADMAP_DOC = os.path.join(VB_ROOT, "docs", "11-methodology-roadmap.md")
-ROLLOUT_DOC = os.path.join(VB_ROOT, "docs", "10-rollout.md")
 
 #: Where a cited symbol is allowed to live. `docs/` is deliberately NOT here:
 #: indexing the documentation would let docs/11 cite a symbol that exists in no
@@ -540,9 +544,22 @@ class TestTheDocumentMakesNoLineCitation:
     def test_the_detector_can_see_a_line_citation(self):
         """Non-vacuity, and not optional: the assertion above is a NEGATIVE
         one, and a negative assertion passes just as happily against a broken
-        regex as against a clean document. docs/10 is made of these."""
-        found = _LINE_CITATION_RE.findall(open(ROLLOUT_DOC).read())
-        assert len(found) >= 30, len(found)
+        regex as against a clean document.
+
+        THE FIXTURE IS A FROZEN LITERAL, AND IT USED TO BE docs/10. That read
+        "docs/10 is made of these" and asserted at least thirty matches in
+        it, which was true and was a dependency between two documents'
+        citation styles: when docs/10 was converted to symbol citations under
+        the policy this page sets out, this test went red on a page that had
+        done exactly what this page asks for. A fixture cannot be converted
+        out from under a test.
+        """
+        found = _LINE_CITATION_RE.findall(
+            "as `harness/metrics/records.py:413` has it, and "
+            "`config/profiles/main.yml:110-112`, and `run-benchmark.sh:7`")
+        assert len(found) == 3, found
+        assert found[0][0] == "harness/metrics/records.py"
+        assert found[1][1:] == ("110", "112")
 
     def test_the_policy_is_stated_in_the_document(self):
         """The reason, not just the rule. A rule whose reason is only in a test

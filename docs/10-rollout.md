@@ -23,11 +23,42 @@ than paraphrased.
 | Kind of claim | How it was established | Marked |
 |---|---|---|
 | A constant, a profile key, a driver attribute | imported or loaded and read back, at the commit this document ships on | **measured** |
-| A sentence or literal in this repository | cited `file:line`, and `tests/test_e3_rollout_doc.py` opens the cited line | **read** |
+| A sentence or literal in this repository | cited by the symbol it sits in, and `tests/test_e3_rollout_doc.py` opens that symbol | **read** |
 | The six steps, the seven checklist items, the cost envelope | from the project spec | **supplied** |
 | Anything about MariaDB, AliSQL, pgvector, Valkey, MongoDB or Percona behaviour | from a vendor source, an MTR result or a document | **supplied** |
 
-Two consequences, and they are the reason this section is first:
+### How this document cites code, and why it cites no line numbers
+
+**Every citation here names a symbol or a file — a function, a class, a
+constant, a config key, a section heading, a path — and never a line number.**
+`CLIENT_BOUND_UTIL`, `consistency_checks`, `config/profiles/main.yml`: never
+*some/file.py:123*.
+
+This document used to cite `path`-colon-line, and `tests/test_e3_rollout_doc.py`
+re-opened every cited line and compared it against what this page claimed was
+there. That mechanism worked — and it kept firing on correct documents: line
+citations here and in `docs/09-adding-percona-server.md` went stale twice in two
+days and put `master` red both times, repaired in pull requests #41 and #43.
+Neither failure was a careless edit. In both cases a later round of edits
+*inside the same change* moved lines below the point where the citations had
+been derived. A line number is invalidated by **any** edit above it; a symbol
+name only by a rename. `docs/11-methodology-roadmap.md` §0 sets the policy out
+and `CLAUDE.md` says to copy it.
+
+Two consequences of the policy rather than of taste. **A citation here is
+coarser** — `consistency_checks` names a function, not the four lines of its
+tolerance arithmetic — so where the exact passage matters this page quotes it
+and says which symbol it sits in, which makes the quotation checkable by search
+instead of by line arithmetic. And **material outside this repository is named
+in prose, never in code font**: the project specification is *SPEC.md* in
+italics throughout, because a backticked path here means a path in **this**
+repository and the spec is not in it. The illustration of the banned form two
+paragraphs up is in italics for the same reason — the guard bans that form as a
+pattern over code-font spans, and an allowlist for one citation would make this
+the one document permitted to make the citation it forbids.
+
+Two consequences of §0's provenance table, and they are the reason this section
+is first:
 
 * **A figure whose inputs are supplied is not a measurement of this system**,
   however arithmetically sound it is. §5 item 1 is the worked example: its
@@ -40,7 +71,8 @@ Two consequences, and they are the reason this section is first:
 
 The spec interleaves merges with live runs: *"The next PR's tasks may start in
 parallel, but nothing is merged to the main branch until the human confirms the
-step for the previous PR."* (`SPEC.md:527`, supplied.) That did not happen.
+step for the previous PR."* (*SPEC.md*, the rollout section's preamble;
+supplied.) That did not happen.
 Every PR in this series merged without a run between them.
 
 **This repo carries no evidence either way**, and that is worth stating
@@ -97,7 +129,7 @@ no network, which is where this suite has to pass.
 
 PR 5 is **not** a single task, and the draft order this document replaces was
 wrong to treat it as one. T5a landed in PR 0's branch, which the spec explicitly
-permits — `harness/metrics/stats.py:49` is `bootstrap_ci`, with
+permits — `harness/metrics/stats.py` carries `bootstrap_ci`, with
 `tests/test_stats.py` beside it. **T5b landed as #16**, bringing
 `report/crosscheck.py`, the report's section 10 and the uncertainty intervals.
 T5c (open-loop latency, `harness/workloads/rate.py`) is optional and the file
@@ -122,16 +154,17 @@ being wrong.
 > *"3. Merge PR 3 (largest); run `dev` per engine, then
 > `verify-alisql-traps.sh`, then `smoke`. Compare tag results with the previous
 > smoke run: they should match within noise, since only the measurement version
-> changed."* (`SPEC.md:530`, supplied.)
+> changed."* (*SPEC.md*, rollout step 3; supplied.)
 
 There is no previous smoke run to compare against **through the report**, and
 the obstacle is a deliberate one.
 
-`OPS_MEASUREMENT_VERSION` is 8 (`harness/metrics/records.py:506`). Records
+`OPS_MEASUREMENT_VERSION` is 8, in `harness/metrics/records.py`. Records
 written before the constant existed carry no version key at all and are
-version 1 by definition, not "unknown"
-(`harness/metrics/records.py:513`). The archived corpus is entirely version 1:
-`harness/metrics/records.py:240-246` records a count of it, and that count was
+version 1 by definition, not "unknown" — that is
+`IMPLICIT_OPS_MEASUREMENT_VERSION`, beside it. The archived corpus is entirely
+version 1: the version charter commented above `OPS_MEASUREMENT_VERSION`
+records a count of it — "239 ops record files and 2,134 ops records" — and that count was
 re-taken independently for this document — 239 ops record files, 2,134 ops
 records, `extra.ops_measurement_version` absent from every one, every record in
 an ops phase. That tree is **not part of this repository** and is resolved
@@ -141,14 +174,15 @@ and otherwise check that the comment still says what this document quotes.
 
 **The refusal is unconditional on any two distinct version values.** It is not
 "two versions that mean different things":
-`report/measurement_versions.py:148` returns early only when fewer than two
-versions are present, so a version 1 record and a version 5 record in one
-report raise `MixedMeasurementVersions`, and so do a version 1 and a version 2
-— which `report/measurement_versions.py:187-191` says **denote the same
-measurement**. The equivalence set
-(`harness/metrics/records.py:544`) changes the *wording* of the refusal,
+`refuse_mixed_measurement_versions` in `report/measurement_versions.py` returns
+early only when fewer than two versions are present —
+`if not unmatched and len(groups) < 2:` — so a version 1 record and a version 5
+record in one report raise `MixedMeasurementVersions`, and so do a version 1
+and a version 2, which the same module's `_SAME_MEASUREMENT_FACT` says
+**denote the same measurement**. The equivalence set
+(`OPS_MEASUREMENT_EQUIVALENT_VERSIONS`) changes the *wording* of the refusal,
 dropping the advice to re-measure; it does not change the decision. And the
-refusal is not a caveat on a chart: `report/generate.py:1213-1214` prints the
+refusal is not a caveat on a chart: `report/generate.py`'s `main` prints the
 message and returns 2, so there is no report.
 
 So step 3's comparison has no in-report form. It can be done by hand, by
@@ -158,7 +192,7 @@ mind.
 **Its expectation was wrong anyway**, and this matters more than the mechanism.
 The step says the results "should match within noise, since only the
 measurement version changed". Version 5 deliberately changed what one recorded
-quantity *is*: `harness/metrics/records.py:229-234` says
+quantity *is*: the version 5 block of that same version charter says
 `extra.reinsert_rows_per_s` **"CHANGES WHAT IT MEASURES"** — the re-insert now
 runs against four concurrent readers by default, which the comment calls *"the
 same workload against a different amount of load, not two samples of one
@@ -173,7 +207,7 @@ repeated.
 
 Step 6's wording holds exactly as written: *"Old `main` results stay valid as
 `ops_measurement_version` 1 and are not mixed into new charts."*
-(`SPEC.md:533`, supplied.) The refusal above is what enforces it.
+(*SPEC.md*, rollout step 6; supplied.) The refusal above is what enforces it.
 
 ## 2. The revised order
 
@@ -183,7 +217,7 @@ you to review. What is left of each step is its run.
 
 All six of the spec's steps are accounted for below:
 
-| Spec step, verbatim (`SPEC.md:528-533`, supplied) | Where it lands here |
+| Spec step, verbatim (*SPEC.md*'s six rollout steps, supplied) | Where it lands here |
 |---|---|
 | 1. Merge PR 0 and PR 1; run `dev` for all six engines, then `smoke` for pgvector and MariaDB 11.8. | steps A and C, widened to all engines |
 | 2. Merge PR 2; run `smoke` for all engines. Check the operating-point table: MHNSW and VIDX should show `floor_above_target` or a low chosen `ef`. | step C |
@@ -198,13 +232,13 @@ MariaDB alone first would buy nothing.
 
 **Step A — `dev`, all engines.** The cheapest end-to-end exercise: images build,
 every driver connects, every phase writes records. `dev` pins
-`ops.churn_readers: 0` (`config/profiles/dev.yml:77`), which is the write-only
+`ops.churn_readers: 0` (`config/profiles/dev.yml`'s `ops.churn_readers`), which is the write-only
 re-insert pass and is deliberate, not an omission.
 
 **What step A cannot confirm, and the draft of this page had it wrong.** With
 readers off there is no reader pool, so the `during_writes` churn record is
-never written: `harness/workloads/churn_readers.py:156-157` returns a count of
-zero for `readers <= 0`, and `harness/workloads/churn.py:279-280` says
+never written: `_reader_count` in `harness/workloads/churn_readers.py` returns
+a count of zero for `readers <= 0`, and `harness/workloads/churn.py`'s `run` says
 `reader_baseline` being None is *"the one state in which the whole
 during-writes record is absent"*. Step A therefore exercises two of the three
 new record shapes — the `ef_calibration` phase and the second churn record
@@ -221,9 +255,10 @@ does not pin `ops.churn_readers`, so it inherits the default of 4 — this is
 where the reader pool and the `during_writes` record are first exercised. It is
 also where the operating-point table gets its first look, which is spec step 2's
 check: *"Check the operating-point table: MHNSW and VIDX should show
-`floor_above_target` or a low chosen `ef`."* (`SPEC.md:529`, supplied.) The
-status names are real — `harness/workloads/calibrate.py:102-109` declares `ok`,
-`target_unreached` and `floor_above_target` — but **what MHNSW and VIDX will
+`floor_above_target` or a low chosen `ef`."* (*SPEC.md*, rollout step 2;
+supplied.) The
+status names are real — `harness/workloads/calibrate.py` declares them as
+`STATUS_OK`, `STATUS_TARGET_UNREACHED` and `STATUS_FLOOR_ABOVE_TARGET` — but **what MHNSW and VIDX will
 show is supplied**, from the tuned-profile notes the spec cites. Anything else
 is a finding, not a config slip, because calibration makes `ef_search` measured
 rather than declared.
@@ -231,13 +266,13 @@ rather than declared.
 **Step D — churn-only smoke on pgvector and MongoDB**, `--workloads
 build,churn`. Spec step 4: *"run churn-only smoke (`--workloads build,churn`)
 on pgvector and MongoDB first, where the new hooks do something."*
-(`SPEC.md:531`, supplied.) Which hook is different for each, and §4 item 4
+(*SPEC.md*, rollout step 4; supplied.) Which hook is different for each, and §4 item 4
 below says why that matters.
 
 **Step E — regenerate the reports for steps A, C and D and read the consistency
 section.** No rerun needed. Spec step 5. The section is **section 10 of the
-report** (`report/render.py:3397`), computed by
-`report/crosscheck.py:335`'s `consistency_checks`. §4 item 5 says what to look
+report**, emitted by `render_markdown` in `report/render.py`, and computed by
+`consistency_checks` in `report/crosscheck.py`. §4 item 5 says what to look
 at and what the coverage table means.
 
 **Step F — only then `main`.** Spec step 6. On `main` the cross-check is no
@@ -246,11 +281,11 @@ that exercises it against published numbers.
 
 ### Do not pool one run's churn records with another's
 
-`main.yml` pins `ops.churn_readers: 4` (`config/profiles/main.yml:200`) and
-`dev.yml` pins `0` (`config/profiles/dev.yml:77`). Both stamp version 5, so the
+`config/profiles/main.yml` pins `ops.churn_readers: 4` and
+`config/profiles/dev.yml` pins `0`. Both stamp version 5, so the
 cross-version refusal in §1 will **not** catch a reader-contended re-insert rate
-pooled with a write-only one. The code names the gap itself:
-`harness/metrics/records.py:253-260` says *"`extra.readers` is a diagnostic,
+pooled with a write-only one. The code names the gap itself: the version
+charter above `OPS_MEASUREMENT_VERSION` says *"`extra.readers` is a diagnostic,
 not a guard. Two `reinsert_rows_per_s` figures both stamped version 5, one at 4
 readers and one at 0, load together with no refusal."*
 
@@ -289,7 +324,8 @@ it.
 
 ## 4. The seven-item checklist, annotated
 
-Quoted verbatim from the spec (`SPEC.md:535-541`, supplied).
+Quoted verbatim from the spec (*SPEC.md*'s seven-item pre-publication
+checklist, supplied).
 
 ### 1. "Every concurrency record has recall, and no point is `client_bound` (or the report marks it)"
 
@@ -297,16 +333,16 @@ The recall half is straightforward and enforced. **The `client_bound` half
 cannot be satisfied by reading that flag**, and this is the flag's own code
 rather than an opinion about where a threshold sits.
 
-`harness/workloads/pool_window.py:58` sets `CLIENT_BOUND_UTIL = 0.80`, and
-`harness/workloads/pool_window.py:184` is the whole decision:
-`self.client_cpu_util > CLIENT_BOUND_UTIL`. So a client that is not burning CPU
-is not flagged, whatever else is limiting it. The module states why moving the
-threshold does not help: *"a CPU-utilisation threshold cannot see a GIL
-ceiling, because the lock prevents the CPU consumption the threshold looks
-for"* (`harness/workloads/clients.py:34-45`).
+`harness/workloads/pool_window.py` sets `CLIENT_BOUND_UTIL = 0.80`, and
+`PoolWindow.client_bound` in the same module is the whole decision:
+`return self.client_cpu_util > CLIENT_BOUND_UTIL`. So a client that is not
+burning CPU is not flagged, whatever else is limiting it. The module states why
+moving the threshold does not help: *"a CPU-utilisation threshold cannot see a
+GIL ceiling, because the lock prevents the CPU consumption the threshold looks
+for"* — `harness/workloads/clients.py`'s module docstring.
 
 **The shape that demonstrates it was measured against the fake driver, and the
-module says it may not reproduce.** `harness/workloads/clients.py:34-45`
+module says it may not reproduce.** That same docstring
 reports the concurrency workload's own CPU flat at 2.06 cores across 4, 8, 16
 and 32 clients — 0.515 of a four-CPU container, comfortably under the 0.80
 threshold — while aggregate throughput peaks at two clients and falls by better
@@ -316,8 +352,8 @@ on the **retired thread pool**: the clients are OS processes from
 `OPS_MEASUREMENT_VERSION` 6, so no interpreter-lock ceiling is reachable any
 more and what the flag is now about is the cpuset alone. The shape is still
 the one to recognise, which is why both the module and this page keep it.
-The next paragraph,
-`harness/workloads/clients.py:47-55`, says the fake's queries are numpy-bound
+Its next paragraph
+says the fake's queries are numpy-bound
 in-process whereas a real driver spends most of a query blocked on a socket with
 the lock released, so **"the synthetic SHAPE may not reproduce"**. The earlier
 draft of this page presented the figure as a measurement of this system; it is
@@ -354,18 +390,20 @@ exact span-sum is the blind one.
 ### 2. "Operating-point table reviewed; every non-`ok` status explained in the text"
 
 See step C. The three statuses are real and named in
-`harness/workloads/calibrate.py:102-109`; which engine shows which is supplied
+`harness/workloads/calibrate.py`, as `STATUS_OK`, `STATUS_TARGET_UNREACHED` and
+`STATUS_FLOOR_ABOVE_TARGET`; which engine shows which is supplied
 and is what the run settles.
 
 ### 3. "Filtered: `near_fail` recall shown for `ctag`; time-bounded points greyed"
 
 Note what changed underneath this item: the selectivity label used to be the
-share *requested*, and is now the share *delivered*
-(`docs/05-methodology.md:490-497`). If you compare against an older chart, the
+share *requested*, and is now the share *delivered* —
+`docs/05-methodology.md` §3.3's *The two filter modes*, which states that "The
+selectivity recorded is the one that was delivered". If you compare against an older chart, the
 axis means a different thing.
 
 **The overshoot is not a single number**, and the draft of this page quoted one
-as if it were. `harness/datasets.py:456-468` measures a nominal 1% delivering
+as if it were. `FilterThreshold` in `harness/datasets.py` measures a nominal 1% delivering
 between 1.04% and 3.47% of the rows with a median of 1.43% over sixteen
 clustering seeds, and an independent re-derivation from a different draw came
 out *wider*, so those are a lower bound on the gap rather than its extent. The
@@ -377,11 +415,12 @@ corpus a run would use.
 ### 4. "Churn: before/after maintenance shown where a repair path exists; `repair_path: none` stated elsewhere"
 
 **Two engines have a repair path: pgvector and Percona Server.**
-`harness/drivers/base.py:258` sets `repair_path: str = "none"` as the class
-default and `harness/drivers/base.py:254-257` names the inheritors; the two
-overrides in the tree are `harness/drivers/postgres.py:172`,
-`repair_path = "vacuum_analyze"`, and
-`harness/drivers/mysql_family.py:770`, `repair_path = "index-replace"`.
+`EngineDriver.repair_path` in `harness/drivers/base.py` sets
+`repair_path: str = "none"` as the class default, and the comment above it names
+the inheritors; the two overrides in the tree are
+`PostgresDriver.repair_path` in `harness/drivers/postgres.py`,
+`repair_path = "vacuum_analyze"`, and `PerconaDriver.repair_path` in
+`harness/drivers/mysql_family.py`, `repair_path = "index-replace"`.
 MongoDB inherits `"none"`. The draft of this
 page said pgvector and MongoDB were both non-trivial here; they are not, and a
 before/after maintenance panel for MongoDB would be an empty comparison
@@ -416,7 +455,7 @@ stops for the duration).
 > Percona to the `repair_path: none` branch until the capability is flipped.
 
 What MongoDB has instead is the index-sync wait, a different hook:
-`harness/drivers/base.py:435-448` returns `0.0` by default and MongoDB and
+`EngineDriver.wait_index_synced` returns `0.0` by default and MongoDB and
 Valkey override it. So spec step 4's "where the new hooks do something" is
 correct about which two engines to run first, and this checklist item is about a
 different hook than that step is.
@@ -430,9 +469,9 @@ is still true.
 
 ### 5. "Consistency checks pass, or each failure is explained"
 
-**This section now exists.** `report/crosscheck.py:335`'s `consistency_checks`
-matches ops calibration points to ann recall points, and the report renders it
-as section 10 (`report/render.py:3397`). It is the check that cross-references
+**This section now exists.** `consistency_checks` in `report/crosscheck.py`
+matches ops calibration points to ann recall points, and `render_markdown` in
+`report/render.py` renders it as section 10. It is the check that cross-references
 the two measurement paths against each other, which is the one check that could
 have caught a published-result defect that neither path contradicted on its own.
 
@@ -446,8 +485,8 @@ What to read, in the order it matters:
 * **The tolerance, when a row fails.** It is
   `max(0.01, 2 × the ops 95% CI half-width)` — one recall point is allowed
   unconditionally because the two paths score different query subsets, and a
-  record with no usable interval gets exactly the floor
-  (`report/crosscheck.py:113`). A failure at a wide interval and a failure at
+  record with no usable interval gets exactly the floor, which is
+  `CROSSCHECK_MIN_TOLERANCE`. A failure at a wide interval and a failure at
   the floor are different findings.
 * **The QPS inversions, which are flagged and never failed.** The ops path pays
   a TCP round trip per query that the in-process path does not, so two engines
@@ -456,8 +495,9 @@ What to read, in the order it matters:
 **On `main` an empty section is a fault, not a design.** That profile sweeps
 `ann.m_values: [8, 16, 32]` against `ops.m_values: [16]` — see §5 item 3 — so
 the grids meet, and every engine with a calibration record should produce
-matched rows. `report/render.py:3022` and `docs/05-methodology.md:971` both say
-so.
+matched rows. `_consistency_section` in `report/render.py` and
+`docs/05-methodology.md` §2.7 both say so, in the same words: "the grids meet,
+so an empty section there is the fault case".
 
 Until #16 was corrected they said the opposite: each described the `[8, 32]`
 grid `main` carried before the pull request that added this section, and
@@ -512,10 +552,10 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 ### 7. "Run manifest records `ops_measurement_version`, seeds and the resolved profile"
 
-Satisfied for the version: `orchestrator/manifest.py:291` writes
-`config.ops_measurement_version` from the constant, `report/render.py:357-358`
-prints it above the numbers, and `docs/05-methodology.md:1039-1040`
-documents it.
+Satisfied for the version: `Manifest.__init__` in `orchestrator/manifest.py`
+writes `config.ops_measurement_version` from the constant,
+`_environment_rows` in `report/render.py` prints it above the numbers, and
+`docs/05-methodology.md` §5 documents it.
 This is what keeps a version 1 curve out of a version 5 report, and what makes
 everything above auditable a year from now.
 
@@ -524,8 +564,9 @@ everything above auditable a year from now.
 ### 1. The HNSW memory policy, once Percona lands
 
 `innodb_hnsw_max_memory` is a hard bound and not a cache, which makes it a
-fairness problem rather than a tuning knob
-(`docs/09-adding-percona-server.md:700`). That document holds the floor
+fairness problem rather than a tuning knob —
+`docs/09-adding-percona-server.md` §3, whose heading says exactly that. That
+document holds the floor
 formula, the per-dataset table and the policy decision, and
 **the numbers are not repeated here on purpose** — `docs/09` carries its own
 guards, including a test that recomputes every row of that table from the
@@ -533,10 +574,11 @@ formula it cites, and a second copy in this file would be a second thing to go
 stale. This repository's most frequent defect is a figure restated in two
 places and corrected in one.
 
-Where to look: `docs/09-adding-percona-server.md:754-793` for the table and its
-provenance — which says in its own words that the figures are projections and
-not measurements, because row counts, dimensionality and `M` are all supplied —
-and `docs/09-adding-percona-server.md:859-862` for the conclusion that matters
+Where to look: `docs/09-adding-percona-server.md` §3's *What the default costs,
+with the inputs named* for the table and its provenance — which says in its own
+words that "These figures are projections, not measurements.", because row
+counts, dimensionality and `M` are all supplied — and the same section's
+*The policy* subsection for the conclusion that matters
 to a rollout: the smoke profile fits under the shipped default, so **a green
 smoke run is not evidence the memory policy is sound**. The `main` profile does
 not fit. The policy chosen is unlimited, which removes the hazard; the point is
@@ -551,16 +593,16 @@ have to read the printed estimate against.**
 `orchestrator/estimate.py` ended `_effective_rate` with
 `_INGEST_ROWS_PER_S.get(engine, 300)`, so an engine with no entry in that table
 was modelled at 300 rows/s. The table's own measured MySQL-family rates are
-mariadb 150, mariadb123 110 and alisql 55 (`orchestrator/estimate.py:51`), so
+mariadb 150, mariadb123 110 and alisql 55, in `_INGEST_ROWS_PER_S`, so
 the fallback was **5.45× optimistic against the slowest engine already
 measured** — for an engine that builds its HNSW graph inside every INSERT,
 which is the slowest shape in the study.
 
 That contradicted the rule the comment above the table sets for itself. It is
-headed "Measured ingest rates, rows/s, on a Xeon Gold 6230"
-(`orchestrator/estimate.py:44`) and explains that the first guesses were
-replaced because an estimate optimistic *by 3x* is worse than none
-(`orchestrator/estimate.py:44-52`). The fallback was a guess, was not measured,
+headed "Measured ingest rates, rows/s, on a Xeon Gold 6230." — the comment
+block above `_INGEST_ROWS_PER_S` in `orchestrator/estimate.py` — and explains
+that the first guesses were replaced because an estimate optimistic *by 3x* is
+worse than none. The fallback was a guess, was not measured,
 and was optimistic by more than the margin that argument rejects. Measured on
 `main` before the fix: 273.45 rows/s for an unmeasured engine on glove-100
 against MariaDB's measured 147, putting **9.10 h** of invented ingest into a
@@ -569,7 +611,7 @@ engines that had a rate, at the commit of the fix) with nothing printed to
 say so.
 
 **What it does now.** `_effective_rate` returns `None` where nothing has been
-measured — `orchestrator/estimate.py:280` is `_INGEST_ROWS_PER_S.get(engine)`
+measured — its lookup is `_INGEST_ROWS_PER_S.get(engine)`
 with no default — and `estimate_load_hours` reports
 `engines_without_ingest_rate` on the same terms the query half has always used
 for `engines_without_query_rate`: the engine is **named, contributes nothing to
@@ -613,10 +655,11 @@ seven engines: the 726 h this page used to quote was six of them, and the
 
 The spec's own figure is roughly 2–3 hours typical and up to about 13 hours
 worst case on top of the current ~2 days, for six engines on two datasets, and
-requires the estimate to print the worst case (`SPEC.md:525`, supplied).
+requires the estimate to print the worst case (*SPEC.md*'s cost envelope,
+supplied).
 
 **The spec's decision point D1 is decided, and `main` got more expensive.**
-`config/profiles/main.yml:110` is now `m_values: [8, 16, 32]` against an ops
+`config/profiles/main.yml`'s `ann.m_values` is now `m_values: [8, 16, 32]` against an ops
 `m_values` of `[16]`, so the two grids meet and §4 item 5's cross-check runs on
 the profile the report is published from. There is still no crosscheck profile
 in `config/profiles/`, and that is the point: the other option on the table
@@ -639,9 +682,13 @@ did not move: it is three named engines and Percona is not one of them.
 
 An earlier revision of this page carried the two "added" figures and removed
 them as unsourced, because at that commit nothing in the repo supported them.
-They are now in the repo — `config/profiles/main.yml:84-87` states them with
-the reasoning — and the table above is recomputed from the estimator at test
-time rather than copied from that comment.
+They are now in the repo — the comment above `config/profiles/main.yml`'s
+`ann.m_values` states both of them with the reasoning — and the table above is
+recomputed from the estimator at test time rather than copied from that
+comment. The figures are deliberately not restated here a second time:
+`tests/test_e3_rollout_doc.py` holds the string it checks that comment for,
+which keeps the number in one place in this document and one place in the
+profile.
 
 **Those are ingest hours, and they are not the number in `README.md`.** The
 README profile table reports ~61 h for `main` by the hand method of
@@ -663,9 +710,13 @@ is the conservative direction.
 `tests/test_e3_rollout_doc.py` holds the checkable half of this document. It
 asserts, against the repository rather than against prose:
 
-* that every `file:line` citation above points at the thing this document says
-  it points at, in both directions — a number edited here without its row, and
-  a row whose anchor has moved, each fail;
+* that this document makes **no line citation at all**, over a pattern proved
+  against a frozen fixture carrying one of each form it has to catch;
+* that every symbol this document cites into this repository resolves in the
+  tree, and that every claim it makes about a named symbol's *contents* is
+  checked by opening that symbol — in both directions: a repository code file
+  cited here with nothing checking it fails, and a row naming a symbol this
+  document stopped citing fails;
 * that every figure stated above about this repository is recomputed from the
   repository at test time: the measurement version, the equivalence set, the
   `client_bound` threshold and its arithmetic, both profiles' `churn_readers`,
@@ -693,6 +744,9 @@ asserts, against the repository rather than against prose:
   rather than a number never used, and nothing local can tell those apart;
 * that none of `docs/09` §3's figures has been copied into this page, with the
   parser that looks for them proved against `docs/09` itself;
+* that the project specification is never cited in code font, because
+  *SPEC.md* is not in this repository and a backticked path here means one that
+  is;
 * that this document states no test count and no figure that the next merge
   would falsify.
 

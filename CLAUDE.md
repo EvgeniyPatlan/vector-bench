@@ -274,8 +274,12 @@ unimplemented).
 
 09, 10 and 11 are guarded: `tests/test_e1_percona_design.py`, `tests/test_e3_rollout_doc.py`
 and `tests/test_e15_methodology_roadmap_doc.py` fail when the document drifts from the tree.
-12 is not guarded yet, and its own phase 0 says so. **09 and 10 cite `file:line` and 11 cites
-symbols only** — and if you are adding a document, copy 11. Line citations in 09 and 10 have
-rotted twice in two days and put `master` red both times (#41, #43), both times because a
-later round of edits in the same change moved lines after the citations were derived. A line
-number dies to any edit above it; a symbol name dies only to a rename.
+12 is not guarded yet, and its own phase 0 says so. **All three cite symbols only — never a
+line number — and each guard ratchets its document to zero line citations.** If you are adding
+a document, copy 11; `docs/11-methodology-roadmap.md` §0 is where the policy and its reasoning
+live. 09 and 10 cited `file:line` until they were converted, and those citations rotted twice
+in two days and put `master` red both times (#41, #43), both times because a later round of
+edits in the same change moved lines after the citations were derived. A line number dies to
+any edit above it; a symbol name dies only to a rename. The vendor half was worse and nothing
+reported it: 09's guard deny-listed every Percona path by name, so on the order of 164 line
+references into a tree that is not in this checkout were checked by nothing at all.
