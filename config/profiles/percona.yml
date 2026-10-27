@@ -6,10 +6,36 @@
 # exactly why they do not belong in `main`: an axis only one engine has would
 # add a dimension to the shared grid that the other six cannot be placed on.
 #
-# NOTHING HERE HAS EVER BEEN RUN, and Percona's ingest rate is unmeasured, so
-# `./run-benchmark.sh run --profile percona` prints an estimate that names the
-# engine in `engines_without_ingest_rate` rather than giving it an hour figure.
-# Run the smoke gate first; it is the run that supplies the rate.
+# WHAT HAS RUN, AND WHAT HAS NOT. This comment said "NOTHING HERE HAS EVER BEEN
+# RUN" after the profile had run twice, and that sentence cost a review of
+# `docs/12-percona-feedback-plan.md` a wrong finding: a reader who searched
+# this repository and believed this line concluded the ef_construction sweep
+# did not exist. The results live outside the repository, so there is nothing
+# here to contradict a stale comment -- which is exactly why it has to be
+# accurate.
+#
+# RUN: 2026-10-20 (`percona-20261020-140151`) and 2026-10-21
+# (`percona-20261021-134142`). Both carry the tuned ann sweep at `m_values:
+# [16]` on fashion-mnist with `percona_ef_construction` at all three values, at
+# five `ef_search` points for 50 and 800 and nine for 200, plus one ops unit at
+# M=16 `incremental` over the 20,000-row subset. The ann pass reads the full
+# 60,000 rows -- `ops.subset_rows` is an `ops:` key and `ann_pass` never reads
+# it -- so the sweep's corpus is the whole corpus and the ops unit's is not.
+#
+# NOT RUN: the normalized pass, which is the half that pins the knob to the
+# vendor default and is the baseline the tuned sweep is read against; the
+# second build mode (`post`, still blocked by
+# `capabilities.bulk_vector_index_build`); and churn, which `workloads` below
+# excludes on purpose.
+#
+# The ingest rate IS measured now -- 412.99 and 417.64 rows/s on those two runs
+# -- but nothing has been written back into `orchestrator/estimate.py`, whose
+# `_MEASURED_ROWS_PER_S` and `_INGEST_ROWS_PER_S` both omit this engine. So
+# `./run-benchmark.sh run --profile percona` still prints an estimate that
+# names the engine in `engines_without_ingest_rate` rather than giving it an
+# hour figure. Feeding that table is a one-line change and is not the smoke
+# gate's job; run the smoke gate for a rate that describes the pin being
+# published.
 name: percona
 description: Percona Server alone — ef_construction sweep and both build modes
 
