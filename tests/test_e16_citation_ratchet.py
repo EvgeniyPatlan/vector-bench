@@ -496,6 +496,27 @@ CITATION_CEILINGS: Dict[str, int] = {
     "tests/test_t5b_stats.py": 1,
 }
 
+#: The two guards whose own documents now ratchet to ZERO line citations, and
+#: for which a ceiling above the file is therefore not grandfathered slack but
+#: a reopened hole.
+#:
+#: WHY THESE TWO ARE DIFFERENT from every other entry above. The census
+#: tolerates slack on purpose: a repair should not fail this file, and
+#: `test_no_ceiling_is_slack_by_more_than_the_file_holds` only refuses once a
+#: file holds none at all. That is right for a file whose citations are
+#: incidental. It is wrong for these two, because each one IS the guard that
+#: refuses every line citation in the document it checks -- banked allowance
+#: there is free citations in the one place the repository has decided there
+#: will be none.
+#:
+#: Measured, not supposed: raising `tests/test_e1_percona_design.py` back from
+#: 14 to 23 after the conversion passed the whole suite. That mutant survived
+#: until this list existed.
+RATCHETED_TO_ZERO = (
+    "tests/test_e1_percona_design.py",
+    "tests/test_e3_rollout_doc.py",
+)
+
 TOTAL_CEILING = sum(CITATION_CEILINGS.values())
 
 #: Named in every failure, because a guard that only says no teaches nothing.
@@ -743,6 +764,48 @@ class TestNoFileGainedALineCitation:
             "these files no longer hold any line citation, so their entries "
             "are pure allowance, so remove them\n  "
             + "\n  ".join(dead))
+
+    def test_a_document_guards_ceiling_is_exact(self):
+        """No banked slack in the two files that refuse citations for a living.
+
+        The test above tolerates a ceiling above its file and only refuses at
+        zero, which is the right rule for a file whose citations are
+        incidental and the wrong one for these two: each is the guard that
+        ratchets its document to zero, so allowance there is free citations in
+        the one place the repository has decided there will be none.
+
+        This is a mutant that survived. Converting docs/09 and docs/10 took 13
+        counted citations out of these two files; the ceilings were lowered in
+        the same change, and raising
+        `tests/test_e1_percona_design.py` back from 14 to 23 afterwards passed
+        the whole suite. "A repair is free" is a statement about the
+        comparison, not a licence to bank the difference -- so for these two a
+        repair comes with its ceiling or it fails here.
+        """
+        _files, counts = census()
+        wrong = []
+        for rel in RATCHETED_TO_ZERO:
+            ceiling = CITATION_CEILINGS.get(rel)
+            live = counts.get(rel, 0)
+            if ceiling != live:
+                wrong.append(f"{rel}: ceiling {ceiling}, file holds {live}")
+        assert not wrong, (
+            "a document guard's ceiling must equal its exact count, because a "
+            "ceiling above it is allowance in the file that refuses every "
+            "citation in the document it checks. Lower it in the same commit "
+            "as the repair:\n  " + "\n  ".join(wrong))
+
+    def test_the_ratcheted_files_are_really_the_document_guards(self):
+        """Non-vacuity for the list above: an empty or stale tuple would make
+        the exactness check pass over nothing."""
+        assert len(RATCHETED_TO_ZERO) == 2, RATCHETED_TO_ZERO
+        for rel in RATCHETED_TO_ZERO:
+            assert os.path.isfile(os.path.join(VB_ROOT, rel)), rel
+            assert rel in CITATION_CEILINGS, rel
+            # Each must actually contain a zero-ratchet assertion, or it is
+            # not a file this rule is about.
+            source = open(os.path.join(VB_ROOT, rel)).read()
+            assert "contains_no_line_citation" in source, rel
 
     def test_this_file_makes_none_of_the_citations_it_counts(self):
         """The ban is unconditional, which is only possible because this file
