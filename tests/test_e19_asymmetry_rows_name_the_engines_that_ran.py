@@ -39,11 +39,10 @@ WHAT IS PINNED HERE
   can fail on the defect is one whose engine set contains Percona.
 * `TestEveryEngineThatExposesTheKnobIsNamed` -- the general shape: the row is
   a list derived from the records, not a sentence with a length.
-* `TestARunWithNoTunableEngineSaysSo` -- the arm that rules out the obvious
-  wrong discriminator. `harness/main.py` sets `IndexSpec.ef_construction`
-  from `--ef-construction` for every engine, so `Record.ef_construction` is
-  populated for MariaDB too; a `tunable` derived from that field being
-  non-null would name MariaDB and AliSQL here.
+* `TestARunWithNoTunableEngineSaysSo` -- the arm for a run in which nothing
+  exposes the knob, which the old two-branch code could not say.
+* `TestTheFallbackIsPinnedInBothDirections` -- the constant, and the two
+  mutants that nothing else in the repository can see.
 * `TestTheBuildModeRowNamesTheEnginesThatBuilt` -- the second row, including
   the asynchronous case, which `separable_build` alone cannot tell from a
   bulk build.
@@ -62,6 +61,7 @@ import re
 import sys
 from typing import Any, Dict, List
 
+import pytest
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,12 +87,27 @@ def _records(spec: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     value, which is how an engine swept over both build modes appears) and
     `async_build`.
 
-    `ef_construction` is populated on every record on purpose: `main.py` in
-    the harness sets it from `--ef-construction` for every engine, so a
-    discriminator read off that field would pass
-    `TestEveryEngineThatExposesTheKnobIsNamed` and fail
-    `TestARunWithNoTunableEngineSaysSo`. Leaving it None would hide the
-    difference between the right discriminator and that wrong one.
+    `Record.ef_construction` is populated on every synthetic record here, and
+    that models a tree state the orchestrator cannot produce: `ops_pass.py`
+    appends `--ef-construction` only inside `if engine == "pgvector"`, and
+    across every reachable archive a non-null `ef_construction` appears on
+    pgvector's `index_build` records (182 of 182) and on no other engine's.
+    It is kept deliberately, and for a different reason from the one an
+    earlier revision of this file gave.
+
+    The earlier reason was wrong and is recorded here because it inverted the
+    failure: it said a `tunable` derived from `ef_construction is not None`
+    would over-name MariaDB. Against a real run it does the opposite -- the
+    field is null on every Percona record, so that discriminator yields an
+    empty set and the row reads "exposed by none of the engines in this run",
+    denying Percona the knob, which is this unit's defect arriving by another
+    route. `TestAPerconaRunIsNotToldTheKnobBelongsToPgvector` is what refutes
+    it against reality.
+
+    Populating the field anyway closes the other direction: it is what makes
+    `TestARunWithNoTunableEngineSaysSo` refuse that discriminator even in the
+    hypothetical where `ops_pass.py` is widened to pass the flag for every
+    engine, which is a one-line change to a gate nothing here guards.
     """
     out: List[Dict[str, Any]] = []
     for engine, how in sorted(spec.items()):
@@ -295,7 +310,12 @@ class TestEveryEngineThatExposesTheKnobIsNamed:
 
 
 class TestARunWithNoTunableEngineSaysSo:
-    """MariaDB and AliSQL, which is the arm the wrong discriminator fails."""
+    """MariaDB and AliSQL: the arm the old two-branch code could not say.
+
+    Its `else` covered both "one engine has it" and "none of them does", so
+    this run was told the knob was "exposed only by pgvector" -- an engine
+    that had not run.
+    """
 
     SPEC = {"mariadb": {"tunable": False, "separable": [False]},
             "alisql": {"tunable": False, "separable": [False]}}
@@ -308,10 +328,95 @@ class TestARunWithNoTunableEngineSaysSo:
         assert "pgvector" not in _row(_text(self.SPEC), EF)
         assert "only by pgvector" not in _text(self.SPEC)
 
-    def test_the_sweep_consequence_is_stated(self):
-        """A run with no knob to vary sweeps `M` alone, and the row has to
-        say so or it is a row about an absence with no consequence."""
-        assert "`M`" in _row(_text(self.SPEC), EF)
+    def test_the_consequence_is_stated_without_a_second_knob(self):
+        """A row about an absence still has to say what the absence costs --
+        and must say it without the obvious sentence, "so the sweep varies
+        `M` alone", which is false for Percona Search.
+
+        That engine gets `m_values[:1]` from `orchestrator/ann_pass.py` under
+        its own comment, "M is carried, not applied: mongot exposes no graph
+        degree", so a report narrowed to it would have carried this row three
+        rows above "M is pinned at one value for every other engine and
+        cannot be set here at all" and contradicted it. The consequence is
+        therefore about the pass, which is true of every engine.
+        """
+        row = _row(_text(self.SPEC), EF)
+        assert "normalized" in row and "no knob to pin" in row
+        assert "`M`" not in row
+
+    @pytest.mark.parametrize("spec", [
+        {"percona": {"tunable": True, "separable": [False]}},
+        {"pgvector": {"tunable": True, "separable": [True]},
+         "valkey": {"tunable": True, "separable": [True]}},
+        {"mariadb": {"tunable": False, "separable": [False]}},
+    ])
+    def test_no_arm_claims_what_the_m_sweep_varies(self, spec):
+        """All three arms, because the row is about `ef_construction` and a
+        claim about a second knob in it is a claim nothing checked."""
+        assert "`M`" not in _row(_text(spec), EF)
+
+    def test_a_report_narrowed_to_percona_search_does_not_contradict_itself(
+            self):
+        """The reproduction: `--profile full --engines mongodb` is an
+        ordinary invocation that `orchestrator/cli.py` permits, and in that
+        report the two rows sit in one table."""
+        text = _text({"mongodb": {"separable": [True], "async_build": True}})
+        assert "cannot be set here at all" in text
+        assert not re.search(r"(varies|varying|sweeps|swept over)\s+`M`",
+                             text), "a row claims the sweep varies M"
+
+
+class TestTheFallbackIsPinnedInBothDirections:
+    """`EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED`, and why one assertion is
+    not enough for it.
+
+    Absence-as-DENIAL was already guarded, by
+    `test_an_engine_whose_records_predate_the_capability_key_is_placed` here
+    and by `tests/test_config.py`'s pgvector-only assertion. The other two
+    directions were guarded by nothing in the repository, measured: with
+    `else True` in place of the set, or with `mariadb` and `alisql` added to
+    it, this file and the whole of `tests/test_config.py` stayed green -- 677
+    tests blind to a one-token edit.
+
+    What that edit costs is not theoretical. 132 archived `index_build`
+    records carry no `ef_construction_tunable` at all, 94 of them from
+    engines that do not have the knob (mariadb 44, alisql 34, mariadb123 12,
+    mongodb 4), so under either mutant a report regenerated over a legacy
+    mariadb-only directory reads "exposed only by MariaDB MHNSW" -- the
+    original defect with its sign flipped.
+    """
+
+    def test_the_set_is_exactly_what_the_engine_configs_declare(self):
+        """Closes the widening direction. A set that may be extended by a
+        one-word edit is the literal this unit removed, wearing a name."""
+        assert (set(render.EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED)
+                == set(_configured_tunable_engines()))
+
+    def test_a_silent_non_tunable_engine_is_not_named(self):
+        """Closes the affirmation direction.
+
+        The spec records NO `ef_construction_tunable` at all, which is the
+        only shape that reaches the fallback: every other non-tunable spec in
+        this file records `False`, a recorded value beats the fallback, and
+        that is precisely why the hole was open.
+        """
+        exposed = _exposed_by(_text({"mariadb": {"separable": [False]}}))
+        assert "none" in exposed.lower()
+        assert "MariaDB" not in exposed
+
+    def test_a_legacy_single_engine_directory_is_not_handed_the_knob(self):
+        """The regeneration above, as the sentence a reader would see."""
+        text = _text({"mariadb": {"separable": [False]}})
+        assert "exposed only by" not in text
+
+    def test_silence_from_several_non_tunable_engines_is_still_silence(self):
+        spec = {"mariadb": {"separable": [False]},
+                "alisql": {"separable": [False]},
+                "mongodb": {"separable": [True], "async_build": True}}
+        exposed = _exposed_by(_text(spec))
+        assert "none" in exposed.lower()
+        for engine in ("MariaDB", "AliSQL", "Percona Search"):
+            assert engine not in exposed, engine
 
 
 class TestTheBuildModeRowNamesTheEnginesThatBuilt:
@@ -354,6 +459,22 @@ class TestTheBuildModeRowNamesTheEnginesThatBuilt:
         text = _text({"percona": {"tunable": True, "separable": [False]}})
         assert "does either" not in text
 
+    def test_the_consequence_does_not_claim_two_modes_when_one_ran(self):
+        """The subject was derived and master's consequence was left alone,
+        so `percona-20261021-134142` -- one engine, one mode -- rendered
+        "reported separately for both modes" beside a subject naming one.
+        A row whose two cells disagree about how many modes ran is worse
+        than the unconditional row it replaced, because the derivation makes
+        it look checked."""
+        one = _rows_about_build_mode(
+            _text({"percona": {"tunable": True, "separable": [False]}}))
+        assert "both modes" not in one
+        assert "the operation that ran" in one
+        both = _rows_about_build_mode(
+            _text({"pgvector": {"tunable": True, "separable": [True]},
+                   "mariadb": {"tunable": False, "separable": [False]}}))
+        assert "both modes" in both
+
     def test_an_async_build_is_not_filed_as_a_bulk_build(self):
         """mongot's `separable_build` is True and its build is neither bulk
         nor incremental -- `_index_build_kind` already splits the four kinds
@@ -394,6 +515,74 @@ class TestTheMethodologyTableSaysTheSameThing:
         incomplete."""
         doc = open(METHODOLOGY_DOC).read()
         assert "can only vary `M` for the MySQL-family engines" not in doc
+
+    def test_the_cell_does_not_claim_the_m_sweep_covers_every_engine(self):
+        """The second false claim this cell acquired while being repaired.
+
+        "The build-quality sweep varies `M` for every engine" is false for
+        Percona Search, which `orchestrator/ann_pass.py` gives `m_values[:1]`
+        and which cannot apply the value at all -- the same shape of error as
+        the `ef_construction` half it replaced, one knob over.
+
+        Conditional rather than a banned phrase: the cell may drop the claim
+        or state it with its exception, and only the unqualified version
+        fails. A guard that fires on correct prose teaches the next author to
+        delete it.
+
+        THE TRIGGER IS THE UNIVERSAL, NOT AN ADJACENCY, and that is measured
+        rather than chosen. The first version of this assertion looked for
+        the verb immediately followed by the knob, and a reworded mutant
+        walked straight through it:
+        "varies `ef_construction` only for the three that have it, and `M`
+        for every engine" puts another knob between the verb and the subject
+        and makes exactly the same false claim. What is false is `M` plus a
+        universal over the engine set, in any word order, so that is what
+        this looks for.
+        """
+        row = [line for line in _methodology_section_4().splitlines()
+               if EF in line][0]
+        universal = re.search(
+            r"`M`[^|]{0,60}\b(every|all|each)\s+engine"
+            r"|\b(every|all|each)\s+engine[^|]{0,60}`M`"
+            r"|(varies|varying|sweeps|swept over)\s+`M`", row)
+        if universal:
+            assert "Percona Search" in row, (
+                "the cell claims `M` is swept across the engine set without "
+                "naming the engine that cannot apply it: "
+                f"{universal.group()!r}")
+
+    def test_2_7_does_not_call_the_cost_fields_ops_only(self):
+        """§2.7's stated reason for reading build mode off the ops records
+        was that `build_wall_s`, `ingest_wall_s` and `index_bytes` "are
+        ops-only fields anyway". `index_bytes` is on every one of the 6,035
+        archived `recall_qps` records, so that was false before A1's loader
+        work and stays false after it -- and the real reason is the one the
+        two sentences above it already give.
+
+        Pinned by polarity on the affirmation, not by the corrected text:
+        the paragraph may say what it likes about these fields as long as it
+        does not assert they are ops-only, and it must still carry the
+        reason that is true either way. Whitespace-normalised, because the
+        document is hard-wrapped and the sentence spans a line break.
+        """
+        doc = " ".join(open(METHODOLOGY_DOC).read().split())
+        para = doc.split(
+            "Percona Server is the fourth for a different reason")[1].split(
+            "An empty list has two causes")[0]
+        assert re.search(r"silent about `build_mode`|says nothing about "
+                         r"`build_mode`", para), (
+            "§2.7 no longer gives the reason that is true of either tree")
+        assert not re.search(r"\bare ops-only fields\b", para), (
+            "§2.7 asserts the cost fields are ops-only; `index_bytes` is on "
+            "every archived recall record")
+
+    def test_the_cells_claim_about_that_engine_is_executable(self):
+        """`CLAUDE.md`: documentation asserting engine behaviour should be
+        checkable. The cell's parenthetical is about one expression."""
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "ann_pass.py")).read()
+        assert "m_values[:1]" in source
+        assert "exposes no graph degree" in source
 
     def test_every_engine_whose_config_declares_the_knob_is_named(self):
         """The ratchet. Both stale sentences were stale because an engine

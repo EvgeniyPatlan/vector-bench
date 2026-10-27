@@ -3457,18 +3457,32 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
 #
 # These helpers belong beside `_known_asymmetries`, and they are down here
 # instead for one reason, written down because it otherwise reads as
-# carelessness: `docs/10-rollout.md` cites two lines of THIS module BY LINE
-# NUMBER -- the "grids meet" sentence in `_consistency_section`'s docstring
-# and the "## 10. Consistency checks" heading inside `render_markdown` -- and
+# carelessness: `docs/10-rollout.md` cites THREE locations in this module BY
+# LINE NUMBER -- the ops-measurement-version row in `_environment_rows`, the
+# "grids meet" sentence in `_consistency_section`'s docstring, and the
+# "## 10. Consistency checks" heading inside `render_markdown` -- and
 # `tests/test_e3_rollout_doc.py::TestEveryCitationIntoThisRepoIsChecked`
-# resolves each of them against that exact line. Inserting anything above
-# either shifts both and puts `master` red -- `CLAUDE.md` records that
-# happening twice in two days (#41, #43), both times because edits moved
-# lines under a citation derived earlier. docs/10 is not this change's to
-# edit, and everything after `render_markdown` is free of its citations, so
-# the call site above keeps its line count and the bodies live here.
-# Converting those two citations to symbols is the real repair and belongs
-# with the rest of the citation conversion.
+# resolves each of them against that exact line. The last two are below
+# `_known_asymmetries`, so inserting anything there shifts both and puts
+# `master` red -- `CLAUDE.md` records that happening twice in two days
+# (#41, #43), both times because edits moved lines under a citation derived
+# earlier. docs/10 is not this change's to edit, and nothing after
+# `render_markdown` is cited, so the call site above keeps its line count and
+# the bodies live here.
+#
+# EXTRACTING THEM INTO A MODULE DOES NOT HELP, which is the first thing a
+# reader will propose: removing ~100 lines near the call site shifts the two
+# later citations UP, which fails the same guard a plain insertion does.
+# Net-zero above the first of them was the only option inside this change's
+# file set that adds code at all.
+#
+# FOLLOW-UP, with the condition that clears it: ~240 lines now sit ~2,290
+# lines from their only call site. When docs/10 cites those two anchors by
+# SYMBOL instead of by line -- the citation conversion -- this block should
+# move back up beside `_known_asymmetries` in the same change, and this
+# comment should go with it. Nothing enforces that: the citation ratchet in
+# `tests/test_e16_citation_ratchet.py` counts citations and cannot see a
+# block that wants moving, so this paragraph is the only record of the debt.
 # ---------------------------------------------------------------------------
 
 #: How this table names an engine in PROSE, which is not how a chart legend
@@ -3509,6 +3523,20 @@ _PROSE_NAME = {
 #: A record that DOES carry the key always wins, so this set cannot overrule
 #: a driver: it is consulted only for an engine whose every build record is
 #: silent.
+#:
+#: MEASURED, because both halves of that argument are claims about archived
+#: data. Of the `index_build` records in the reachable archives, 132 carry no
+#: `ef_construction_tunable`: pgvector 38, mariadb 44, alisql 34,
+#: mariadb123 12, mongodb 4. The pgvector 38 are why absence must not be read
+#: as a denial -- a legacy pgvector-only directory would otherwise regenerate
+#: with the knob withdrawn from the one engine that had it. The other 94 are
+#: why absence must not be read as an affirmation either: read that way, a
+#: legacy mariadb-only directory regenerates as "exposed only by MariaDB
+#: MHNSW", which is the original defect with its sign flipped. Both
+#: directions are pinned in
+#: `tests/test_e19_asymmetry_rows_name_the_engines_that_ran.py`, and so is
+#: this set's equality with the engine configs, because a set that may be
+#: widened by a one-word edit is a literal again.
 EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED = frozenset(
     {"pgvector", "valkey", "percona"})
 
@@ -3560,14 +3588,24 @@ def _ef_construction_row(tunable: List[str],
     "one engine has it" and "none of them does" and said "only by pgvector"
     for both, so a MariaDB-and-AliSQL report named an engine that had not run
     and a Percona report denied the engine that had.
+
+    NO ROW HERE SAYS WHAT THE SWEEP VARIES INSTEAD, and that absence is
+    deliberate. The obvious sentence -- "so the sweep varies `M` alone" --
+    is false for one of the seven engines: `orchestrator/ann_pass.py` gives
+    Percona Search `m_values[:1]` under its own comment, "M is carried, not
+    applied: mongot exposes no graph degree", where every other engine gets
+    the whole grid. `--profile full --engines mongodb` is an ordinary
+    invocation, and in that report this row would have sat three rows above
+    "M is pinned at one value for every other engine and cannot be set here
+    at all" and contradicted it. Writing a second claim about a second knob
+    to explain the first is how this row went wrong in the first place.
     """
     others = [e for e in engines if e not in tunable]
     if not tunable:
         return [
             "`ef_construction` is exposed by none of the engines in this run",
-            "Build quality cannot be tuned here at all, so the build-quality "
-            "sweep varies `M` alone and the normalized pass has no knob to "
-            "pin."
+            "Build quality cannot be tuned here at all, so the normalized "
+            "pass has no knob to pin."
             + (f" {_prose_list(others)} "
                + ("exposes" if len(others) == 1 else "expose")
                + " no equivalent." if others else ""),
@@ -3611,10 +3649,18 @@ def _build_mode_engines(summary: Optional[Dict[str, Any]]
     block adds a few rows down. `_index_build_kind` splits the same four
     kinds for §5's table and this follows it.
 
-    An UNRECORDED build -- no `separable_build` key at all, which is what
-    every record written before that key existed carries -- lands in no list.
-    Nothing in such a record says which operation `build_wall_s` timed, and
-    this row is a claim about an operation.
+    An UNRECORDED build -- no `separable_build` key at all -- lands in no
+    list. Nothing in such a record says which operation `build_wall_s` timed,
+    and this row is a claim about an operation.
+
+    That third case is a GUARD rather than a described population, and the
+    difference is worth stating because the fallback above is the other way
+    round. Counted over every archived run reachable here, 817 `index_build`
+    records carry `separable_build` and none is missing it, so no archive
+    exercises this branch; 132 of those same records are missing
+    `ef_construction_tunable` -- 38 of them pgvector's -- which is why
+    `EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED` is backed by data and this is
+    not.
     """
     from report.generate import (BUILD_KIND_BULK, BUILD_KIND_INCREMENTAL,
                                  build_kind)
@@ -3658,9 +3704,23 @@ def _build_mode_rows(summary: Optional[Dict[str, Any]]) -> List[List[str]]:
             + ("builds" if len(incremental) == 1 else "build")
             + " incrementally on every INSERT")
     if clauses:
+        # The CONSEQUENCE is conditional too, and leaving it unconditional
+        # while deriving the subject was half a fix. Master's sentence says
+        # "reported separately for both modes", which on
+        # `percona-20261021-134142` -- one engine, one mode, incremental --
+        # described a second column the report does not contain, directly
+        # beside a correctly derived subject naming one mode. A row whose two
+        # cells disagree about how many modes ran is worse than the
+        # unconditional row it replaced, because the derivation makes it look
+        # checked.
         rows.append(["; ".join(clauses),
                      "Build cost is reported separately for both modes. A "
                      "single 'build time' comparison would compare different "
+                     "operations."
+                     if bulk and incremental else
+                     "Build cost is reported as the operation that ran. A "
+                     "single 'build time' comparison against the other mode "
+                     "-- in this run or in another -- would compare different "
                      "operations."])
     if either:
         consequence = (
