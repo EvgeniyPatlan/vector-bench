@@ -61,6 +61,18 @@ build:
 #     the three and not the others and the build runs with fewer workers than
 #     the manifest records, succeeds, and says nothing.
 #
+# THAT RULE IS A POSTGRESQL FACT AND DOES NOT PORT, which matters because
+# this comment is the artefact whoever copies this shape will read.
+# docs/12-percona-feedback-plan.md §5.2 proposes the same treatment for
+# Percona's innodb_parallel_read_threads -- from {build_threads} in tuned
+# and to 1 in normalized -- and the 1 there is right where the 0 here is
+# right. MySQL documents that variable with a MINIMUM VALUE OF 1 and
+# defines it as the number of THREADS used for a parallel clustered index
+# read, not the number of workers beyond a leader. So its off position is
+# 1, not 0, and "one zero per path" is a statement about these four GUCs
+# rather than about parallelism budgets in general. Check the vendor's
+# units and floor before reusing the rule.
+#
 # Hence three keys up and one key down, plus a fourth that exists only in
 # normalized because there are two independent paths to close:
 #
@@ -112,9 +124,13 @@ build:
 # runs under are part of what its numbers mean. max_parallel_workers=0 or
 # max_worker_processes=0 in normalized, or
 # max_parallel_workers_per_gather={build_threads} in tuned, is the same
-# workload against a different amount of machine -- which is exactly what
-# OPS_MEASUREMENT_VERSION 3 was bumped for (harness/metrics/records.py) --
-# and would owe a bump that invalidates comparison across every ops phase of
+# workload against a different amount of machine. That is an application of
+# the precedent OPS_MEASUREMENT_VERSION 3 set rather than the thing it was
+# bumped for -- 3 was the concurrency query pool, "two different amounts of
+# the corpus" -- and version 6 is where the precedent is stated in the form
+# this borrows: "the same workload against a different amount of load is not
+# two samples of one quantity" (harness/metrics/records.py). So it would owe
+# a bump that invalidates comparison across every ops phase of
 # every engine, to settle a fairness question nobody has raised about a
 # published number. This change moved no key, so every pgvector figure in the
 # archive still means what it meant.
