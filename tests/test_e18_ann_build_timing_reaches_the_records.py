@@ -2,14 +2,37 @@
 
 THE DEFECT
 ----------
-Every ann-benchmarks result file this framework writes carries TWO build
-timings, and the report reads neither:
+Every ann-benchmarks result file this framework writes carries a build timing
+and a load timing, and the report read neither. The build timing is spelled
+once; the load timing is spelled twice, and which spelling a file uses depends
+on the engine:
 
 * `build_time`, written by upstream `ann_benchmarks/runner.py:build_index`
-  around its `algo.fit` call;
-* `ingest_seconds`, written by our own
+  around its `algo.fit` call. **Every** engine has it -- it is upstream's, not
+  ours.
+* `ingest_seconds`, written by
   `overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py:get_additional`, which
-  rounds the loader's own wall clock to 3 decimals.
+  rounds its own wall clock to 3 decimals. That base class serves the MySQL
+  family only: **mariadb, mariadb123, alisql and percona**.
+* `load_seconds`, written by the **pgvector, valkey and mongodb** modules,
+  which do not derive from `vb_mysql` and write no `ingest_seconds` at all.
+  Confirmed in the three modules' own `get_additional` and in the archived
+  artifacts: mongodb `load_seconds` 1.899 / `build_seconds` 30.228, valkey
+  1.184 / 4.022, pgvector 10.280 / 71.544, and `ingest_seconds` absent from
+  all three.
+
+`ingest_seconds` and `load_seconds` are one quantity under two names -- wall
+time of the corpus load -- so `ingest_wall_s` reads whichever is present. The
+three engines that write neither would otherwise have been the three engines
+left with a build time and no load time, and they are the three the second
+clock exists for.
+
+`build_seconds`, which those same three write, is deliberately **not** read.
+It is not one quantity: mongodb's is `load + index-ready`, pgvector's and
+valkey's exclude the load in `post` mode and include it in incremental mode,
+and an ann record carries no `separable_build` for a reader to tell which. One
+column holding three definitions of "build" is the defect
+`charts.build_cost`'s own docstring describes on the ops path.
 
 `report/loaders.py:load_annb_results` copies a dozen other attributes into the
 record and, out of the whole result file, takes exactly one derived value off
@@ -31,12 +54,27 @@ team it was "16 times the build effort" -- which is the ratio of the
 reaches for when the measured one is not in the report. The numbers were in the
 files the whole time.
 
-The two agree to within half a second at the low end and 15 ms at the high end,
-which is the expected relationship and not a redundancy: `build_time` is
-upstream's clock around `fit()` and `ingest_seconds` is our module's clock
-around the load alone, so the difference is this engine's non-load build work.
-Both are kept, because a future engine where they diverge is exactly the
-engine worth noticing.
+WHY BOTH FIELDS, which is not "the gap is build work"
+-----------------------------------------------------
+That was the first answer here and the evidence refuses it. The gap between
+`build_time` and the load is 0.418 s at `ef_construction` 50, 0.014 at 200 and
+0.015 at 800 -- **largest at the cheapest configuration**, which graph
+construction would not do. For an incremental engine there is no separate
+build to measure at all: `vb_mysql.fit` sets `_build_seconds =
+_ingest_seconds` in so many words, because the graph is maintained on every
+INSERT. The gap is `fit()`'s fixture overhead -- `DROP`/`CREATE DATABASE`, the
+`CREATE TABLE` carrying the index, and `_measure_index_bytes` walking the
+datadir -- and pgvector's incremental artifact shows the same ~0.42 s gap with
+`build_seconds == load_seconds`.
+
+The two fields earn their place for a different reason: they are two clocks of
+different SCOPE, and the scope matters most where the index goes live after the
+load rather than during it. mongodb loads in 1.899 s and its index is ready
+28.329 s later, so its `build_time` is 30.450 s -- **16.0x its load**. "Time to
+load the corpus" and "time until the index is queryable" are both findings,
+they differ by more than an order of magnitude on that engine, and one field
+cannot carry both. For the MySQL family they nearly coincide, and that
+coincidence is itself the statement that those engines have no separable build.
 
 THE COLLATERAL HAZARD, which is why this unit also edits `report/charts.py`
 ----------------------------------------------------------------------------
@@ -66,13 +104,33 @@ WHAT IS PINNED HERE
   attribute yields a record carrying neither key. A `0.0` would read as a
   build that cost nothing, and `build_cost`'s own selection is
   `is not None`, so a zero would also be a plotted point.
+* `TestTheLoadIsSpelledTwiceAcrossTheEngines` -- the `load_seconds`
+  fallback, the precedence between the two spellings, and `build_seconds`
+  staying unread.
 * `TestNoRateIsDerivedFromAFileThatCannotSupportOne` -- the result file holds
-  no training-row count (its full attribute set is enumerated below), so
-  `ingest_rows_per_s` stays `None` rather than being computed from a number
-  the file does not have.
-* `TestAnnBuildsStayOffTheOpsBuildCostChart` -- the phase filter, asserted
-  through the predicate rather than off the PNG, so it is checked on a host
-  with no matplotlib.
+  no training-row count, so `ingest_rows_per_s` stays `None` rather than being
+  computed from a number the file does not have. There is a second,
+  independent reason, and it is worth stating because it bounds what
+  `ingest_wall_s` on a recall record MEANS: the ann path does not measure
+  ingest under control. `vb_mysql._resolve_insert_threads`' own docstring says
+  so -- "Ingest speed is not what this pass measures -- the ops harness
+  measures it properly and under controlled conditions. Here we only need the
+  load to finish in reasonable time, so parallelism is allowed" (up to 8
+  threads, recorded as `insert_threads`). So this field is the build cost's
+  companion, not an ingest-rate measurement, and a rate derived from it would
+  invite exactly the comparison against the ops path's `ingest_rows_per_s`
+  that it cannot support. The guard is the record
+  assertion; `ARCHIVED_RESULT_ATTRIBUTES` below is the evidence behind the
+  decision and is checked against the fixture, not asserted as a tautology.
+* `TestAnnBuildsStayOffTheOpsBuildCostChart` -- the phase filter, asserted on
+  what `build_cost` RETURNS rather than on how it is spelled or on the drawn
+  PNG, so one assertion holds it on a host with no matplotlib. An earlier
+  version of this file asserted on `inspect.getsource`; a reviewer defeated it
+  with a mutant that re-spelled the leak around the predicate call while
+  leaving the call in place, and was green on a bare host. A test that pins a
+  spelling is not a test of behaviour.
+* `TestTheCoercersMovedWithoutLoss` -- the `report/coercers.py` extraction,
+  after `report/measurement_versions.py`'s own precedent test.
 
 HOW THE SYNTHETIC RESULT FILES ARE BUILT, and why not with h5py
 ---------------------------------------------------------------
@@ -87,6 +145,20 @@ layout, reached by the real `os.walk`, gated by the real ground-truth
 existence check and stamped with the real `os.path.getmtime`. Only the binary
 container is JSON. Attribute values are handed back as the numpy scalars h5py
 hands back, because that is what the coercers have to survive.
+
+WHY THE COERCION MATTERS, which is not "json.dump would fail"
+-------------------------------------------------------------
+That was the second wrong answer here. `numpy.float64` is a subclass of
+`float` and serialises as a JSON number with nothing wrong. The hazard is the
+opposite of a loud failure: `report/generate.py` writes records with
+`json.dumps(..., default=str)`, so a value `json` cannot serialise is not an
+error -- it is silently stringified. `numpy.float32` is NOT a `float`
+subclass, so it lands in `report/records.jsonl` as the JSON **string**
+`"283.27"` and `report --from-records` reads it back as a `str`. A measurement
+whose Python type depends on which numpy width a result file happened to use
+is one a chart sorts as text or drops on a comparison, and nothing anywhere
+says so. `float()` at the boundary is what makes the record's type the
+record's own.
 
 `tests/test_e14_per_pass_manifest.py` and `tests/test_e17_report_scope.py`
 monkeypatch `load_annb_results` away wholesale for the same reason. That is
@@ -109,10 +181,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.metrics import records as records_mod  # noqa: E402
 from report import charts, loaders  # noqa: E402
 
-#: Skips the one test that reads a drawn figure. The phase filter is asserted
-#: through `charts._is_build_cost_point` in a test that never imports
-#: matplotlib, so the invariant is covered on a bare host and this only adds
-#: the "and `build_cost` actually calls it" half.
+VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+#: Skips the two tests that read a drawn figure. The phase filter itself is
+#: held by `test_a_recall_record_alone_draws_no_build_chart`, which asserts on
+#: `build_cost`'s return value and runs everywhere; these two add what the
+#: reader would have SEEN -- the plotted series and the published subtitle.
 needs_matplotlib = pytest.mark.skipif(
     not charts.have_matplotlib(),
     reason="reads a drawn figure; matplotlib lives in the bench images")
@@ -137,15 +211,39 @@ ARCHIVED_EF_CONSTRUCTION_SWEEP = (
 #: `ingest_seconds` has no such value: the overlay rounds it before writing.
 ARCHIVED_BUILD_TIME_FULL_PRECISION = 283.274920463562
 
-#: Every attribute name in that artifact, which is the evidence for
-#: `TestNoRateIsDerivedFromAFileThatCannotSupportOne`: there is no row count,
-#: no training-set size and no `rows` among them, so no rate is derivable.
+#: Every attribute name in that artifact, read out of its object header by
+#: parsing the HDF5 attribute-message layout (there is no h5py on the
+#: measuring host). This is the evidence behind
+#: `TestNoRateIsDerivedFromAFileThatCannotSupportOne`: no row count, no
+#: training-set size, no `rows`, so no rate is derivable from the file.
+#:
+#: **It was wrong once and the error is instructive.** The first version
+#: listed 23 of these 25, missing `candidates` (float64, 10.0) and
+#: `expect_extra` (bool) -- both written by upstream
+#: `ann_benchmarks/runner.py` rather than by one of our modules, which is
+#: exactly the half a census assembled by reading our own code misses.
+#: Neither is a row count, so the decision survived its own evidence being
+#: incomplete; a list asserted complete and not complete is still a false
+#: statement in shipped text. `test_the_synthetic_attributes_are_all_real`
+#: now checks this against the fixture, so a name here that is not in a real
+#: file, or a fixture key that is not in this list, fails.
 ARCHIVED_RESULT_ATTRIBUTES = (
-    "M", "algo", "batch_mode", "best_search_time", "build_time", "count",
-    "dataset", "distance", "ef_construction", "ef_search", "engine",
-    "engine_version", "index_bytes", "index_size", "ingest_seconds",
-    "insert_threads", "march", "metric", "name", "resource_pass",
-    "run_count", "storage_engine", "vector_index_used",
+    "M", "algo", "batch_mode", "best_search_time", "build_time", "candidates",
+    "count", "dataset", "distance", "ef_construction", "ef_search", "engine",
+    "engine_version", "expect_extra", "index_bytes", "index_size",
+    "ingest_seconds", "insert_threads", "march", "metric", "name",
+    "resource_pass", "run_count", "storage_engine", "vector_index_used",
+)
+
+#: `(engine, load_seconds, build_seconds, build_time)` from the archived
+#: artifacts of the three engines whose modules do not derive from `vb_mysql`
+#: and write `load_seconds` instead of `ingest_seconds`. mongodb is the row
+#: that makes the two clocks worth keeping apart: its index is ready 28.329 s
+#: AFTER a 1.899 s load, so `build_time` is 16.0x the load.
+ARCHIVED_LOAD_SECONDS_ENGINES = (
+    ("mongodb", 1.899, 30.228, 30.44968605041504),
+    ("valkey", 1.184, 4.022, 5.206523418426514),
+    ("pgvector", 10.280, 71.544, 82.10410451889038),
 )
 
 
@@ -261,6 +359,42 @@ def _result_attrs(ef_construction: int, **overrides: Any) -> Dict[str, Any]:
     return attrs
 
 
+def _non_mysql_attrs(engine: str, load_seconds: Any, build_seconds: Any,
+                     build_time: Any, **overrides: Any) -> Dict[str, Any]:
+    """A result file from a module that does not derive from `vb_mysql`.
+
+    The attribute set the pgvector, valkey and mongodb modules' own
+    `get_additional` returns, trimmed to what this loader reads. No
+    `ingest_seconds`, which is the whole point: that key exists only in
+    `vb_mysql.get_additional`.
+    """
+    attrs: Dict[str, Any] = {
+        "dataset": DATASET,
+        "count": COUNT,
+        "distance": "euclidean",
+        "algo": engine,
+        "engine": engine,
+        "engine_version": "x",
+        "resource_pass": "tuned",
+        "ef_search": 10,
+        "best_search_time": 0.0005,
+        "vector_index_used": True,
+        "batch_mode": False,
+        "run_count": 1,
+    }
+    for key, value in (("build_time", build_time),
+                       ("load_seconds", load_seconds),
+                       ("build_seconds", build_seconds)):
+        if value is not _ABSENT:
+            attrs[key] = value
+    for key, value in overrides.items():
+        if value is _ABSENT:
+            attrs.pop(key, None)
+        else:
+            attrs[key] = value
+    return attrs
+
+
 class _Absent:
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return "<absent>"
@@ -274,10 +408,22 @@ _ABSENT = _Absent()
 def _write_result(annb_dir: str, attrs: Dict[str, Any],
                   filename: Optional[str] = None,
                   rows: int = 4) -> str:
-    """One result file, in the layout ann-benchmarks writes."""
+    """One result file, in the layout ann-benchmarks writes.
+
+    The stem is built from the attributes rather than hard-coded, because
+    ann-benchmarks names the file after the build arguments and
+    `charts.series_key` reads identity back out of it. A fixture that wrote
+    `engine_InnoDB` into a pgvector filename would be describing a file that
+    cannot exist.
+    """
     engine = str(attrs.get("engine", "percona"))
-    stem = filename or ("euclidean_M_16_efConstruction_"
-                        f"{attrs.get('ef_construction', 0)}_engine_InnoDB_10.hdf5")
+    parts = ["euclidean"]
+    for key, label in (("M", "M"), ("ef_construction", "efConstruction"),
+                       ("storage_engine", "engine")):
+        if attrs.get(key) is not None:
+            parts += [label, str(attrs[key])]
+    parts.append(str(attrs.get("ef_search", 10)))
+    stem = filename or ("_".join(parts) + ".hdf5")
     path = os.path.join(annb_dir, "tuned", str(attrs.get("dataset", DATASET)),
                         str(COUNT), engine, stem)
     # Run distances inside the ground-truth threshold, so recall is 1.0 and no
@@ -415,8 +561,16 @@ class TestAnAbsentAttributeIsAbsentAndNotZero:
         assert "ingest_wall_s" not in records[0]
 
     def test_one_present_and_one_absent_is_one_key(self, tmp_path, stub_h5py):
-        """Upstream's `build_time` with no overlay `ingest_seconds`: what a
-        third-party algorithm module's result file looks like."""
+        """Upstream's `build_time` with neither of our two load spellings.
+
+        Described here first as "what a third-party algorithm module's result
+        file looks like", which was wrong in the direction that mattered: with
+        `ingest_seconds` alone it was what **pgvector, valkey and mongodb**
+        look like -- three of our own seven engines, and the three the second
+        clock exists for. The `load_seconds` fallback is why this is now the
+        hypothetical it was described as: a module writing `build_time` and
+        neither `ingest_seconds` nor `load_seconds`.
+        """
         records = _load(tmp_path, [_result_attrs(
             800, build_time=283.275, ingest_seconds=_ABSENT)])
         assert records[0]["build_wall_s"] == 283.275
@@ -452,25 +606,124 @@ class TestAnAbsentAttributeIsAbsentAndNotZero:
 
 
 # ---------------------------------------------------------------------------
+# 2b. The load is spelled twice across the seven engines
+# ---------------------------------------------------------------------------
+
+class TestTheLoadIsSpelledTwiceAcrossTheEngines:
+    """`ingest_seconds` is `vb_mysql`'s; `load_seconds` is the other three's.
+
+    The first version of this change read `ingest_seconds` only, which meant
+    pgvector, valkey and mongodb got a `build_wall_s` and no `ingest_wall_s`
+    at all -- and they are the three engines where the two differ by more than
+    rounding, so they are the three the second field exists for.
+    """
+
+    def test_load_seconds_fills_ingest_wall_s(self, tmp_path, stub_h5py):
+        """All three archived engines, from their own recorded figures."""
+        records = _load(tmp_path, [
+            _non_mysql_attrs(engine, load_s, build_s, build_t)
+            for engine, load_s, build_s, build_t
+            in ARCHIVED_LOAD_SECONDS_ENGINES])
+        assert len(records) == len(ARCHIVED_LOAD_SECONDS_ENGINES)
+        by_engine = {r["engine"]: r for r in records}
+        for engine, load_s, _build_s, build_t in ARCHIVED_LOAD_SECONDS_ENGINES:
+            assert by_engine[engine]["ingest_wall_s"] == load_s, engine
+            assert by_engine[engine]["build_wall_s"] == build_t, engine
+
+    def test_the_mongodb_row_is_why_both_fields_exist(self, tmp_path,
+                                                      stub_h5py):
+        """1.899 s to load, queryable 28.329 s later: `build_time` is 16.0x.
+
+        The one number in the archive that cannot be expressed by a single
+        field, and the reason "the gap is small so one field would do" is
+        wrong for this corpus of engines rather than just unsupported.
+        """
+        engine, load_s, _build_s, build_t = ARCHIVED_LOAD_SECONDS_ENGINES[0]
+        assert engine == "mongodb"
+        records = _load(tmp_path,
+                        [_non_mysql_attrs(engine, load_s, _build_s, build_t)])
+        record = records[0]
+        assert round(record["build_wall_s"] / record["ingest_wall_s"], 1) == 16.0
+        assert record["build_wall_s"] - record["ingest_wall_s"] > 28.0
+
+    def test_ingest_seconds_wins_where_both_somehow_appear(self, tmp_path,
+                                                           stub_h5py):
+        """No module writes both; the precedence is pinned anyway.
+
+        A fallback whose order is undefined is a fallback that changes
+        behaviour the first time a module grows the other key. `ingest_seconds`
+        first, because it is the one a `vb_mysql` engine writes and the one the
+        archived percona figures in this file were read from.
+        """
+        records = _load(tmp_path, [_result_attrs(
+            800, build_time=283.275, ingest_seconds=283.260,
+            load_seconds=99.9)])
+        assert records[0]["ingest_wall_s"] == 283.26
+
+    def test_build_seconds_is_not_read(self, tmp_path, stub_h5py):
+        """`build_wall_s` comes from `build_time` even when both are present.
+
+        mongodb's `build_seconds` is load + index-ready, pgvector's and
+        valkey's exclude the load in `post` mode, and an ann record has no
+        `separable_build` to tell a reader which -- so one column holding all
+        three would be the ops path's own published defect, re-created on the
+        ann path. `build_time` is upstream's and means the same thing for all
+        seven engines.
+        """
+        engine, load_s, build_s, build_t = ARCHIVED_LOAD_SECONDS_ENGINES[0]
+        records = _load(tmp_path,
+                        [_non_mysql_attrs(engine, load_s, build_s, build_t)])
+        assert records[0]["build_wall_s"] == build_t
+        assert records[0]["build_wall_s"] != build_s
+        assert "build_seconds" not in records[0]
+        assert "build_seconds" not in records[0]["extra"]
+
+    def test_build_seconds_alone_populates_nothing(self, tmp_path, stub_h5py):
+        """And it is not a fallback for `build_time` either."""
+        records = _load(tmp_path, [_non_mysql_attrs(
+            "pgvector", 10.280, 71.544, _ABSENT)])
+        assert len(records) == 1
+        assert "build_wall_s" not in records[0]
+        assert records[0]["ingest_wall_s"] == 10.280
+
+
+# ---------------------------------------------------------------------------
 # 3. No rate is invented
 # ---------------------------------------------------------------------------
 
 class TestNoRateIsDerivedFromAFileThatCannotSupportOne:
 
-    def test_the_result_file_holds_no_row_count(self):
-        """The evidence, enumerated: nothing in the artifact counts rows.
+    def test_the_synthetic_attributes_are_all_real(self):
+        """The census is checked against the fixture, both ways.
 
-        `ingest_rows_per_s` needs rows / seconds. The seconds are there twice
-        over; the rows are nowhere, and the dataset's own training-set size is
-        not the loaded row count whenever a load was interrupted or a
-        configuration was re-run against a populated table. Deriving the rate
-        from the dataset's nominal size would produce a number that looks
-        measured and is modelled.
+        The version of this test that shipped first asserted only that no name
+        in `ARCHIVED_RESULT_ATTRIBUTES` contained the substring "row" -- a
+        statement about a literal in this module, which no change to any
+        source file or any artifact could falsify. It was not a test. The
+        no-rate invariant is held by
+        `test_no_rate_and_no_row_count_reach_the_record` below, which drives
+        the loader.
+
+        What IS worth checking is the thing the census is for: these tests
+        stand in for real artifacts, so a fixture key that no real file
+        carries would make every assertion above a statement about a file that
+        does not exist. Both directions, because the census being short is how
+        it was wrong before.
         """
-        for name in ARCHIVED_RESULT_ATTRIBUTES:
-            assert "row" not in name, name
-        assert "rows" not in ARCHIVED_RESULT_ATTRIBUTES
-        assert "train_size" not in ARCHIVED_RESULT_ATTRIBUTES
+        fixture = set(_result_attrs(800, build_time=1.0,
+                                   ingest_seconds=1.0))
+        census = set(ARCHIVED_RESULT_ATTRIBUTES)
+        assert fixture <= census, fixture - census
+        # The four the fixture has no reason to carry, each for a stated
+        # reason rather than as a tolerated gap:
+        #   candidates, expect_extra -- upstream's, read by nothing here;
+        #   index_size -- upstream's kilobyte figure, which the loader uses
+        #     only as a fallback where `index_bytes` is absent, and the
+        #     fixture sets `index_bytes` directly;
+        #   metric -- written by our modules, but the loader takes
+        #     `metric_space` from `distance`, which the fixture does set.
+        assert census - fixture == {"candidates", "expect_extra",
+                                    "index_size", "metric"}
 
     def test_no_rate_and_no_row_count_reach_the_record(self, tmp_path,
                                                        stub_h5py):
@@ -555,21 +808,64 @@ class TestAnnBuildsStayOffTheOpsBuildCostChart:
         assert not charts._is_build_cost_point(
             dict(ops, build_wall_s=None), DATASET)
 
-    def test_build_cost_selects_through_the_predicate(self):
-        """A correct predicate `build_cost` does not call is the other way to
-        fail this, and the test that catches it off the drawn figure is
-        `@needs_matplotlib` -- so on a host built from the documented
-        prerequisites it would not be caught at all. Asserted off the source
-        for the same reason `tests/test_config.py` reads
-        `harness/drivers/valkey.py`'s `delete_ids` body: the invariant is
-        which selection the function performs, and that is legible without a
-        rendering stack.
+    def test_a_recall_record_alone_draws_no_build_chart(self, tmp_path):
+        """The invariant, asserted on what `build_cost` RETURNS.
+
+        This is the whole phase filter in one line, and it is deliberately not
+        `@needs_matplotlib`. `build_cost` reaches `if not plotted_records:
+        return None` BEFORE it touches `plt`, so on a host that has matplotlib
+        a leaking selection draws a figure and returns a dict, and on a host
+        that does not it raises on `plt.subplots`. Either way this assertion
+        fails and the fixed tree returns `None`, so one line covers both host
+        configurations.
+
+        WHY NOT `inspect.getsource`, which this test used to do: a reviewer
+        wrote a mutant that kept the predicate call and re-spelled the leak
+        beside it --
+
+            plotted_records = [r for r in records
+                               if _is_build_cost_point(r, dataset)
+                               or (r.get("dataset") == dataset
+                                   and not r.get("build_wall_s") is None)]
+
+        -- which satisfied every string the source assertions looked for, put
+        the leak fully back on the drawn figure, and was green on a bare host.
+        A spelling is not the invariant; what the function selects is.
         """
-        import inspect
-        body = inspect.getsource(charts.build_cost)
-        assert "_is_build_cost_point(r, dataset)" in body, body
-        # The clause the predicate replaced must not come back beside it.
-        assert 'r.get("build_wall_s") is not None' not in body, body
+        assert charts.build_cost([_ann_recall_record()], DATASET,
+                                 str(tmp_path), "e18-leak") is None
+
+    @needs_matplotlib
+    def test_the_published_subtitle_does_not_name_an_unmeasured_engine(
+            self, tmp_path, monkeypatch):
+        """The most quotable harm the leak would have done.
+
+        A `recall_qps` record carries no `extra.separable_build`, so
+        `generate.build_kind` returns `BUILD_KIND_UNRECORDED` for it and
+        `build_cost` names it in the subtitle: "1 engine(s) left off the first
+        two panels (percona): their records do not say whether the build was
+        separable, so the build time cannot be placed". That is a published
+        sentence about an engine that was never measured on the ops path,
+        explaining its absence from panels it never belonged on. Asserted on
+        the figure's own suptitle rather than on the record set, because the
+        sentence is the artefact.
+        """
+        captured = []
+        real_suptitle = charts.plt.Figure.suptitle
+
+        def capture(self, text, *args, **kw):
+            captured.append(text)
+            return real_suptitle(self, text, *args, **kw)
+
+        monkeypatch.setattr(charts.plt.Figure, "suptitle", capture)
+        recs = ([_ops_build_record(m=m) for m in (8, 16, 32)]
+                + [_ann_recall_record(m=m) for m in (8, 16, 32)])
+        assert charts.build_cost(recs, DATASET, str(tmp_path),
+                                 "e18-sub") is not None
+        assert captured, "no suptitle was drawn"
+        subtitle = captured[0]
+        assert "percona" not in subtitle, subtitle
+        assert "left off the first two panels" not in subtitle, subtitle
 
     @needs_matplotlib
     def test_the_drawn_chart_plots_the_ops_record_alone(self, tmp_path,
@@ -606,3 +902,85 @@ class TestAnnBuildsStayOffTheOpsBuildCostChart:
         plotted = {y for s in captured for _x, y in s["points"]}
         assert 283.275 not in plotted
         assert 249856 * 1024 not in plotted
+
+
+# ---------------------------------------------------------------------------
+# 5. The report/coercers.py extraction
+# ---------------------------------------------------------------------------
+
+class TestTheCoercersMovedWithoutLoss:
+    """`report/loaders.py` was at 798 of this repo's 800-line ceiling.
+
+    After `report/measurement_versions.py`'s precedent, whose own test says
+    the extraction was taken at 793 lines "so the next addition would not
+    breach it, and so the change would be reviewed here rather than inherited
+    by unrelated work in the file". This change arrived with less margin than
+    the condition that triggered that one, and two lines do not hold one
+    comment, so the four coercers left as well.
+
+    The ceiling tests in `tests/test_config.py` and `tests/test_t2b_report.py`
+    glob `loaders.py` and `measurement_versions.py` by name and neither file
+    belongs to this unit, so `report/coercers.py`'s own ceiling is asserted
+    here.
+    """
+
+    def test_the_private_names_still_resolve_from_loaders(self):
+        """`loaders._maybe_*` is how every call site in that file reaches
+        them, and aliasing on import is what keeps those sites unchanged."""
+        from report import coercers, loaders
+        for private, public in (("_maybe_int", "maybe_int"),
+                                ("_maybe_float", "maybe_float"),
+                                ("_maybe_str", "maybe_str"),
+                                ("_maybe_bool", "maybe_bool")):
+            assert getattr(loaders, private) is getattr(coercers, public), \
+                private
+
+    def test_all_three_files_are_within_the_line_ceiling(self):
+        for parts in (("report", "loaders.py"),
+                      ("report", "measurement_versions.py"),
+                      ("report", "coercers.py")):
+            path = os.path.join(VB_ROOT, *parts)
+            lines = len(open(path).read().splitlines())
+            assert lines <= 800, f"{parts}: {lines} lines"
+
+    def test_the_extraction_actually_bought_headroom(self):
+        """The point of the move, stated as a number.
+
+        Not `<= 800`, which the file already satisfied: the precedent was
+        taken at 793 because 7 lines is not room to work in, and landing this
+        one at 798 and calling it done would repeat that mistake rather than
+        learn from it.
+        """
+        path = os.path.join(VB_ROOT, "report", "loaders.py")
+        lines = len(open(path).read().splitlines())
+        assert lines <= 780, f"report/loaders.py is back up to {lines} lines"
+
+    def test_the_new_module_does_not_import_the_orchestrator(self):
+        """`report/` runs in a bench image that mounts `report/` and
+        `harness/` only; this once crashed generation at the end of a
+        twenty-hour run."""
+        source = open(os.path.join(VB_ROOT, "report", "coercers.py")).read()
+        # Line-wise and skipping comments, after the precedent's own form in
+        # `tests/test_config.py`: this module's docstring explains the rule,
+        # so a whole-file substring search fails on the explanation.
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "import orchestrator" not in stripped, stripped
+            assert "from orchestrator" not in stripped, stripped
+
+    def test_nan_is_the_callers_decision_and_not_the_coercers(self):
+        """`maybe_float` converts a NaN; `load_annb_results` drops it.
+
+        Split that way on purpose: a NaN is a value the file genuinely holds,
+        and the two readers of this module want opposite things from it.
+        Folding the filter into the coercer would make
+        `test_an_unparseable_attribute_is_absent_rather_than_fatal` pass for
+        the wrong reason.
+        """
+        from report import coercers
+        value = coercers.maybe_float(float("nan"))
+        assert value is not None and value != value
+        assert coercers.maybe_float(None) is None
+        assert coercers.maybe_float("n/a") is None

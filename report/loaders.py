@@ -36,6 +36,16 @@ from report.measurement_versions import (  # noqa: F401
     refuse_mixed_measurement_versions,
 )
 
+# Extracted for the same reason. Aliased rather than renamed at the call sites,
+# which read them a dozen times; `report/coercers.py` has the argument for why
+# the conversion happens at all. New code should import it directly.
+from report.coercers import (  # noqa: F401
+    maybe_bool as _maybe_bool,
+    maybe_float as _maybe_float,
+    maybe_int as _maybe_int,
+    maybe_str as _maybe_str,
+)
+
 
 def knn_recall(dataset_distances: numpy.ndarray, run_distances: numpy.ndarray,
                count: int, epsilon: float = 1e-3) -> float:
@@ -172,24 +182,32 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                         # ann-benchmarks records index size in kilobytes.
                         record.setdefault("index_bytes",
                                           int(float(attrs["index_size"]) * 1024))
-                    # The build cost, measured since this framework existed
-                    # and dropped by this reader for just as long: the report
-                    # could say what an `ef_construction` bought and never what
-                    # it cost, so the published claim was the ratio of the KNOB
-                    # ("16 times the build effort") against a measured 2.17x.
-                    # Two fields, because `build_time` is upstream's clock
-                    # around `algo.fit` and `ingest_seconds` is ours around the
-                    # load alone. No rate is derived -- the file holds no row
-                    # count. Absent stays absent rather than 0.0, which reads
-                    # as a free build and which every `is not None` selector
-                    # downstream would plot, and `value == value` drops a NaN
-                    # for the reason the `qps` line above does. The full
-                    # account: tests/test_e18_ann_build_timing_reaches_the_records.py
-                    for field, attribute in (("build_wall_s", "build_time"),
-                                             ("ingest_wall_s", "ingest_seconds")):
-                        value = _maybe_float(attrs.get(attribute))
-                        if value is not None and value == value:
-                            record[field] = value
+                    # The build cost: measured since this framework existed
+                    # and dropped by this reader for just as long, so the
+                    # published claim was the ratio of the KNOB ("16 times the
+                    # build effort") against a measured 2.17x. `build_time` is
+                    # the only timing EVERY engine writes and is the sole
+                    # source of `build_wall_s`. The load is spelled
+                    # `ingest_seconds` by `vb_mysql` and `load_seconds` by the
+                    # pgvector, valkey and mongodb modules, never both at once,
+                    # and is one quantity, so one field reads both;
+                    # `build_seconds` beside them is NOT read, because
+                    # mongodb's includes the load and the other two's do not.
+                    # No rate is derived -- the file holds no row count.
+                    # Absent stays absent rather than 0.0, and a NaN is dropped
+                    # because `generate.py` writes with `default=str` and would
+                    # land it as the string "nan" rather than failing. Why each
+                    # of those, with the measured figures:
+                    # tests/test_e18_ann_build_timing_reaches_the_records.py
+                    for field, attributes in (
+                            ("build_wall_s", ("build_time",)),
+                            ("ingest_wall_s", ("ingest_seconds", "load_seconds")),
+                    ):
+                        for attribute in attributes:
+                            value = _maybe_float(attrs.get(attribute))
+                            if value is not None and value == value:
+                                record[field] = value
+                                break
                     if times is not None and len(times):
                         record["latency_p50_ms"] = float(numpy.percentile(times, 50) * 1000)
                         record["latency_p95_ms"] = float(numpy.percentile(times, 95) * 1000)
@@ -361,47 +379,6 @@ def ceiling_pressure(rows: List[Dict[str, Any]],
         "fraction_at_ceiling": at_ceiling / len(values),
         "first_hit_fraction": first / len(values),
     }
-
-
-def _maybe_int(value: Any) -> Optional[int]:
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _maybe_float(value: Any) -> Optional[float]:
-    """`_maybe_int`'s float sibling, for the two build timings above. A plain
-    float, not the `numpy.float64` h5py returns and `json.dump` cannot write."""
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _maybe_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return str(value)
-
-
-def _maybe_bool(value: Any) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, (bool, numpy.bool_)):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in ("true", "1"):
-        return True
-    if text in ("false", "0"):
-        return False
-    return None
 
 
 def pareto_frontier(points: List[Dict[str, Any]], x: str = "recall_at_k",
