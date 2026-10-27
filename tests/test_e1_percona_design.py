@@ -1172,10 +1172,26 @@ class TestTheDocument:
 
     def test_the_pinned_sha_is_the_same_in_every_file_that_names_one(self, doc):
         """A pin that differs between the document and the code it describes is
-        not a pin."""
+        not a pin.
+
+        THE SECOND ASSERTION IS NOT REDUNDANT, and it was nearly lost. The set
+        comparison alone is satisfied by a SHA in `percona/module.py` with
+        docs/09 naming none at all -- so a document that dropped its pin would
+        pass. That half used to live in
+        `test_foreign_citations_are_skipped_explicitly`, as a repeated
+        forty-character literal, and the citation conversion deleted that test
+        along with the foreign-citation machinery it belonged to. It is here
+        now, spelled `PINNED_SHA` rather than repeated, so the pin has one
+        definition in this file instead of two that can drift -- which is the
+        argument the comment above `PINNED_SHA` already makes about three
+        copies.
+        """
         module = open(os.path.join(ALGORITHMS, "percona", "module.py")).read()
         shas = set(re.findall(r"\b[0-9a-f]{40}\b", doc + module))
         assert shas == {PINNED_SHA}, shas
+        assert PINNED_SHA in doc, (
+            "docs/09 names no 40-character SHA; §0's pin table is where the "
+            "document commits to having been read against a specific tree")
 
     @pytest.fixture(scope="class")
     def section1(self, doc):
