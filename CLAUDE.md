@@ -219,13 +219,14 @@ in the worst case once querying is counted — all seven engines, which is what 
 measures when `--engines` is omitted. **The ingest figure covers six of those seven**:
 Percona's rate is measured but unmodelled, so the estimator names it in
 `engines_without_ingest_rate` rather than folding it in, and 726 h is a floor by an amount
-nothing here knows. Fifteen `ingest` records across four runs put it between 48 rows/s
-(gist-960, M=32, 1M rows) and 638 (sift-128, M=8, 1M rows), and none has been written into
-`_MEASURED_ROWS_PER_S` or `_INGEST_ROWS_PER_S` in `orchestrator/estimate.py`, so
-`_effective_rate` returns `None` for this engine and feeding that table is unlanded work.
-Before proposing a run, check `docs/07-planning-a-run.md` and the estimate the run prints.
-Prefer `dev` → `smoke` when validating framework changes; long profiles are the user's call,
-not a default.
+nothing here knows. Seventeen `ingest` records across six runs measure it: sixteen
+`incremental`, from 48 rows/s (gist-960, M=32, 1M rows) to 638 (sift-128, M=8, 1M rows), plus
+one `post` plain load at 2,653 rows/s, which is a different quantity because no graph is
+built during it. None has been written into `_MEASURED_ROWS_PER_S` or `_INGEST_ROWS_PER_S` in
+`orchestrator/estimate.py`, so `_effective_rate` returns `None` for this engine and feeding
+that table is unlanded work. Before proposing a run, check `docs/07-planning-a-run.md` and
+the estimate the run prints. Prefer `dev` → `smoke` when validating framework changes; long
+profiles are the user's call, not a default.
 
 Runs are resumable, checkpointed per `(pass, engine, dataset, phase)` and, inside an ops
 phase, per `(M, build_mode)`:
