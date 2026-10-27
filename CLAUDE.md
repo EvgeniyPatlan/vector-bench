@@ -216,11 +216,16 @@ Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
 --resource-pass both` is ~726 h of ingest before a single query runs, and ~1,066 h of run time
 in the worst case once querying is counted — all seven engines, which is what that command
-measures when `--engines` is omitted. **The ingest figure covers six of those seven**: nothing
-has measured Percona's ingest rate, so the estimator names it in `engines_without_ingest_rate`
-rather than modelling it, and 726 h is a floor by an amount nothing here knows. Before proposing a run,
-check `docs/07-planning-a-run.md` and the estimate the run prints. Prefer `dev` → `smoke` when
-validating framework changes; long profiles are the user's call, not a default.
+measures when `--engines` is omitted. **The ingest figure covers six of those seven**:
+Percona's rate is measured but unmodelled, so the estimator names it in
+`engines_without_ingest_rate` rather than folding it in, and 726 h is a floor by an amount
+nothing here knows. Fifteen `ingest` records across four runs put it between 48 rows/s
+(gist-960, M=32, 1M rows) and 638 (sift-128, M=8, 1M rows), and none has been written into
+`_MEASURED_ROWS_PER_S` or `_INGEST_ROWS_PER_S` in `orchestrator/estimate.py`, so
+`_effective_rate` returns `None` for this engine and feeding that table is unlanded work.
+Before proposing a run, check `docs/07-planning-a-run.md` and the estimate the run prints.
+Prefer `dev` → `smoke` when validating framework changes; long profiles are the user's call,
+not a default.
 
 Runs are resumable, checkpointed per `(pass, engine, dataset, phase)` and, inside an ops
 phase, per `(M, build_mode)`:

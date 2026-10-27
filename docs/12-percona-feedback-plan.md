@@ -247,14 +247,18 @@ survives costs a whole corpus load.
 
 6. **Build, then `dev`, then `smoke`.** No long profile runs until smoke is green at
    the new pin. **What that supplies is the ingest rate at the new pin, not the
-   first one ever measured.** Percona's ingest rate has been measured — the
-   2026-10-15 run and both *percona* runs record `ingest_rows_per_s`, from 48.17 on
-   gist-960 at `M=32` to 638.11 on sift-128 at `M=8` — but none of it was ever
-   fed back into `orchestrator/estimate.py`, whose `_MEASURED_ROWS_PER_S` and
-   `_INGEST_ROWS_PER_S` both omit this engine, so `_effective_rate` still returns
-   `None` for it and the estimator still names it in `engines_without_ingest_rate`.
-   Feeding the table is a separate one-line change from running smoke, and the
-   smoke run is what makes the figure describe the tree we would be publishing.
+   first one ever measured.** Percona's ingest rate has been measured fifteen
+   times across four runs — *full-20261015-215006*, *percona-20261015-213836* and
+   the two *percona* runs of 2026-10-20 and 2026-10-21 all record
+   `ingest_rows_per_s` — from 48.17 on gist-960 at `M=32` to 638.11 on sift-128 at
+   `M=8`. None of it was ever fed back into `orchestrator/estimate.py`, whose
+   `_MEASURED_ROWS_PER_S` and `_INGEST_ROWS_PER_S` both omit this engine, so
+   `_effective_rate` still returns `None` for it and the estimator still names it
+   in `engines_without_ingest_rate`. **So the rate is measured but unmodelled**,
+   which makes the fix a table entry rather than a run; CLAUDE.md said the rate was
+   unmeasured and is corrected in the same change as this section. Feeding the
+   table is separate work from running smoke, and the smoke run is what makes the
+   figure describe the tree we would be publishing.
 
 7. **A guard for this document.** `docs/09`, `docs/10` and `docs/11` are each
    guarded by a test that fails when the document drifts from the tree. This one
@@ -520,9 +524,13 @@ run that does not exist.** It is in the *percona* profile runs
 *percona-20261020-140151* and *percona-20261021-134142*, in the `tuned` pass, phase
 `recall_qps`, at `M=16` on fashion-mnist only, with `ef_construction` in {50, 200,
 800} — five `ef_search` points at 50 and 800 and nine at 200. Both runs carry the
-same grid and identical figures. The `percona` profile's own header comment says
-nothing here has ever been run, which is false, is what misled a review of this
-document, and is corrected in the same change as this section.
+same grid and identical figures. The profile ran a third time, on 2026-10-15
+(*percona-20261015-213836*), but that one ran the ops phase alone in the
+`normalized` pass, where the knob is coerced to the single vendor default, so it
+contributes a baseline and not a sweep point. The `percona` profile's own header
+comment says nothing here has ever been run, which is false of all three, is what
+misled a review of this document, and is corrected in the same change as this
+section.
 
 The five `ef_search` points the three settings share, from `recall_at_k`:
 
