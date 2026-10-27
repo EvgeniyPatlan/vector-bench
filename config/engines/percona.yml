@@ -161,6 +161,43 @@ server:
     # argument; the entrypoint supplies it there, and a second copy arriving
     # later makes the server exit 2 at startup.
     - --skip-name-resolve
+    # THE TWO FLAGS BELOW HAVE NEVER BEEN ACCEPTED BY A RUNNING SERVER, and
+    # nothing in the test suite can change that. An unknown server variable
+    # makes mysqld exit at startup, so the only thing that establishes these
+    # two spellings exist on this base is the rebuild on the build host
+    # followed by `./run-benchmark.sh run --profile dev`. Until that run
+    # starts a server and the log shows the `exec mysqld` line carrying both,
+    # treat them as proposed. If `dev` fails at startup, the failure will look
+    # like "the image is broken" and it will be one of these.
+    #
+    # WHY ASK FOR A CORE AT ALL. In run full-20261015-215006 half the percona
+    # ops units wrote no record at all: each died inside its first INSERT
+    # with `Lost connection to server during query` in 0.5-5.5 s. The count,
+    # and the resume that moved it, are in `runtime.error_log`'s comment
+    # below and are deliberately not restated here -- two copies of one
+    # figure is how the figure drifts. A core is the one artefact that
+    # distinguishes which of several faults that was, and it needs three
+    # separate things to be true -- this flag,
+    # `runtime.ulimits.core` below, and a host `kernel.core_pattern` that
+    # writes a file rather than piping to apport. The orchestrator prints the
+    # third at server start and must not change it.
+    - --core-file
+    # THE SECOND FLAG IS THE DIFFERENCE BETWEEN AN ARTEFACT AND A DISK
+    # INCIDENT, and it is the one a reader will be tempted to delete.
+    # `innodb_buffer_pool_in_core_file` defaults ON, which means the core
+    # contains the whole buffer pool. config/resources/tuned.yml sets
+    # `buffer_fraction: 0.35`, and the tuned pass on the reference machine
+    # gives this engine a 112.5 GiB container cap (the figure
+    # orchestrator/manifest.py quotes), so the buffer pool alone is
+    # 0.35 x 112.5 = 39.4 GiB of core -- written into the data volume under
+    # state/, on the filesystem the checkout is on, and then copied into
+    # results/ before teardown. With it OFF the core is bounded by the rest of
+    # the resident set, which in that run peaked at 48.5 GiB total.
+    #
+    # Nothing is lost by switching it off: the buffer pool is a cache of pages
+    # that are also on disk, and the question a core answers here is which
+    # stack frame the server died in.
+    - --innodb-buffer-pool-in-core-file=OFF
   normalized:
     - --innodb-buffer-pool-size={buffer_bytes}
     # UNLIMITED, AND NOT {graph_cache_bytes}. This is a decided policy and the
@@ -312,7 +349,7 @@ runtime:
   # This key exists because that is a path in the data volume and not a
   # stream: the container's stdout is the three-line entrypoint banner, and
   # teardown stops the container and removes the volume. In run
-  # full-20261015-215006, 13 of 24 ops units died inside the first INSERT with
+  # full-20261015-215006, 12 of 24 ops units died inside the first INSERT with
   # `mariadb.InterfaceError: Lost connection to server during query` within
   # 0.5-5.5 s, server RSS flat at the buffer-pool baseline and CPU at 0.16
   # cores -- and whether that was a signal, an assertion or a refused
@@ -320,7 +357,51 @@ runtime:
   # logs/percona-server-*.log in that run is the banner and the file that
   # would have said was deleted with the volume. ops_pass copies this out
   # before teardown.
+  #
+  # THE COUNT WAS 13 UNTIL A RESUME MOVED IT, and that is recorded here
+  # because the next reader will re-derive it and reach a different number.
+  # During the original pass (2026-10-15T21:50Z to 2026-10-17T15:42Z) thirteen
+  # of the twenty-four ops-percona-*.jsonl files were empty. A `--resume` of
+  # the same run id on 2026-10-19 re-ran fashion-mnist-784-euclidean /
+  # normalized / M=16 and it SURVIVED -- 20 records stamped 08:45-08:55Z --
+  # which is what leaves twelve. So the figure was never an arithmetic error;
+  # it was a statement about a run that was still moving, and the
+  # percona-only export taken on 2026-10-18 still shows thirteen and carries
+  # no checkpoint for that unit while the seven-engine bundle shows twelve and
+  # does.
+  #
+  # The "12 of 18" million-row figure in docs/12 is NOT in conflict with
+  # either number and was not evidence against 13: the eighteen million-row
+  # configurations (gist, glove, sift x two passes x three M values) held
+  # twelve empty files both before and after the resume, and the unit the
+  # resume recovered is fashion-mnist, which is 60,000 rows. 12 + 1 = 13 then,
+  # 12 + 0 = 12 now.
   error_log: /var/lib/vbench/percona.err
+  # UNLIMITED CORE SIZE, and it is the second of the three things a usable
+  # core needs -- `server.common`'s --core-file is the first and the host's
+  # kernel.core_pattern is the third. A container inherits the docker
+  # daemon's own RLIMIT_CORE, which on a stock install is whatever started
+  # dockerd, so mysqld can be asked to dump and still produce a core
+  # truncated at that limit. A truncated core is worse than none: gdb opens it
+  # and prints a backtrace that stops where the file does, and the reader has
+  # no way to tell that from a stack that really ends there.
+  #
+  # Per-engine rather than a global default, so the six engines that are not
+  # under investigation keep the `docker run` argv they had.
+  #
+  # NOTHING A RUN LEAVES BEHIND RECORDS THIS VALUE, and that is worth knowing
+  # before trusting a core's size. `Manifest.set_engine` writes an engine's
+  # source, build, images and presentation and NOT this runtime block, and the
+  # `exec mysqld ...` banner that ops_pass archives carries the SERVER flags
+  # only -- --ulimit is a docker flag and never reaches mysqld's argv. So the
+  # limit in force when a core was written is whatever this file said at the
+  # time, and the only way to tell is the commit.
+  #
+  # Quoted, because YAML would otherwise read -1 as an integer. `docker run
+  # --ulimit core=-1` takes either, but the registry stringifies and a
+  # quoted value is what the test asserts.
+  ulimits:
+    core: "-1"
   credentials:
     user: "bench"
     password: "bench"

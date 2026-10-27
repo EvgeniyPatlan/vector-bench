@@ -70,6 +70,18 @@ class EngineRuntime:
     #: genuinely optional -- is what forces it to the end rather than beside
     #: `data_mount` where it reads best.
     error_log: Optional[str] = None
+    #: `docker run --ulimit` entries for this engine's server container, as
+    #: `((name, value), ...)`. Empty for every engine that declares none, and
+    #: `ContainerSpec.ulimits` says what the one live entry is for.
+    #:
+    #: A TUPLE OF PAIRS AND NOT THE DICT IT READS AS. This class is
+    #: `@dataclass(frozen=True)`, so Python generates `__hash__` from its
+    #: fields and `hash()` on a registry entry works today; one `Dict` field
+    #: makes every engine unhashable, and that would surface at whatever first
+    #: put one in a set rather than here. `probe` is a tuple for the same
+    #: reason. Callers that want a mapping build one -- `dict(engine.ulimits)`
+    #: -- which also keeps them from mutating the registry.
+    ulimits: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def credentials(self) -> Tuple[str, str]:
@@ -121,6 +133,15 @@ def _build(name: str, config: Dict[str, Any], fallback_index: int) -> EngineRunt
         # Not in `missing` above: an engine that logs to stderr declares no
         # error_log and must keep working without one.
         error_log=str(runtime["error_log"]) if runtime.get("error_log") else None,
+        # Sorted, so the argv an engine produces does not depend on the order
+        # keys happen to appear in its YAML -- a server command line that
+        # changes without the configuration changing is a diff nobody can
+        # account for. Values are stringified because YAML reads `-1` as an
+        # int and `"-1"` as a string and `--ulimit core=-1` is the same flag
+        # either way.
+        ulimits=tuple(sorted(
+            (str(key), str(value))
+            for key, value in (runtime.get("ulimits") or {}).items())),
     )
 
 
