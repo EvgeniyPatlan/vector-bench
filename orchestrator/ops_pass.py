@@ -645,6 +645,17 @@ class OpsRun:
         unit of work, and a four-dataset profile would otherwise overwrite
         three of four.
 
+        AND WHAT THAT COSTS `export`, which is not handled here and should be
+        known before it surprises someone. `orchestrator/export.py`'s
+        `write_bundle` tars the WHOLE run directory, so a run holding a core
+        produces a bundle carrying it -- gigabytes, in a thing whose stated
+        job is to be "sent to someone who does not have this checkout".
+        `cmd_export` prints the size, so it is visible, but only afterwards. A
+        core is also the wrong artefact to send: it is specific to this
+        machine and this build, and what the server team can act on is the
+        BACKTRACE taken from it. Excluding `cores/` from the bundle is the
+        right fix and belongs to whoever owns `export.py`.
+
         NOTHING HERE MAY RAISE. `copy_glob_as_root` returns `[]` for every
         failure; the `try` is for the registry lookup and the path arithmetic.
         """
