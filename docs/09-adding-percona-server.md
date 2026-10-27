@@ -183,27 +183,34 @@ The behaviour at the edges is in the server's own recorded output, the
 *sys_vars* suite's *innodb_hnsw_ef_search_basic.result*:
 
 ```
- 1  SET @start_global_value = @@global.innodb_hnsw_ef_search;
- 2  # Default: 40, in both scopes.
- 3  SELECT @@global.innodb_hnsw_ef_search, @@session.innodb_hnsw_ef_search;
- 4  @@global.innodb_hnsw_ef_search  @@session.innodb_hnsw_ef_search
- 5  40  40
+SET @start_global_value = @@global.innodb_hnsw_ef_search;
+# Default: 40, in both scopes.
+SELECT @@global.innodb_hnsw_ef_search, @@session.innodb_hnsw_ef_search;
+@@global.innodb_hnsw_ef_search  @@session.innodb_hnsw_ef_search
+40  40
 ...
-20  # A session value does not change the global one.
-21  SET SESSION innodb_hnsw_ef_search = 200;
-22  SELECT @@global.innodb_hnsw_ef_search, @@session.innodb_hnsw_ef_search;
-23  @@global.innodb_hnsw_ef_search  @@session.innodb_hnsw_ef_search
-24  40  200
+# A session value does not change the global one.
+SET SESSION innodb_hnsw_ef_search = 200;
+SELECT @@global.innodb_hnsw_ef_search, @@session.innodb_hnsw_ef_search;
+@@global.innodb_hnsw_ef_search  @@session.innodb_hnsw_ef_search
+40  200
 ...
-30  # The bounds, and values outside them clamped with a warning.
-31  SET SESSION innodb_hnsw_ef_search = 1;
+# The bounds, and values outside them clamped with a warning.
+SET SESSION innodb_hnsw_ef_search = 1;
 ...
-35  SET SESSION innodb_hnsw_ef_search = 100000;
+SET SESSION innodb_hnsw_ef_search = 100000;
 ...
-39  SET SESSION innodb_hnsw_ef_search = 0;
-40  Warnings:
-41  Warning 1292  Truncated incorrect innodb_hnsw_ef_search value: '0'
+SET SESSION innodb_hnsw_ef_search = 0;
+Warnings:
+Warning 1292  Truncated incorrect innodb_hnsw_ef_search value: '0'
 ```
+
+(The gutter numbers this excerpt used to carry are gone, and the `...` lines
+are what is left of them: they mark where the recording was elided, which is
+the only thing the numbers were doing that the reader needed. A gutter number
+is a line citation that the ratchet's pattern cannot see, because it is not in
+code font — so it is the one form of the rot a guard cannot catch and only the
+author can.)
 
 So: **default 40, range 1..100000, clamped with a warning outside it, integers
 only** (`1.1`, `1e1` and `'AUTO'` are all *ER_WRONG_TYPE_FOR_VAR*, in the same
@@ -276,15 +283,15 @@ loader works unchanged, and it is settled by *field.cc*'s
 `store(const char *from, size_t length, const CHARSET_INFO *cs)`:
 
 ```c
-7096  uint32 dimensions = get_dimensions(length, Field_vector::precision);
-7097  if (dimensions == UINT32_MAX || cs != &my_charset_bin) {
-7098    my_error(ER_DATA_INCOMPATIBLE_WITH_VECTOR, MYF(0), "string", length);
-7099    return TYPE_ERR_BAD_VALUE;
-7100  }
+  uint32 dimensions = get_dimensions(length, Field_vector::precision);
+  if (dimensions == UINT32_MAX || cs != &my_charset_bin) {
+    my_error(ER_DATA_INCOMPATIBLE_WITH_VECTOR, MYF(0), "string", length);
+    return TYPE_ERR_BAD_VALUE;
+  }
 ...
-7107  /* Check for NAN or INF value in the vector. */
+  /* Check for NAN or INF value in the vector. */
 ...
-7130  return Field_blob::store(from, length, cs);
+  return Field_blob::store(from, length, cs);
 ```
 
 with *Field_vector::precision* declared `sizeof(float)` in *field.h*, and
