@@ -483,6 +483,211 @@ class TestRecords:
 
 
 # ---------------------------------------------------------------------------
+# Storage engine
+# ---------------------------------------------------------------------------
+
+class TestOnlyTheDriverDecidesTheStorageEngine:
+    """A record may name a storage engine only where there is one to name.
+
+    `IndexSpec.storage_engine` is a MySQL-family `ENGINE=` clause.
+    `harness/main.py` defaults `--storage-engine` to `InnoDB` and
+    `orchestrator/cli.py:_ops_storage_engines` passes `InnoDB` for every
+    engine that is not MariaDB, so the field arrives populated for all seven
+    engines and only three of them put it in a CREATE TABLE.
+    `RunContext.record_defaults` stamped it regardless, which published this,
+    counted over the seven-engine run `full-20261015-215006`
+    (`report/records.jsonl`, by engine and storage_engine):
+
+        alisql     InnoDB 161                 percona  InnoDB 433
+        mariadb    InnoDB 163                 pgvector InnoDB 268
+        mariadb123 InnoDB 163                 pgvector heap   200
+        mongodb    InnoDB 120                 valkey   InnoDB 128
+        mongodb    wiredTiger 37              valkey   memory 100
+
+    The honest rows are the `recall_qps` ones, written by the ann overlay
+    modules; every other phase is the ops harness. So pgvector, Valkey and
+    Percona Search each reported two different storage engines inside one run,
+    and the false value was the one on the build-cost, concurrency, filtered
+    and churn records. PostgreSQL has no InnoDB, and neither does Valkey or
+    MongoDB.
+
+    MariaDB's InnoDB-versus-MyISAM sweep is the one real within-engine
+    comparison here (`orchestrator/cli.py:_ops_storage_engines`,
+    `docs/05-methodology.md`), so the fix cannot be a blanket None: the first
+    test below is what stops it becoming one.
+    """
+
+    #: Every engine the harness drives, and the storage engine its records are
+    #: entitled to claim. Spelled per ENGINE rather than per driver class
+    #: because that is the axis the defect was measured on, and because
+    #: `mariadb`/`mariadb123` sharing one class is exactly the kind of mapping
+    #: a per-class table hides.
+    EXPECTED = {
+        "mariadb": "InnoDB", "mariadb123": "InnoDB", "alisql": "InnoDB",
+        "percona": "InnoDB", "pgvector": None, "mongodb": None,
+        "valkey": None,
+    }
+
+    @staticmethod
+    def _spec(storage_engine: str = "InnoDB"):
+        from harness.drivers.base import IndexSpec
+        return IndexSpec(dim=8, m=16, metric="euclidean",
+                         storage_engine=storage_engine)
+
+    def _drivers(self):
+        """One offline instance per engine, keyed by engine name.
+
+        Constructed, not connected: none of the four client libraries is
+        installed on the host, and `__init__` needs none of them.
+
+        The registry check lives here rather than in a test of its own, so
+        that it is carried by tests a mutation of the fix can fail. A table
+        that fell behind `_driver_table` would leave a new engine's answer
+        untested, which is how an InnoDB default survived three engines with
+        no storage engine being added beneath it -- but a standalone
+        assertion about two dictionaries passes against the defect and
+        against the repair alike, and a probe that cannot fail is not
+        coverage.
+        """
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.postgres import _driver_table
+
+        table = _driver_table()
+        assert set(self.EXPECTED) == set(table)
+        # Both branches are populated, so neither test below runs over an
+        # empty collection and passes by doing nothing.
+        assert sum(1 for v in self.EXPECTED.values() if v is not None) == 4
+        assert sum(1 for v in self.EXPECTED.values() if v is None) == 3
+        spec = ConnectionSpec(host="h", port=1)
+        return {engine: cls(spec) for engine, cls in table.items()}
+
+    def test_the_mysql_family_reports_the_engine_its_ddl_used(self):
+        """And reports MyISAM when MyISAM is what was asked for.
+
+        Asserted against the DDL the driver builds rather than against the
+        `IndexSpec` it was handed, so this cannot pass for a driver that
+        reports a storage engine it did not create the table with -- which is
+        the whole failure being repaired, one engine over.
+        """
+        drivers = self._drivers()
+        family = [name for name, want in self.EXPECTED.items()
+                  if want is not None]
+        assert family, "no MySQL-family engine to check"
+        for engine in family:
+            driver = drivers[engine]
+            for storage in ("InnoDB", "MyISAM"):
+                index = self._spec(storage)
+                ddl = driver._create_table_ddl(index, with_index=True)
+                assert ddl.rstrip().endswith(f") ENGINE={storage}"), ddl
+                assert driver.storage_engine_in_use(index) == storage, engine
+
+    def test_no_other_driver_claims_one(self):
+        """None, whatever the spec says, because there is nothing to report.
+
+        Both values are tried: a driver that returned the spec's value
+        unconditionally passes a single-value check as long as that value is
+        the one the test expected to see suppressed.
+        """
+        drivers = self._drivers()
+        others = [name for name, want in self.EXPECTED.items() if want is None]
+        assert others, "no non-MySQL engine to check"
+        for engine in others:
+            for storage in ("InnoDB", "MyISAM"):
+                driver = drivers[engine]
+                got = driver.storage_engine_in_use(self._spec(storage))
+                assert got is None, f"{engine} claimed {got!r}"
+
+    def test_record_defaults_asks_the_driver_and_not_the_spec(self, tmp_path):
+        """The one line the defect lived on, both ways round.
+
+        A real `MariaDBDriver` and a real `PostgresDriver`, with only
+        `server_version` stubbed -- that call needs a live server and has
+        nothing to do with this field, while `storage_engine_in_use` is the
+        drivers' own.
+
+        * Honest: MariaDB's record says MyISAM, pgvector's says nothing.
+        * Mutant (`index.storage_engine` back in `record_defaults`): both say
+          MyISAM, and the pgvector one is a claim about an engine that has no
+          storage engines.
+        """
+        from harness.drivers.base import ConnectionSpec
+        from harness.drivers.mysql_family import MariaDBDriver
+        from harness.drivers.postgres import PostgresDriver
+        from harness.workloads.context import RunContext
+
+        class _OfflineMariaDB(MariaDBDriver):
+            def server_version(self) -> str:
+                return "11.8.8-offline"
+
+        class _OfflinePostgres(PostgresDriver):
+            def server_version(self) -> str:
+                return "17.0-offline"
+
+        class _Dataset:
+            name = "d"
+            metric = "euclidean"
+
+        recorder = records.Recorder(str(tmp_path / "ops.jsonl"))
+        try:
+            ctx = RunContext(run_id="r", resource_pass="normalized",
+                             recorder=recorder, engine="e")
+            conn = ConnectionSpec(host="h", port=1)
+            index = self._spec("MyISAM")
+            mariadb = ctx.record_defaults(_OfflineMariaDB(conn), _Dataset(),
+                                          index)
+            pgvector = ctx.record_defaults(_OfflinePostgres(conn), _Dataset(),
+                                           index)
+            assert mariadb["storage_engine"] == "MyISAM"
+            assert pgvector["storage_engine"] is None
+
+            # And None leaves the written record with no such key at all,
+            # rather than a null. That is what `report/loaders.py:memory_stem`
+            # needs: it suffixes the `mem-*.jsonl` name it reconstructs only
+            # for a storage engine that is not InnoDB, and the orchestrator
+            # named that file from its own `InnoDB`, so an absent field takes
+            # the same unsuffixed branch and the sampled peak RSS still joins.
+            for common in (mariadb, pgvector):
+                recorder.write(records.Record(
+                    **common, phase=records.PHASE_BUILD))
+        finally:
+            recorder.close()
+
+        written = list(records.read_records(recorder.path))
+        assert written[0]["storage_engine"] == "MyISAM"
+        assert "storage_engine" not in written[1], written[1]
+
+    def test_the_writer_reads_the_driver_in_source(self):
+        """No workload may stamp the field from an `IndexSpec` again.
+
+        `record_defaults` is the choke point every ops record's provenance
+        passes through, and the field now has exactly one producer. A second
+        one would be invisible to the tests above, which drive the choke
+        point: a workload that overwrote `storage_engine` in its own
+        `Record(**common, ...)` call would restore the defect for its phase
+        alone.
+        """
+        import glob
+        import re
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        context_src = open(os.path.join(root, "harness", "workloads",
+                                        "context.py")).read()
+        writer = [line for line in context_src.splitlines()
+                  if re.search(r'^\s*"storage_engine":', line)]
+        assert len(writer) == 1, writer
+        assert "driver.storage_engine_in_use(index)" in writer[0], writer[0]
+
+        workloads = glob.glob(os.path.join(root, "harness", "workloads",
+                                           "*.py"))
+        assert len(workloads) > 5, workloads
+        for path in workloads:
+            src = open(path).read()
+            assert "index.storage_engine" not in src, path
+            if os.path.basename(path) != "context.py":
+                assert '"storage_engine":' not in src, path
+
+
+# ---------------------------------------------------------------------------
 # CPU topology
 # ---------------------------------------------------------------------------
 

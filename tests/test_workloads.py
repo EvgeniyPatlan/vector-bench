@@ -38,6 +38,7 @@ from harness.datasets import Dataset  # noqa: E402
 from harness.metrics import latency, records  # noqa: E402
 from harness.workloads import build as build_workload  # noqa: E402
 from harness.workloads import churn as churn_workload  # noqa: E402
+from harness.workloads import churn_readers  # noqa: E402
 from harness.workloads import concurrency as concurrency_workload  # noqa: E402
 from harness.workloads import filtered as filtered_workload  # noqa: E402
 from harness.workloads.context import RunContext  # noqa: E402
@@ -1370,6 +1371,117 @@ class TestWorkloadsShareOneSchema:
         # Recorder.write refuses an unknown phase, so getting this far proves
         # every phase these workloads emit is in ALL_PHASES.
         assert set(phases) <= set(records.ALL_PHASES)
+
+    def test_no_phase_claims_a_storage_engine_the_engine_does_not_have(
+            self, ctx, dataset, monkeypatch):
+        """The defect, reproduced over every phase one unit writes.
+
+        `FakeDriver` is not a MySQL-family driver and therefore has no
+        `ENGINE=` clause, exactly like `PostgresDriver`, `ValkeyDriver` and
+        `MongoDriver`. The `IndexSpec` it is handed still carries `InnoDB`,
+        because `harness/main.py` defaults `--storage-engine` to it and
+        `orchestrator/cli.py:_ops_storage_engines` passes it for every engine
+        that is not MariaDB -- so the value is present, unused, and was being
+        stamped on the record anyway. In `full-20261015-215006` that published
+        268 pgvector, 128 Valkey and 120 Percona Search records claiming
+        InnoDB, beside the same run's `heap`, `memory` and `wiredTiger` from
+        the ann path: one engine, two storage engines, one run.
+        * Honest: not one record carries the key.
+        * Mutant (`record_defaults` reading `index.storage_engine` again):
+          every record in the file carries `InnoDB`.
+
+        All five phases, not a sample, because the defect was in the shared
+        provenance dict and a per-phase check could pass against a workload
+        that happens to overwrite it.
+        """
+        # Imported here rather than in this module's header: the file is about
+        # the four measurement workloads, and calibration is in
+        # tests/test_calibrate.py. It is in this list because the archived run
+        # carries 139 `ef_calibration` records for Percona Server alone, and
+        # they were wrong in the same way.
+        from harness.workloads import calibrate as calibrate_workload
+
+        driver = FakeDriver(dim=dataset.dim, metric=dataset.metric,
+                            ef_half=16.0, ef_search=64)
+        driver.connect()
+        index = index_spec(dataset)
+        # The precondition that makes the rest of this non-vacuous: the spec
+        # really does carry the value the bug published. A fixture whose spec
+        # held None would pass this test against the unfixed code.
+        assert index.storage_engine == "InnoDB"
+
+        build_workload.run(ctx, driver, dataset, index)
+        indexed_rows = driver.count_rows()
+        calibrate_workload.run(ctx, driver, dataset, index, ef_grid=(64,),
+                               max_queries=N_QUERIES, warmup=1,
+                               indexed_rows=indexed_rows)
+        concurrency_workload.run(
+            ctx, driver.clone, dataset, index, ef_search=64,
+            client_counts=(1,), duration_s=0.05, warmup=1,
+            max_queries=N_QUERIES)
+        filtered_workload.run(
+            ctx, driver, dataset, index, ef_search=64, selectivities=(0.50,),
+            max_queries=N_QUERIES, warmup=2, indexed_rows=indexed_rows,
+            columns=(ds.FILTER_TAG,))
+        # WITH A READER POOL, which is not decoration. `churn_readers.py`
+        # stamps `extra.reader_ops_unit` -- the ops unit both halves of the
+        # reader ratio must share -- and `OPS_UNIT_KEYS` names
+        # `storage_engine` as one of its four axes. `Record.to_dict` drops
+        # None at the TOP LEVEL only, so that nested axis is a literal `null`
+        # on the wire for an engine with no storage engine. Without readers
+        # the key is absent and the raw-text assertion below passes for the
+        # wrong reason; it did, and this is what that cost.
+        #
+        # The baseline window is shortened the way `tests/test_t4b_readers.py`
+        # shortens it, and patched on `churn` rather than on `churn_readers`
+        # because `churn.run` reads the name out of its own module globals --
+        # patching the defining module would silently run the real 30 s window
+        # and cost this test thirty seconds per fraction. It did, before this
+        # line existed.
+        monkeypatch.setattr(churn_workload, "READER_BASELINE_WINDOW_S", 0.4)
+        churn_workload.run(
+            ctx, driver, dataset, index, ef_search=64, fractions=(0.10,),
+            max_queries=N_QUERIES, indexed_rows=indexed_rows,
+            driver_factory=driver.clone, readers=2)
+
+        rows = written(ctx)
+        # Every phase a unit writes is represented, so "no record claims one"
+        # below is a statement about all of them.
+        assert {r["phase"] for r in rows} == {
+            records.PHASE_INGEST, records.PHASE_BUILD,
+            records.PHASE_CALIBRATION, records.PHASE_CONCURRENCY,
+            records.PHASE_FILTERED, records.PHASE_CHURN,
+        }, sorted({r["phase"] for r in rows})
+        claimed = [(r["phase"], r["storage_engine"]) for r in rows
+                   if "storage_engine" in r]
+        assert claimed == [], claimed
+        # No record claims InnoDB in any field, nested ones included, which is
+        # the whole point and is what a raw-text check is good for.
+        raw = open(ctx.recorder.path).read()
+        assert "InnoDB" not in raw
+
+        # The ONE place the name still appears, deliberately, and asserted
+        # rather than excluded: `extra.reader_ops_unit` is an identity tuple,
+        # not a claim about the engine. `None` there says "this unit has no
+        # storage engine", which is exactly what both halves of the ratio must
+        # agree about -- and dropping the axis to make the text assertion
+        # above simpler would weaken the guard for the one engine where the
+        # axis is real, since MariaDB's InnoDB and MyISAM units must never be
+        # paired with each other.
+        units = [(r.get("extra") or {}).get("reader_ops_unit") for r in rows]
+        units = [u for u in units if u is not None]
+        assert units, "the reader pool wrote no ops unit to key the ratio on"
+        for unit in units:
+            assert set(unit) == set(churn_readers.OPS_UNIT_KEYS), unit
+            assert unit["storage_engine"] is None, unit
+            # The other three axes are populated, so the None above is this
+            # field's own answer and not a unit that failed to resolve.
+            assert unit["m"] == index.m
+            assert unit["build_mode"] == index.build_mode
+            assert unit["resource_pass"] == "normalized"
+        # Which is a null on the wire, under `extra` and nowhere else.
+        assert '"storage_engine": null' in raw
+        assert raw.count('"storage_engine"') == len(units)
 
 
 #: Warm-up queries per client for the bracketing test below, and the client

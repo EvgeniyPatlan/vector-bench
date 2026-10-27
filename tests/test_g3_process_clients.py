@@ -1485,7 +1485,7 @@ class TestForkIsForcedByTheCallersAndNotChosen:
     """
 
     def test_the_real_factory_cannot_be_pickled(self):
-        """Measured against the shape `harness/main.py:298` actually has.
+        """Measured against the shape `harness/main.py:309` actually has.
 
         A `def` nested inside `main()`, whose `__qualname__` is
         `main.<locals>.driver_factory`. Pickle resolves a function by
@@ -1986,14 +1986,25 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
     def test_the_constant_moved_and_the_record_carries_it(self, tmp_path):
         """Honest and mutant, both read back out of a written record.
 
-        Honest: `OPS_MEASUREMENT_VERSION` is 7 and a record written by
-        `Recorder` carries `extra.ops_measurement_version` 7. Mutant (the
-        constant rebound to 5 at run time): the same `Recorder` call stamps a
-        5 onto a record measured by the process pool, which is the state that
-        would put this pool's numbers on one axis with the thread pool's.
+        Honest: a record written by `Recorder` carries
+        `extra.ops_measurement_version` equal to whatever
+        `OPS_MEASUREMENT_VERSION` currently is. Mutant (the constant rebound
+        to 5 at run time): the same `Recorder` call stamps a 5 onto a record
+        measured by the process pool, which is the state that would put this
+        pool's numbers on one axis with the thread pool's.
         `Recorder.write` reads the constant out of the module's globals on
         every call, so the rebinding reaches it -- a value captured at import
         would make this mutant pass unchanged.
+
+        The floor is `>= 7` rather than `== 7`, which is the form
+        `tests/test_harness.py:TestOpsMeasurementVersion` already uses for
+        version 2's. What this class claims is that THIS change carried a
+        bump, and `>= 7` says exactly that and keeps saying it: a later
+        version is a later change's business, not a regression of this one,
+        while anything below 7 means the process-pool bump was reverted. The
+        literal was `== 7` and version 8 -- the ops harness withdrawing a
+        storage engine from engines that have none -- is what showed it to be
+        a pin on the wrong thing.
         """
         from harness.metrics.records import PHASE_CONCURRENCY, Record
 
@@ -2009,7 +2020,8 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
             return list(records.read_records(str(path)))[0]["extra"][
                 records.OPS_MEASUREMENT_VERSION_KEY]
 
-        assert records.OPS_MEASUREMENT_VERSION == 7
+        assert records.OPS_MEASUREMENT_VERSION >= 7
+        live = records.OPS_MEASUREMENT_VERSION
         honest = stamp(tmp_path / "honest.jsonl")
         original = records.OPS_MEASUREMENT_VERSION
         try:
@@ -2017,7 +2029,7 @@ class TestTheMeasurementVersionIsAtomicWithTheChange:
             mutant = stamp(tmp_path / "mutant.jsonl")
         finally:
             records.OPS_MEASUREMENT_VERSION = original
-        assert honest == 7
+        assert honest == live
         assert mutant == 5
         assert honest != mutant
         assert records.OPS_MEASUREMENT_VERSION == original

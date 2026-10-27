@@ -90,6 +90,40 @@ function fieldLabel(name) {
 // honoured is worse than a missing one, because an empty chart reads as "this
 // run measured nothing" rather than as "this is not measured here".
 //
+// A declared FILTER is a weaker promise than an axis, and `storage_engine` is
+// the one that makes the difference visible. Every other filter named below
+// comes off `RunContext.record_defaults` unconditionally, so every ops record
+// carries it. That field does not: it is a MySQL-family `ENGINE=` clause, and
+// `EngineDriver.storage_engine_in_use` reports it only for the three engines
+// that put it in a CREATE TABLE. pgvector, Valkey and Percona Search have no
+// storage engine and their ops records now carry none -- they used to carry
+// `InnoDB`, which the harness stamped on all seven engines and which was
+// false for those three on 516 of the 1,168 ops records of
+// `full-20261015-215006`.
+//
+// It stays declared on every ops view anyway, and that is a decision rather
+// than an oversight: MariaDB's InnoDB-versus-MyISAM build is a real
+// within-engine comparison (`docs/05-methodology.md`), it is the ops path
+// that measures it, and a run carrying that extra curve should be filterable
+// by the axis that separates the two halves of it. Dropping the filter to
+// make the field look universal would cost the comparison to spare the
+// explanation.
+//
+// What it does cost is a known, pre-existing gap, kept here beside the
+// declaration because this is where someone will look for it. `S.facets` is
+// RUN-GLOBAL: `webui/api.py:get_facets` ignores the query and hands back the
+// whole run, so the checkboxes for a filter are every value any record in the
+// run carries. The ann overlay modules write `heap`, `memory` and
+// `wiredTiger` on `recall_qps` records, and no ops record of any phase has
+// ever carried those -- so on a seven-engine run three of this facet's
+// checkboxes narrow an ops view to nothing. `explore.js` can hide a facet
+// whose FIELD has one value run-global; it has no way to hide a VALUE this
+// phase cannot match. Closing it means teaching `get_facets` a `phase`
+// parameter and `app.js` to refetch per view; see
+// `tests/test_c2_webui_phases.py:TestFacetValuesAreRunGlobalToo`, which
+// measures it. The same hazard is why `ef_construction` and `clients` are
+// left off the calibration view below and `selectivity` off the ingest view.
+//
 // ONE corpus backs every count quoted below, named here rather than per
 // comment: the archive of completed runs kept beside this repo, which is 239
 // `ops-*.jsonl` files plus 41 merged `report/records.jsonl` files and 7,284

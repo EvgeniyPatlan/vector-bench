@@ -76,14 +76,22 @@ from typing import Any, Dict, List, Optional
 #:   sides read None.
 #: * `storage_engine` is OMITTED, which is the only subtraction, and the
 #:   reason is measurable rather than stylistic: the two paths do not name
-#:   the same storage comparably. `harness/main.py:112` defaults
-#:   `--storage-engine` to `InnoDB` for EVERY engine, so pgvector's ops
-#:   records say "InnoDB", while its ann module reports "heap"
-#:   (`algorithms/pgvector/module.py:324`), Valkey's reports "memory" and
-#:   mongodb's "wiredTiger". Put it in the key and pgvector, Valkey and
-#:   Percona Search never match at all -- the check would be empty for three
-#:   of seven engines for a naming reason (Percona SERVER reports `InnoDB`
-#:   like the rest of the MySQL family, so it is not a fourth here). It is
+#:   the same storage comparably. The ops path records one only where there
+#:   is one. `harness/main.py:120` still defaults `--storage-engine` to
+#:   `InnoDB`, because the MySQL family's DDL needs a value, but
+#:   `EngineDriver.storage_engine_in_use` decides what reaches a record and
+#:   returns None for the three engines that have no such concept -- so
+#:   pgvector's, Valkey's and Percona Search's ops records carry the field
+#:   not at all, while their ann modules do name something: "heap"
+#:   (`algorithms/pgvector/module.py:324`), "memory" and "wiredTiger". The
+#:   mismatch is therefore an absent field against a name, and it is the same
+#:   three engines it always was. Put it in the key and they never match --
+#:   the check would be empty for three of seven (Percona SERVER reports
+#:   `InnoDB` like the rest of the MySQL family, so it is not a fourth here).
+#:   Before `OPS_MEASUREMENT_VERSION` 8 those three ops records said
+#:   `InnoDB`, a value the harness stamped on engines that have no storage
+#:   engine, so the mismatch was two different names; the omission was
+#:   equally necessary then and is unchanged by the repair. It is
 #:   instead used to PAIR inside a
 #:   key (see `_normalised_storage`) and is carried on every row, so two ops
 #:   units differing only in storage engine stay two visible rows instead of

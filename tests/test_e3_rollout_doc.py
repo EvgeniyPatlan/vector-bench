@@ -443,9 +443,9 @@ CITED_IN_REPO = {
     # something different from a version 5 record in the 2026-10-14 run.
     # There was no edit that bumped the constant and left this row green, and
     # that is the row doing its job rather than a row in the way.
-    "harness/metrics/records.py:413":
-        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 7"),
-    "harness/metrics/records.py:420":
+    "harness/metrics/records.py:506":
+        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 8"),
+    "harness/metrics/records.py:513":
         ("harness/metrics/records.py", "IMPLICIT_OPS_MEASUREMENT_VERSION = 1"),
     "harness/metrics/records.py:240-246":
         ("harness/metrics/records.py",
@@ -454,7 +454,7 @@ CITED_IN_REPO = {
         ("harness/metrics/records.py", "CHANGES WHAT IT MEASURES"),
     "harness/metrics/records.py:253-260":
         ("harness/metrics/records.py", "is a diagnostic, not a guard"),
-    "harness/metrics/records.py:451":
+    "harness/metrics/records.py:544":
         ("harness/metrics/records.py",
          "OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({"),
     "harness/metrics/stats.py:49":
@@ -503,14 +503,14 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", 'repair_path: str = "none"'),
     "harness/drivers/base.py:254-257":
         ("harness/drivers/base.py", "Valkey and Percona Search inherit"),
-    "harness/drivers/base.py:340-353":
+    "harness/drivers/base.py:435-448":
         ("harness/drivers/base.py", "def wait_index_synced"),
     "harness/drivers/postgres.py:172":
         ("harness/drivers/postgres.py", 'repair_path = "vacuum_analyze"'),
     # The second repair path, added when Percona Server landed. Cited beside
     # pgvector's so §4 item 4's "two engines" is a pointer and not a count a
     # reader has to take on trust.
-    "harness/drivers/mysql_family.py:751":
+    "harness/drivers/mysql_family.py:770":
         ("harness/drivers/mysql_family.py", 'repair_path = "index-replace"'),
     "harness/datasets.py:456-468":
         ("harness/datasets.py", "1.04%-3.47% of the rows (median 1.43%)"),
@@ -542,9 +542,9 @@ CITED_IN_REPO = {
     "config/profiles/main.yml:84-87":
         ("config/profiles/main.yml",
          "+17.04 h of ingest for"),
-    "report/crosscheck.py:327":
+    "report/crosscheck.py:335":
         ("report/crosscheck.py", "def consistency_checks"),
-    "report/crosscheck.py:105":
+    "report/crosscheck.py:113":
         ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
     "report/render.py:3397":
         ("report/render.py", "## 10. Consistency checks"),
@@ -1185,8 +1185,8 @@ class TestItemFiveLeftTheTableForAReasonThatStillHolds:
         # The three things §4 item 5 tells the reader to look at. Named
         # individually because "the section exists" is not advice.
         assert "coverage" in section.lower(), section[:200]
-        assert "report/crosscheck.py:105" in section
-        assert "report/crosscheck.py:327" in section
+        assert "report/crosscheck.py:113" in section
+        assert "report/crosscheck.py:335" in section
 
     def test_the_document_records_why_the_row_left(self):
         """An audit trail, not a deletion. The next reader of §3 should be able

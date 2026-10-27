@@ -87,7 +87,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from harness import datasets as ds  # noqa: E402
 from harness.drivers.base import IndexSpec  # noqa: E402
+from harness.drivers.mysql_family import MySQLFamilyDriver  # noqa: E402
 from harness.metrics import records as records_mod  # noqa: E402
 from harness.metrics.records import Recorder  # noqa: E402
 from harness.workloads import build as build_workload  # noqa: E402
@@ -405,6 +407,138 @@ def calibration_records(tmp, ef_grid: Sequence[int] = (10, 16, 24)
             if row["phase"] == records_mod.PHASE_CALIBRATION]
 
 
+class _StorageEngineFake(FakeDriver):
+    """A `FakeDriver` that answers the storage-engine question as the MySQL
+    family answers it, by borrowing that family's own method.
+
+    `MySQLFamilyDriver.storage_engine_in_use` reads nothing but the
+    `IndexSpec` it is handed, so the delegation is exact and cannot drift: if
+    that family changes what it reports, this fixture changes with it. A
+    hand-written `return index.storage_engine` here would be this file's
+    opinion of the MySQL family, asserted against itself.
+
+    It exists because the interesting fixture is the MIXED one.
+    `storage_engine` is the one declared filter whose presence depends on
+    which engine wrote the record: InnoDB -- or MyISAM, which is a real
+    within-engine axis -- from the three MySQL-family engines, and nothing at
+    all from pgvector, Valkey and Percona Search, which have no storage
+    engines for `EngineDriver.storage_engine_in_use` to name. A single-shape
+    fixture makes every claim about that field either a tautology or vacuous,
+    which is the same reason `calibration_records` above sets
+    `ef_construction`.
+    """
+
+    name = "fake-mysql"
+    storage_engine_in_use = MySQLFamilyDriver.storage_engine_in_use
+
+
+#: The two engine shapes a real multi-engine run mixes, as (engine name,
+#: driver class). The names are the run's `engine` field, which
+#: `RunContext.record_defaults` takes from the context rather than from
+#: `driver.name`, so they have to be set here to make the records look like
+#: two engines.
+MIXED_SHAPES = (("fake-mysql", _StorageEngineFake),
+                ("fake-heap", FakeDriver))
+
+
+def mixed_storage_records(tmp) -> List[Dict[str, Any]]:
+    """Real ops records from two engines of different SHAPES, both phases.
+
+    One engine reports a storage engine and one does not. Everything else
+    about them is identical, including the `IndexSpec`, which carries
+    `InnoDB` for both -- `harness/main.py` defaults `--storage-engine` to it
+    and `orchestrator/cli.py:_ops_storage_engines` passes it for every engine
+    that is not MariaDB, so the value really is in the spec on the engine that
+    drops it. That is what makes the asymmetry below a property of the driver
+    and not of the fixture's inputs.
+
+    Both phases in one list because the two views that declare this filter
+    want the same comparison, and writing it twice would be two fixtures that
+    could disagree about what a mixed run looks like.
+    """
+    out = os.path.join(str(tmp), "ops-c2-mixed.jsonl")
+    recorder = Recorder(out)
+    dataset = tiny_dataset()
+    try:
+        for engine, cls in MIXED_SHAPES:
+            ctx = RunContext(run_id="c2", resource_pass="normalized",
+                             recorder=recorder, engine=engine,
+                             engine_tag="none", march="x86-64-v3", k=K,
+                             cache_dir=os.path.join(str(tmp), "cache"))
+            for m in (16, 32):
+                driver = cls(dim=dataset.dim, metric=dataset.metric)
+                driver.connect()
+                build_workload.run(ctx, driver, dataset,
+                                   index_spec(dataset, m=m))
+            driver = cls(dim=dataset.dim, metric=dataset.metric)
+            driver.connect()
+            driver.create_schema(index_spec(dataset))
+            driver.load(dataset.train, ds.assign_tags(len(dataset.train)))
+            calibrate_workload.run(
+                ctx, driver, dataset,
+                IndexSpec(dim=dataset.dim, m=16, metric=dataset.metric,
+                          ef_construction=SPEC_EF_CONSTRUCTION),
+                ef_grid=(10, 16), target_recall=0.999, max_queries=20,
+                warmup=2, indexed_rows=len(dataset.train))
+    finally:
+        recorder.close()
+    return list(records_mod.read_records(out))
+
+
+@pytest.fixture(scope="module")
+def mixed(tmp_path_factory):
+    """`mixed_storage_records`, built once for the three classes that read it.
+
+    Module-scoped rather than class-scoped like `rows` above, because it is
+    the same two-engine run in each of them and building it per class would be
+    three runs of two workloads to answer one question three times.
+    """
+    return mixed_storage_records(tmp_path_factory.mktemp("c2-mixed"))
+
+
+# ---------------------------------------------------------------------------
+# The two kinds of declared filter, and why the difference has to be named
+# ---------------------------------------------------------------------------
+#
+# `RunContext.record_defaults` is the choke point every ops record's
+# provenance passes through, and it supplies these unconditionally: whichever
+# engine wrote the record, and whatever it supports, the field is there. So
+# "every record of this phase carries it" is a true and useful claim about
+# them, and it is the form the two view classes below keep.
+UNIVERSAL_OPS_FILTERS = ("dataset", "engine", "resource_pass", "build_mode",
+                         "m")
+
+#: And the ones only some engines can carry, which is a different claim and
+#: needs a different check.
+#:
+#: `storage_engine` is here because it is a MySQL-family `ENGINE=` clause and
+#: three of the seven engines have no such concept;
+#: `EngineDriver.storage_engine_in_use` returns None for them and
+#: `Record.to_dict` drops it, so the field is absent rather than false. It
+#: used to be universal only because the harness stamped a default `InnoDB`
+#: on all seven -- 516 of the 1,168 ops records in `full-20261015-215006` --
+#: so the `== len(rows)` form of the check below was a guard that PASSED
+#: BECAUSE OF A DEFECT, and withdrawing the claim is what turned it red.
+#:
+#: `ef_construction` is here for the same reason one axis over and is listed
+#: although no ops view declares it: pgvector, Valkey and Percona Server
+#: expose the knob and the other four engines do not, so a view that ever
+#: declares it is making the engine-dependent claim and not the universal
+#: one. Listing it costs nothing and makes the classification a statement
+#: about the FIELD rather than about today's view list.
+ENGINE_DEPENDENT_OPS_FILTERS = ("storage_engine", "ef_construction")
+
+#: The views whose records are written through `record_defaults`, which is
+#: what makes a claim about universality checkable at all. `recall` is
+#: excluded because ann-benchmarks writes those records and this module
+#: cannot produce one (see the module docstring); its own filter list is
+#: engine-dependent in a second way the ops path is not -- four of the seven
+#: ann modules write no `build_mode` whatever the ops records say. `raw`
+#: declares no filters.
+OPS_VIEW_IDS = ("ingest", "build", "calibration", "concurrency", "filtered",
+                "churn")
+
+
 # ---------------------------------------------------------------------------
 # 1. Coverage
 # ---------------------------------------------------------------------------
@@ -534,6 +668,174 @@ class TestAvailableMeasuresIsRunGlobal:
         assert "ys: view.ys.filter((f) => S.measures.includes(f))," in \
             source(EXPLORE_JS)
         assert "ingest_rows_per_s" in webui_records.MEASURE_FIELDS
+
+
+class TestFacetValuesAreRunGlobalToo:
+    """The same hazard one dimension down, and the reason this round could not
+    close it.
+
+    `available_measures` is run-global and `explore.js` filters each view's
+    `ys` against it; `facets` is run-global by the same chain, and
+    `explore.js` renders each declared filter's checkboxes straight out of it:
+
+        filters: view.filters.filter((f) => (S.facets[f] || []).length > 1)
+        const values = S.facets[field] || [];
+
+    So the front end can hide a facet whose field has one value across the
+    WHOLE RUN, and it has no way to hide a VALUE that this phase's records
+    cannot match. Three of the file's filter decisions already turn on that --
+    `ef_construction` and `clients` on the calibration view, `selectivity` on
+    the ingest view -- and each says so: "a facet this phase does not vary is
+    a checkbox that narrows to nothing as soon as the run holds a phase that
+    does vary it."
+
+    `storage_engine` is the case those three do not cover, and it is why this
+    class is a measurement rather than a repair. The ann overlay modules write
+    `heap`, `memory` and `wiredTiger` on `recall_qps` records, so a
+    seven-engine run's run-global facet holds those three beside `InnoDB` --
+    and no ops record of any phase has ever carried them. Picking `heap` on
+    the ingest view therefore narrows it to zero, which was true before the
+    ops harness stopped stamping `InnoDB` on engines with no storage engine
+    and is true after. What that change did was remove the compensating
+    value, so those engines' ops records are now unreachable by the facet
+    rather than reachable under a wrong name.
+
+    It cannot be fixed from the three files this round owns.
+    `webui/api.py:get_facets` takes the query and ignores it (`_q`), so every
+    caller gets the whole run; narrowing per view needs a `phase` parameter
+    there, `records_mod.facets` applied to the narrowed set, and `app.js` to
+    refetch per view. Computing the values in `explore.js` from the records it
+    already loads is not a substitute: that list is narrowed by the user's own
+    filters, so a value would vanish from the facet as soon as a sibling value
+    was ticked, and `get_records` truncates at `MAX_RECORDS` (5,000), so a
+    value carried only by a record past the cut would silently disappear from
+    the checkbox list. Both are worse than the dead checkbox.
+
+    Delete this class when `get_facets` learns the phase.
+    """
+
+    def test_a_facet_value_no_ops_record_can_match_is_still_offered(self,
+                                                                   mixed):
+        """The dead checkbox, built from real records plus the one shape this
+        module cannot write.
+
+        `recall_qps` comes out of ann-benchmarks, so the `heap` row is the
+        only hand-built record here and it carries exactly the field under
+        discussion -- pgvector's own overlay module
+        (`algorithms/pgvector/module.py`) writes `"storage_engine": "heap"`
+        beside its recall figures.
+        """
+        ann_row = {"run_id": "c2", "engine": "fake-heap",
+                   "phase": records_mod.PHASE_RECALL, "dataset": "tiny",
+                   "timestamp": "t", "storage_engine": "heap",
+                   "recall_at_k": 0.9, "qps": 100.0}
+        run_global = webui_records.facets(list(mixed) + [ann_row])
+        offered = run_global.get("storage_engine") or []
+        # The facet survives `explore.js`'s only narrowing, which is run-global
+        # and counts values rather than asking which phase carries them.
+        assert len(offered) > 1, offered
+        assert "heap" in offered
+
+        for phase in (records_mod.PHASE_INGEST, records_mod.PHASE_CALIBRATION):
+            in_view = [r for r in mixed if r["phase"] == phase]
+            assert in_view, phase
+            assert "heap" not in distinct(in_view, "storage_engine"), phase
+            # Which is the defect, stated as the operator experiences it: the
+            # checkbox renders and selecting it empties the view.
+            matched = webui_records.filter_records(
+                in_view, {"storage_engine": ["heap"]})
+            assert matched == [], phase
+
+    def test_the_front_end_has_no_per_phase_facet_to_use(self):
+        """The three reads that make the paragraph above checkable rather than
+        a claim about code nobody compared."""
+        assert "def get_facets(api: Api, match, _q, _b=None)" in source(API_PY)
+        assert '"facets": records_mod.facets(recs),' in source(API_PY)
+        assert "S.facets = meta.facets;" in source(APP_JS)
+        assert ("filters: view.filters.filter((f) => "
+                "(S.facets[f] || []).length > 1),") in source(EXPLORE_JS)
+
+
+class TestEveryOpsViewClassifiesItsFilters:
+    """Closing the gap the two per-view classes leave, without records.
+
+    Six views declare `storage_engine` as a filter and only two of them --
+    ingest and calibration -- have a class here that checks a filter list at
+    all. That asymmetry is DELIBERATE at the module level and an OVERSIGHT in
+    its effect: this file exists to make the two views C2 added resolve, and
+    its docstring declines to drive the concurrency, filtered and churn
+    writers because `tests/test_workloads.py` owns them. So the four views
+    were never in scope, and nothing checked their filter declarations either.
+
+    The classification question needs no records, so it can cover all six and
+    is the right shape for the general form: every filter an ops view
+    declares must be a facet the front end knows, and must be one the file has
+    decided is universal or engine-dependent. A seventh field added to a view
+    without being classified fails here rather than in whichever per-view
+    class happens to exist.
+    """
+
+    def test_the_two_classes_of_filter_are_disjoint_and_both_populated(self):
+        assert not (set(UNIVERSAL_OPS_FILTERS)
+                    & set(ENGINE_DEPENDENT_OPS_FILTERS))
+        assert len(UNIVERSAL_OPS_FILTERS) >= 4
+        assert len(ENGINE_DEPENDENT_OPS_FILTERS) >= 1
+
+    def test_the_ops_view_list_is_every_non_raw_view_but_recall(self):
+        """Derived, so a new view joins this guard by existing."""
+        assert set(OPS_VIEW_IDS) == set(view_ids()) - {"raw", "recall"}
+
+    def test_every_declared_filter_is_a_known_and_classified_facet(self):
+        known = set(UNIVERSAL_OPS_FILTERS) | set(ENGINE_DEPENDENT_OPS_FILTERS)
+        seen = set()
+        for view_id in OPS_VIEW_IDS:
+            declared = view_array("filters", view_chunk(view_id))
+            assert declared, view_id
+            for field in declared:
+                assert field in webui_records.FACET_FIELDS, (view_id, field)
+                assert field in known, (view_id, field)
+                seen.add(field)
+        # Not an empty sweep, and the field this round is about is in it.
+        assert "storage_engine" in seen
+        assert len(seen) >= 4, sorted(seen)
+
+    def test_the_universal_ones_really_are_universal_on_every_ops_record(
+            self, mixed):
+        """The claim the `== len(rows)` form rests on, checked across two
+        engine shapes and two phases at once rather than per view.
+
+        `m` is in the list and is the ingest view's x axis, so a regression
+        that dropped it from `record_defaults` would fail here as well as
+        there."""
+        assert mixed
+        declared = set()
+        for view_id in OPS_VIEW_IDS:
+            declared |= set(view_array("filters", view_chunk(view_id)))
+        for field in sorted(declared & set(UNIVERSAL_OPS_FILTERS)):
+            assert facet_coverage(mixed, field) == len(mixed), field
+
+    def test_the_engine_dependent_one_splits_exactly_by_driver(self, mixed):
+        """And splits on the DRIVER, not on anything the fixture chose.
+
+        Both engines are handed the same `IndexSpec`, carrying `InnoDB`, so
+        the only thing that differs is which `storage_engine_in_use` they
+        inherit -- the MySQL family's, which returns the clause its DDL used,
+        or `EngineDriver`'s, which returns None because there is no such
+        clause to report. A fixture that passed a different spec to each
+        would be asserting its own inputs.
+        """
+        ops = [r for r in mixed if r["phase"] != records_mod.PHASE_RECALL]
+        assert ops
+        with_engine = {r["engine"] for r in ops
+                       if r.get("storage_engine") is not None}
+        without = {r["engine"] for r in ops
+                   if r.get("storage_engine") is None}
+        assert with_engine == {"fake-mysql"}, with_engine
+        assert without == {"fake-heap"}, without
+        # The value reported is the clause the spec carried, so MariaDB's
+        # MyISAM curve would land here as MyISAM rather than as a second
+        # InnoDB.
+        assert distinct(ops, "storage_engine") == ["InnoDB"]
 
 
 # ---------------------------------------------------------------------------
@@ -755,14 +1057,33 @@ class TestTheIngestViewsAxesResolve:
         assert facet_coverage(rows, x) == len(rows)
         assert len(distinct(rows, x)) > 1
 
-    def test_every_filter_is_a_facet_an_ingest_record_carries(self, rows):
+    def test_every_filter_is_a_facet_an_ingest_record_carries(self, rows,
+                                                              mixed):
         """`explore.js` hides a facet with one value, so a foreign facet is
         invisible in an ingest-only run and appears the moment the run also
         holds the phase that does carry it -- a checkbox that narrows to
-        nothing."""
+        nothing.
+
+        Two forms, because there are two kinds of filter and one claim is not
+        true of both. A universal filter comes off `record_defaults`
+        unconditionally and every record carries it. An engine-dependent one
+        is carried by the engines that have the thing and by no others, so the
+        claim is that the run can match it at all -- checked on the mixed
+        fixture, where one engine reports a storage engine and one does not,
+        and asserted BOTH ways so that a field no engine carries and a field
+        every engine carries are each a failure. The `== len(rows)` form used
+        to hold for `storage_engine` too, and only because the ops harness
+        stamped a default `InnoDB` on three engines that have none.
+        """
+        ingest = [r for r in mixed if r["phase"] == records_mod.PHASE_INGEST]
+        assert ingest, "the mixed fixture produced no ingest records"
         for field in view_array("filters", view_chunk("ingest")):
             assert field in webui_records.FACET_FIELDS, field
-            assert facet_coverage(rows, field) == len(rows), field
+            if field in ENGINE_DEPENDENT_OPS_FILTERS:
+                covered = facet_coverage(ingest, field)
+                assert 0 < covered < len(ingest), (field, covered, len(ingest))
+            else:
+                assert facet_coverage(rows, field) == len(rows), field
 
     def test_each_offered_axis_has_a_readers_label(self):
         labels = field_labels()
@@ -848,10 +1169,19 @@ class TestTheCalibrationViewsAxesResolve:
         assert len(distinct(rows, x)) > 1
         assert len(distinct(rows, x)) == len(rows)
 
-    def test_every_filter_is_a_facet_a_calibration_record_carries(self, rows):
+    def test_every_filter_is_a_facet_a_calibration_record_carries(self, rows,
+                                                                  mixed):
+        """The same two forms the ingest class explains, one phase over."""
+        calib = [r for r in mixed
+                 if r["phase"] == records_mod.PHASE_CALIBRATION]
+        assert calib, "the mixed fixture produced no calibration records"
         for field in view_array("filters", view_chunk("calibration")):
             assert field in webui_records.FACET_FIELDS, field
-            assert facet_coverage(rows, field) == len(rows), field
+            if field in ENGINE_DEPENDENT_OPS_FILTERS:
+                covered = facet_coverage(calib, field)
+                assert 0 < covered < len(calib), (field, covered, len(calib))
+            else:
+                assert facet_coverage(rows, field) == len(rows), field
 
     def test_the_build_effort_is_not_offered_as_a_filter(self, rows):
         """The one omission that is a judgement rather than an absence.

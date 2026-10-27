@@ -1219,7 +1219,7 @@ class TestTheDocument:
         because the old regex accepted either spelling.
 
         `max(ef, LIMIT)` is the server's own help string (ha_innodb.cc:1208)
-        and `base.py:374` is the hook that has to be overridden; the attack
+        and `base.py:469` is the hook that has to be overridden; the attack
         carried neither. Requiring the quoted forms is the same technique that
         already works for the bounds.
         """
@@ -1227,7 +1227,7 @@ class TestTheDocument:
         assert "max(ef, LIMIT)" in section1, (
             "the clamp must be quoted in the server's own spelling, not "
             "paraphrased")
-        assert "base.py:374" in section1
+        assert "base.py:469" in section1
         assert "ef_construction" in section1
 
     def test_it_recommends_implementing_the_clamp_rather_than_inheriting(
@@ -1251,7 +1251,7 @@ class TestTheDocument:
             **must** implement `effective_ef` as `max(ef, k)`    -> FAILED
 
         `override` is if anything the more precise verb -- `effective_ef` is an
-        inherited concrete method with a default at `base.py:374`, so
+        inherited concrete method with a default at `base.py:469`, so
         overriding is literally what happens -- and `must` is strictly stronger
         than `should`. A guard that fires on correct prose teaches the next
         author to weaken or delete it, which is how the vacuity shapes reached
@@ -1286,7 +1286,7 @@ class TestTheDocument:
         banned `needs no edit` anywhere in §1, and that is subject-blind: it
         fires on a true sentence about something else, for instance
 
-            "`base.py:374`'s inherited default is correct for every other
+            "`base.py:469`'s inherited default is correct for every other
              engine here and **needs no edit**"
 
         which is correct prose about a different subject, and "needs no edit"
@@ -1634,11 +1634,11 @@ CITED_IN_REPO = {
         ("harness/drivers/base.py", 'repair_path: str = "none"'),
     "base.py:255-256":
         ("harness/drivers/base.py", "Valkey and Percona Search inherit"),
-    "base.py:374":
+    "base.py:469":
         ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "harness/drivers/base.py:325-371":
+    "harness/drivers/base.py:420-466":
         ("harness/drivers/base.py", "def prepare_churn"),
-    "harness/drivers/base.py:374":
+    "harness/drivers/base.py:469":
         ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
     "churn.py:525-526":
         ("harness/workloads/churn.py", "what = driver.maintain()"),
@@ -1646,7 +1646,7 @@ CITED_IN_REPO = {
         ("harness/workloads/build.py", "ingest_wall_s"),
     "harness/datasets.py:492":
         ("harness/datasets.py", "1,183,514 training rows"),
-    "harness/main.py:237-255":
+    "harness/main.py:248-266":
         ("harness/main.py", "def _detect_march"),
     "harness/drivers/mysql_family.py:58":
         ("harness/drivers/mysql_family.py", "def to_binary_f32"),
@@ -1727,8 +1727,19 @@ BARE_CONTINUATIONS = {
     # Re-derived with `grep -n`, not by arithmetic: the ops harness gained
     # `--no-bulk-vector-index-build` in `parse_args` and a declaration hook
     # inside `driver_factory`, which moved everything in `main()` below them.
-    ("harness/main.py", 331, 331):
+    ("harness/main.py", 342, 342):
         "args.march or _detect_march()",
+    # The GUTTER NUMBERS in the fenced block of docs/09 §4.8, which the
+    # citation parser cannot see at all: they are line labels inside a
+    # ```python fence, not `path:line` citations. That block has rotted
+    # before, and both times the range citation beside it absorbed the drift
+    # because the anchor stayed inside the stale window -- a 19-line window
+    # tolerates 18 lines of it. This row pins the three lines the block
+    # reproduces, so a shift above them fails here instead.
+    ("harness/main.py", 267, 269):
+        ('for path in ("/opt/mariadb/.march"',
+         '"/opt/pgvector-artifacts/.march"',
+         '"/opt/percona/.march"'),
 }
 
 #: Local citations with no sensible anchor, and why. Empty, and that is a
