@@ -195,8 +195,12 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                     # mongodb's includes the load and the other two's do not.
                     # No rate is derived -- the file holds no row count.
                     # Absent stays absent rather than 0.0, and a NaN is dropped
-                    # because `generate.py` writes with `default=str` and would
-                    # land it as the string "nan" rather than failing. Why each
+                    # because `json` writes it as the bare token `NaN`, which
+                    # is not JSON and which `allow_nan=False` refuses to emit
+                    # -- the reason the `qps` line above drops one. NOT because
+                    # `generate.py`'s `default=str` would stringify it: by this
+                    # point `maybe_float` has already called `float()`, so
+                    # `default` is never reached. Why each
                     # of those, with the measured figures:
                     # tests/test_e18_ann_build_timing_reaches_the_records.py
                     for field, attributes in (

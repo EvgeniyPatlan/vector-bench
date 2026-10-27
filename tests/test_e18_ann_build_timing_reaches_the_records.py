@@ -69,12 +69,25 @@ datadir -- and pgvector's incremental artifact shows the same ~0.42 s gap with
 
 The two fields earn their place for a different reason: they are two clocks of
 different SCOPE, and the scope matters most where the index goes live after the
-load rather than during it. mongodb loads in 1.899 s and its index is ready
-28.329 s later, so its `build_time` is 30.450 s -- **16.0x its load**. "Time to
+load rather than during it. mongodb loads in 1.899 s and upstream's whole-fit()
+clock reads 30.450 s -- **16.0x the load**, a difference of 28.551 s. "Time to
 load the corpus" and "time until the index is queryable" are both findings,
 they differ by more than an order of magnitude on that engine, and one field
 cannot carry both. For the MySQL family they nearly coincide, and that
 coincidence is itself the statement that those engines have no separable build.
+
+**THE WARNING THAT REPLACES THE WITHDRAWN CLAIM.** Dropping "the gap is build
+work" leaves a reader needing to know what the gap IS, because
+`build_wall_s - ingest_wall_s` is now computable for every engine and will be
+computed. It carries fit()'s fixture overhead -- `DROP`/`CREATE DATABASE`, the
+`CREATE TABLE` carrying the index, `_measure_index_bytes` walking the datadir
+-- measured at 0.014-0.418 s across the three percona configurations above and
+0.325-0.333 s across pgvector's four incremental ones. Against mongodb's
+28.551 s that is noise. For the MySQL family it is the ENTIRE quantity: there
+the difference is overhead and nothing else, because the graph is built inside
+the load. So the difference is a real measurement only where it is large, and
+a small one is not a small amount of build work -- it is no build work and
+some fixture.
 
 THE COLLATERAL HAZARD, which is why this unit also edits `report/charts.py`
 ----------------------------------------------------------------------------
@@ -115,8 +128,12 @@ WHAT IS PINNED HERE
   ingest under control. `vb_mysql._resolve_insert_threads`' own docstring says
   so -- "Ingest speed is not what this pass measures -- the ops harness
   measures it properly and under controlled conditions. Here we only need the
-  load to finish in reasonable time, so parallelism is allowed" (up to 8
-  threads, recorded as `insert_threads`). So this field is the build cost's
+  load to finish in reasonable time, so parallelism is allowed". All four
+  load paths resolve it with the identical `max(1, min(8, affinity))` rule
+  (`vb_mysql._resolve_insert_threads` and the three modules' own), so the
+  field is at least not engine-BIASED -- but only the MySQL family records
+  `insert_threads`, so for pgvector, valkey and mongodb the thread count is
+  not on the record at all. So this field is the build cost's
   companion, not an ingest-rate measurement, and a rate derived from it would
   invite exactly the comparison against the ops path's `ingest_rows_per_s`
   that it cannot support. The guard is the record
@@ -237,9 +254,27 @@ ARCHIVED_RESULT_ATTRIBUTES = (
 
 #: `(engine, load_seconds, build_seconds, build_time)` from the archived
 #: artifacts of the three engines whose modules do not derive from `vb_mysql`
-#: and write `load_seconds` instead of `ingest_seconds`. mongodb is the row
-#: that makes the two clocks worth keeping apart: its index is ready 28.329 s
-#: AFTER a 1.899 s load, so `build_time` is 16.0x the load.
+#: and write `load_seconds` instead of `ingest_seconds`. Trees named, because
+#: they are not all one tree:
+#:
+#:   mongodb   normalized/84129bf3/fashion-mnist-784-euclidean/10/mongodb/
+#:                 euclidean_M_16_quantization_none_10.hdf5
+#:   valkey    tuned/a9349676/fashion-mnist-784-euclidean/10/valkey/
+#:                 euclidean_M_8_build_mode_post_efConstruction_64_10.hdf5
+#:   pgvector  normalized/84129bf3/fashion-mnist-784-euclidean/10/pgvector/
+#:                 euclidean_M_16_build_mode_post_efConstruction_200_200.hdf5
+#:
+#: mongodb is the row that makes the two clocks worth keeping apart, and each
+#: of its figures belongs to a different pair -- an earlier version of this
+#: note crossed them:
+#:
+#:   * 28.329 s is `build_seconds - load_seconds`, and is exactly the
+#:     `index_ready_seconds` the module also writes: how long after the load
+#:     ended before mongot could answer.
+#:   * 16.0x is `build_time / load_seconds` (30.449686 / 1.899 = 16.035).
+#:   * 28.551 s is `build_time - load_seconds`, which is what
+#:     `build_wall_s - ingest_wall_s` equals on the record and therefore the
+#:     only one of the three a report can compute.
 ARCHIVED_LOAD_SECONDS_ENGINES = (
     ("mongodb", 1.899, 30.228, 30.44968605041504),
     ("valkey", 1.184, 4.022, 5.206523418426514),
@@ -632,11 +667,16 @@ class TestTheLoadIsSpelledTwiceAcrossTheEngines:
 
     def test_the_mongodb_row_is_why_both_fields_exist(self, tmp_path,
                                                       stub_h5py):
-        """1.899 s to load, queryable 28.329 s later: `build_time` is 16.0x.
+        """A 1.899 s load; `build_time` 30.450 s, which is 16.0x it.
 
-        The one number in the archive that cannot be expressed by a single
-        field, and the reason "the gap is small so one field would do" is
-        wrong for this corpus of engines rather than just unsupported.
+        (The 28.329 s mongot wait is `build_seconds - load_seconds`, a
+        different pair -- see `ARCHIVED_LOAD_SECONDS_ENGINES`. What this test
+        asserts is `build_wall_s / ingest_wall_s` and their difference,
+        28.551 s, which is `build_time - load_seconds`.)
+
+        The one relationship in the archive that a single field cannot
+        express, and the reason "the gap is small so one field would do" is
+        wrong for this corpus of engines rather than merely unsupported.
         """
         engine, load_s, _build_s, build_t = ARCHIVED_LOAD_SECONDS_ENGINES[0]
         assert engine == "mongodb"
@@ -644,7 +684,7 @@ class TestTheLoadIsSpelledTwiceAcrossTheEngines:
                         [_non_mysql_attrs(engine, load_s, _build_s, build_t)])
         record = records[0]
         assert round(record["build_wall_s"] / record["ingest_wall_s"], 1) == 16.0
-        assert record["build_wall_s"] - record["ingest_wall_s"] > 28.0
+        assert round(record["build_wall_s"] - record["ingest_wall_s"], 3) == 28.551
 
     def test_ingest_seconds_wins_where_both_somehow_appear(self, tmp_path,
                                                            stub_h5py):
@@ -675,8 +715,33 @@ class TestTheLoadIsSpelledTwiceAcrossTheEngines:
                         [_non_mysql_attrs(engine, load_s, build_s, build_t)])
         assert records[0]["build_wall_s"] == build_t
         assert records[0]["build_wall_s"] != build_s
-        assert "build_seconds" not in records[0]
-        assert "build_seconds" not in records[0]["extra"]
+        assert records[0]["ingest_wall_s"] == load_s
+        # Asserted as "no field is SOURCED from it", which is the invariant.
+        # This test first asserted `"build_seconds" not in records[0]` -- a key
+        # nothing ever writes under that name, so it held in every mutant
+        # including the one that fed the attribute into a field.
+        assert build_s not in records[0].values(), records[0]
+
+    def test_build_seconds_does_not_fill_the_load_column(self, tmp_path,
+                                                         stub_h5py):
+        """A build with no load is where the wrong edit actually bites.
+
+        Adding `build_seconds` to the `ingest_wall_s` tuple survives every
+        other case here, because every fixture carrying `build_seconds` also
+        carries `load_seconds`, which wins first -- and the tuple's shape
+        invites exactly that edit. On a file with a build and no load it is a
+        real defect: pgvector `post`'s load-EXCLUDED 71.544 s index build would
+        land in `ingest_wall_s`, which is the three-definitions-in-one-column
+        failure the declination exists to prevent, relocated to the load
+        column. Declining `build_seconds` is also what KEEPS
+        `build_wall_s - ingest_wall_s` well defined for every engine: both
+        sources mean exactly one thing each.
+        """
+        records = _load(tmp_path, [_non_mysql_attrs(
+            "pgvector", _ABSENT, 71.544, 82.10410451889038)])
+        assert len(records) == 1
+        assert records[0]["build_wall_s"] == 82.10410451889038
+        assert "ingest_wall_s" not in records[0]
 
     def test_build_seconds_alone_populates_nothing(self, tmp_path, stub_h5py):
         """And it is not a fallback for `build_time` either."""
@@ -808,6 +873,50 @@ class TestAnnBuildsStayOffTheOpsBuildCostChart:
         assert not charts._is_build_cost_point(
             dict(ops, build_wall_s=None), DATASET)
 
+    def test_the_selection_reaching_the_chart_is_the_build_phase_alone(
+            self, tmp_path, monkeypatch):
+        """The phase filter over a MIXED set, without matplotlib.
+
+        `test_a_recall_record_alone_draws_no_build_chart` below only ever
+        probes the EMPTY-selection path: an ann-only set returns at `if not
+        plotted_records: return None` before the rest of the function runs. So
+        a reviewer wrote the leak it cannot see -- keep the predicate's
+        selection and the early return, then append the unfiltered records
+        after it -- and the whole module was green on a bare host with the leak
+        fully restored. The mirror case was uncovered too: a `return None` at
+        the top of `build_cost`, so the chart silently never renders, was also
+        green.
+
+        `_grouped` is the one hook after the selection and before `plt`
+        (`plotted_records` -> early return -> `_grouped` -> `plt.subplots`), so
+        spying on it and raising captures exactly what the chart was about to
+        draw and stops before matplotlib is touched. That makes this the
+        positive direction as well: the selection must be non-empty AND
+        correct.
+
+        It couples to a private name in its own package, which is weaker
+        coupling than the source string this replaces and stronger than none.
+        """
+        class Reached(Exception):
+            """Carries the selection out before `plt.subplots`."""
+
+        seen = {}
+
+        def spy(records):
+            seen["phases"] = [r.get("phase") for r in records]
+            raise Reached
+
+        monkeypatch.setattr(charts, "_grouped", spy)
+        try:
+            charts.build_cost([_ann_recall_record(), _ops_build_record()],
+                              DATASET, str(tmp_path), "e18-grouped")
+        except Reached:
+            pass
+        assert "phases" in seen, (
+            "`_grouped` was never reached, so `build_cost` returned before the "
+            "selection: with an ops build record present the chart must render")
+        assert seen["phases"] == [records_mod.PHASE_BUILD], seen["phases"]
+
     def test_a_recall_record_alone_draws_no_build_chart(self, tmp_path):
         """The invariant, asserted on what `build_cost` RETURNS.
 
@@ -896,12 +1005,17 @@ class TestAnnBuildsStayOffTheOpsBuildCostChart:
         labels = {s["label"] for s in captured}
         assert labels and all("pgvector" in str(label) for label in labels), \
             labels
-        # 283.275 is the ann build time. It must be on no panel, and the
-        # memory and index-size panels are the ones where an ann figure would
-        # be a different container's number entirely.
+        # NOT asserted: that 283.275, the ann build time, is on no panel.
+        # That assertion was here and it was vacuous -- a recall record has no
+        # `extra.separable_build`, so `generate.build_kind` returns
+        # BUILD_KIND_UNRECORDED and BOTH time panels return None for it even
+        # under the leak. What the leak actually publishes is a series in the
+        # legend and the subtitle sentence asserted in the test below, which
+        # is where the harm is.
         plotted = {y for s in captured for _x, y in s["points"]}
-        assert 283.275 not in plotted
-        assert 249856 * 1024 not in plotted
+        assert 283.275 not in plotted, (
+            "vacuous historically, kept as a regression guard in case a "
+            "future record carries separable_build onto the ann path")
 
 
 # ---------------------------------------------------------------------------
