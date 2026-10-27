@@ -342,26 +342,57 @@ class TestReportRegenerationRisk:
         to assert the note claiming the run "does not record which ann results
         are its own"; that went from true to false without reddening, because
         the claim lived in prose and nothing compared it to the generator.
+
+        Three counts, all different, because a fixture whose pairs, corpora
+        and unpaired engines happen to be equal pins none of them: a clause
+        built from `len(scope.pairs)` where `len(scope.datasets)` belongs
+        reads correctly on it. Three pairs over two corpora, plus a third
+        engine the block declares and the log never mentions, so 3, 2 and 1
+        cannot stand in for each other -- and the product (3 x 2 = 6) is a
+        fourth number, which is the reading this clause used to have.
         """
-        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"])
+        manifest = basic_manifest("r1")
+        manifest["engines"] = {"mariadb": {}, "pgvector": {}, "alisql": {}}
+        manifest["config"]["profile"]["datasets"] = ["tiny-16-euclidean",
+                                                     "glove-100-angular"]
+        manifest["phases"] = [
+            {"phase": "ops", "engine": "mariadb",
+             "dataset": "tiny-16-euclidean", "resource_pass": "normalized",
+             "status": "completed", "duration_s": 22.0},
+            {"phase": "ann", "engine": "mariadb",
+             "dataset": "glove-100-angular", "resource_pass": "normalized",
+             "status": "completed", "duration_s": 31.0},
+            {"phase": "ops", "engine": "pgvector",
+             "dataset": "tiny-16-euclidean", "resource_pass": "normalized",
+             "status": "completed", "duration_s": 12.0},
+        ]
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             manifest=manifest)
         assert found["regenerate_risk"] == "unnarrowed_resources"
         assert found["ann_results_present"] == 1
         assert found["ann_tree_narrowed"] is False
         assert found["scope_narrowed"] is True
-        assert found["scope_engines"] == ["mariadb", "pgvector"]
-        assert found["scope_datasets"] == ["tiny-16-euclidean"]
+        assert found["scope_engines"] == ["alisql", "mariadb", "pgvector"]
+        assert found["scope_datasets"] == ["glove-100-angular",
+                                           "tiny-16-euclidean"]
         # The two claims that were false, in the form a revert would restore.
         assert "does not record which ann results are its own" \
             not in found["regenerate_note"]
         assert "rather than only this run's" not in found["regenerate_note"]
         # And the claim that replaced them.
         assert "DIFFERENT memory or CPU budget" in found["regenerate_note"]
-        # In PAIRS, which is the unit the scope narrows on. This fixture has
-        # two engines and one corpus, so the product is 2 and the phase log
-        # records 1 -- enough to tell the two apart.
-        assert "1 engine/corpus combination(s)" in found["regenerate_note"]
-        assert "plus the 1 engine(s) it configured and recorded no unit for" \
-            in found["regenerate_note"]
+        # In PAIRS, which is the unit the scope narrows on, and asserted
+        # through the END of the clause: the corpus count in the unpaired
+        # half is the one expression this branch computes, and an assertion
+        # that stopped at "recorded no unit for" left it uncovered -- a
+        # mutant that replaced it with "on every corpus the tree holds"
+        # passed the whole suite.
+        assert ("It would publish only the 3 engine/corpus combination(s) "
+                "this run's phase log records, plus the 1 engine(s) it "
+                "configured and recorded no unit for, on those 2 corpus(es), "
+                "and name the rest in its Validity section."
+                ) in found["regenerate_note"]
+        assert "6 engine/corpus combination(s)" not in found["regenerate_note"]
 
     def test_the_note_counts_pairs_and_not_engines_times_corpora(self,
                                                                  tmp_path):
@@ -414,6 +445,127 @@ class TestReportRegenerationRisk:
         assert found["regenerate_risk"] == "unnarrowed_resources"
         assert "nor the corpora it measured" not in found["regenerate_note"]
         assert "it records no engine" in found["regenerate_note"]
+        # And it splices into ONE sentence. The phrase used to be a complete
+        # clause -- "... so every engine in the tree is read for them" --
+        # dropped into "It would publish only {phrase} and name the rest ...",
+        # which ran the two together.
+        assert ("It would publish only every engine the tree holds, on the 1 "
+                "corpus(es) this run asked for (it records no engine, so the "
+                "engine axis narrows nothing), and name the rest in its "
+                "Validity section.") in found["regenerate_note"]
+
+    def test_a_run_killed_before_its_first_unit_still_narrows_by_corpus(
+            self, tmp_path):
+        """The shape a Ctrl-C produces, and a return of its own.
+
+        `orchestrator/cli.py` calls `Manifest.set_engine` before the dataset
+        loop and `add_phase` only once a unit returns, so a run interrupted
+        during its first unit -- an ingest that runs for hours on the long
+        profiles -- leaves an `engines` block, an EMPTY phase log and a
+        profile still declaring its corpora. Ordinary operational state, not
+        the hand-edited manifest the no-corpus shape below needs, and the
+        branch an operator is most likely to be reading.
+
+        It is a separate return of `_scope_phrase`: with no phase log the
+        engines fall to `unpaired` while `datasets` comes from the profile,
+        so `admits` narrows on BOTH axes here. Nothing asserted it, and a
+        mutant that gave this state the no-corpus sentence -- "on every
+        corpus the tree holds (it names no corpus, so the corpus axis narrows
+        nothing)" -- passed the whole suite while denying a restriction that
+        excludes 10 of the 12 pairs in a 4-engine by 3-corpus universe. That
+        is the inverse of the defect this file's other new tests cover, and
+        it was green.
+        """
+        from report.scope import scope_of
+        manifest = basic_manifest("r1")
+        manifest["phases"] = []
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             manifest=manifest)
+        assert found["scope_engines"] == ["mariadb", "pgvector"]
+        assert found["scope_datasets"] == ["tiny-16-euclidean"]
+        assert found["scope_narrowed"] is True
+        assert found["regenerate_risk"] == "unnarrowed_resources"
+        assert ("It would publish only the 2 engine(s) this run configured, "
+                "on the 1 corpus(es) it asked for, and name the rest in its "
+                "Validity section.") in found["regenerate_note"]
+        # The no-corpus wording, which is true of the shape below and false
+        # of this one.
+        assert "corpus axis narrows nothing" not in found["regenerate_note"]
+        # Held against the predicate in both directions on both axes, since
+        # the sentence makes a claim on each: the declared corpus is in, an
+        # undeclared corpus is OUT -- the corpus axis does narrow, which is
+        # the whole point of this state -- and an engine this run never
+        # configured is out whatever the corpus.
+        scope = scope_of(manifest)
+        assert scope.admits("mariadb", "tiny-16-euclidean") is True
+        assert scope.admits("mariadb", "gist-960-euclidean") is False
+        assert scope.admits("alisql", "tiny-16-euclidean") is False
+
+    def test_a_run_with_engines_and_no_corpora_promises_no_corpus_narrowing(
+            self, tmp_path):
+        """The note promised a corpus restriction `Scope.admits` never applies.
+
+        An `engines` block, an empty phase log and a profile declaring no
+        `datasets:` -- a hand-edited, truncated or imported manifest, which
+        is the shape `Scope.engines_known` is documented for. The corpus axis
+        is then silent, and `admits` for an engine with no pair reads
+        `engine in unpaired and (not datasets_known or ...)`: that engine is
+        admitted on EVERY corpus in the tree. The note said the opposite, in
+        mangled English -- "on the no corpus it names it asked for" -- which
+        is the corpus axis claim PR #49 exists to stop, made by the surface
+        that reports PR #49's narrowing.
+
+        Untested until now because the fixture next door pops the declared
+        corpora AND empties the engines block, so it leaves `scope.known`
+        false and takes the `unnarrowed` arm instead of this phrase.
+        """
+        from report.scope import scope_of
+        manifest = basic_manifest("r1")
+        manifest["phases"] = []
+        manifest["config"]["profile"].pop("datasets")
+        found = self._inputs(tmp_path, annb=["normalized/d1/10/mariadb/a.hdf5"],
+                             manifest=manifest)
+        assert found["scope_engines"] == ["mariadb", "pgvector"]
+        assert found["scope_datasets"] == []
+        assert found["scope_narrowed"] is True
+        assert found["regenerate_risk"] == "unnarrowed_resources"
+        note = found["regenerate_note"]
+        # The mangled wording, in the form a revert would restore.
+        assert "no corpus it names" not in note
+        assert ("It would publish only the 2 engine(s) this run configured, "
+                "on every corpus the tree holds (it names no corpus, so the "
+                "corpus axis narrows nothing), and name the rest in its "
+                "Validity section.") in note
+        # And the sentence is held against the predicate it describes rather
+        # than against itself: a corpus this run never named is admitted, so
+        # any note restricting the corpus axis here is false.
+        scope = scope_of(manifest)
+        assert scope.admits("mariadb", "gist-960-euclidean") is True
+        assert scope.datasets == frozenset()
+        # The engine half of the same sentence: "the 2 engine(s) this run
+        # configured" is a restriction, and it is the only one left here, so
+        # an engine the block never named stays out on every corpus.
+        assert scope.admits("alisql", "gist-960-euclidean") is False
+        assert scope.admits("alisql", "tiny-16-euclidean") is False
+
+    def test_the_phrase_for_a_scope_that_says_nothing_claims_nothing(self):
+        """The fourth axis state, which no call site reaches, said it too.
+
+        `report_inputs` guards it -- `elif scope.known:` is false when neither
+        axis says anything, and that state takes the `unnarrowed` arm -- so
+        this is `_scope_phrase` tested directly, the way the repo keeps a
+        guarded branch honest rather than letting it rot. It read "the no
+        corpus it names this run asked for", a corpus restriction over a
+        scope that restricts nothing at all.
+        """
+        from report.scope import scope_of
+        scope = scope_of({"engines": {}, "phases": [], "config": {}})
+        assert scope.known is False
+        assert scope.admits("mariadb", "gist-960-euclidean") is True
+        phrase = runs_mod._scope_phrase(scope)
+        assert "no corpus it names" not in phrase
+        assert phrase == ("every engine and corpus the tree holds (this run "
+                          "names neither, so neither axis narrows anything)")
 
     def test_a_run_that_records_no_scope_still_says_it_cannot_narrow(
             self, tmp_path):
