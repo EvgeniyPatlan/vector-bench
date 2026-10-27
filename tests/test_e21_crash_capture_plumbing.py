@@ -495,13 +495,10 @@ class TestExitStateReturnsNoneForEveryFailure:
     def test_output_in_a_shape_it_does_not_understand_is_not_an_error(
             self, monkeypatch):
         from orchestrator import docker_ctl
-        for stdout in ("", "\n", "not\ttab\tseparated\tbut\ttoo\tmany",
-                       "notanint\tfalse\t2026-10-15T22:22:05Z\t"):
+        for stdout in ("", "\n", "false\t1\tfalse",
+                       "false\tnotanint\tfalse\t2026-10-15T22:22:05Z\t"):
             monkeypatch.setattr(docker_ctl, "_run", _inspect(stdout))
-            got = docker_ctl.exit_state("x")
-            assert got is None or isinstance(got, dict), (stdout, got)
-            if stdout.startswith("notanint"):
-                assert got is None, (stdout, got)
+            assert docker_ctl.exit_state("x") is None, stdout
 
 
 class TestExitStateParsesWhatTheDaemonPrints:
@@ -510,8 +507,19 @@ class TestExitStateParsesWhatTheDaemonPrints:
     a non-empty string: anything that coerces rather than compares turns the
     answer "this was not an OOM" into "this was an OOM"."""
 
-    HONEST = "137\ttrue\t2026-10-15T22:22:05.123456789Z\t"
-    MUTANT = "1\tfalse\t2026-10-16T15:12:17.000000000Z\tOCI runtime error"
+    HONEST = "false\t137\ttrue\t2026-10-15T22:22:05.123456789Z\t"
+    MUTANT = ("false\t1\tfalse\t2026-10-16T15:12:17.000000000Z\t"
+              "OCI runtime error")
+    #: A server that is STILL UP, which is what `run_harness`'s `finally`
+    #: usually meets: the client failed and the server never stopped. The
+    #: daemon answers ExitCode 0 and Go's zero time for it.
+    RUNNING = "true\t0\tfalse\t0001-01-01T00:00:00Z\t"
+    #: Created and never started -- not running, and still no exit.
+    NEVER_STARTED = "false\t0\tfalse\t0001-01-01T00:00:00Z\t"
+    #: STARTED AGAIN after a stop: running, and carrying a real `FinishedAt`
+    #: from its previous life. The zero-time check cannot see this one, which
+    #: is why `Running` is a separate check rather than a redundant one.
+    RESTARTED = "true\t139\tfalse\t2026-10-16T15:12:17.000000000Z\t"
 
     def test_oom_killed_is_a_bool_and_not_the_string(self, monkeypatch):
         """HONEST arm: `OOMKilled` true. MUTANT arm: false."""
@@ -543,7 +551,63 @@ class TestExitStateParsesWhatTheDaemonPrints:
         assert state["finished_at"] == "2026-10-16T15:12:17.000000000Z"
         assert state["error"] == "OCI runtime error"
 
-    def test_it_asks_for_all_four_fields_in_one_inspect(self, monkeypatch):
+    def test_a_container_that_has_not_ended_has_no_exit_state(self,
+                                                              monkeypatch):
+        """HONEST arm: a stopped container. MUTANT arm: the same output with
+        `Running` true.
+
+        "exit_code: 0" for a server that is still up would say it exited
+        cleanly when it had not exited at all, and a reader would close the
+        question on it. `run_harness`'s `finally` runs after the CLIENT
+        failed, so this is the common case rather than an edge one.
+        """
+        from orchestrator import docker_ctl
+        monkeypatch.setattr(docker_ctl, "_run", _inspect(self.MUTANT))
+        honest = docker_ctl.exit_state("x")
+        monkeypatch.setattr(docker_ctl, "_run", _inspect(self.RUNNING))
+        mutant = docker_ctl.exit_state("x")
+        print(f"HONEST (Running false) = {honest}")
+        print(f"MUTANT (Running true)  = {mutant}")
+        assert honest != mutant, (
+            "DEAD PROBE: a running container and a stopped one report the "
+            "same exit state, so the artefact would claim an exit that never "
+            "happened")
+        assert honest is not None
+        assert mutant is None
+
+    def test_a_restarted_container_does_not_report_its_previous_exit(
+            self, monkeypatch):
+        """The case the zero-time check cannot see, and the reason `Running`
+        is a second check and not a duplicate of the first.
+
+        `docker start` after a stop leaves `FinishedAt` pointing at the
+        previous exit, so a container that is up right now carries a real
+        timestamp and a real exit code belonging to a life that is over. Both
+        would be archived as the exit of the phase being captured.
+        """
+        from orchestrator import docker_ctl
+        monkeypatch.setattr(docker_ctl, "_run", _inspect(self.MUTANT))
+        honest = docker_ctl.exit_state("x")
+        monkeypatch.setattr(docker_ctl, "_run", _inspect(self.RESTARTED))
+        mutant = docker_ctl.exit_state("x")
+        print(f"HONEST (stopped, exit 1)        = {honest}")
+        print(f"MUTANT (running, stale exit 139) = {mutant}")
+        assert honest != mutant, "DEAD PROBE"
+        assert honest is not None
+        assert mutant is None, (
+            "a running container's FinishedAt belongs to a previous life; "
+            f"reporting it would archive someone else's exit: {mutant}")
+
+    def test_a_container_created_and_never_started_has_no_exit_state(
+            self, monkeypatch):
+        """Not running either, and still nothing to report: the daemon gives
+        Go's zero time for `FinishedAt`, which is the only thing that tells
+        this apart from a clean exit 0."""
+        from orchestrator import docker_ctl
+        monkeypatch.setattr(docker_ctl, "_run", _inspect(self.NEVER_STARTED))
+        assert docker_ctl.exit_state("x") is None
+
+    def test_it_asks_for_every_field_in_one_inspect(self, monkeypatch):
         """One `docker inspect`, not four: the capture chain already sits on
         510 s of worst-case timeouts before a failed setup gives up."""
         from orchestrator import docker_ctl
@@ -557,8 +621,9 @@ class TestExitStateParsesWhatTheDaemonPrints:
         docker_ctl.exit_state("srv")
         assert len(calls) == 1, calls
         argv = " ".join(calls[0])
-        for field in (".State.ExitCode", ".State.OOMKilled",
-                      ".State.FinishedAt", ".State.Error"):
+        for field in (".State.Running", ".State.ExitCode",
+                      ".State.OOMKilled", ".State.FinishedAt",
+                      ".State.Error"):
             assert field in argv, (field, argv)
 
 

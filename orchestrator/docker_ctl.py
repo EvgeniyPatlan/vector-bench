@@ -375,14 +375,23 @@ def container_exists(name: str) -> bool:
     return proc.returncode == 0
 
 
-#: The four fields of `docker inspect`'s State that say how a container ended,
-#: in one template. Tab-separated with `State.Error` LAST deliberately: Go's
-#: text/template copies the separator through verbatim, and the only one of the
-#: four whose value can itself contain a tab is the daemon's error string, so
-#: putting it last means an embedded tab lands inside the field it belongs to
-#: rather than shifting every field after it.
-_EXIT_STATE_FORMAT = ("{{.State.ExitCode}}\t{{.State.OOMKilled}}\t"
-                      "{{.State.FinishedAt}}\t{{.State.Error}}")
+#: The fields of `docker inspect`'s State that say how a container ended, in
+#: one template. Tab-separated with `State.Error` LAST deliberately: Go's
+#: text/template copies the separator through verbatim, and the only one whose
+#: value can itself contain a tab is the daemon's error string, so putting it
+#: last means an embedded tab lands inside the field it belongs to rather than
+#: shifting every field after it.
+#:
+#: `State.Running` is read and NOT reported. It is one of two independent
+#: discriminators that stop this reporting an exit the container has not had;
+#: see `exit_state`.
+_EXIT_STATE_FORMAT = ("{{.State.Running}}\t{{.State.ExitCode}}\t"
+                      "{{.State.OOMKilled}}\t{{.State.FinishedAt}}\t"
+                      "{{.State.Error}}")
+
+#: What `FinishedAt` reads as for a container that has never finished -- Go's
+#: zero time, which the daemon returns for one created and never started.
+_NEVER_FINISHED = "0001-01-01T00:00:00Z"
 
 
 def exit_state(name: str) -> Optional[Dict[str, Any]]:
@@ -420,6 +429,23 @@ def exit_state(name: str) -> Optional[Dict[str, Any]]:
     `bool("false")` is True: an engine that died on its own would be reported
     as having been killed by the kernel, which is the one error this field
     exists to prevent.
+
+    None FOR A CONTAINER THAT HAS NOT ENDED, which is not a failure case, and
+    TWO CHECKS RATHER THAN ONE because they catch different containers:
+
+    * `Running` true. The usual caller is `run_harness`'s `finally` AFTER THE
+      CLIENT FAILED, where the server is very often still up, and the daemon
+      answers `ExitCode` 0 for it. "exit_code: 0" there would say the server
+      exited cleanly when it had not exited at all, and a reader would close
+      the question on it. It also catches a container STARTED AGAIN after a
+      stop, which keeps the previous life's `FinishedAt` -- a real timestamp
+      belonging to an exit that is not the one being asked about.
+    * `FinishedAt` at Go's zero time. A container created and never started is
+      not running either, and reports `ExitCode` 0 with no exit behind it;
+      this is the only field that tells that apart from a clean exit 0.
+
+    A server that was alive at capture time and is then stopped by `teardown`
+    has no exit state worth recording, because teardown is what stopped it.
     """
     try:
         proc = _run(["docker", "inspect", "--type", "container",
@@ -436,10 +462,14 @@ def exit_state(name: str) -> Optional[Dict[str, Any]]:
     # the trailing tab and leaves three fields, and the normal case -- a
     # server that crashed without the daemon having anything to add -- parses
     # as "no exit state". Found by the test, not by reading.
-    fields = (proc.stdout or "").rstrip("\r\n").split("\t", 3)
-    if len(fields) != 4:
+    fields = (proc.stdout or "").rstrip("\r\n").split("\t", 4)
+    if len(fields) != 5:
         return None
-    code, oom, finished, error = fields
+    running, code, oom, finished, error = fields
+    if running.strip().lower() == "true":
+        return None
+    if finished.strip() == _NEVER_FINISHED:
+        return None
     try:
         exit_code = int(code.strip())
     except ValueError:
