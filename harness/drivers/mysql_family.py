@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -53,6 +54,74 @@ INSERT_SQL = (
     f"INSERT INTO {TABLE} (id, {FILTER_TAG}, {FILTER_CTAG}, v) "
     f"VALUES (%s, %s, %s, %s)"
 )
+
+
+#: The two scopes `SHOW ... STATUS` accepts, lowercase request -> the keyword
+#: the statement is built with. A mapping and not a `.upper()` for the reason
+#: `checked_filter_column` is a whitelist and not a quoting routine: the value
+#: is formatted into a statement string, so what reaches the server is always
+#: an element of this dict and never the caller's string.
+STATUS_SCOPES: Dict[str, str] = {"global": "GLOBAL", "session": "SESSION"}
+
+#: A status-variable name that can be put in a `LIKE` pattern and mean itself.
+#: Letters, digits and underscore only, which every variable in
+#: `innobase_system_variables[]` and its status array satisfies.
+#:
+#: Two separate hazards, and the second is the quiet one. A quote or a
+#: semicolon would be injection, which is the obvious one. But `LIKE` also
+#: gives `%` and `_` their own meanings, and `Innodb_hnsw_memory_used` CONTAINS
+#: underscores -- so the pattern this builds is already slightly wider than the
+#: name it was built from, and a name carrying a literal `%` would be wider
+#: still. `status_counters` closes that by matching the row the server returns
+#: against the name it asked for, rather than trusting the pattern to have been
+#: exact.
+STATUS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def status_int(value: Any) -> Optional[int]:
+    """A status value as an `int`, or `None` when it is not a number.
+
+    Connector/C hands a `SHOW STATUS` value back as `str` for most servers,
+    as `bytes` when the column arrives binary, and occasionally already
+    coerced -- and `int(b"17")` is a `TypeError`, not a parse. All three
+    spellings are the same measurement, so all three are accepted here rather
+    than at each call site.
+
+    `None` for anything that is not a number, because `status_counters`
+    returns `Dict[str, int]` and a status variable can perfectly well hold a
+    word: `Ssl_cipher` is a string and `Innodb_buffer_pool_dump_status` is a
+    sentence. Guessing a number for one of those would put a fabricated
+    integer on a record. Omitting it is the same answer this module gives a
+    variable the server does not expose at all, and for the same reason.
+    """
+    if isinstance(value, bool):
+        # `True` is an int in Python and is not a counter reading. No server
+        # sends one; a fake or a future connector could.
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        # A gauge spelled `0.000`, which some status variables are. Truncating
+        # is right for a byte count and is why this is a second attempt rather
+        # than the first: `int(float(...))` on a 19-digit byte count would
+        # lose the low bits to float64.
+        return int(float(text))
+    except (ValueError, OverflowError):
+        return None
 
 
 def to_binary_f32(vector) -> bytes:
@@ -643,6 +712,83 @@ class MySQLFamilyDriver(EngineDriver):
         except Exception:
             return "unknown"
 
+    def status_counters(self, names: Sequence[str],
+                        scope: str = "global") -> Dict[str, int]:
+        """`SHOW {GLOBAL|SESSION} STATUS LIKE` per name, coerced to `int`.
+
+        See `EngineDriver.status_counters` for the contract, for why a name
+        the server does not expose is OMITTED rather than zeroed, and for the
+        caveat that travels with the one gauge this family declares.
+
+        Implemented for the whole family although only `PerconaDriver`
+        declares a gauge: the statement is the same in all three dialects and
+        nothing about it is Percona's. MariaDB and AliSQL declare
+        `status_gauges = ()` -- inherited, not written -- so no caller reaches
+        this method for them and no statement is issued on their builds;
+        `tests/test_e20_server_status_capture.py` asserts that on the
+        cursor's statement list, because "the record has no key" would also be
+        true of a driver that asked five servers a question none of them can
+        answer.
+
+        **One statement per name, rather than one `SHOW STATUS` and a filter
+        over the result.** A full `SHOW GLOBAL STATUS` is several hundred rows
+        of which this wants one, and the per-name form is what makes a dead
+        name cost only itself: the loop below swallows per statement, so a
+        gauge a future server drops does not take the gauges beside it with
+        it.
+
+        **Two failure kinds, kept apart.** A server that cannot answer is
+        operational and is omitted. A `scope` or a `name` this method cannot
+        spell safely is a CALLER bug -- both reach a statement string, and
+        `status_gauges` is a code-declared tuple, so the only way to get here
+        is a typo in this repository -- and raises `ValueError`, the
+        discipline `checked_filter_column` uses for exactly the same reason.
+        Raising loses nothing: `build.py`'s call site swallows, so the typo
+        costs the gauge and never the run, and it is findable instead of
+        looking forever like a server that has no such variable.
+        """
+        keyword = STATUS_SCOPES.get(str(scope).lower())
+        if keyword is None:
+            raise ValueError(
+                f"{scope!r} is not a status scope; "
+                f"expected one of {sorted(STATUS_SCOPES)}")
+        wanted = []
+        for name in names:
+            if not STATUS_NAME_RE.match(str(name)):
+                raise ValueError(
+                    f"{name!r} is not a status variable name; a name reaches "
+                    f"a LIKE pattern and must be letters, digits and "
+                    f"underscores only")
+            wanted.append(str(name))
+
+        found: Dict[str, int] = {}
+        for name in wanted:
+            try:
+                self._cur.execute(f"SHOW {keyword} STATUS LIKE '{name}'")
+                rows = self._cur.fetchall() or []
+            except Exception as exc:
+                # After the build, and after it was timed. Nothing measured is
+                # at risk here, so report and carry on.
+                print(f"[{self.name}] status read '{name}' failed: {exc}")
+                continue
+            for row in rows:
+                if len(row) < 2 or str(row[0]).lower() != name.lower():
+                    # `_` is a LIKE wildcard, so the pattern can match a name
+                    # that is not the one asked for. Checked rather than
+                    # assumed -- see STATUS_NAME_RE.
+                    continue
+                value = status_int(row[1])
+                if value is not None:
+                    # Keyed by the name ASKED FOR, not by the server's
+                    # spelling of it. `checked_filter_column` returns the
+                    # whitelisted element for the same reason: the key set of
+                    # the record this lands on has to be decidable from this
+                    # repository, because that is what a report looks a name
+                    # up in.
+                    found[name] = value
+                break
+        return found
+
     def capabilities(self) -> Dict[str, Any]:
         return {"incremental_index": True, "ef_construction_tunable": False}
 
@@ -768,6 +914,42 @@ class PerconaDriver(MySQLFamilyDriver):
     #: maintenance" record BEFORE `maintain()` runs. Percona is the only
     #: MySQL-family engine here that has a repair path at all.
     repair_path = "index-replace"
+
+    #: The one HNSW status variable the server registers, and the only
+    #: engine-reported live graph memory figure in this study.
+    #:
+    #: **GLOBAL status**, which is why `status_counters`' default scope is the
+    #: right one and nothing here passes a scope.
+    #: `docs/09-adding-percona-server.md` §2.6 establishes both the scope and
+    #: the fact that there is no second entry, from the server's own
+    #: registration arrays rather than from filenames: the system-variable
+    #: array holds exactly two HNSW entries (`hnsw_ef_search`,
+    #: `hnsw_max_memory`, both of which this framework SETS) and the
+    #: status-variable array exactly one, `hnsw_memory_used`. A grep of that
+    #: file for `hnsw` returns no other variable of either kind.
+    #:
+    #: **A tuple on this class and not on `EngineDriver`.** On the base class
+    #: it would send a `SHOW GLOBAL STATUS` to MariaDB, AliSQL, PostgreSQL,
+    #: Valkey and Percona Search on every build, for a variable none of them
+    #: has, and would add a record key none of their records has ever carried
+    #: -- which is the difference between additive and "additive for the
+    #: engine we were thinking about".
+    #:
+    #: **THE CAVEAT TRAVELS WITH THE NUMBER OR THE NUMBER IS NOT USABLE.** The
+    #: gauge omits the node map (*HNSW::m_nodes*, a supplied 30-50 bytes per
+    #: node) and search scratch, so it is a **FLOOR** on graph memory and not
+    #: a measurement of it: at glove-100's 1,183,514 rows, 35.5-59.2 MB
+    #: unreported per vector index. It is also read lazily -- §2.6 records it
+    #: reading `0` after a restart, rising on the first search -- so a figure
+    #: taken before anything has queried the index describes what the build
+    #: faulted in and not what a query phase will need.
+    #:
+    #: Recording it is the audit trail `config/engines/percona.yml` promises
+    #: for leaving `innodb_hnsw_max_memory` at 0 (unlimited) rather than
+    #: feeding it from `graph_cache_bytes` like the two engines whose
+    #: equivalent knob is a cache. That decision's argument ends in "and we
+    #: record the gauge instead"; until this hook existed, nothing did.
+    status_gauges: Tuple[str, ...] = ("Innodb_hnsw_memory_used",)
 
     #: Whether the server's BULK vector index build works at the pinned
     #: version. Host-supplied with a class-level default, because this file

@@ -119,6 +119,34 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     # the graph work happened inside those INSERTs and cannot be separated.
     effective_build = build_seconds if not incremental else load.wall_seconds
 
+    # Whatever status variables the driver declares, read HERE: after the
+    # build has finished and been timed, and before the sizing and counting
+    # queries below. Both halves of that matter.
+    #
+    # After the build, because the quantity of interest is what the completed
+    # graph occupies -- Percona's `Innodb_hnsw_memory_used` reads 0 after a
+    # restart and rises as nodes are faulted in, so a reading taken before the
+    # load would describe an empty index.
+    #
+    # Before the sizing queries, because a status read is a statement and an
+    # honest record says which statements preceded it. Nothing below touches
+    # the HNSW graph today -- `SELECT COUNT(*)` and the catalog lookups do not
+    # -- so the ordering changes no number; it is fixed so that it cannot
+    # start to, and `tests/test_e20_server_status_capture.py` asserts it.
+    #
+    # Six of seven engines declare no gauges and this is one attribute read
+    # and an early return for them.
+    server_status = _server_status(driver)
+    if server_status:
+        # A FLOOR on graph memory, not a measurement of it: the figure omits
+        # the node map (~30-50 B/node) and search scratch. The caveat is
+        # printed with the number for the same reason it is in the hook's
+        # docstring and in `PerconaDriver.status_gauges` -- whoever reads this
+        # line in a run log is the first person to see the figure.
+        print(f"[{driver.name}] server status (floor, omits the node map): "
+              + ", ".join(f"{name}={value:,}"
+                          for name, value in sorted(server_status.items())))
+
     index_bytes = driver.index_bytes()
     table_bytes = driver.table_bytes()
     rows = driver.count_rows()
@@ -157,8 +185,25 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         # which is a different operation, and its time-to-ready was dropped
         # entirely. separable_build is set last because it is a property of
         # how this workload ran, not of the driver.
+        #
+        # `server_status` is appended after it and collides with neither: it
+        # is a reading taken off the server rather than a property of the
+        # driver or of this workload. ONE key holding a {name: int} dict and
+        # not one key per variable, so a second gauge needs no schema
+        # decision and a report looks a name up inside a key it already
+        # knows.
+        #
+        # **Conditional, and that is the point of the unit rather than a
+        # tidiness.** Written unconditionally -- even as an empty dict -- this
+        # would change the `extra` key set of every index_build record of all
+        # seven engines, and `extra` key sets are what a reader diffs when
+        # asking whether two runs measured the same thing. Absent means "this
+        # engine reports no such variable", which is the honest claim for six
+        # of the seven and for the seventh on a server that has lost the
+        # variable.
         extra={**_driver_capabilities(driver),
-               "separable_build": not incremental},
+               "separable_build": not incremental,
+               **({"server_status": server_status} if server_status else {})},
     ))
 
 
@@ -170,5 +215,35 @@ def _driver_capabilities(driver) -> dict:
     """
     try:
         return dict(driver.capabilities() or {})
+    except Exception:
+        return {}
+
+
+def _server_status(driver) -> dict:
+    """The status variables this driver declares, as `{name: int}`, or `{}`.
+
+    `_driver_capabilities`' discipline above, for the same reason and with one
+    addition. The reason: this runs after a build that may have taken hours,
+    so a driver or a server that misbehaves here must not cost the
+    measurement already in hand -- hence the bare `except`.
+
+    The addition is the `names` check. An engine that declares no gauges --
+    `EngineDriver.status_gauges` is `()`, which is six of the seven here --
+    never reaches the driver at all, so no statement is sent to a server that
+    has nothing to answer and the hook is free for everyone who does not use
+    it. That early return is also the ONLY thing standing between "additive"
+    and a `SHOW GLOBAL STATUS` per build per engine.
+
+    Coerced here rather than trusted: the hook's contract is `Dict[str, int]`
+    and this is the last point before the value becomes a published record
+    field, so a driver that returned a string gets it turned into a number or
+    loses the name.
+    """
+    names = tuple(getattr(driver, "status_gauges", ()) or ())
+    if not names:
+        return {}
+    try:
+        reported = driver.status_counters(names) or {}
+        return {str(name): int(value) for name, value in reported.items()}
     except Exception:
         return {}

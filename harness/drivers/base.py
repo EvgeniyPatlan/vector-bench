@@ -256,6 +256,23 @@ class EngineDriver(abc.ABC):
     #: Valkey and Percona Search inherit "none" and need no edit, which is
     #: what "No hooks" in §4.1 item 4 means.
     repair_path: str = "none"
+    #: Server status variables worth recording per phase, by name, or `()` for
+    #: an engine that exposes none. Declared per DRIVER and not per call site,
+    #: so a workload asks `driver.status_gauges` rather than carrying a table
+    #: of engine names -- and so the answer to "what happens for the engines
+    #: that have no such variable" is a value in this file rather than an
+    #: implication: the empty tuple, which `harness/workloads/build.py` turns
+    #: into no statement and no record key at all.
+    #:
+    #: `()` here is therefore load-bearing twice over. It is what six of the
+    #: seven engines use, and it is what makes their records byte-identical to
+    #: the ones written before any of this existed.
+    #:
+    #: Only `PerconaDriver` overrides it. Its one gauge,
+    #: `Innodb_hnsw_memory_used`, is the only engine-reported live graph
+    #: memory figure in the study -- see that override for the caveat that
+    #: travels with every figure quoted from it.
+    status_gauges: Tuple[str, ...] = ()
 
     def __init__(self, spec: ConnectionSpec):
         self.spec = spec
@@ -460,6 +477,56 @@ class EngineDriver(abc.ABC):
         timed itself would have to be trusted about the clock it used.
         """
         return None
+
+    # -- server-reported status ------------------------------------------
+
+    def status_counters(self, names: Sequence[str],
+                        scope: str = "global") -> Dict[str, int]:
+        """Server status variables by name, as integers. `{}` by default.
+
+        A fourth optional hook with a no-op default, beside the three churn
+        hooks above and for the same reason: six of the seven engines here
+        expose nothing of the kind, and they must need no code and record
+        exactly what they recorded before this existed. An engine that
+        overrides nothing collects nothing and writes no record key -- see
+        `status_gauges` and `harness/workloads/build.py:_server_status`.
+
+        **It must not cost a measurement.** A status read happens AFTER the
+        thing it describes has been built and timed, so a server that has
+        gone away by then has already been paid for. An implementation
+        therefore omits what it cannot read rather than raising, and the call
+        site swallows anyway -- the pattern is
+        `harness/workloads/build.py:_driver_capabilities`, which keeps a
+        completed measurement when a driver misbehaves afterwards.
+
+        **Omitting, not zeroing, and the distinction is the whole point of
+        the return type being a dict rather than a row.** A variable the
+        server does not expose and a variable reading zero are different
+        facts about different servers, and for the one gauge this hook exists
+        for they are both reachable: `docs/09-adding-percona-server.md` §2.6
+        records `Innodb_hnsw_memory_used` reading `0` after a restart,
+        because the graph is faulted in lazily and the figure rises on the
+        first search. So zero is a legitimate measurement here, and a
+        collector that zero-filled a missing name would publish "the graph is
+        not loaded" and "this server has no such variable" as one number.
+
+        `scope` is `"global"` or `"session"`. It is a parameter rather than a
+        property of the name because the MySQL family has variables in both
+        scopes and the same statement serves either; the default is global,
+        which is what the only declared gauge needs.
+
+        **THE CAVEAT THAT TRAVELS WITH THE NUMBER, repeated here because this
+        is where a future reader will look for what the number means.** For
+        `Innodb_hnsw_memory_used` the gauge omits the node map
+        (*HNSW::m_nodes*, a supplied 30-50 bytes per node) and search
+        scratch, so it is a **floor** on graph memory and not a measurement
+        of it -- at glove-100's 1,183,514 rows, 35.5-59.2 MB unreported per
+        vector index. `config/engines/percona.yml` states this in capitals,
+        `CLAUDE.md` restates it, and a report quoting the figure without it
+        is quoting a number a reader will reconcile against a container's
+        resident set and find short.
+        """
+        return {}
 
     # -- query ----------------------------------------------------------
 
