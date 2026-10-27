@@ -3457,16 +3457,18 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
 #
 # These helpers belong beside `_known_asymmetries`, and they are down here
 # instead for one reason, written down because it otherwise reads as
-# carelessness: `docs/10-rollout.md` cites `report/render.py:3022` and
-# `report/render.py:3397` BY LINE, and
+# carelessness: `docs/10-rollout.md` cites two lines of THIS module BY LINE
+# NUMBER -- the "grids meet" sentence in `_consistency_section`'s docstring
+# and the "## 10. Consistency checks" heading inside `render_markdown` -- and
 # `tests/test_e3_rollout_doc.py::TestEveryCitationIntoThisRepoIsChecked`
-# resolves each citation against that exact line. Inserting anything above
-# them shifts both and puts `master` red -- `CLAUDE.md` records that
-# happening twice in two days (#41, #43), both times because edits moved lines
-# under a citation derived earlier. docs/10 is not this change's to edit, and
-# everything below :3397 is free, so the call site above keeps its line count
-# and the bodies live here. Converting those two citations to symbols is the
-# real repair and belongs with the rest of the citation conversion.
+# resolves each of them against that exact line. Inserting anything above
+# either shifts both and puts `master` red -- `CLAUDE.md` records that
+# happening twice in two days (#41, #43), both times because edits moved
+# lines under a citation derived earlier. docs/10 is not this change's to
+# edit, and everything after `render_markdown` is free of its citations, so
+# the call site above keeps its line count and the bodies live here.
+# Converting those two citations to symbols is the real repair and belongs
+# with the rest of the citation conversion.
 # ---------------------------------------------------------------------------
 
 #: How this table names an engine in PROSE, which is not how a chart legend
