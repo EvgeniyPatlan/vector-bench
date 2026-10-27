@@ -258,12 +258,16 @@ any long run) · `08-web-ui.md` (the browser front end, its access model and its
 decided each choice) · `10-rollout.md` (what to run after this series, in what order, and the
 two checks that cannot be done as specified) · `11-methodology-roadmap.md` (what the
 measurement methodology cannot yet observe, what it already handles, and in what order to
-address the rest — a design document, nothing in it is implemented).
+address the rest — a design document, nothing in it is implemented) ·
+`12-percona-feedback-plan.md` (the four things the server team asked for after reading the
+report, the re-pin that gates all of them, and what each costs — also a plan, also
+unimplemented).
 
-Each of the last three is guarded: `tests/test_e1_percona_design.py`,
+09, 10 and 11 are guarded: `tests/test_e1_percona_design.py`,
 `tests/test_e3_rollout_doc.py` and `tests/test_e15_methodology_roadmap_doc.py` fail when the
-document drifts from the tree. **09 and 10 cite `file:line` and 11 cites symbols only** — and
-if you are adding a document, copy 11. Line citations in 09 and 10 have rotted twice in two
+document drifts from the tree. 12 is not guarded yet, and its own phase 0 says so.
+**09 and 10 cite `file:line` and 11 cites symbols only** — and if you are adding a
+document, copy 11. Line citations in 09 and 10 have rotted twice in two
 days and put `master` red both times (#41, #43), both times because a later round of edits in
 the same change moved lines after the citations were derived. A line number dies to any edit
 above it; a symbol name dies only to a rename.
