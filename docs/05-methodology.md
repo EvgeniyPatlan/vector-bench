@@ -956,9 +956,9 @@ differently or does not name at all.
   rather than emitting two identical recall curves. So for this engine the
   axis is real on the ops path and silent on the recall path, and dropping it
   here is still right: the ann records genuinely say nothing about it. The
-  build-mode comparison for Percona therefore comes from the ops records —
-  `build_wall_s`, `ingest_wall_s` and `index_bytes`, which are ops-only
-  fields anyway — and not from a pair of recall curves.
+  build-mode comparison for Percona therefore comes from the ops records and
+  not from a pair of recall curves: the recall path is silent about
+  `build_mode`, and these fields are not ops-only — `index_bytes` never was.
 
 **An empty list has two causes and the report distinguishes them.** "No `M` is
 measured by both paths" is a profile choice: the recall sweep varies `M`
