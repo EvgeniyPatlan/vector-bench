@@ -61,6 +61,32 @@ build:
 #     the three and not the others and the build runs with fewer workers than
 #     the manifest records, succeeds, and says nothing.
 #
+# A FOURTH LIMIT ON THE SAME COUNT, WHICH IS NOT A PARALLELISM KEY AT ALL:
+# maintenance_work_mem, set two lines above each chain from
+# {maintenance_bytes}. PostgreSQL 17's CREATE INDEX page states that it "may
+# influence the number of worker processes requested, since parallel workers
+# must have at least a 32MB share of the total maintenance_work_mem budget.
+# There must also be a remaining 32MB share for the leader process." The
+# granted count is therefore capped at floor(maintenance_work_mem / 32MB) - 1
+# where that bites: eight workers need 288 MB, at 256 MB an eight-worker
+# request is granted as seven, and smaller values cut harder. It reaches the
+# HNSW build because ComputeParallelWorkers calls plan_create_index_workers,
+# which is where the clamp lives, and the documented way out of it does not
+# apply here -- that is a table-level `parallel_workers` reloption, and
+# PostgresDriver's CREATE TABLE sets none.
+#
+# It does not bite at today's fractions, so this is a guard and not a live
+# defect: both passes give maintenance_work_mem a tenth of the container
+# limit, so eight workers are covered by any container above about 2.9 GB, and
+# the normalized pass requests no workers to clamp. What it guards against is
+# a literal in place of the placeholder or a shrunken maintenance_fraction,
+# either of which would re-cap the chain three keys above it while every
+# parallelism key still read correctly. Hence the tuned-chain test asserts
+# that this value, too, derives from {maintenance_bytes}B -- and it is
+# deliberately kept OUT of that test's parallelism family, because a memory
+# knob with its own resource-fraction machinery is not a parallelism setting
+# and a predicate that called it one would mis-describe it.
+#
 # THAT RULE IS A POSTGRESQL FACT AND DOES NOT PORT, which matters because
 # this comment is the artefact whoever copies this shape will read.
 # docs/12-percona-feedback-plan.md §5.2 proposes the same treatment for
@@ -140,7 +166,15 @@ build:
 # four GUCs. What is tested is what this repository SENDS:
 # tests/test_config.py::TestEveryPgvectorParallelismKnobIsPinnedOnPurpose
 # asserts each pass's key set and values rather than the presence of a
-# string, so moving a key between the blocks fails against this comment.
+# string, so moving a key between the blocks fails against this comment. Both
+# blocks are also asserted CLOSED over any setting whose name mentions a
+# worker or parallelism: the four above are the whole of it, and pinning a
+# fifth -- autovacuum_max_workers, max_logical_replication_workers, anything
+# like them -- fails that test whatever its value, so it costs an edit there
+# and a reviewer who reads the reason. Note that naming one in this comment is
+# NOT that argument: autovacuum_max_workers appears above, in the sentence
+# about which pool autovacuum draws on, and a substring check mistook that for
+# an explanation.
 server:
   common:
     - -c

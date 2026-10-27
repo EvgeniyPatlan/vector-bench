@@ -8157,6 +8157,7 @@ class TestEachConcurrencyPointIsRepeated:
                                    if k != "concurrency_repeats"}}
         assert windows(shipped) == windows(once) * 3
 
+
 # ---------------------------------------------------------------------------
 # A4: pgvector's two parallelism blocks pin different keys, on purpose
 # ---------------------------------------------------------------------------
@@ -8185,15 +8186,65 @@ def _is_pg_parallelism_setting(name):
     cost -- it makes a parallel plan cheaper, so it widens exactly what the
     caps narrow, and it did it where nothing was looking.
 
-    DELIBERATELY OUTSIDE THE FAMILY: autovacuum_max_workers and
-    max_logical_replication_workers, which cap workers and match neither test
-    here. Nothing they start does vector work -- including them would turn
+    DELIBERATELY OUTSIDE THE FAMILY, illustratively and not exhaustively:
+    autovacuum_max_workers, max_logical_replication_workers,
+    max_sync_workers_per_subscription. They cap workers and match neither test
+    here, and nothing they start does vector work -- including them would turn
     this into a list of every worker PostgreSQL has and tell a reader nothing
-    about the comparison. If either is ever set in this file it needs its own
-    argument rather than this one, and the test that every knob is named in
-    the comment will ask for it.
+    about the comparison. The list is illustrative because this is a rule and
+    not an enumeration: any other non-vector worker cap is outside too,
+    without an edit here.
+
+    An earlier version of this paragraph ended "the test that every knob is
+    named in the comment will ask for it". IT DID NOT, in two ways, and the
+    second is the interesting one.
+
+    First, that test built its key set from THIS predicate, so a name outside
+    the family was never compared against the prose at all:
+    `autovacuum_max_workers=8` added to the tuned block passed all five tests,
+    and so did `max_sync_workers_per_subscription=8`.
+
+    Second, widening the predicate was still not enough, which is why the
+    guard is no longer a prose grep. `autovacuum_max_workers` is ALREADY named
+    in `config/engines/pgvector.yml` -- in the sentence explaining why the two
+    pools are unreachable in the normalized pass -- so a substring check found
+    it "explained" and the mutant passed again. A grep cannot tell an argument
+    for setting something from an incidental mention of it while arguing
+    something else, and it never will.
+
+    So the promise is kept by
+    `test_no_other_worker_or_parallelism_setting_is_pinned` instead, which
+    asserts the two blocks are CLOSED over `_names_a_worker_or_parallelism`:
+    nothing whose name mentions a worker or parallelism may be pinned beyond
+    the documented four. Setting one of these here stays allowed, and it now
+    costs an edit to that test -- which is where a reviewer sees the argument,
+    rather than a sentence a grep cannot evaluate.
     """
     return "parallel" in name or name == "max_worker_processes"
+
+
+def _names_a_worker_or_parallelism(name):
+    """Whether a setting's name mentions a worker or parallelism at all.
+
+    Deliberately wider than `_is_pg_parallelism_setting`, and used by the two
+    tests that ask "would a reader of this file be surprised to find this
+    set?" rather than "does this cap a vector worker?" -- the closed-world
+    test, which is the load-bearing one, and the prose test beside it.
+
+    The two are separate predicates because they answer different questions,
+    and widening the narrow one instead would be wrong.
+    `_is_pg_parallelism_setting` feeds assertions about key sets and VALUES --
+    putting autovacuum_max_workers into those would assert that the normalized
+    pass must pin it to zero, which is false and would be a worse claim than
+    the gap it closed. This one feeds assertions about PRESENCE only, where
+    the cost of including a setting is an edit to one test and the cost of
+    excluding it is a worker cap nobody is asked about.
+
+    A superset of the narrow predicate by construction: every name that one
+    matches either contains "parallel" or is max_worker_processes, which
+    contains "worker".
+    """
+    return "parallel" in name or "worker" in name
 
 
 def _pg_settings(engine, resource_pass, info):
@@ -8333,7 +8384,8 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
         one of the three and not the others and the request is silently
         clipped -- the build still succeeds, with fewer workers than the
         manifest records, which is a measurement this repository would publish
-        and could not detect.
+        and could not detect. `maintenance_work_mem` is a fourth limit on the
+        same count and is asserted at the end for the same reason.
 
         Asserted against the RAW value, which is the fix for a hole in the
         first version of this test. It compared the rendered value with
@@ -8363,6 +8415,30 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
         assert set(rendered) == chain
         for name in sorted(chain):
             assert rendered[name] == str(resolved.build_threads)
+        # THE FOURTH CLAMP, which is not a parallelism key and is checked here
+        # anyway. PostgreSQL 17's CREATE INDEX page: maintenance_work_mem "may
+        # influence the number of worker processes requested, since parallel
+        # workers must have at least a 32MB share of the total
+        # maintenance_work_mem budget. There must also be a remaining 32MB
+        # share for the leader process." So the three assertions above are
+        # only as good as the memory behind them -- at a 256 MB literal an
+        # eight-worker request is granted as seven, and smaller values cut
+        # harder -- and a de-parameterised value here produces exactly the
+        # failure this test's docstring names. It is deliberately NOT in the
+        # parallelism family: it is a memory knob with its own
+        # resource-fraction machinery, and a parallelism predicate that
+        # matched it would mis-describe it.
+        #
+        # Tuned only. In the normalized pass the request is zero workers, so
+        # there is nothing for this to clamp; a literal there would be a
+        # memory-budget bug rather than a parallelism one and is not this
+        # test's business.
+        maintenance = _raw_pg_settings("pgvector", "tuned").get(
+            "maintenance_work_mem")
+        assert maintenance == "{maintenance_bytes}B", (
+            f"tuned maintenance_work_mem={maintenance} is not derived from "
+            "the resource pass; it is the fourth clamp on the worker count, "
+            "so a literal silently re-caps the chain asserted above")
 
     def test_the_two_passes_differ_by_exactly_the_documented_keys(self, info):
         """The passes are not each other's control, and this pins how far.
@@ -8381,6 +8457,40 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
         assert tuned - normalized == {"max_parallel_workers",
                                       "max_worker_processes"}
 
+    def test_no_other_worker_or_parallelism_setting_is_pinned(self, info):
+        """Each block is closed over anything whose name mentions a worker.
+
+        The documented four are the whole of it. A fifth setting whose name
+        mentions a worker or parallelism fails here whatever its value and
+        whatever the comment says, which is the point: this is the guard the
+        family docstring's "needs its own argument" promise rests on, and it
+        is a key-set assertion rather than a prose grep because a grep cannot
+        tell an argument from an incidental mention.
+
+        It was a prose grep first and that did not work.
+        `autovacuum_max_workers=8` in the tuned block passed a widened grep,
+        because the name already appears in the file -- in the sentence saying
+        autovacuum draws on that pool rather than on max_worker_processes. The
+        mention was honest and had nothing to do with setting it.
+
+        Adding one of these deliberately means editing this test, where a
+        reviewer reads the reason. That is the intended cost.
+        """
+        documented = {
+            "normalized": {"max_parallel_maintenance_workers",
+                           "max_parallel_workers_per_gather"},
+            "tuned": {"max_parallel_maintenance_workers",
+                      "max_parallel_workers", "max_worker_processes"},
+        }
+        for resource_pass, expected in sorted(documented.items()):
+            named = {name
+                     for name in _pg_settings("pgvector", resource_pass, info)
+                     if _names_a_worker_or_parallelism(name)}
+            assert named == expected, (
+                f"{resource_pass} pins a worker or parallelism setting the "
+                f"file does not account for: {sorted(named - expected)}; "
+                f"missing: {sorted(expected - named)}")
+
     def test_every_knob_either_pass_touches_is_argued_in_the_file(self, info):
         """A config decision carries its argument, or it is not a decision.
 
@@ -8390,16 +8500,26 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
         cheapest guard against that: a key added to either pass without a
         sentence explaining it fails this.
 
+        The key set comes from `_names_a_worker_or_parallelism`, which is
+        wider than the parallelism family the other tests use, because this is
+        the one question whose answer should not depend on whether a setting
+        caps a *vector* worker. Before that, this test filtered by the narrow
+        family and so never looked at a name outside it:
+        `autovacuum_max_workers=8` in the tuned block, explained nowhere,
+        passed.
+
         It guards the names and not the argument, which is a known limit. A
-        comment replaced by a bare list of the four key names passes, and
-        testing prose is not attempted here.
+        comment replaced by a bare list of the key names passes, and testing
+        prose is not attempted here.
         """
         with open(os.path.join(VB_ROOT, "config", "engines",
                                "pgvector.yml")) as fh:
             lines = fh.read().splitlines()
         prose = "\n".join(line for line in lines if line.strip().startswith("#"))
-        touched = (set(_pg_parallel_settings("pgvector", "normalized", info))
-                   | set(_pg_parallel_settings("pgvector", "tuned", info)))
+        touched = {name
+                   for resource_pass in ("normalized", "tuned")
+                   for name in _pg_settings("pgvector", resource_pass, info)
+                   if _names_a_worker_or_parallelism(name)}
         for name in sorted(touched):
             assert name in prose, (
                 f"{name} is pinned in config/engines/pgvector.yml and "
