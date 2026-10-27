@@ -8233,12 +8233,20 @@ def _names_a_worker_or_parallelism(name):
 
     The two are separate predicates because they answer different questions,
     and widening the narrow one instead would be wrong.
-    `_is_pg_parallelism_setting` feeds assertions about key sets and VALUES --
-    putting autovacuum_max_workers into those would assert that the normalized
-    pass must pin it to zero, which is false and would be a worse claim than
-    the gap it closed. This one feeds assertions about PRESENCE only, where
-    the cost of including a setting is an edit to one test and the cost of
-    excluding it is a worker cap nobody is asked about.
+    `_is_pg_parallelism_setting` feeds assertions about key sets and VALUES,
+    and autovacuum_max_workers does not belong in any of them: the tuned-chain
+    test asserts that family is exactly the three-key chain, and the
+    differs-by test asserts the two passes' difference, so a legitimately set
+    autovacuum cap would have to be written into both AS A PARALLELISM KEY,
+    which is what it is not. (It would NOT, as an earlier draft of this
+    paragraph said, assert that the normalized pass must pin it to zero. That
+    test's zero check filters on names starting `max_parallel`/`max_worker`,
+    so an autovacuum cap would land in its presence-refused branch instead.
+    The decision was right and the reason given for it was wrong.)
+
+    This one feeds assertions about PRESENCE only, where the cost of including
+    a setting is an edit to one test and the cost of excluding it is a worker
+    cap nobody is asked about.
 
     A superset of the narrow predicate by construction: every name that one
     matches either contains "parallel" or is max_worker_processes, which
@@ -8247,8 +8255,63 @@ def _names_a_worker_or_parallelism(name):
     return "parallel" in name or "worker" in name
 
 
+def _pg_settings_from_argv(tokens):
+    """Every GUC assignment in a postgres argv, keyed by canonical name.
+
+    MIRRORS THE SERVER'S PARSING AND NOT THIS FILE'S HOUSE STYLE, which is the
+    whole reason it exists. An earlier version recognised a setting only when
+    the preceding token was exactly `-c`, while the tests built on it claimed
+    the two blocks were "closed" over anything that names a worker. They were
+    closed over one spelling. All three of these were accepted in silence:
+
+        - "--max_worker_processes=16"
+        - "--max-worker-processes=16"
+        - "--autovacuum-max-workers=16"
+
+    and the last is precisely the class the closed-world test exists to
+    refuse. The spelling is reachable rather than theoretical, twice over.
+    `docker/pgvector/entrypoint-pgvector.sh` appends `${VB_SERVER_ARGS}`
+    UNQUOTED into the argv it execs, so the token word-splits and arrives at
+    postgres unchanged. And a bare `--name=value` is the prevailing style in
+    four sibling configs -- `percona.yml`, `mariadb.yml`, `mariadb123.yml` and
+    `alisql.yml` all spell their whole tuned block that way, and this file is
+    the only one using `-c` pairs -- so someone moving between them writes
+    `--max-parallel-workers=16` from habit, the server honours it, and the
+    guard says nothing.
+
+    So three spellings are accepted, as postgres accepts them: `-c name=value`,
+    `-cname=value`, and a standalone `--name=value`. Hyphens in the NAME are
+    folded to underscores, which is what the server's own `ParseLongOption`
+    does before looking a GUC up, so `--max-worker-processes` and
+    `max_worker_processes` are one key here as they are one setting there.
+    `--name value` is deliberately not accepted: postgres rejects a long option
+    with no `=` rather than consuming the next token.
+
+    Last writer wins, matching both a Python dict and the server: a duplicate
+    assignment later in the argv is the one in force, so a decoy placed BEFORE
+    the real value correctly changes nothing here.
+    """
+    settings = {}
+    index = 0
+    while index < len(tokens):
+        text = str(tokens[index])
+        pair = None
+        following = str(tokens[index + 1]) if index + 1 < len(tokens) else ""
+        if text == "-c" and "=" in following:
+            pair, index = following, index + 1
+        elif text.startswith("--") and "=" in text:
+            pair = text[2:]
+        elif text.startswith("-c") and len(text) > 2 and "=" in text:
+            pair = text[2:]
+        if pair:
+            name, _, value = pair.partition("=")
+            settings[name.replace("-", "_")] = value
+        index += 1
+    return settings
+
+
 def _pg_settings(engine, resource_pass, info):
-    """The `-c name=value` settings this repository actually sends, as a dict.
+    """The settings this repository actually sends, as a dict.
 
     Rendered through `server_args`, so this is what reaches the postmaster
     rather than what the file says. `_raw_pg_settings` is the other half: a
@@ -8256,16 +8319,10 @@ def _pg_settings(engine, resource_pass, info):
     equal it on this host, which is how a de-parameterised tuned chain
     survived the first version of these tests.
     """
-    rendered = server_args(load_engine(engine), resource_pass,
-                           resolve_resources(load_resources(resource_pass),
-                                             engine, info))
-    settings = {}
-    for flag, setting in zip(rendered, rendered[1:]):
-        if flag != "-c" or "=" not in setting:
-            continue
-        name, _, value = setting.partition("=")
-        settings[name] = value
-    return settings
+    return _pg_settings_from_argv(
+        server_args(load_engine(engine), resource_pass,
+                    resolve_resources(load_resources(resource_pass),
+                                      engine, info)))
 
 
 def _raw_pg_settings(engine, resource_pass):
@@ -8275,18 +8332,18 @@ def _raw_pg_settings(engine, resource_pass):
     resource pass has to be made before substitution. After it,
     `max_worker_processes=8` and `max_worker_processes={build_threads}` are
     the same string on an eight-thread host.
+
+    Reads `server.common` ahead of the pass block, in that order, because
+    `server_args` concatenates them that way: otherwise moving a setting into
+    the shared block -- placeholder intact and nothing wrong -- would read here
+    as the setting having vanished.
     """
     with open(os.path.join(VB_ROOT, "config", "engines",
                            f"{engine}.yml")) as fh:
         cfg = yaml.safe_load(fh) or {}
-    settings = {}
-    for setting in (cfg.get("server") or {}).get(resource_pass) or []:
-        text = str(setting)
-        if "=" not in text:
-            continue
-        name, _, value = text.partition("=")
-        settings[name] = value
-    return settings
+    server = cfg.get("server") or {}
+    return _pg_settings_from_argv(list(server.get("common") or [])
+                                  + list(server.get(resource_pass) or []))
 
 
 def _pg_parallel_settings(engine, resource_pass, info):
@@ -8461,11 +8518,22 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
         """Each block is closed over anything whose name mentions a worker.
 
         The documented four are the whole of it. A fifth setting whose name
-        mentions a worker or parallelism fails here whatever its value and
-        whatever the comment says, which is the point: this is the guard the
-        family docstring's "needs its own argument" promise rests on, and it
-        is a key-set assertion rather than a prose grep because a grep cannot
-        tell an argument from an incidental mention.
+        mentions a worker or parallelism fails here whatever its value,
+        whatever the comment says and whatever spelling it is written in,
+        which is the point: this is the guard the family docstring's "needs
+        its own argument" promise rests on, and it is a key-set assertion
+        rather than a prose grep because a grep cannot tell an argument from
+        an incidental mention.
+
+        "Whatever spelling" is load-bearing and was not true at first. This
+        test read its names through a helper that recognised only `-c
+        name=value`, so `--autovacuum-max-workers=16` -- the house spelling in
+        four sibling engine configs, word-split into the argv unquoted by
+        docker/pgvector/entrypoint-pgvector.sh, and honoured by the server --
+        passed while the comment claimed the block was closed. The claim was
+        the new guard rather than a remark at its edge, which is what made it
+        worth fixing rather than qualifying. `_pg_settings_from_argv` now
+        parses what postgres parses.
 
         It was a prose grep first and that did not work.
         `autovacuum_max_workers=8` in the tuned block passed a widened grep,
