@@ -1350,7 +1350,14 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
         """The constraint on the repair: another task re-baselined these
         figures, and if the six moved its numbers and this change would
         fight. Percona is the seventh and is asserted beside them rather than
-        in a second dict, so the whole table is pinned by one literal."""
+        in a second dict, so ALL OF THIS table is pinned by one literal.
+
+        Only this one. `_MEASURED_ROWS_PER_S` is per `(engine, dataset)` and
+        is pinned for percona by the assertion below plus
+        `tests/test_estimate.py`'s
+        `test_the_three_entries_are_the_records_they_came_from`; its other
+        engines' entries are not pinned anywhere by value, which is the state
+        this change found and did not widen."""
         from orchestrator import estimate as est_mod
         assert est_mod._INGEST_ROWS_PER_S == {
             "mariadb": 150, "mariadb123": 110, "alisql": 55,
@@ -1367,10 +1374,12 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
         a `post`-mode figure fails."""
         from orchestrator import estimate as est_mod
         assert est_mod._INGEST_ROWS_PER_S["percona"] == 275
-        assert {k[1] for k in est_mod._MEASURED_ROWS_PER_S
-                if k[0] == "percona"} == {"fashion-mnist-784-euclidean",
-                                          "glove-100-angular",
-                                          "sift-128-euclidean"}
+        assert {k[1]: v for k, v in est_mod._MEASURED_ROWS_PER_S.items()
+                if k[0] == "percona"} == {
+            "fashion-mnist-784-euclidean": 339,
+            "glove-100-angular": 275,
+            "sift-128-euclidean": 427,
+        }
         assert ("percona", "gist-960-euclidean") not in est_mod._MEASURED_ROWS_PER_S
 
     def test_a_dataset_with_no_row_count_does_not_make_every_engine_a_gap(self):

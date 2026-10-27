@@ -250,9 +250,16 @@ class TestPerconasMeasuredIngestRateReachesTheEstimator:
     * *build_mode* is `incremental`, Percona's default at this pin. The `post`
       record's 2653.0 rows/s is in neither table.
 
-    The figures are asserted against the census SPAN rather than restated,
-    which is what makes the `post` figure fail here: 2653.0 is 4.2x the top of
-    the incremental range, so an entry taken from it cannot pass.
+    The figures are asserted TWICE, and the pair is deliberate: once by value,
+    because each is a specific record and a neighbouring integer is not that
+    record, and once against the census SPAN, which is the shape check that no
+    `post`-mode figure can pass -- 2653.0 is 4.2x the top of the incremental
+    range. The span alone was not enough. fashion-mnist is 60,000 rows, so
+    337 through 341 all satisfied every OTHER assertion in this repository
+    while plus or minus one on the other two moves nine published figures;
+    `test_the_three_entries_are_the_records_they_came_from` is what closes
+    that, and `--profile main` cannot close it because `main` loads
+    glove-100 and sift-128 and not fashion-mnist.
     """
 
     #: The incremental min and max of B1's census: gist-960 tuned M=32 at
@@ -292,6 +299,19 @@ class TestPerconasMeasuredIngestRateReachesTheEstimator:
         out = printed("main")
         assert "percona ~" in out
         assert "No measured ingest rate" not in out
+
+    def test_the_three_entries_are_the_records_they_came_from(self):
+        """By value, per dataset. The span below is a shape check and this is
+        the identity one: these are three named records -- 338.94, 275.04 and
+        426.53 rows/s, M=16, `incremental`, from `full-20261015-215006` -- and
+        a figure one row/s away from any of them is not a measurement this
+        repository has taken."""
+        assert {k[1]: v for k, v in est_mod._MEASURED_ROWS_PER_S.items()
+                if k[0] == "percona"} == {
+            "fashion-mnist-784-euclidean": 339,
+            "glove-100-angular": 275,
+            "sift-128-euclidean": 427,
+        }
 
     def test_every_entry_is_inside_the_census_span(self):
         lo, hi = self.CENSUS_SPAN

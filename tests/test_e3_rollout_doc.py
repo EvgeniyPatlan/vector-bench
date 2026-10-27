@@ -520,13 +520,14 @@ CITED_IN_REPO = {
     # anchor deliberately has NO default argument in it, so the old spelling
     # coming back fails this row rather than satisfying it.
     #
-    # Then `:162`, and now `:260`: the call did not move, the table above it
+    # Then `:162`, and now `:280`: the call did not move, the table above it
     # grew. Percona's three measured entries, the provenance comment that
     # dates them to the pin they were taken at and the measurement-version
-    # verdict beside it pushed everything below the tables down by 98 lines.
+    # verdict beside it pushed everything below the tables down by 118 lines.
     # This row is the reason that shift could not silently invalidate the
-    # document.
-    "orchestrator/estimate.py:260":
+    # document -- it fired on the shift twice while this change was being
+    # written, once per revision of that comment.
+    "orchestrator/estimate.py:280":
         ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine)"),
     "orchestrator/estimate.py:44":
         ("orchestrator/estimate.py",

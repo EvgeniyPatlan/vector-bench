@@ -569,7 +569,7 @@ engines that had a rate, at the commit of the fix) with nothing printed to
 say so.
 
 **What it does now.** `_effective_rate` returns `None` where nothing has been
-measured — `orchestrator/estimate.py:260` is `_INGEST_ROWS_PER_S.get(engine)`
+measured — `orchestrator/estimate.py:280` is `_INGEST_ROWS_PER_S.get(engine)`
 with no default — and `estimate_load_hours` reports
 `engines_without_ingest_rate` on the same terms the query half has always used
 for `engines_without_query_rate`: the engine is **named, contributes nothing to

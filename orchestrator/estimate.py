@@ -194,17 +194,37 @@ _MEASURED_ROWS_PER_S = {
     # module writes no records. It reads none either, at runtime: nothing here
     # reaches `build_signature`, `memory_stem` or `charts.series_key`, so no
     # recorded number changes value, meaning or series, which is the whole of
-    # `OPS_MEASUREMENT_VERSION`'s charter. The version question that DOES
-    # apply points the other way -- these entries were READ OFF records at
-    # `ops_measurement_version` 6 and 7 while the constant is 8 -- and it
-    # resolves: `ingest_rows_per_s` last changed meaning at version 5, which
-    # widened every row with the `ctag` column, and versions 6, 7 and 8 moved
-    # five `extra.*scaling_status` fields and `storage_engine` respectively
-    # and no throughput figure at all. All three entries are therefore the
-    # same quantity as each other and as a load measured at HEAD. A future
-    # bump that does move `ingest_rows_per_s` -- another column, a different
-    # load path -- makes them rates for a different quantity, and they must be
-    # re-read rather than carried forward.
+    # `OPS_MEASUREMENT_VERSION`'s charter.
+    #
+    # The version question that DOES apply points the other way: all three
+    # entries above and the reference rate were READ OFF records stamped
+    # `ops_measurement_version` **7**, while the constant is 8. It resolves,
+    # and the argument is about this field and not about the versions in
+    # general. `ingest_rows_per_s` is SINGLE-WRITER load throughput -- every
+    # one of the seventeen census records carries `ingest_threads: 1` and the
+    # ingest phase has no client pool -- and nothing since version 5, which
+    # widened every row with the `ctag` column, has moved it:
+    #
+    #   * version 6 made the clients OS processes and moved every
+    #     MULTI-CLIENT figure: `qps` and all four latency columns wherever
+    #     `clients > 1`, the four `extra.*concurrency`/`scaling_*` keys, and
+    #     the churn during-writes record's aggregate reader throughput,
+    #     percentiles, p99 ratio and `extra.reinsert_rows_per_s`. TWO OF
+    #     THOSE ARE THROUGHPUT FIGURES and neither is this one: a pool's
+    #     `qps` and a re-insert rate against readers are not a one-writer
+    #     load rate.
+    #   * version 7 moved five one-client `extra.*scaling_status` fields and
+    #     explicitly nothing else -- "No `qps`, no percentile, no efficiency".
+    #   * version 8 moved `storage_engine`, an identity label and not a
+    #     measurement. For Percona it stays populated; InnoDB is real here.
+    #
+    # So these three rates are commensurable with each other and with a load
+    # measured at HEAD. (6 and 7 are the span of the CENSUS, not the
+    # provenance of the entries: its one version-6 record is the `post` plain
+    # load noted above, which is in neither table.) A future bump that does
+    # move `ingest_rows_per_s` -- another column, a different load path, more
+    # than one writer -- makes these a different quantity, and they must then
+    # be re-read rather than carried forward.
 }
 
 
