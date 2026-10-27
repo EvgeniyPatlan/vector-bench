@@ -453,7 +453,6 @@ CITATION_CEILINGS: Dict[str, int] = {
     "tests/test_c4_pgvector_ingest.py": 2,
     "tests/test_e10_report_unit_join_keys.py": 2,
     "tests/test_e13_percona_churn_repair_is_a_noop.py": 1,
-    "tests/test_e14_per_pass_manifest.py": 1,
     "tests/test_e1_percona_design.py": 23,
     "tests/test_e3_rollout_doc.py": 6,
     "tests/test_e4_percona_build_flags.py": 21,

@@ -184,6 +184,75 @@ def _accumulate_passes(prior: Dict[str, Any], resource_pass: str,
     return out
 
 
+def _accumulate_datasets(prior: Dict[str, Any], phases: Any,
+                         datasets: Optional[List[str]]) -> List[str]:
+    """The corpora this run directory resolved to measure, as a new list.
+
+    Why the key exists at all. `--datasets` narrows a run and leaves the
+    profile alone: `cli.py` builds its own list from the flag and handed
+    `set_config` the profile dict unchanged, so `run --profile full
+    --datasets fashion-mnist-784-euclidean` measured one corpus and left
+    behind a manifest whose only statement about corpora --
+    `config.profile.datasets` -- named four. A reader of that manifest, human
+    or otherwise, had nothing to tell the declaration from the run. The
+    orchestrator already records the RESOLVED form of everything else it
+    decides on the host: `resolved_resources` beside the profile's own
+    `resources:` block, `ann_fingerprint` beside the pass it keys, the
+    `engines` block beside `config.profile.engines`. The corpus list is the
+    one axis that was recorded only as declared.
+
+    The declaration stays where it is. `config.profile` is a verbatim copy of
+    the profile as loaded and remains the answer to "what does this profile
+    ask for"; this key is the answer to "what did this run resolve to
+    measure", and the two differ exactly when a flag narrowed the run.
+
+    **Additive, never narrowing, for the reason `_accumulate_passes` is.**
+    `cli.py` calls `set_config` per (pass, engine) *above* the checkpoint
+    skip, so `run --resume --run-id <old-run> --datasets one-corpus` reaches
+    it with one name in hand for a directory that holds four corpora of
+    completed measurement. Overwriting would delete three of them from the
+    manifest -- the corpus-side twin of the engine-declaration hazard
+    `report/scope.py::measured_engines` describes, where a scope taken from
+    the declaration would have deleted six engines of real measurement from
+    `percona-20261020-140151`. So three sources are unioned in order: what the
+    directory already recorded here, every corpus named in its phase log (what
+    it has actually measured, which is how an archived run resumed by this
+    code keeps its full breadth even though nothing wrote this key when it
+    ran), and this call's own resolved list.
+
+    Absent stays absent. A caller that resolves no corpora -- which is every
+    caller but `cmd_run`, and every archived manifest reopened without being
+    re-run -- gets no key rather than a list invented from the declaration.
+    Inventing one would re-state the very claim this exists to stop making:
+    the declaration is already in the file, under `config.profile`, and
+    copying it up here would dress it as a resolution nobody performed. What
+    a reader does with the absence is their business -- `export.py` falls
+    back to the declaration and says so -- and nothing in `report/` reads
+    this key at all today, so no claim is made here about what the report
+    would do with it.
+    """
+    if isinstance(datasets, str):
+        # `Sequence[str]` admits `str`, which is how the annotation used to
+        # read, and a bare one would union character by character into a
+        # manifest claiming corpora named "s", "i", "f". `cmd_run` splits
+        # the flag before this is reached, so nothing can reach it today --
+        # but a manifest is read years later and a loud refusal before any
+        # measurement costs nothing, where the record it would otherwise
+        # write is absurd without being obviously anybody's mistake.
+        raise TypeError(
+            f"datasets must be a list of corpus names, not the raw "
+            f"--datasets string {datasets!r}: split it first")
+    out: List[str] = []
+    for source in (prior.get("resolved_datasets") or (),
+                   [p.get("dataset") for p in (phases or [])
+                    if isinstance(p, dict)],
+                   datasets or ()):
+        for name in source:
+            if name and str(name) not in out:
+                out.append(str(name))
+    return out
+
+
 class Manifest:
     def __init__(self, run_dir: str, run_id: str):
         self.run_dir = run_dir
@@ -249,7 +318,8 @@ class Manifest:
             )
 
     def set_config(self, profile: Dict[str, Any], resource_pass: str,
-                   resolved: Any, extra: Optional[Dict[str, Any]] = None) -> None:
+                   resolved: Any, extra: Optional[Dict[str, Any]] = None,
+                   datasets: Optional[List[str]] = None) -> None:
         # Carried forward from whatever this directory already said, never
         # re-stamped, and never invented for a manifest that does not have it.
         #
@@ -296,6 +366,16 @@ class Manifest:
             prior, resource_pass, config["resolved_resources"],
             config.get("ann_fingerprint"),
             recorded_host=(self.data.get("host") or {}).get("hostname"))
+        # Popped first and then set only if there is something to say, so a
+        # smuggled `extra` value cannot survive the empty case the way one
+        # survives the conditional `ops_measurement_version` assignment above.
+        # Which corpora a run resolved to measure is the orchestrator's own
+        # resolution, not a caller's opinion of it.
+        resolved_datasets = _accumulate_datasets(
+            prior, self.data.get("phases"), datasets)
+        config.pop("resolved_datasets", None)
+        if resolved_datasets:
+            config["resolved_datasets"] = resolved_datasets
         self.data["config"] = config
         # Persisted here rather than left to the next populator's save(). Every
         # other method on this class saves, and set_config did not only because

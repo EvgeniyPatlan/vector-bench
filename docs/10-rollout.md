@@ -512,7 +512,7 @@ name absent, and a name that regresses out of docs/05 fails the `PRESENT` half.
 
 ### 7. "Run manifest records `ops_measurement_version`, seeds and the resolved profile"
 
-Satisfied for the version: `orchestrator/manifest.py:222` writes
+Satisfied for the version: `orchestrator/manifest.py:291` writes
 `config.ops_measurement_version` from the constant, `report/render.py:357-358`
 prints it above the numbers, and `docs/05-methodology.md:1039-1040`
 documents it.

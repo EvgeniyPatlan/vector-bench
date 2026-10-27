@@ -470,7 +470,7 @@ CITED_IN_REPO = {
          'print(f"[report] {exc}", file=sys.stderr)'),
     "report/render.py:357-358":
         ("report/render.py", '"Ops measurement version"'),
-    "orchestrator/manifest.py:222":
+    "orchestrator/manifest.py:291":
         ("orchestrator/manifest.py",
          '"ops_measurement_version": OPS_MEASUREMENT_VERSION'),
     # These two changed FILE, not just line. G3 split `clients.py`, which
