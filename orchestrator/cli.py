@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import ast
 import getpass
+import inspect
 import json
 import os
 import re
@@ -1520,13 +1521,60 @@ def _lab_script_problem(script: str) -> Optional[str]:
     return None
 
 
+def _lab_artifacts_problem(path: str) -> Optional[str]:
+    """Reject an --artifacts directory before Docker sees it.
+
+    Two separate refusals, and the second is the reason this is not just an
+    `isdir` call. The orchestrator hands HOST paths to the Docker daemon, so
+    this value becomes a bind mount: an arbitrary path would make `lab` a
+    way to read any directory on the measurement host into a container.
+    Everything it legitimately wants is under the repo -- a run directory in
+    `results/`, a lab session's own `state/lab/<session>` -- so the bound is
+    the repo, resolved through symlinks rather than compared as a string.
+
+    Read-only is not negotiated here: `run_script` appends `:ro` itself. A
+    lab script invents its own vectors and its own ground truth, and those
+    numbers must never be able to reach a run directory a report reads.
+    """
+    resolved = os.path.realpath(os.path.abspath(path))
+    if not os.path.isdir(resolved):
+        return f"--artifacts: not a directory: {path}"
+    root = os.path.realpath(VB_ROOT)
+    if resolved != root and not resolved.startswith(root + os.sep):
+        return (f"--artifacts: {path} resolves to {resolved}, which is "
+                f"outside {root}.\nlab mounts this path into a container; "
+                f"name a directory in the repo, such as\nresults/<run-id>.")
+    return None
+
+
+def _artifacts_mount_problem() -> Optional[str]:
+    """Whether this tree's `run_script` can mount an artefacts directory.
+
+    The parameter is added by the crash-capture change that also saves the
+    core; this flag is useless without it and the two land separately. Asked
+    rather than assumed because the alternative is a TypeError raised AFTER
+    the server is up, which for the MySQL family is several minutes of an
+    operator's time to be told about a keyword argument. Deleting this check
+    is correct as soon as `artifacts_dir` is unconditionally present.
+    """
+    if "artifacts_dir" in inspect.signature(
+            ops_pass.OpsRun.run_script).parameters:
+        return None
+    return ("--artifacts needs OpsRun.run_script's `artifacts_dir` "
+            "parameter, which this tree does not have yet.\nIt arrives with "
+            "the crash-capture change that saves the core in the first "
+            "place; until then\nthere is nothing to mount and nothing to "
+            "read. Run the script without --artifacts to\nsee what it says "
+            "about that.")
+
+
 #: lab's own options. Listed rather than read off the parser at call time,
 #: which would mean either module-level mutable state or reaching into
 #: argparse's privates; a test asserts this matches the subparser exactly, so a
 #: flag added and forgotten here fails rather than quietly going unmentioned.
 _LAB_OPTIONS = frozenset({
     "-h", "--help", "--engine", "--resource-pass", "--shell", "--list",
-    "--client-memory-gb", "--force", "--timeout",
+    "--client-memory-gb", "--force", "--timeout", "--artifacts",
 })
 
 
@@ -1578,6 +1626,13 @@ def cmd_lab(args: argparse.Namespace) -> int:
         if problem:
             print(problem, file=sys.stderr)
             return 2
+
+    if args.artifacts:
+        for problem in (_lab_artifacts_problem(args.artifacts),
+                        _artifacts_mount_problem()):
+            if problem:
+                print(problem, file=sys.stderr)
+                return 2
 
     # argparse.REMAINDER takes everything after the script name, which is what
     # lets a script have any flags it likes -- and also means a lab flag typed
@@ -1635,6 +1690,14 @@ def cmd_lab(args: argparse.Namespace) -> int:
     client_memory = (int(args.client_memory_gb * GB)
                      if args.client_memory_gb else None)
 
+    # Passed as **kwargs and only when asked for, so a tree whose
+    # `run_script` has no such parameter behaves exactly as it did and the
+    # refusal above is the only thing --artifacts changes there. Both
+    # branches get it: opening a core by hand in the bench container is
+    # `lab --shell`, and that is the likelier first move of the two.
+    artifacts = ({"artifacts_dir": os.path.abspath(args.artifacts)}
+                 if args.artifacts else {})
+
     try:
         with ops_pass.OpsRun(args.engine, engine_cfg, resolved,
                              args.resource_pass, paths, session,
@@ -1644,10 +1707,11 @@ def cmd_lab(args: argparse.Namespace) -> int:
                       f"'{run.server_name}' on port {run.port}")
                 print(f"[lab] harness importable; scripts in /opt/scripts\n")
                 return run.run_script("", [], interactive=True,
-                                      client_memory_bytes=client_memory)
+                                      client_memory_bytes=client_memory,
+                                      **artifacts)
             return run.run_script(args.script, args.script_args,
                                   client_memory_bytes=client_memory,
-                                  timeout_s=args.timeout)
+                                  timeout_s=args.timeout, **artifacts)
     except KeyboardInterrupt:
         # OpsRun.__exit__ has already torn the pair down by the time this is
         # caught; saying so is the difference between a clean stop and an
@@ -1797,6 +1861,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help="start even though a measurement is running")
     lab.add_argument("--timeout", type=int, default=4 * 3600,
                      help="seconds before the script's container is killed")
+    # Explicit rather than derived. The core a diagnostic script wants to
+    # open is in results/<run-id>/, and a lab session's own run directory is
+    # state/lab/<session>, created empty moments earlier -- so the session
+    # cannot name the artefact for itself and has to be told.
+    lab.add_argument("--artifacts", default=None,
+                     help="a directory in the repo to mount read-only at "
+                          "/artifacts, for a script that reads a run's "
+                          "artefacts (a saved core, a server log)")
     lab.set_defaults(func=cmd_lab)
 
     c = sub.add_parser("clean", help="remove docker resources left by a run")

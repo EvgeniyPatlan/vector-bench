@@ -167,6 +167,7 @@ each is asserted rather than assumed:
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 
@@ -921,3 +922,647 @@ class TestTheTwoFlagListsMirrorEachOther:
         assert "${CMAKE_FLAGS}" in cmake_region, (
             "the builder's cmake invocation no longer expands ${CMAKE_FLAGS}, "
             "so config/engines/percona.yml build.cmake_flags is dead config")
+
+
+# ---------------------------------------------------------------------------
+# The debugger, the stage it belongs in, and the audit entry it reverses
+# ---------------------------------------------------------------------------
+#
+# 2026-10-27, request 1 of docs/12-percona-feedback-plan.md -- its §4, "get
+# stack traces for the crashes". NOT request 3, which is filtered search
+# against pgvector (§7) and another unit's subject; an earlier revision of
+# this section said 3 at every site.
+#
+# Twelve of the twenty-four Percona ops units in run full-20261015-215006
+# died inside the first INSERT -- exactly half. `config/profiles/full.yml` is
+# four datasets and `ops.m_values: [8, 16, 32]`, so twelve units a pass and
+# twenty-four across both; the twelve that died is the plan's count over the
+# archived unit files, which `results/` being gitignored puts outside this
+# checkout. The figure is NOT taken from `config/engines/percona.yml`'s
+# `error_log` note, which still reads "13 of 24" -- wrong, and corrected by
+# the crash-capture change.
+#
+# Nothing in the tree could turn such a crash into text: `gdb` was installed
+# by no stage of any image here, and that was a RECORDED decision -- the
+# audit note above the builder's apt list lists it beside
+# valgrind, doxygen and the rest of Percona's packaging and test pipeline as
+# "deliberately NOT taken, with the reason, so the audit does not have to be
+# redone".
+#
+# So this is a reversal of a written decision and not merely a package, and
+# the two halves are asserted separately:
+#
+#   * the package is in the BENCH stage and in no other. The runtime image is
+#     the container the ops path measures -- `OpsRun._start_server` starts it
+#     from `image.runtime` -- and a debugger in it is a package in the
+#     measured server's own filesystem. The bench image is what
+#     `OpsRun.run_script` starts for a lab script, which is the route that
+#     opens a core.
+#   * the audit note stops LISTING it and starts RECORDING the reversal. A
+#     list that silently loses an entry is how an audit has to be redone,
+#     which is the note's own stated reason for existing, so a deletion that
+#     leaves no trace fails here just as a silent addition does.
+#
+# WHAT THESE ASSERTIONS CANNOT ESTABLISH, in the same spirit as the module
+# docstring above: nothing here builds an image. Whether noble has a `gdb`
+# candidate, whether the layer builds, and whether gdb can open a core
+# written by this mysqld are all for the first rebuild. These are text guards
+# over a Dockerfile, a script and a tuple.
+
+#: The debugger the crash-capture route needs.
+DEBUGGER_PACKAGE = "gdb"
+
+#: The stage it belongs in, and the stages it must stay out of. `bench` is
+#: `FROM runtime AS bench`, so a package in `runtime` is also in `bench` --
+#: the containment is the reason the negative assertion is the load-bearing
+#: one here rather than a formality.
+DEBUGGER_STAGE = "bench"
+DEBUGGER_FORBIDDEN_STAGES = ("runtime", "builder")
+
+#: What a parsed package name may look like. Debian policy allows
+#: lowercase alphanumerics plus `+ - .`, starting alphanumeric.
+#:
+#: THIS CONSTANT EXISTS BECAUSE THE PARSER READ A COMMENT. `_apt_packages`
+#: matches `apt-get install` anywhere in a stage's text, prose included, and
+#: this change's own note in the bench stage quoted that string while
+#: explaining why gdb used to be absent. The bench stage then parsed to
+#: `['3', 'Request', '`', 'any', 'build-essential', 'gdb', ...]` -- every
+#: membership assertion in this file still passed, because junk tokens
+#: collide with no package name anyone asserts. The note was reworded; this
+#: is the guard that makes the next one fail loudly instead.
+PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+
+#: Runtime packages the runtime stage really does install, asserted beside
+#: every "gdb is not in runtime" claim. A negative assertion passes just as
+#: happily against an empty string, and `_apt_packages` returning nothing for
+#: a restructured stage is exactly how that would happen.
+RUNTIME_PACKAGES_IT_DOES_CARRY = ("procps", "libssl3t64")
+
+#: The audit note, by its own words. The first is its anchor; the second and
+#: third bound the enumeration of package names inside it, which is the part
+#: `gdb` has to leave. The note's prose continues past the enumeration, and
+#: the reversal sentence is added to that prose -- so the two regions are
+#: parsed separately and a name cannot satisfy one by sitting in the other.
+AUDIT_NOTE_ANCHOR = "Vendor packages deliberately NOT taken"
+AUDIT_NOTE_END = "\nARG BASE_IMAGE"
+AUDIT_ENUMERATION_OPEN = "does not have to be redone:"
+AUDIT_ENUMERATION_CLOSE = "are their packaging and test pipeline"
+
+#: An entry that must still be listed. Without it, "gdb is not in the
+#: enumeration" is satisfied by deleting the paragraph.
+AUDIT_ENTRY_THAT_STAYS = "valgrind"
+
+#: The marker the reversal sentence must carry, and the request it must name.
+#:
+#: BOTH EXIST BECAUSE TOKEN CO-OCCURRENCE HAS NO POLARITY, and that was a
+#: review finding against the first version of this file rather than a
+#: hypothetical. `"gdb" in note` plus `"bench" in <the sentence naming gdb>`
+#: is satisfied by a note reading "gdb is not taken in the bench stage
+#: either, for the same reason" -- the OPPOSITE of what the image does -- and
+#: by one reading literally `gdb bench.`. A marker is what distinguishes a
+#: record of a reversal from any other sentence that happens to mention the
+#: package and the stage, and the request number is what sends the next
+#: auditor to the right section of the plan.
+#:
+#: Pinning prose in a test is deliberate here: the audit note's whole purpose
+#: is that the audit not have to be redone, so what it SAYS is the artefact
+#: under test, exactly as `tests/test_e8_package_flags_overwrite.py` holds
+#: both Dockerfiles' notes to naming the flags they explain.
+AUDIT_REVERSAL_MARKER = "ONE REVERSAL"
+AUDIT_REQUEST = "request 1"
+
+#: The reversal sentence exactly as the Dockerfile spells it, used ONLY as a
+#: mutation needle. The PROPERTIES that matter are asserted above and apply
+#: to any wording; this string is how the probes below reach the sentence in
+#: raw text, where it is one line. A reword should update this and leave the
+#: property assertions alone -- and is told to, because a probe whose needle
+#: stopped matching would silently stop mutating anything, which is why its
+#: presence is asserted rather than assumed.
+AUDIT_REVERSAL_NEEDLE = " ONE REVERSAL: gdb, for request 1; see the bench stage."
+
+#: The lab script that runs the debugger, and the flag that mounts the
+#: directory holding the core.
+LAB_SCRIPT = "gdb-backtrace.py"
+LAB_ARTIFACTS_OPTION = "--artifacts"
+
+#: The gdb command the plan asks for, and the name of the constant that has
+#: to hold it. Pinned as a value because the value is the claim: `bt` alone
+#: gives one thread, and the crashing thread of a multi-threaded server is
+#: not reliably the one gdb stops in.
+#:
+#: READ OUT OF THE AST, NOT GREPPED, and this is vacuity shape 3 from the
+#: module docstring caught live rather than argued. The script documents the
+#: command it runs at length, so `"thread apply all bt full" in source` is
+#: true no matter what the constant says -- the mutation run below weakened
+#: the constant to `bt` and the grepped form of this assertion SURVIVED.
+GDB_COMMAND_CONSTANT = "GDB_COMMAND"
+GDB_BATCH_COMMAND = "thread apply all bt full"
+
+#: The two code fragments that say the constant is actually what gdb is
+#: handed. Spelled as code so that prose cannot satisfy them: a script that
+#: defines the constant correctly and then passes a literal would otherwise
+#: pass everything above.
+GDB_INVOCATION_FRAGMENTS = ('[gdb, "--batch", "--nx",', '"-ex", GDB_COMMAND,')
+
+
+def _audit_note(dockerfile_text: str) -> str:
+    """The 'deliberately NOT taken' paragraph, flattened to one line.
+
+    Comment markers and line wrapping are removed so that an assertion about
+    a sentence is not also an assertion about where the 77th column fell.
+    """
+    assert AUDIT_NOTE_ANCHOR in dockerfile_text, (
+        f"{AUDIT_NOTE_ANCHOR!r} is not in the Dockerfile; this parser's "
+        f"anchor is stale or the audit note is gone")
+    after = dockerfile_text.split(AUDIT_NOTE_ANCHOR, 1)[1]
+    assert AUDIT_NOTE_END in after, (
+        f"no {AUDIT_NOTE_END!r} after the audit note to bound it on")
+    note = AUDIT_NOTE_ANCHOR + after.split(AUDIT_NOTE_END, 1)[0]
+    return " ".join(note.replace("#", " ").split())
+
+
+def _audit_enumeration(dockerfile_text: str) -> frozenset[str]:
+    """The package names the audit note enumerates as not taken.
+
+    Whole tokens off the comma list, not a substring scan of the paragraph:
+    the reversal sentence names `gdb` on purpose, and a substring check would
+    read that as the entry still being listed -- which is the one way this
+    guard could pass while the edit it asks for had not happened.
+    """
+    note = _audit_note(dockerfile_text)
+    assert AUDIT_ENUMERATION_OPEN in note, AUDIT_ENUMERATION_OPEN
+    assert AUDIT_ENUMERATION_CLOSE in note, AUDIT_ENUMERATION_CLOSE
+    listed = note.split(AUDIT_ENUMERATION_OPEN, 1)[1]
+    listed = listed.split(AUDIT_ENUMERATION_CLOSE, 1)[0]
+    names = set()
+    for part in listed.replace(" and ", ", ").split(","):
+        name = part.strip(" `.;:")
+        if name:
+            names.add(name)
+    return frozenset(names)
+
+
+def _script_constant(source: str, name: str):
+    """A module-level constant of a lab script, read out of its AST.
+
+    The parse exists because the grepped form of the assertion it serves was
+    a mutation SURVIVOR: `scripts/gdb-backtrace.py` explains the gdb command
+    it runs in its docstring, so a substring check for that command passes
+    against a script whose constant has been changed to something else.
+    """
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    return ast.literal_eval(node.value)
+    return None
+
+
+def _audit_sentences(dockerfile_text: str) -> list:
+    r"""The audit note, split into sentences.
+
+    `(?<=\.)\s+` and not `split(".")`: the paragraph cites `CMakeLists.txt`
+    and `build-binary.sh`, and the dot in a filename is followed by no space.
+    """
+    return re.split(r"(?<=\.)\s+", _audit_note(dockerfile_text))
+
+
+def _audit_reversal_sentence(dockerfile_text: str) -> str:
+    """The sentence recording the reversal, or '' if it is not unique.
+
+    SELECTED BY THE MARKER, NOT BY THE PACKAGE NAME. The first version of
+    this helper returned the first sentence containing `gdb`, which has two
+    faults: a legitimate earlier mention of the package would be read as the
+    record and fail a correct file, and any sentence naming the package and
+    the stage would satisfy the assertions whatever it claimed about them.
+    Returning '' for zero matches AND for more than one is deliberate: two
+    reversal sentences mean the caller cannot know which one it checked.
+    """
+    found = [s for s in _audit_sentences(dockerfile_text)
+             if AUDIT_REVERSAL_MARKER in s]
+    return found[0] if len(found) == 1 else ""
+
+
+@pytest.fixture(scope="module")
+def lab_script_source() -> str:
+    path = os.path.join(VB_ROOT, "scripts", LAB_SCRIPT)
+    with open(path) as handle:
+        return handle.read()
+
+
+class TestTheDebuggerIsInTheStageThatDiagnoses:
+    """`gdb`, in `bench` and nowhere else."""
+
+    def test_the_bench_stage_installs_it(self, dockerfile_stages):
+        packages = _apt_packages(dockerfile_stages[DEBUGGER_STAGE])
+        assert packages, (
+            "the bench stage parsed to no packages at all, so the assertion "
+            "below would be about nothing")
+        assert DEBUGGER_PACKAGE in packages, (
+            f"{DEBUGGER_PACKAGE} is not in the {DEBUGGER_STAGE} stage's "
+            f"apt-get install list, so `lab ... {LAB_SCRIPT}` has no "
+            f"debugger to run. {DEBUGGER_STAGE} installs: {sorted(packages)}")
+
+    @pytest.mark.parametrize("stage", DEBUGGER_FORBIDDEN_STAGES)
+    def test_no_other_stage_installs_it(self, stage, dockerfile_stages):
+        """The runtime stage is the measured server's filesystem.
+
+        Paired with a positive assertion about the same list, because an
+        absence check is satisfied by a parse that returned nothing -- and a
+        restructured stage is precisely how that happens.
+        """
+        packages = _apt_packages(dockerfile_stages[stage])
+        assert len(packages) >= 5, (
+            f"the {stage} stage parsed to {sorted(packages)}, which is too "
+            f"few for the absence below to mean anything")
+        assert DEBUGGER_PACKAGE not in packages, (
+            f"{DEBUGGER_PACKAGE} is installed in the {stage} stage. The "
+            f"runtime image is the container the ops path measures, and a "
+            f"debugger belongs in the one a lab script runs in. "
+            f"{stage} installs: {sorted(packages)}")
+
+    def test_the_runtime_list_really_does_carry_packages_it_claims(
+            self, dockerfile_stages):
+        """Non-vacuity for the test above, by name rather than by count."""
+        packages = _apt_packages(dockerfile_stages["runtime"])
+        for expected in RUNTIME_PACKAGES_IT_DOES_CARRY:
+            assert expected in packages, (
+                f"{expected} is no longer in the runtime stage, so this "
+                f"file's model of that stage is stale: {sorted(packages)}")
+
+    def test_no_stage_parses_prose_as_packages(self, dockerfile_stages):
+        """Every stage's parsed list is package names and nothing else.
+
+        `_apt_packages` is not bounded to a RUN -- it matches the apt install
+        step wherever it appears, and this Dockerfile is mostly comments. A
+        note that quotes the string turns the following words into
+        "packages": harmless for membership assertions, and not harmless for
+        a count or for anyone reading a failure message. This is the
+        assertion that names the cause.
+
+        Every stage the fixture found, not a hardcoded three: a fourth stage
+        would otherwise be added and never checked, which is the same shape
+        as the flag added and forgotten that `_LAB_OPTIONS` guards against.
+        """
+        offenders = {}
+        for stage, text in dockerfile_stages.items():
+            junk = sorted(p for p in _apt_packages(text)
+                          if not PACKAGE_NAME.match(p))
+            if junk:
+                offenders[stage] = junk
+        assert not offenders, (
+            f"these stages parsed prose as package names: {offenders}. A "
+            f"comment in docker/percona/Dockerfile most likely quotes the "
+            f"literal apt install step; the parser reads prose, so reword "
+            f"the comment rather than widening this check.")
+
+    def test_it_is_installed_in_exactly_one_stage(self, dockerfile_stages):
+        """`bench` is `FROM runtime AS bench`, so an entry copied into
+        runtime rather than moved would leave the bench assertion green and
+        put the debugger in the measured server after all."""
+        carrying = sorted(name for name, text in dockerfile_stages.items()
+                          if DEBUGGER_PACKAGE in _apt_packages(text))
+        assert carrying == [DEBUGGER_STAGE], carrying
+
+
+class TestTheAuditNoteRecordsTheReversalRatherThanLosingIt:
+    """The half that is about the decision and not about the package.
+
+    The note's own reason for existing is "so the audit does not have to be
+    redone". Dropping an entry from it silently is how it has to be redone.
+    """
+
+    def test_the_enumeration_parsed_to_something(self, dockerfile_text):
+        """Non-vacuity: every assertion below is about this set."""
+        listed = _audit_enumeration(dockerfile_text)
+        assert len(listed) >= 10, sorted(listed)
+        for name in ("doxygen", "patchelf", "copyright-update"):
+            assert name in listed, sorted(listed)
+
+    def test_the_enumeration_no_longer_lists_the_debugger(self,
+                                                          dockerfile_text):
+        listed = _audit_enumeration(dockerfile_text)
+        assert DEBUGGER_PACKAGE not in listed, (
+            f"the audit note still lists {DEBUGGER_PACKAGE} among the "
+            f"packages deliberately not taken, while the {DEBUGGER_STAGE} "
+            f"stage installs it. The note and the image disagree: "
+            f"{sorted(listed)}")
+
+    def test_the_paragraph_was_not_deleted_to_satisfy_that(self,
+                                                           dockerfile_text):
+        listed = _audit_enumeration(dockerfile_text)
+        assert AUDIT_ENTRY_THAT_STAYS in listed, (
+            f"{AUDIT_ENTRY_THAT_STAYS} has left the audit note too, so the "
+            f"edit removed the paragraph rather than one entry: "
+            f"{sorted(listed)}")
+
+    def test_the_note_still_records_the_entry_it_reversed(self,
+                                                          dockerfile_text):
+        """The entry leaves the list and stays in the record.
+
+        This is the assertion a silent deletion fails. The mutant is not
+        hypothetical: removing the name is the smallest edit that satisfies
+        the test above.
+        """
+        note = _audit_note(dockerfile_text)
+        assert DEBUGGER_PACKAGE in note, (
+            f"{DEBUGGER_PACKAGE} has vanished from the audit note entirely. "
+            f"It was a recorded decision; a reader auditing this image "
+            f"against the vendor's install_deps() would now have to redo the "
+            f"work the note exists to save.")
+
+    def test_the_record_is_marked_as_a_reversal(self, dockerfile_text):
+        """Exactly one sentence, and it says that it is one.
+
+        Without the marker the guards below are two token co-occurrences
+        with no polarity, and a sentence asserting the opposite of what the
+        image does satisfies them.
+        """
+        sentence = _audit_reversal_sentence(dockerfile_text)
+        assert sentence, (
+            f"the audit note carries no single sentence marked "
+            f"{AUDIT_REVERSAL_MARKER!r}. Sentences naming the debugger: "
+            f"{[s for s in _audit_sentences(dockerfile_text) if DEBUGGER_PACKAGE in s]}")
+
+    def test_the_record_says_what_it_reversed_and_where_it_went(
+            self, dockerfile_text):
+        """The marked sentence has to name both, or it records nothing."""
+        sentence = _audit_reversal_sentence(dockerfile_text)
+        assert sentence, "no marked reversal sentence; see the test above"
+        assert DEBUGGER_PACKAGE in sentence, (
+            f"the reversal sentence does not name what was reversed: "
+            f"{sentence!r}")
+        assert DEBUGGER_STAGE in sentence, (
+            f"the reversal sentence does not say where {DEBUGGER_PACKAGE} "
+            f"now is. It reads: {sentence!r}")
+
+    def test_the_record_names_the_request_it_serves(self, dockerfile_text):
+        """The pointer an auditor follows.
+
+        Every other refusal in that paragraph carries a citation; a reversal
+        that carries only a purpose leaves the reader to find the reason
+        somewhere in a 700-line file. The number is checked because getting
+        it wrong is worse than omitting it: an earlier revision said
+        "request 3", which is filtered search against pgvector.
+        """
+        sentence = _audit_reversal_sentence(dockerfile_text)
+        assert sentence, "no marked reversal sentence; see the test above"
+        assert AUDIT_REQUEST in sentence, (
+            f"the reversal sentence does not name {AUDIT_REQUEST!r}, so the "
+            f"next auditor has no section to go to. It reads: {sentence!r}")
+
+
+class TestTheLabRouteThatOpensTheCore:
+    """The script, and the flag that lets it see a saved core.
+
+    `OpsRun.run_script` mounts no writable path and deliberately so -- a lab
+    script's invented numbers must not be able to reach a report. The core,
+    however, is in `results/<run-id>/`, which a lab session cannot name, so
+    the directory has to be handed in explicitly and read-only.
+    """
+
+    def test_the_script_exists_and_is_the_file_it_names(self):
+        path = os.path.join(VB_ROOT, "scripts", LAB_SCRIPT)
+        assert os.path.isfile(path), path
+        assert not os.path.islink(path), (
+            f"{path} is a symlink; `lab` runs files in scripts/ so that the "
+            f"name in the command is the code that runs")
+
+    def test_the_script_parses_and_has_a_summary_line(self, lab_script_source):
+        """`lab --list` prints the first line of the docstring, and
+        `lab_scripts()` swallows a SyntaxError into an empty summary -- so a
+        script that does not parse is listed with a blank description rather
+        than failing."""
+        tree = ast.parse(lab_script_source)
+        summary = (ast.get_docstring(tree) or "").split("\n")[0].strip()
+        assert summary, (
+            f"scripts/{LAB_SCRIPT} has no one-line docstring summary, so "
+            f"`lab --list` would print its name against nothing")
+
+    def test_the_lab_would_actually_run_it(self):
+        """The check `cmd_lab` makes before it starts anything."""
+        from orchestrator.cli import _lab_script_problem, lab_scripts
+        assert _lab_script_problem(LAB_SCRIPT) is None, (
+            _lab_script_problem(LAB_SCRIPT))
+        assert LAB_SCRIPT in dict(lab_scripts()), sorted(dict(lab_scripts()))
+
+    def test_it_signs_the_contract_every_lab_script_signs(self,
+                                                          lab_script_source):
+        """`run_script` passes --host and --port to every script. A script
+        that does not accept them dies on argparse after the server is up."""
+        assert '"--host"' in lab_script_source
+        assert '"--port"' in lab_script_source
+
+    def test_it_runs_the_command_the_plan_asks_for(self, lab_script_source):
+        """The value is the claim. `bt` alone reports the thread gdb happens
+        to stop in, which for a crashed multi-threaded server is not
+        reliably the one that crashed -- InnoDB alone contributes a dozen
+        background threads.
+
+        Read out of the AST. The grepped version of this assertion survived
+        the mutant that weakens the constant to `bt`, because the script's
+        own docstring quotes the full command while explaining it.
+        """
+        value = _script_constant(lab_script_source, GDB_COMMAND_CONSTANT)
+        assert value == GDB_BATCH_COMMAND, (
+            f"scripts/{LAB_SCRIPT}'s {GDB_COMMAND_CONSTANT} is {value!r}, "
+            f"not {GDB_BATCH_COMMAND!r}")
+
+    @pytest.mark.parametrize("fragment", GDB_INVOCATION_FRAGMENTS)
+    def test_the_constant_is_what_gdb_is_actually_handed(
+            self, fragment, lab_script_source):
+        """A correct constant the invocation does not use is the other half
+        of the same mutant."""
+        assert fragment in lab_script_source, (
+            f"scripts/{LAB_SCRIPT} no longer contains {fragment!r}, so "
+            f"{GDB_COMMAND_CONSTANT} may not be what gdb is given")
+
+    def test_lab_has_the_flag_that_mounts_the_artefacts(self):
+        """`_LAB_OPTIONS` is lab's own list of its flags, and a test in
+        tests/test_config.py asserts it matches the subparser exactly -- so
+        the flag cannot be added here and forgotten there, or vice versa."""
+        from orchestrator.cli import _LAB_OPTIONS
+        assert LAB_ARTIFACTS_OPTION in _LAB_OPTIONS, sorted(_LAB_OPTIONS)
+
+    def test_the_compatibility_refusal_collects_itself(self):
+        """A ratchet, because a comment saying "delete this later" is not one.
+
+        `cli._artifacts_mount_problem()` exists only while
+        `OpsRun.run_script` has no `artifacts_dir` parameter: it turns what
+        would be a TypeError raised minutes after a server came up into an
+        immediate refusal. The change that ADDS that parameter does not
+        touch `orchestrator/cli.py` -- its file set is
+        config/engines/percona.yml, docs/09, orchestrator/docker_ctl.py,
+        orchestrator/engines.py, orchestrator/ops_pass.py and three test
+        files -- so nothing in its path would prompt the cleanup, and the
+        function would sit there returning None forever.
+
+        So this test fails ON THE DAY the refusal becomes dead code, and
+        says what to delete. That deliberately reddens the change that lands
+        the parameter, which is the only moment anyone is looking at this
+        seam; the failure message is the whole instruction, and the
+        alternative is dead code nobody is told about.
+        """
+        import inspect
+
+        from orchestrator import cli, ops_pass
+
+        supported = "artifacts_dir" in inspect.signature(
+            ops_pass.OpsRun.run_script).parameters
+        if not supported:
+            # The refusal is still load-bearing: assert it refuses, so this
+            # test is not merely waiting.
+            assert cli._artifacts_mount_problem() is not None, (
+                "run_script has no artifacts_dir parameter, yet "
+                "_artifacts_mount_problem() returns None -- the refusal is "
+                "broken and --artifacts would raise a TypeError after the "
+                "server is up")
+            return
+        assert not hasattr(cli, "_artifacts_mount_problem"), (
+            "OpsRun.run_script now takes `artifacts_dir`, so "
+            "cli._artifacts_mount_problem() can only ever return None and "
+            "the refusal in cmd_lab is dead. Delete all three: the "
+            "function, the `_artifacts_mount_problem()` entry in cmd_lab's "
+            "refusal loop, and this test's `supported` branch along with "
+            "this assertion.")
+
+
+# ---------------------------------------------------------------------------
+# Mutation probes for the four assertions above
+# ---------------------------------------------------------------------------
+#
+# Each corrupts the text, asserts the corruption applied, and reports the
+# honest reading beside the mutant one. The two package probes matter most:
+# both halves of "in bench, not in runtime" are set-membership claims over a
+# parse, and a parse that silently returned nothing would make the negative
+# half green forever.
+
+class TestTheseProbesDiscriminate:
+
+    def test_moving_the_debugger_to_the_runtime_stage_is_seen(
+            self, dockerfile_stages):
+        """The mutant that a whole-file grep cannot see, and the one that
+        would put a debugger in the measured server's filesystem.
+
+        The slice comes from the fixture and the parse from `_apt_packages`,
+        so the probe exercises the two the assertions use rather than a
+        simpler copy of them.
+        """
+        honest = dockerfile_stages["runtime"]
+        mutant = honest.replace(
+            "      ca-certificates procps tzdata \\",
+            "      ca-certificates procps tzdata gdb \\")
+        assert mutant != honest, "mutation did not apply"
+        assert DEBUGGER_PACKAGE not in _apt_packages(honest)
+        assert DEBUGGER_PACKAGE in _apt_packages(mutant)
+
+    def test_adding_the_package_without_editing_the_note_is_seen(
+            self, dockerfile_text):
+        """The mutant the audit assertions exist for: install gdb, leave the
+        note claiming it was deliberately not taken."""
+        mutant = dockerfile_text.replace(AUDIT_REVERSAL_NEEDLE, "")
+        mutant = mutant.replace("redone: valgrind, doxygen,",
+                                "redone: valgrind, gdb, doxygen,")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        assert DEBUGGER_PACKAGE not in _audit_enumeration(dockerfile_text)
+        assert DEBUGGER_PACKAGE in _audit_enumeration(mutant)
+
+    def test_deleting_the_entry_silently_is_seen(self, dockerfile_text):
+        """The other direction, and the one an edit is likelier to take: drop
+        the name from the list, record nothing."""
+        mutant = dockerfile_text.replace(AUDIT_REVERSAL_NEEDLE, "")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        assert DEBUGGER_PACKAGE in _audit_note(dockerfile_text)
+        assert DEBUGGER_PACKAGE not in _audit_note(mutant)
+
+    def test_the_probe_needle_is_in_the_file(self, dockerfile_text):
+        """Non-vacuity for every probe below that mutates the note.
+
+        `str.replace` of a string that is not there returns the original,
+        and each probe asserts `mutant != honest` for that reason -- but
+        this says so once, with the needle named, so a reword produces one
+        clear failure here instead of three confusing ones.
+        """
+        assert AUDIT_REVERSAL_NEEDLE in dockerfile_text, (
+            f"{AUDIT_REVERSAL_NEEDLE!r} is no longer in the Dockerfile. If "
+            f"the reversal sentence was reworded, update this constant; the "
+            f"property assertions above do not need changing.")
+
+    def test_a_note_asserting_the_opposite_is_seen(self, dockerfile_text):
+        """The review finding, kept as an assertion.
+
+        Token co-occurrence has no polarity: a sentence naming the package
+        and the stage while claiming the package is NOT taken satisfies
+        `"gdb" in note` and `"bench" in <sentence naming gdb>`. The marker
+        is what tells the two apart, and this proves it does.
+        """
+        mutant = dockerfile_text.replace(
+            AUDIT_REVERSAL_NEEDLE,
+            " gdb is not taken in the bench stage either, for the same "
+            "reason.")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        # Both of the weak conditions still hold on the mutant...
+        assert DEBUGGER_PACKAGE in _audit_note(mutant)
+        assert any(DEBUGGER_PACKAGE in s and DEBUGGER_STAGE in s
+                   for s in _audit_sentences(mutant))
+        # ...and the marked-sentence selector finds nothing, which is what
+        # every assertion in TestTheAuditNote... now rests on.
+        assert _audit_reversal_sentence(dockerfile_text)
+        assert _audit_reversal_sentence(mutant) == ""
+
+    def test_a_contentless_note_is_seen(self, dockerfile_text):
+        """The degenerate case of the same finding: the two tokens alone."""
+        mutant = dockerfile_text.replace(AUDIT_REVERSAL_NEEDLE,
+                                         " gdb bench.")
+        assert mutant != dockerfile_text, "mutation did not apply"
+        assert _audit_reversal_sentence(mutant) == ""
+
+    def test_the_wrong_request_number_is_seen(self, dockerfile_text):
+        """The blocking defect this file shipped once: request 3 is filtered
+        search against pgvector, not the stack traces."""
+        mutant = dockerfile_text.replace(AUDIT_REVERSAL_NEEDLE,
+                                         AUDIT_REVERSAL_NEEDLE.replace(
+                                             AUDIT_REQUEST, "request 3"))
+        assert mutant != dockerfile_text, "mutation did not apply"
+        sentence = _audit_reversal_sentence(mutant)
+        assert sentence, "the mutant lost the marker as well; wrong mutant"
+        assert AUDIT_REQUEST not in sentence
+        assert AUDIT_REQUEST in _audit_reversal_sentence(dockerfile_text)
+
+    def test_an_empty_stage_parse_would_not_pass_as_an_absence(
+            self, dockerfile_stages):
+        """What the paired positive assertions are for, stated directly."""
+        assert DEBUGGER_PACKAGE not in _apt_packages("")
+        assert _apt_packages("") == frozenset()
+        assert _apt_packages(dockerfile_stages["runtime"]) != frozenset()
+
+    def test_grepping_for_the_gdb_command_cannot_see_it_change(
+            self, lab_script_source):
+        """The survivor this file was corrected for, kept as an assertion.
+
+        Both readings are reported: the grep is true of the mutant and the
+        AST is not, which is the whole difference between the two forms.
+        """
+        mutant = lab_script_source.replace(
+            f'{GDB_COMMAND_CONSTANT} = "{GDB_BATCH_COMMAND}"',
+            f'{GDB_COMMAND_CONSTANT} = "bt"')
+        assert mutant != lab_script_source, "mutation did not apply"
+        assert GDB_BATCH_COMMAND in mutant, (
+            "the grepped assertion would have failed on this mutant after "
+            "all, so this probe no longer records anything")
+        assert _script_constant(lab_script_source,
+                                GDB_COMMAND_CONSTANT) == GDB_BATCH_COMMAND
+        assert _script_constant(mutant, GDB_COMMAND_CONSTANT) == "bt"
+
+    def test_a_substring_scan_of_the_note_cannot_answer_the_question(
+            self, dockerfile_text):
+        """Why the enumeration is parsed into tokens rather than grepped.
+
+        After the edit the paragraph names `gdb` deliberately -- that is the
+        record of the reversal -- so `"gdb" in note` is TRUE while the
+        enumeration does not list it. A guard written as a substring check
+        would therefore report the edit as not having happened.
+        """
+        note = _audit_note(dockerfile_text)
+        assert DEBUGGER_PACKAGE in note
+        assert DEBUGGER_PACKAGE not in _audit_enumeration(dockerfile_text)
