@@ -52,7 +52,7 @@ PERCONA_DOC = os.path.join(VB_ROOT, "docs", "09-adding-percona-server.md")
 # module docstring and this file all name the same commit -- the value is the
 # whole point of pinning, and three copies that can drift is how a pin stops
 # meaning anything.
-PINNED_SHA = "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304"
+PINNED_SHA = "56124b03fdc5954e2401ab4d2c7bf7cb3a767158"
 
 
 # ---------------------------------------------------------------------------
@@ -1750,7 +1750,7 @@ NO_ANCHOR: Dict[str, str] = {}
 
 #: Paths that belong to the pinned Percona tree. They cannot be checked from
 #: here and must not be: they are pinned by SHA
-#: (02a8b80c70b0ccf6c9035d8a2307e7fa988cc304), so a local file of the same name
+#: (56124b03fdc5954e2401ab4d2c7bf7cb3a767158), so a local file of the same name
 #: would be the wrong file, and checking against one would be worse than not
 #: checking at all. Verified by reading that tree, which is what §0's
 #: provenance table commits the document to.
@@ -1900,7 +1900,7 @@ class TestEveryCitationIntoThisRepoIsChecked:
         for citation in foreign:
             assert citation not in CITED_IN_REPO, citation
         doc = open(PERCONA_DOC).read()
-        assert "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304" in doc
+        assert "56124b03fdc5954e2401ab4d2c7bf7cb3a767158" in doc
 
     def test_no_anchor_set_is_documented_rather_than_silent(self):
         """If a citation ever has no sensible anchor, saying so is the finding.

@@ -6,9 +6,12 @@ REVIEW STATUS: never run against a server. Written to be reviewed.
 docs/09-adding-percona-server.md carries the evidence for every claim below and
 §7 lists what only a live server can settle.
 
-Designed against percona/percona-server branch `vector-mvp` at
-02a8b80c70b0ccf6c9035d8a2307e7fa988cc304. Every file:line citation in this
-module is on that tree. Paths beginning `mysql-test/` are MTR tests and their
+Designed against percona/percona-server at
+56124b03fdc5954e2401ab4d2c7bf7cb3a767158, in the `9.7` series the vector work
+was merged into. Every file:line citation in this module was derived on the
+earlier `vector-mvp` pin and has not been re-derived here: the series was
+rebased into `9.7`, so the paths hold and the line numbers are unverified at
+this pin. Paths beginning `mysql-test/` are MTR tests and their
 recorded output — a `.result` file is the server's own output, which is why they
 are cited in preference to Docs/percona-hnsw.md wherever both say the same thing.
 
