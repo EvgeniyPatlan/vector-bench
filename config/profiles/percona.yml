@@ -6,44 +6,61 @@
 # exactly why they do not belong in `main`: an axis only one engine has would
 # add a dimension to the shared grid that the other six cannot be placed on.
 #
-# WHAT HAS RUN, AND WHAT HAS NOT. This comment said "NOTHING HERE HAS EVER BEEN
-# RUN" after the profile had run three times, and that sentence cost a review
-# of `docs/12-percona-feedback-plan.md` a wrong finding: a reader who searched
-# this repository and believed this line concluded the ef_construction sweep
-# did not exist. The results live outside the repository, so there is nothing
-# here to contradict a stale comment -- which is exactly why it has to be
-# accurate.
+# WHAT HAS RUN, AND HOW TO FIND OUT -- DO NOT TRUST A LIST HERE. This comment
+# has now been wrong four times in four different ways. It said "NOTHING HERE
+# HAS EVER BEEN RUN" after the profile had run. It then named two runs, and
+# then three, when seven directories carry this profile's name. It said the
+# normalized vendor-default curve did not exist when it does. And it counted
+# result cells as this profile's when the ann tree they live in is shared, so
+# some of them were produced by a wider grid run from somewhere else. Each
+# time the cause was the same: the results live OUTSIDE this repository, so
+# nothing here contradicts a stale enumeration -- and each repair enumerated
+# something new. So this comment states the QUERY instead of the answer.
 #
-# RUN, three times. 2026-10-15 (`percona-20261015-213836`): the ops phase
-# alone, in the NORMALIZED pass -- M=16 over the 20,000-row subset, exit 0,
-# 88 s. That branch coerces the knob to the single vendor default, so it is
-# the normalized ops baseline and not a sweep. Then 2026-10-20
-# (`percona-20261020-140151`) and 2026-10-21 (`percona-20261021-134142`):
-# the tuned ann sweep at `m_values: [16]` on fashion-mnist with
-# `percona_ef_construction` at all three values, at five `ef_search` points
-# for 50 and 800 and nine for 200, plus a tuned ops unit at M=16
-# `incremental` over the 20,000-row subset. The ann pass reads the full
-# 60,000 rows -- `ops.subset_rows` is an `ops:` key and `ann_pass` never
-# reads it -- so the sweep's corpus is the whole corpus and the ops unit's
-# is not.
+# THE QUERY. Runs of this profile are the directories whose
+# `run-manifest.json` has `config.profile.name == "percona"`, across BOTH
+# result trees -- `ALL_RESULTS/results/` and `PS/` -- because `PS/` holds
+# copies of some of the same runs under the same ids, so anything counted
+# across both trees must be deduped by run id first. At the time of writing
+# that is seven directories, and the shape of them is the point rather than
+# the number: five executed Percona phases, two of those five failed with
+# `exit_code: 1`, one completed having run `mariadb123` and no Percona phase
+# at all, one has `phases: []`, and one ran all SEVEN engines despite the
+# `engines: [percona]` below. A directory named for this profile is therefore
+# not evidence that this profile measured anything; its `phases` entries are.
 #
-# NOT RUN: the normalized ANN pass, so the vendor-default recall/QPS curve
-# the tuned sweep should be read against does not exist even though the
-# normalized ops unit does; the second build mode (`post`, still blocked by
-# `capabilities.bulk_vector_index_build`); and churn, which `workloads`
-# below excludes on purpose.
+# WHAT IS ACTUALLY MISSING, stated so it stays true: no run of THIS profile
+# has executed a normalized ANN phase. The normalized ops unit has run, and
+# the vendor-default recall/QPS curve DOES exist -- `full-20261015-215006`
+# carries a complete normalized Percona curve on this dataset at M=16 with
+# `ef_construction` at the default, among 56 normalized Percona `recall_qps`
+# rows -- it just was not produced from here. Also never run from here: the
+# second build mode (`post`, blocked by
+# `capabilities.bulk_vector_index_build`), and churn, which `workloads` below
+# excludes on purpose.
 #
-# The ingest rate IS measured -- 384.90, 417.64 and 412.99 rows/s on the three
-# runs above, and fifteen measurements in all across these and
-# `full-20261015-215006`, from 48.17 rows/s on gist-960 at M=32 to 638.11 on
-# sift-128 at M=8. But none of it has been written back into
-# `orchestrator/estimate.py`, whose `_MEASURED_ROWS_PER_S` and
+# AND THE ANN TREE IS SHARED, which is why a cell appearing under a run id is
+# not evidence that run built it. `results/annb/<pass>/<fingerprint>/` is
+# shared across runs by design (see CLAUDE.md): ann-benchmarks skips a
+# configuration that already has a result file, so an unchanged tree
+# reappears in every later report whose fingerprint matches.
+# `report/loaders.py` stamps `source_mtime` into each record for exactly that
+# reason, and each artifact's own `build_time` attribute is what actually
+# identifies the build behind a cell.
+#
+# THE INGEST RATE IS MEASURED -- seventeen times across six runs, counting
+# distinct `(dataset, resource_pass, M, build_mode, rows)` tuples over every
+# `phase: ingest` record carrying an `ingest_rows_per_s`. Sixteen are
+# `incremental`, from 48.17 rows/s (gist-960, tuned, M=32, 1M rows) to 638.11
+# (sift-128, normalized, M=8, 1M rows); the seventeenth is the `post` plain
+# load at 2653.0 rows/s, which is the maximum and a different quantity,
+# because no graph is being built during it. None of it has been written back
+# into `orchestrator/estimate.py`, whose `_MEASURED_ROWS_PER_S` and
 # `_INGEST_ROWS_PER_S` both omit this engine, so `_effective_rate` returns
 # None and `./run-benchmark.sh run --profile percona` still prints an estimate
 # that names the engine in `engines_without_ingest_rate` rather than giving it
-# an hour figure. Measured but unmodelled, so the fix is a table entry and not
-# a run -- and it is unlanded work, not the smoke gate's job. Run the smoke
-# gate for a rate that describes the pin being published.
+# an hour figure. Measured but unmodelled: the fix is a table entry, not a
+# run, and it is unlanded work rather than the smoke gate's job.
 name: percona
 description: Percona Server alone — ef_construction sweep and both build modes
 
@@ -70,9 +87,16 @@ resources:
     # it. Three values, three full corpus reloads, and the row count here is
     # the ANN pass's: 60,000, not the 20,000 an ops unit loads. `ann_pass`
     # never reads `ops.subset_rows`, so the sweep always gets the whole
-    # corpus. At the ~359 rows/s measured on this dataset at M=16 that is
-    # about three minutes a reload, which is the whole reason the dataset
-    # here is the small one.
+    # corpus. The three builds behind the recorded cells cost 130.8 s, 161.6 s
+    # and 283.3 s of `build_time` at M=16 -- minutes, which is the whole
+    # reason the dataset here is the small one, and a 2.17x spread between
+    # the ends of the sweep rather than the 16x the knob ratio suggests.
+    #
+    # The cells carry MORE `ef_search` points than `ann.ef_search` below sets,
+    # and that is not this profile's doing: the ann tree is shared, so a
+    # wider grid run from another profile leaves cells here that this
+    # profile would never request. Read `ann.ef_search` for what a run from
+    # here measures, not the file count.
     percona_ef_construction: [50, 200, 800]
 
 ann:
