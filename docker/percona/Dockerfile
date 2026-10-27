@@ -1,6 +1,6 @@
 #
-# Percona Server (MySQL 9.7.1 base + native InnoDB HNSW vector index),
-# built from a pinned SHA on the `vector-mvp` branch.
+# Percona Server (MySQL 9.7.2 base + native InnoDB HNSW vector index),
+# built from a pinned SHA in the `9.7` series.
 #
 # Targets:
 #   runtime  — server binaries only. Use this to run Percona Server by hand
@@ -388,9 +388,9 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 #
 # CFLAGS CANNOT BE HANDED TO THIS TREE BY `export` ALONE ON A DEBIAN HOST, AND
 # THE cmake LINE BELOW CARRIES THREE FLAGS THAT EXIST ONLY FOR THAT. Every step
-# of the chain is READ from the pinned tree
-# (02a8b80c70b0ccf6c9035d8a2307e7fa988cc304) unless it says MEASURED, which
-# means measured on the build host rather than inside this image:
+# of the chain is READ from the Percona tree -- at the 9.7.1 base this file was
+# written against, NOT re-derived at the pin 56124b03fdc5954e2401ab4d2c7bf7cb3a767158
+# -- unless it says MEASURED: measured on the build host, not inside this image.
 #
 #   1. source CMakeLists.txt:747-764 -- for `LINUX_STANDALONE AND
 #      (LINUX_DEB_PLATFORM OR LINUX_RPM_PLATFORM)` (:750) the tree offers a

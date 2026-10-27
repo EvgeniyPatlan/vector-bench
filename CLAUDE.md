@@ -20,7 +20,7 @@ The repo root is `vector-bench/` (git repo, branch `master`). All commands below
 | `pgvector` | PostgreSQL + pgvector | tag `v0.8.6` |
 | `mongodb` | Percona Search for MongoDB (mongot) | Percona package |
 | `valkey` | Valkey + valkey-search | Percona repo `valkey-91` |
-| `percona` | Percona Server, InnoDB HNSW | branch `vector-mvp`, commit `02a8b80c` |
+| `percona` | Percona Server, InnoDB HNSW | `9.7` series, commit `56124b03` |
 
 `KNOWN_ENGINES` is whatever `config/engines/*.yml` holds — there is no list in Python to keep
 in step with it. `orchestrator/engines.py` is the registry everything derives from.
@@ -108,7 +108,7 @@ command with no rebuild:
 | `harness/`, `report/`, `orchestrator/`, `config/` | nothing — just re-run |
 | `overlay/ann-benchmarks/` | nothing — `run` and `render` re-apply the overlay onto `work/` every time |
 | `docker/*/Dockerfile`, entrypoints, `docker/_shared/requirements-*.txt` | `./run-benchmark.sh build --engines <e>` |
-| engine `source.tag` | `./run-benchmark.sh build` (AliSQL is 1.5–3 h) |
+| engine `source.tag` | `./run-benchmark.sh build` (AliSQL is 1.5–3 h), then `--force` on the first ann run — see the ann results tree invariant below |
 | `webui/` (server or static) | nothing in `--no-container` mode; the repo is mounted, so container mode also just needs a restart |
 | `docker/webui/Dockerfile` | `./scripts/build-images.sh --engine webui` (~1 min) |
 
@@ -178,7 +178,16 @@ These are the reasons the code looks over-defensive. Do not relax them.
   memory or how many cores the engine had. `ann_fingerprint()` keys the tree by the resource
   pass's *declared* knobs so a 16 GB curve is never silently reused under a 64 GB manifest.
   The fingerprint is deliberately **engine-invariant**; making it engine-specific fragments the
-  tree and produces a seven-engine recall chart containing one engine.
+  tree and produces a seven-engine recall chart containing one engine. It also holds **no
+  source tag**, so a re-pin does not move the tree: once an engine's `source.tag` changes,
+  ann-benchmarks skips every configuration whose result file is already on disk and the old
+  binary's recall cells are reused under the new pin's `engine_version`, with only
+  `report/generate.py`'s `stale_ann` bucket saying so — in the Validity section, after the
+  report is written. **Pass `--force` on the first ann run after a re-pin**, which
+  `ann_pass.run_engine` hands through to ann-benchmarks and `--engines <e>` scopes to the one
+  engine, or move that engine's subtree aside. Bumping `ANN_MEASUREMENT_VERSION` is not the
+  remedy: it moves every pass's tree and re-measures every recall point for all seven engines
+  and both resource passes.
 - **Filtered ground truth is recomputed** (`harness/datasets.py`) — a `WHERE` predicate changes
   the correct answer set, and reusing unfiltered neighbours scores every engine against the
   wrong targets.
