@@ -479,6 +479,297 @@ def _grouped(records: List[Dict[str, Any]]
     return groups, series_labels(records), per_engine, degrees
 
 
+# ---------------------------------------------------------------------------
+# Figure geometry
+#
+# `_save` writes every chart with `bbox_inches="tight"`, which grows the SAVED
+# image to contain whatever artists hang off the canvas. That is what makes a
+# legend a width decision: an artist wider than the figure does not get
+# clipped or wrapped, it enlarges the file. Everything in this section exists
+# to keep the legend from being the thing that decides how wide a chart is.
+# ---------------------------------------------------------------------------
+
+#: Widest a saved chart may be, as a multiple of its own height.
+#:
+#: **The defect this bounds, measured.** `fig.legend(..., ncol=len(handles))`
+#: laid every series on ONE legend row, so the row grew with the series count
+#: and `bbox_inches="tight"` grew the PNG to match. On
+#: `PS/new/full-20261015-215006`, the seven-engine `--resource-pass both` run
+#: of 2026-10-15 -- fashion-mnist is the one corpus all seven engines ran, so
+#: each (engine, M, pass) combination is its own legend entry:
+#:
+#:     churn-fashion-mnist-784-euclidean.png         64,730 x 792   81.7 : 1
+#:     concurrency-fashion-mnist-784-euclidean.png   25,943 x 864   30.0 : 1
+#:     filtered-tag-fashion-mnist-784-euclidean.png  25,326 x 817   31.0 : 1
+#:     filtered-ctag-fashion-mnist-784-euclidean.png 25,326 x 817   31.0 : 1
+#:     build-fashion-mnist-784-euclidean.png         25,326 x 792   32.0 : 1
+#:     storage-fashion-mnist-784-euclidean.png        7,484 x 826    9.1 : 1
+#:     churn-sift-128-euclidean.png                   4,514 x 792    5.7 : 1
+#:
+#: Seven of that run's fifty charts, and the report's headline corpus took six
+#: of the seven. A 64,730-pixel strip is not a chart in any document: placed
+#: in a 6.5-inch text column it is 0.08 inches tall.
+#:
+#: **And past a certain series count it stops being a presentation problem.**
+#: Measured against `acaf032`, the revision before this fix, by rendering its
+#: own `charts.churn` with seven engines over nine graph degrees -- 63 units,
+#: 126 legend entries:
+#:
+#:     ValueError: Image size of 67288x792 pixels is too large.
+#:     It must be less than 2^16 in each direction.
+#:
+#: raised from `_RendererAgg(int(width), int(height), dpi)` inside `savefig`.
+#: The same revision renders 21 series fine at 22,494 x 792, so this is the
+#: same defect one sweep further along, not a separate one. The failure lands
+#: at REPORT GENERATION, after the measurement work is already spent: the run
+#: has done its hours and comes away with no report at all. That is the real
+#: severity here, and it is why `_require_matplotlib` further up refuses to
+#: draw rather than draw nothing -- it would be a poor trade to protect the
+#: report from a missing dependency and then lose it to a legend.
+#: `tests/test_chart_aspect_ratio.py::TestTheWideShapeDoesNotDestroyTheReport`
+#: pins that shape.
+#:
+#: **Why 4.0 rather than something nearer 3.** The widest FIXED layout in this
+#: module is `build_cost`'s four side-by-side panels, `figsize=(20, 4.6)`,
+#: which saves at 3.8:1 -- and the single-engine versions of the very charts
+#: listed above measured 1.4:1 to 3.8:1 and are fine. A 3:1 bound would
+#: therefore condemn a panel layout doing nothing wrong, and the fix would
+#: become "redesign the panels", which is not what went wrong. 4:1 in a
+#: 6.5-inch column is 1.6 inches tall, about the floor for a legible axis.
+#:
+#: **An earlier revision of this paragraph claimed 4.0 was "the first round
+#: number above every intrinsic panel layout here". That was false, and the
+#: way it was false is the thing to remember.** `latency_percentiles` at
+#: THREE engines is one row of three panels, 13.2 x 3.1, which saves at
+#: 4.07:1 -- over this bound, in the project's headline
+#: MariaDB/AliSQL/pgvector comparison. It was missed because the survey behind
+#: the sentence only swept series counts UPWARD, 21 and then 63, and at those
+#: counts the same chart is a 3x3 grid at 1.41:1. The violating shape was
+#: SMALLER than anything measured. A survey is an input to the number chosen
+#: here, not a decoration on it: had that chart been in it, 4.0 would not have
+#: been available without also bringing it under. `grid_figsize` now does
+#: that, and `tests/test_chart_aspect_ratio.py` sweeps one engine through
+#: seven as well as the high counts, so the claim below is checked rather than
+#: asserted.
+#:
+#: Every figsize in this module that varies with the data now passes through
+#: `bar_chart_figsize` or `grid_figsize`; the rest are literal constants. That
+#: is what makes this a module-wide bound rather than a number referenced in
+#: one place, which is how the exception above survived review once.
+#:
+#: This is a DESIGN bound those helpers honour, not a runtime assertion.
+#: `_save` deliberately does not refuse a figure that exceeds it: a wide chart
+#: is a bad chart, while a generator that raises at the end of a twenty-hour
+#: run loses the report, and this module has already paid that price once for
+#: an import. The bound is held by the helpers and checked by the tests.
+MAX_ASPECT_RATIO = 4.0
+
+#: Where a wrapped legend's top edge sits, in figure fractions, measured from
+#: the bottom of the canvas. Just below it: the axes' own x labels are inside
+#: the canvas once `tight_layout()` has run, so a legend anchored a hair under
+#: zero clears them without having to reserve space inside the figure.
+_WRAPPED_LEGEND_TOP = -0.015
+
+#: Legend padding matplotlib charges per entry, in multiples of the legend's
+#: own fontsize: the handle, the gap between handle and text, and the gap to
+#: the next column. Read from `rcParams` rather than written as 2.0/0.8/2.0 so
+#: the estimate stays honest if a style sheet ever changes them.
+_LEGEND_PAD_KEYS = ("legend.handlelength", "legend.handletextpad",
+                    "legend.columnspacing")
+
+
+def bar_chart_figsize(count: int, per_bar: float, minimum: float,
+                      height: float) -> Tuple[float, float]:
+    """Figure size for a bar chart of `count` bars, capped by the aspect bound.
+
+    Pure arithmetic and public so it is testable on a host with no matplotlib,
+    which is the same reason `series_key` and friends are.
+
+    `storage_breakdown` asked for `max(8, 1.5 * len(labels))` inches with no
+    ceiling. On the 2026-10-15 run that chart had 33 bars -- seven engines,
+    three graph degrees, two resource passes -- so it asked for 49.5 inches
+    and got 7,484 x 826 pixels, 9.1:1. Growing a bar chart per bar is right;
+    growing it without limit is what turns it into a strip.
+    """
+    return (min(max(minimum, per_bar * count), MAX_ASPECT_RATIO * height),
+            height)
+
+
+def grid_figsize(columns: int, rows: int, per_column: float, per_row: float,
+                 minimum: float = 8.0) -> Tuple[float, float]:
+    """Figure size for a grid of panels, raised to meet the aspect bound.
+
+    The DUAL of `bar_chart_figsize`, and the asymmetry is the point rather
+    than an inconsistency. A bar chart's width grows with the data and has no
+    limit, so growing its height cannot save it -- a 49-inch-wide figure is
+    unplaceable at any height -- and the width is what has to yield. A panel
+    grid's width is already bounded by its own column cap: `min(3, ...)` at
+    4.4 inches a column is 13.2 inches whatever the run holds, which is a
+    perfectly placeable figure. Nothing about it is running away; only the
+    RATIO is wrong, and the cheap correction is to give the row more height.
+
+    `latency_percentiles` at THREE engines is one row of three panels, 13.2 x
+    3.1, which saves at 4.07:1 -- over the bound. Three engines is the
+    project's headline MariaDB/AliSQL/pgvector comparison and
+    `--engines mariadb,alisql,pgvector` is a first-class invocation, so this
+    was not a corner. It needs 3.3 inches of height instead of 3.1, and every
+    other engine count clears the bound without a height raise.
+
+    That is not the same as "every other engine count comes out untouched",
+    which is what this sentence used to say and which the very next paragraph
+    contradicts: ONE engine also moves, from 4.4 inches wide to 8.0, through
+    `minimum` below. Two shapes change here, n=3 by height and n=1 by width.
+
+    `minimum` is a FLOOR on the width and it is there for the opposite
+    problem. At one engine the grid asked for 4.4 inches -- narrower than any
+    other chart in this module, all of which floor at 8 or 9 -- and a figure
+    that narrow cannot hold its own furniture: the suptitle "Query latency
+    distribution — fashion-mnist-784-euclidean" at 13pt is wider than the
+    canvas, so `bbox_inches="tight"` widened the PNG to fit it.
+    `latency-gist-960-euclidean.png` and `latency-glove-100-angular.png` in
+    the 2026-10-15 run are 837 and 835 pixels on a 660-pixel canvas for that
+    reason, and they are single-engine charts.
+
+    **The two helpers are duals in RATIO only, and this one does not bound
+    absolute size.** `bar_chart_figsize` caps width outright, so its output is
+    always placeable; this one caps nothing -- `grid_figsize(100, 1, 4.4,
+    3.1)` is 440 x 110 inches at a perfect 4.00:1, which is past matplotlib's
+    own pixel limit. That is latent rather than live: both call sites cap
+    their own column count (`min(3, ...)` and a literal list of four), so
+    `columns` cannot grow without an edit here. A caller that lets its column
+    count follow the data needs a ceiling as well as a ratio.
+    """
+    width = max(minimum, per_column * columns)
+    return (width, max(per_row * rows, width / MAX_ASPECT_RATIO))
+
+
+def _renderer(fig):
+    """A renderer to measure against, without forcing a full draw."""
+    canvas = fig.canvas
+    if not hasattr(canvas, "get_renderer"):
+        canvas.draw()
+    return canvas.get_renderer()
+
+
+def _figure_fraction_y(fig, y_px: float) -> float:
+    return y_px / (fig.get_size_inches()[1] * fig.dpi)
+
+
+def _text_width_px(fig, text: str, fontsize: float) -> float:
+    probe = fig.text(0, 0, text, fontsize=fontsize)
+    try:
+        return probe.get_window_extent(_renderer(fig)).width
+    finally:
+        probe.remove()
+
+
+def _legend_columns(fig, labels: Sequence[Any], fontsize: float,
+                    width_px: float) -> int:
+    """How many legend columns fit across `width_px`.
+
+    Conservative on purpose: every column is sized to the WIDEST label rather
+    than packed to the labels it will actually hold. Packing to fit exactly is
+    one font substitution away from sticking out of the figure again, and
+    sticking out of the figure is the entire defect.
+    """
+    if not labels:
+        return 1
+    widest = max(_text_width_px(fig, str(text), fontsize) for text in labels)
+    pad_em = sum(matplotlib.rcParams[key] for key in _LEGEND_PAD_KEYS)
+    entry_px = widest + pad_em * fontsize * fig.dpi / 72.0
+    if entry_px <= 0:
+        return len(labels)
+    return max(1, min(len(labels), int(width_px / entry_px)))
+
+
+def _wrap_to_figure(fig, text: str, fontsize: float) -> str:
+    """Break a caption into lines that each fit across the figure.
+
+    A caption wider than the canvas widens the PNG for exactly the reason an
+    unwrapped legend row did, and the archive has both: with the legend fixed,
+    `latency-gist-960-euclidean.png` is still 837 pixels on a 660-pixel canvas
+    and `storage-` on a two-engine run is 1,247 on 1,200, because each hangs a
+    single-line `fig.text` off the side of a narrow figure.
+
+    Returns `text` UNCHANGED when it already fits, which is every caption on
+    every figure wide enough to hold it -- so the charts this never had to
+    touch stay byte-identical.
+    """
+    width_px = fig.get_size_inches()[0] * fig.dpi
+    if _text_width_px(fig, text, fontsize) <= width_px:
+        return text
+    lines: List[str] = []
+    current = ""
+    for word in text.split():
+        candidate = f"{current} {word}" if current else word
+        if current and _text_width_px(fig, candidate, fontsize) > width_px:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
+
+
+def _series_legend(fig, handles: Sequence[Any], labels: Sequence[Any],
+                   fontsize: float = 10) -> Optional[float]:
+    """The one legend for a whole figure, wrapped so it never widens it.
+
+    Returns the figure-fraction y of the legend's bottom edge when the legend
+    hangs below the axes -- a negative number -- so a caller that also writes
+    text under the axes can clear it, and `None` when it did not.
+
+    **One row for as long as one row fits, which is not laziness.** The
+    single-row branch is the pre-fix call verbatim, down to the anchor, so a
+    chart whose legend already fitted comes out of this function byte for
+    byte as it did before. Only a figure whose legend would have overflowed
+    takes the second branch, which is exactly the set of charts that was
+    broken. The reason to go to that trouble is that this is a LAYOUT change
+    to a measurement instrument: a chart that moved is a chart a reader has
+    to re-examine, and the narrower the blast radius the cheaper that is.
+    (An earlier revision justified it as "the PNGs are byte-deterministic and
+    tests compare them". Nothing compared them -- there are no golden PNGs in
+    this repository, and the only byte-for-byte chart comparisons are the
+    ones in `tests/test_chart_aspect_ratio.py`, which arrived with this
+    change. The property is worth having; that reason for it was circular.)
+
+    **Below the axes rather than wrapped in place above them.** Above, the
+    legend grows upward into `suptitle`, which these four charts place at
+    y=1.06 to 1.18 and which carries the symbol key a reader needs; every one
+    of them would have had to move its title by an amount only this function
+    can know. Below, the growth lands in empty space, and `bbox_inches="tight"`
+    spends HEIGHT on it -- the same mechanism that used to spend width.
+    """
+    if not handles:
+        return None
+    width_px = fig.get_size_inches()[0] * fig.dpi
+    columns = _legend_columns(fig, labels, fontsize, width_px)
+    if columns >= len(handles):
+        fig.legend(handles, labels, frameon=False, fontsize=fontsize,
+                   loc="upper center", ncol=len(handles),
+                   bbox_to_anchor=(0.5, 1.06))
+        return None
+    legend = fig.legend(handles, labels, frameon=False, fontsize=fontsize,
+                        loc="upper center", ncol=columns,
+                        bbox_to_anchor=(0.5, _WRAPPED_LEGEND_TOP))
+    return _figure_fraction_y(
+        fig, legend.get_window_extent(_renderer(fig)).y0)
+
+
+def _below(floor: float, reserved: Optional[float],
+           gap: float = 0.02) -> float:
+    """Figure-fraction y for text that must sit under everything already there.
+
+    `floor` is where the text went before anything could be below it, and is
+    returned unchanged when nothing is -- which keeps the charts that were
+    already fine byte-identical.
+    """
+    if reserved is None:
+        return floor
+    return min(floor, reserved - gap)
+
+
 def _new_axes(title: str, xlabel: str, ylabel: str,
               figsize: Tuple[float, float] = (9, 5.5)):
     # Every chart starts here, so this is the one place that has to check.
@@ -893,9 +1184,7 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         return None
 
     handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, frameon=False, fontsize=10,
-                   loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    _series_legend(fig, handles, labels)
     unrecorded = sorted({str(r.get("engine")) for r in plotted_records
                          if build_kind(r) == BUILD_KIND_UNRECORDED})
     subtitle = f"Index build cost — {dataset}"
@@ -1309,9 +1598,7 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                  fontsize=8, color="#888888", va="bottom")
 
     handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, frameon=False, fontsize=10,
-                   loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    legend_bottom = _series_legend(fig, handles, labels)
     # The calibration footnotes go below the axes, not into the suptitle that
     # already carries the hollow-marker legend: they are two full sentences
     # each and naming an engine's achieved recall there would push the title
@@ -1323,8 +1610,12 @@ def concurrency(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         fontsize=12, y=1.14)
     fig.tight_layout()
     if footnote:
-        fig.text(0.01, -0.04, footnote, fontsize=9, color="#444444",
-                 ha="left", va="top")
+        # Under the legend when the legend came down here too, which on a
+        # seven-engine run it does: both are anchored in figure fractions
+        # below the canvas, so without this they are drawn on top of one
+        # another.
+        fig.text(0.01, _below(-0.04, legend_bottom), footnote,
+                 fontsize=9, color="#444444", ha="left", va="top")
     return _save(fig, out_dir, stem)
 
 
@@ -1458,9 +1749,7 @@ def filtered(records: List[Dict[str, Any]], dataset: str, out_dir: str,
 
     axes[0].set_ylim(-0.02, 1.02)
     handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, frameon=False, fontsize=10,
-                   loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    _series_legend(fig, handles, labels)
     titled = f"Filtered (hybrid) search — {dataset}"
     if column is not None:
         titled += f" — {column} ({_COLUMN_BLURB.get(column, column)})"
@@ -1579,9 +1868,7 @@ def churn(records: List[Dict[str, Any]], dataset: str, out_dir: str,
             any_whiskers = True
 
     handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, frameon=False, fontsize=10,
-                   loc="upper center", ncol=len(handles), bbox_to_anchor=(0.5, 1.06))
+    _series_legend(fig, handles, labels)
     fig.suptitle(f"Index degradation under churn — {dataset}"
                  + (f"\n{WHISKER_TITLE_NOTE}" if any_whiskers else ""),
                  fontsize=13, y=1.14)
@@ -1757,7 +2044,15 @@ def pass_comparison(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     if not engines or not any(p[2] for p in panels):
         return None
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.8))
+    # Through `grid_figsize` and not `(4.0 * len(panels), 4.8)`, which is what
+    # this said and which is a NO-OP today: `dims` above is a literal list of
+    # four, so the width is always 16 inches and 16/4.8 is 3.33:1. It is
+    # routed anyway because the expression reads as data-dependent and one
+    # more panel would make it 4.17:1 -- over the bound, by the same arithmetic
+    # that put `latency_percentiles` there, in a chart nobody would re-measure
+    # while adding a dimension to a list.
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=grid_figsize(len(panels), 1, 4.0, 4.8))
     fig.patch.set_alpha(0.0)
     if len(panels) == 1:
         axes = [axes]
@@ -1825,7 +2120,8 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
     columns = min(3, len(engines))
     rows_count = (len(engines) + columns - 1) // columns
     fig, axes = plt.subplots(rows_count, columns, sharex=True, sharey=True,
-                             figsize=(4.4 * columns, 3.1 * rows_count))
+                             figsize=grid_figsize(columns, rows_count,
+                                                  4.4, 3.1))
     fig.patch.set_alpha(0.0)
     axes = list(axes.ravel()) if hasattr(axes, "ravel") else [axes]
 
@@ -1883,10 +2179,20 @@ def latency_percentiles(records: List[Dict[str, Any]], dataset: str,
             ax.set_ylabel("Latency (ms)  ↓", fontsize=9.5)
 
     fig.suptitle(f"Query latency distribution — {dataset}", fontsize=13)
-    fig.text(0.99, 0.005, "solid = p50;  dotted = p99;  shaded = the span "
-             "between them.  Log scale, shared across panels.",
+    # Wrapped, because at one engine this figure is 4.4 inches wide and this
+    # sentence is about 6: unwrapped it hung off the side and `_save`'s
+    # `bbox_inches="tight"` paid for it in width. `latency-gist-960-euclidean`
+    # and `latency-glove-100-angular` in the 2026-10-15 run are both 837 and
+    # 835 pixels on a 660-pixel canvas for this one artist.
+    note = _wrap_to_figure(
+        fig, "solid = p50;  dotted = p99;  shaded = the span "
+        "between them.  Log scale, shared across panels.", 8)
+    fig.text(0.99, 0.005, note,
              ha="right", va="bottom", fontsize=8, color="#888888")
-    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    # The band reserved under the axes grows with the caption, or a wrapped
+    # caption climbs into the x labels it sits beneath. One line reserves the
+    # 3% it always did, so a figure wide enough never to wrap is unchanged.
+    fig.tight_layout(rect=(0, 0.03 * (note.count("\n") + 1), 1, 0.96))
     return _save(fig, out_dir, stem)
 
 # ---------------------------------------------------------------------------
@@ -1928,25 +2234,49 @@ def storage_breakdown(records: List[Dict[str, Any]], dataset: str, out_dir: str,
         table_b.append((r.get("table_bytes") or 0))
         colors.append(style_for(r["engine"])["color"])
 
+    # 1.5 inches a bar until the aspect bound stops it. Past that the bars
+    # keep their share of a fixed width and the captions turn upright, which
+    # is the only one of the two that can be given up: a caption reads
+    # rotated, a 49-inch figure does not read at all.
+    figsize = bar_chart_figsize(len(labels), 1.5, 8.0, 5.2)
+    crowded = figsize[0] < 1.5 * len(labels)
     fig, ax = _new_axes(f"On-disk footprint — {dataset}", "",
-                        "Bytes  (lower is better ↓)", figsize=(max(8, 1.5 * len(labels)), 5.2))
+                        "Bytes  (lower is better ↓)", figsize=figsize)
     ax.yaxis.set_major_formatter(FuncFormatter(_bytes_formatter))
     xs = range(len(labels))
     ax.bar(xs, index_b, 0.62, color=colors, edgecolor="none", label="index")
     ax.bar(xs, table_b, 0.62, bottom=index_b, color=colors, alpha=0.4,
            edgecolor="none", label="table")
     for x, (i, tb) in enumerate(zip(index_b, table_b)):
+        # The totals turn upright with the captions and for the same reason:
+        # at the bar pitch a capped width gives, "191 MiB" is wider than the
+        # bar it belongs to and runs into its neighbours' totals.
         ax.text(x, i + tb, _bytes_formatter(i + tb, 0), ha="center", va="bottom",
-                fontsize=8)
+                fontsize=8, rotation=90 if crowded else 0)
     ax.set_xticks(list(xs))
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylim(top=ax.get_ylim()[1] * 1.12)
+    ax.set_xticklabels(labels, fontsize=8, rotation=90 if crowded else 0)
+    # Headroom for those totals: upright they stand about three times as tall
+    # as they do flat, and without the extra room they climb into the title.
+    ax.set_ylim(top=ax.get_ylim()[1] * (1.30 if crowded else 1.12))
     ax.legend(frameon=False, fontsize=9, loc="upper left")
     # Below the axes, not inside them: at seven bars the in-plot version
-    # overlapped the data it was explaining.
-    fig.text(0.5, -0.06,
-             "solid = index, pale = table.  pgvector stores vectors inside the index; "
-             "MHNSW and VIDX keep them in the table — only the totals are comparable.",
+    # overlapped the data it was explaining. Below the CAPTIONS too once they
+    # are upright, because then they are the thing that reaches furthest down.
+    ticks_bottom = None
+    if crowded:
+        ticks_bottom = min(
+            (_figure_fraction_y(fig, tick.get_window_extent(_renderer(fig)).y0)
+             for tick in ax.get_xticklabels()), default=None)
+    # Wrapped for the same reason the latency caption is: on a one- or
+    # two-engine run this figure is at its 8-inch minimum and this sentence is
+    # wider, which made the PNG 1,247 pixels on a 1,200-pixel canvas. Below
+    # the axes already, so the extra line costs height and nothing else.
+    fig.text(0.5, _below(-0.06, ticks_bottom),
+             _wrap_to_figure(
+                 fig,
+                 "solid = index, pale = table.  pgvector stores vectors inside the index; "
+                 "MHNSW and VIDX keep them in the table — only the totals are comparable.",
+                 8),
              ha="center", va="top", fontsize=8, color="#888888")
     return _save(fig, out_dir, stem)
 
