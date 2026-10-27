@@ -1069,6 +1069,36 @@ def draw_recall_whiskers(ax, rows: Sequence[Dict[str, Any]],
 WHISKER_TITLE_NOTE = "bars = 95% bootstrap CI of the recall"
 
 
+def _is_build_cost_point(record: Dict[str, Any], dataset: str) -> bool:
+    """Only the ops pass's index build belongs on the build-cost chart.
+
+    This selection used to be dataset plus `build_wall_s is not None`, which
+    was safe for exactly as long as no `recall_qps` record carried a build
+    time -- and `loaders.load_annb_results` now reads `build_time` and
+    `ingest_seconds` out of every ann-benchmarks result file, so they all do.
+    Without this filter the ann path's builds land on an ops chart whose other
+    two panels are `peak_rss_bytes` and `index_bytes`: figures measured in a
+    different container, under a different memory budget, by a harness that
+    does not run there. Nothing would have crashed and the chart would have
+    gained three curves.
+
+    That is the second time selecting a chart's records on "has the field"
+    rather than "is the measurement" has produced a wrong published figure in
+    this one function -- `build_cost`'s own docstring has the first -- which is
+    why this is a named predicate with the reason attached and not a clause in
+    a comprehension. `_is_concurrency_point` exists for the identical reason.
+
+    The phase is a literal rather than `records.PHASE_BUILD` because
+    `report/charts.py` must not import `harness` at module scope: see the note
+    above `RECALL_CI_EXTRA_KEY`, and the long run that died of such an import.
+    `tests/test_e18_ann_build_timing_reaches_the_records.py` asserts the
+    literal against the constant so the two cannot drift.
+    """
+    return (record.get("phase") == "index_build"
+            and record.get("dataset") == dataset
+            and record.get("build_wall_s") is not None)
+
+
 def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
                stem: str) -> Optional[Dict[str, str]]:
     """Build cost against M: time to a queryable index, the bulk build step on
@@ -1118,8 +1148,7 @@ def build_cost(records: List[Dict[str, Any]], dataset: str, out_dir: str,
     from report.generate import (BUILD_KIND_BULK, BUILD_KIND_UNRECORDED,
                                  build_kind, time_to_queryable_index_s)
 
-    plotted_records = [r for r in records if r.get("dataset") == dataset
-                       and r.get("build_wall_s") is not None]
+    plotted_records = [r for r in records if _is_build_cost_point(r, dataset)]
     if not plotted_records:
         return None
     by_series, labels, storages, degrees = _grouped(plotted_records)

@@ -172,6 +172,24 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                         # ann-benchmarks records index size in kilobytes.
                         record.setdefault("index_bytes",
                                           int(float(attrs["index_size"]) * 1024))
+                    # The build cost, measured since this framework existed
+                    # and dropped by this reader for just as long: the report
+                    # could say what an `ef_construction` bought and never what
+                    # it cost, so the published claim was the ratio of the KNOB
+                    # ("16 times the build effort") against a measured 2.17x.
+                    # Two fields, because `build_time` is upstream's clock
+                    # around `algo.fit` and `ingest_seconds` is ours around the
+                    # load alone. No rate is derived -- the file holds no row
+                    # count. Absent stays absent rather than 0.0, which reads
+                    # as a free build and which every `is not None` selector
+                    # downstream would plot, and `value == value` drops a NaN
+                    # for the reason the `qps` line above does. The full
+                    # account: tests/test_e18_ann_build_timing_reaches_the_records.py
+                    for field, attribute in (("build_wall_s", "build_time"),
+                                             ("ingest_wall_s", "ingest_seconds")):
+                        value = _maybe_float(attrs.get(attribute))
+                        if value is not None and value == value:
+                            record[field] = value
                     if times is not None and len(times):
                         record["latency_p50_ms"] = float(numpy.percentile(times, 50) * 1000)
                         record["latency_p95_ms"] = float(numpy.percentile(times, 95) * 1000)
@@ -350,6 +368,17 @@ def _maybe_int(value: Any) -> Optional[int]:
         if value is None:
             return None
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_float(value: Any) -> Optional[float]:
+    """`_maybe_int`'s float sibling, for the two build timings above. A plain
+    float, not the `numpy.float64` h5py returns and `json.dump` cannot write."""
+    try:
+        if value is None:
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 
