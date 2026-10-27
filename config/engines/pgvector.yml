@@ -32,6 +32,99 @@ build:
 # never mentioned `ctag` once that column arrived.
 # tests/test_c1_engine_sql.py fails if a block comes back.
 
+# Parallelism: four keys, two blocks, and deliberately not the same keys in
+# both. `normalized` pins max_parallel_maintenance_workers=0 and
+# max_parallel_workers_per_gather=0; `tuned` pins
+# max_parallel_maintenance_workers, max_parallel_workers and
+# max_worker_processes from {build_threads}. One key is in both; normalized
+# has one of its own, tuned has two of its own, and each block leaves the
+# other's at the PostgreSQL default.
+#
+# The question "is the normalized block missing two lines?" has been asked
+# twice and never answered in writing -- docs/12-percona-feedback-plan.md
+# §5.2 asks it and then prescribes "the same treatment" for Percona's
+# innodb_parallel_read_threads off the back of it, so an unexamined asymmetry
+# was about to be copied onto an eighth block. The answer belongs here.
+#
+# ANSWER: deliberate, and no key is missing. The blocks are asymmetric
+# because switching parallelism OFF and switching it ON are not the same
+# operation on a PostgreSQL server:
+#
+#   * Off takes one zero per path, at the innermost limit. A worker that is
+#     never requested cannot be granted, so the pools above the request do
+#     not matter.
+#   * On takes every limit in the chain, because the weakest one decides. A
+#     maintenance worker comes out of the pool max_worker_processes
+#     establishes and is capped again by max_parallel_workers; pgvector
+#     v0.8.6's README says so outright -- "For a large number of workers, you
+#     may need to increase max_parallel_workers (8 by default)". Raise one of
+#     the three and not the others and the build runs with fewer workers than
+#     the manifest records, succeeds, and says nothing.
+#
+# Hence three keys up and one key down, plus a fourth that exists only in
+# normalized because there are two independent paths to close:
+#
+#   max_parallel_maintenance_workers -- the BUILD path, pinned in both. The
+#     bulk build reads this and nothing else: ComputeParallelWorkers in the
+#     pinned tree's src/hnswbuild.c returns max_parallel_maintenance_workers,
+#     gated on plan_create_index_workers finding a parallel build safe and
+#     capped by the table's parallel_workers reloption when one is set. The
+#     0 in normalized is the load-bearing line of this block -- it is what
+#     makes CREATE INDEX single-threaded and so comparable with MHNSW's and
+#     VIDX's per-INSERT graph maintenance, which cannot be parallelised at
+#     all. It holds parallel VACUUM to one process too, the same budget by a
+#     second route. It is a literal 0 and not {build_threads} on purpose:
+#     these GUCs count workers BEYOND the leader -- the README's example is
+#     `SET max_parallel_maintenance_workers = 7; -- plus leader` -- so
+#     {build_threads}, which normalized.yml sets to 1, would read as
+#     "single-threaded" and buy a second process.
+#   max_parallel_workers_per_gather -- the QUERY path, normalized only.
+#     Zeroing the build says nothing about the query: a Gather node draws on
+#     its own limit, and PostgreSQL 17 documents 0 here as "disables parallel
+#     query execution". It is pinned because of the full-table-scan fallback
+#     CLAUDE.md warns about -- a filtered query that misses the HNSW index
+#     degrades to an exact scan, and the README names this exact key as the
+#     way to make that scan fast ("To speed up queries without an index,
+#     increase max_parallel_workers_per_gather"). At its default of 2 the
+#     normalized pass would hand pgvector two extra cores on precisely the
+#     queries where it had lost its index, against MySQL-family engines with
+#     no equivalent.
+#   max_parallel_workers and max_worker_processes -- the two POOLS, tuned
+#     only, and absent from normalized by decision rather than by omission.
+#     They are ceilings on requests for parallel workers, and in the
+#     normalized pass this workload makes no such request: the build asks for
+#     zero and Gather is disabled, while autovacuum draws on
+#     autovacuum_max_workers and not on this pool. What sits in the pool is
+#     spare slots that nothing in the measurement can reach.
+#
+# AND THE ASYMMETRY RUNS THE OTHER WAY TOO, which is the half the plan did
+# not notice: max_parallel_workers_per_gather is absent from TUNED, so a
+# tuned pgvector query gets PostgreSQL's default of 2 workers per Gather and
+# not {build_threads}. Per-gather width does not follow from
+# max_parallel_workers -- that is a pool, this is the per-node cap. So the
+# tuned pass gives pgvector a build_threads-wide build and a vendor-default
+# query. That is defensible, because the tuned pass is each vendor's own
+# recommendation and the vendor ties this key to the no-index path that every
+# configuration is checked against through explain_uses_vector_index(); it is
+# recorded here rather than changed, for the reason below.
+#
+# WHY NOT MAKE ALL FOUR SYMMETRIC AND BE DONE: because the settings an engine
+# runs under are part of what its numbers mean. max_parallel_workers=0 or
+# max_worker_processes=0 in normalized, or
+# max_parallel_workers_per_gather={build_threads} in tuned, is the same
+# workload against a different amount of machine -- which is exactly what
+# OPS_MEASUREMENT_VERSION 3 was bumped for (harness/metrics/records.py) --
+# and would owe a bump that invalidates comparison across every ops phase of
+# every engine, to settle a fairness question nobody has raised about a
+# published number. This change moved no key, so every pgvector figure in the
+# archive still means what it meant.
+#
+# NONE OF THIS HAS BEEN VERIFIED AGAINST A RUNNING SERVER. It is read off the
+# pinned pgvector tree (v0.8.6) and PostgreSQL 17's documentation for these
+# four GUCs. What is tested is what this repository SENDS:
+# tests/test_config.py::TestEveryPgvectorParallelismKnobIsPinnedOnPurpose
+# asserts each pass's key set and values rather than the presence of a
+# string, so moving a key between the blocks fails against this comment.
 server:
   common:
     - -c
@@ -43,6 +136,9 @@ server:
     - "shared_buffers={buffer_bytes}B"
     - -c
     - "maintenance_work_mem={maintenance_bytes}B"
+    # Two zeros, one per path: the build and the Gather node have
+    # separate limits. Read the parallelism note above before moving
+    # either, or adding a third key here at anything but 0.
     - -c
     - "max_parallel_maintenance_workers=0"
     - -c
@@ -54,6 +150,8 @@ server:
     - "shared_buffers={buffer_bytes}B"
     - -c
     - "maintenance_work_mem={maintenance_bytes}B"
+    # Three limits, one effect: a maintenance worker has to clear all
+    # three, and the weakest decides. They move together or not at all.
     - -c
     - "max_parallel_maintenance_workers={build_threads}"
     - -c

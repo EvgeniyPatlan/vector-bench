@@ -8156,3 +8156,171 @@ class TestEachConcurrencyPointIsRepeated:
         once = {**shipped, "ops": {k: v for k, v in shipped["ops"].items()
                                    if k != "concurrency_repeats"}}
         assert windows(shipped) == windows(once) * 3
+
+
+# ---------------------------------------------------------------------------
+# A4: pgvector's two parallelism blocks pin different keys, on purpose
+# ---------------------------------------------------------------------------
+
+#: Every PostgreSQL setting that can hand pgvector a worker process beyond the
+#: one backend serving the connection. Matched by prefix rather than listed,
+#: so a knob added to either pass is caught here instead of quietly inheriting
+#: whatever `postgres:17-bookworm` defaults to.
+_PG_PARALLEL_PREFIXES = ("max_parallel", "max_worker")
+
+
+def _pg_settings(engine, resource_pass, info):
+    """The `-c name=value` settings this repository actually sends, as a dict.
+
+    Rendered through `server_args` rather than read out of the YAML, because
+    the YAML holds `{build_threads}` and the question every test below asks is
+    what reaches the postmaster, not what the file says.
+    """
+    rendered = server_args(load_engine(engine), resource_pass,
+                           resolve_resources(load_resources(resource_pass),
+                                             engine, info))
+    settings = {}
+    for flag, setting in zip(rendered, rendered[1:]):
+        if flag != "-c" or "=" not in setting:
+            continue
+        name, _, value = setting.partition("=")
+        settings[name] = value
+    return settings
+
+
+def _pg_parallel_settings(engine, resource_pass, info):
+    return {name: value
+            for name, value in _pg_settings(engine, resource_pass, info).items()
+            if name.startswith(_PG_PARALLEL_PREFIXES)}
+
+
+class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
+    """The two passes pin different keys, and the difference has to be a
+    decision rather than an oversight.
+
+    `server.tuned` sets `max_parallel_maintenance_workers`,
+    `max_parallel_workers` and `max_worker_processes` from `{build_threads}`.
+    `server.normalized` pins `max_parallel_maintenance_workers=0` and
+    `max_parallel_workers_per_gather=0` -- one key in common, one it has to
+    itself, two of the tuned keys left at the server default. Nothing in the
+    file said whether that was the intent or two forgotten lines, and
+    `docs/12-percona-feedback-plan.md` prescribes "the same treatment" for
+    Percona's `innodb_parallel_read_threads` off the back of it, so an
+    undocumented asymmetry was about to be copied onto an eighth block.
+
+    These tests assert the shape of each pass rather than the presence of a
+    string: that the normalized pass hands out no worker on either path, that
+    the tuned pass raises every limit in the chain a parallel build has to
+    pass through, and that the two key sets differ by exactly the keys the
+    file's comment accounts for. An edit that keeps the spellings and breaks
+    the comparison -- `max_worker_processes=4` in tuned, `max_parallel_workers=2`
+    in normalized -- fails these, which a substring check would not.
+    """
+
+    def test_the_normalized_pass_grants_no_worker_on_either_path(self, info):
+        """Two zeros, one per path, because the paths are independent.
+
+        pgvector's bulk build takes its worker count from
+        `max_parallel_maintenance_workers` (`ComputeParallelWorkers` in the
+        pinned tree's `src/hnswbuild.c` returns exactly that, clamped), and
+        the query side takes its workers through a Gather node, which
+        `max_parallel_workers_per_gather=0` disables outright. Zeroing one
+        says nothing about the other.
+        """
+        pinned = _pg_parallel_settings("pgvector", "normalized", info)
+        assert pinned.get("max_parallel_maintenance_workers") == "0", (
+            "the normalized bulk build would be parallel: "
+            f"{pinned!r}")
+        assert pinned.get("max_parallel_workers_per_gather") == "0", (
+            "a normalized query that misses the index could recruit workers "
+            f"for the scan: {pinned!r}")
+        # Any further knob in this family is welcome in the normalized pass --
+        # but only at zero. A non-zero one is a budget MHNSW and VIDX have no
+        # way to spend.
+        assert [name for name, value in sorted(pinned.items())
+                if value != "0"] == []
+
+    def test_the_normalized_zero_is_a_literal_and_not_build_threads(self, info):
+        """`{build_threads}` is 1 in the normalized pass, and 1 is not none.
+
+        These GUCs count workers *beyond* the leader -- the pinned tree's
+        README says so in as many words, `SET max_parallel_maintenance_workers
+        = 7; -- plus leader`. So spelling the normalized pass's zero
+        `{build_threads}` would read as "single-threaded" and buy a second
+        process, which is the whole quantity `build.threads: 1` exists to deny.
+        """
+        resolved = resolve_resources(load_resources("normalized"), "pgvector",
+                                     info)
+        assert resolved.build_threads == 1, (
+            "the normalized pass no longer declares a single build thread; "
+            "the argument in config/engines/pgvector.yml's comment is stated "
+            "against build_threads == 1 and needs re-checking")
+        with open(os.path.join(VB_ROOT, "config", "engines",
+                               "pgvector.yml")) as fh:
+            raw = yaml.safe_load(fh) or {}
+        for setting in (raw.get("server") or {}).get("normalized") or []:
+            name = str(setting).partition("=")[0]
+            if name.startswith(_PG_PARALLEL_PREFIXES):
+                assert "{" not in str(setting), (
+                    f"normalized pins {setting!r} from a placeholder; a "
+                    "worker count of build_threads is one worker, not none")
+
+    def test_the_tuned_pass_raises_every_limit_in_the_chain(self, info):
+        """A build worker has to get past three limits, so three keys move.
+
+        A maintenance worker is drawn from the pool `max_worker_processes`
+        establishes and capped again by `max_parallel_workers`; the pinned
+        tree's README says to raise the second for large worker counts. Raise
+        one of the three and the request is silently clipped -- the build
+        still succeeds, with fewer workers than the manifest records, which is
+        a measurement this repository would publish and could not detect.
+        """
+        resolved = resolve_resources(load_resources("tuned"), "pgvector", info)
+        pinned = _pg_parallel_settings("pgvector", "tuned", info)
+        chain = {"max_parallel_maintenance_workers", "max_parallel_workers",
+                 "max_worker_processes"}
+        assert set(pinned) == chain, (
+            f"the tuned parallel chain changed shape: {sorted(pinned)}")
+        assert resolved.build_threads >= 1
+        for name in sorted(chain):
+            assert pinned[name] == str(resolved.build_threads), (
+                f"tuned {name}={pinned[name]} against build_threads="
+                f"{resolved.build_threads}: the weakest link decides, so the "
+                "pass would measure a worker count nothing declared")
+
+    def test_the_two_passes_differ_by_exactly_the_documented_keys(self, info):
+        """The passes are not each other's control, and this pins how far.
+
+        One key in common, one key normalized has that tuned leaves at the
+        PostgreSQL default, two keys tuned has that normalized leaves at the
+        PostgreSQL default. Each half is argued in the file's comment; moving
+        a key between the blocks fails here and has to answer that comment,
+        which is what stops the next edit making the two blocks incomparable
+        by accident.
+        """
+        normalized = set(_pg_parallel_settings("pgvector", "normalized", info))
+        tuned = set(_pg_parallel_settings("pgvector", "tuned", info))
+        assert normalized & tuned == {"max_parallel_maintenance_workers"}
+        assert normalized - tuned == {"max_parallel_workers_per_gather"}
+        assert tuned - normalized == {"max_parallel_workers",
+                                      "max_worker_processes"}
+
+    def test_every_knob_either_pass_touches_is_argued_in_the_file(self, info):
+        """A config decision carries its argument, or it is not a decision.
+
+        The asymmetry survived unexamined because the block that encodes it
+        says nothing, and the next reader -- `docs/12-percona-feedback-plan.md`
+        §5.2 -- was told to copy it. Naming every knob in the comment is the
+        cheapest guard against that: a key added to either pass without a
+        sentence explaining it fails this.
+        """
+        with open(os.path.join(VB_ROOT, "config", "engines",
+                               "pgvector.yml")) as fh:
+            lines = fh.read().splitlines()
+        prose = "\n".join(line for line in lines if line.strip().startswith("#"))
+        touched = (set(_pg_parallel_settings("pgvector", "normalized", info))
+                   | set(_pg_parallel_settings("pgvector", "tuned", info)))
+        for name in sorted(touched):
+            assert name in prose, (
+                f"{name} is pinned in config/engines/pgvector.yml and "
+                "explained nowhere in it")
