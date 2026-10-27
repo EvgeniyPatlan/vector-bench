@@ -519,7 +519,15 @@ CITED_IN_REPO = {
     # returns None, and the section cites the repaired call instead. The
     # anchor deliberately has NO default argument in it, so the old spelling
     # coming back fails this row rather than satisfying it.
-    "orchestrator/estimate.py:162":
+    #
+    # Then `:162`, and now `:280`: the call did not move, the table above it
+    # grew. Percona's three measured entries, the provenance comment that
+    # dates them to the pin they were taken at and the measurement-version
+    # verdict beside it pushed everything below the tables down by 118 lines.
+    # This row is the reason that shift could not silently invalidate the
+    # document -- it fired on the shift twice while this change was being
+    # written, once per revision of that comment.
+    "orchestrator/estimate.py:280":
         ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine)"),
     "orchestrator/estimate.py:44":
         ("orchestrator/estimate.py",
@@ -1723,6 +1731,16 @@ class TestTheEstimatorFallbackIsRecomputed:
         `engines_without_ingest_rate`, so the assertions are the mirror
         image: no number, and a name in the gap list.
 
+        **And Percona has stopped being the example, which is the second
+        thing this test records.** It demonstrated the gap list with a real
+        engine that had no rate; that engine's rate was measured into
+        `_MEASURED_ROWS_PER_S` and it is counted now, so the demonstration
+        moved to `no-such-engine`, which was already asserted three lines
+        above for exactly this reason. The section's point is unchanged -- an
+        unmeasured engine is named rather than modelled -- and is now carried
+        by an engine nothing could ever have measured, so it cannot expire
+        again the next time a rate is written down.
+
         The historical figure is still checked against the document, because
         §5 item 2 quotes it to make the argument -- it just no longer has to
         be what the code does.
@@ -1748,13 +1766,16 @@ class TestTheEstimatorFallbackIsRecomputed:
                                    "estimate.py")).read()
         assert "base = _INGEST_ROWS_PER_S.get(engine, 300)" not in source
         assert "base = _INGEST_ROWS_PER_S.get(engine)" in source
-        # The engine the section is about is named, not modelled.
+        # An engine with no rate is named, not modelled, in the estimate the
+        # section is about -- and an engine WITH one is counted, which is the
+        # half that proves the list is derived and not a constant.
         e = estimate.estimate_load_hours(
             {"name": "t", "ann": {"m_values": [16]}, "ops": {"m_values": [16]}},
-            ["mariadb", "percona"], ["glove-100-angular"], ["normalized"],
-            ["ann", "ops"])
-        assert e["engines_without_ingest_rate"] == ["percona"]
-        assert "percona" not in e["per_engine_hours"]
+            ["mariadb", "percona", "no-such-engine"], ["glove-100-angular"],
+            ["normalized"], ["ann", "ops"])
+        assert e["engines_without_ingest_rate"] == ["no-such-engine"]
+        assert "no-such-engine" not in e["per_engine_hours"]
+        assert e["per_engine_hours"]["percona"] > 0
 
     def test_the_mysql_family_rates_are_the_ones_the_document_prints(self):
         from orchestrator import estimate
@@ -1850,7 +1871,13 @@ class TestTheDecisionD1IsDecidedAndItsCostIsRecomputed:
         assertions below pass over an empty table."""
         rows, _ = self._doc_cost_table()
         assert len(rows) == 2, sorted(rows)
-        assert any("six" in label for label in rows), sorted(rows)
+        # "seven", not "six": the first row was labelled for the six engines
+        # with a measured ingest rate while it was computed over all seven and
+        # Percona fell out of it. Percona's rate is measured, so the row
+        # prices every engine and says so -- and this assertion is what makes
+        # the label and the engine list below it move together.
+        assert any("seven" in label for label in rows), sorted(rows)
+        assert not any("six" in label for label in rows), sorted(rows)
         assert any("three" in label for label in rows), sorted(rows)
 
     def test_every_figure_in_it_comes_from_the_estimator(self):
@@ -1859,7 +1886,7 @@ class TestTheDecisionD1IsDecidedAndItsCostIsRecomputed:
         before = {**now, "ann": {**now["ann"],
                                  "m_values": list(self.GRID_BEFORE)}}
         for label, (said_before, said_after, said_added) in rows.items():
-            engines = (list(KNOWN_ENGINES) if "six" in label
+            engines = (list(KNOWN_ENGINES) if "seven" in label
                        else list(self.HEADLINE))
             got_before = self._hours(before, engines)
             got_after = self._hours(now, engines)

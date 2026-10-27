@@ -564,15 +564,18 @@ replaced because an estimate optimistic *by 3x* is worse than none
 and was optimistic by more than the margin that argument rejects. Measured on
 `main` before the fix: 273.45 rows/s for an unmeasured engine on glove-100
 against MariaDB's measured 147, putting **9.10 h** of invented ingest into a
-published total (102.16 h against the honest 93.06 h) with nothing printed to
+published total (102.16 h against the honest 93.06 h — both over the six
+engines that had a rate, at the commit of the fix) with nothing printed to
 say so.
 
 **What it does now.** `_effective_rate` returns `None` where nothing has been
-measured — `orchestrator/estimate.py:162` is `_INGEST_ROWS_PER_S.get(engine)`
+measured — `orchestrator/estimate.py:280` is `_INGEST_ROWS_PER_S.get(engine)`
 with no default — and `estimate_load_hours` reports
 `engines_without_ingest_rate` on the same terms the query half has always used
 for `engines_without_query_rate`: the engine is **named, contributes nothing to
-the total, and the printed block says which engines the total covers**:
+the total, and the printed block says which engines the total covers**. This is
+that block as it printed for `main`, verbatim, until Percona's rate was
+measured:
 
 ```
   total ~93.1 h across 1 pass(es), 3 M value(s)
@@ -582,12 +585,29 @@ the total, and the printed block says which engines the total covers**:
     cost of this plan is higher than the number above, by an amount nothing here knows.
 ```
 
+**That disclosure fired for Percona on every profile in this repository, and it
+no longer fires for any.** Its ingest rate was measured seventeen times across
+six archived runs and modelled nowhere; the M=16 `incremental` figures —
+339 rows/s on fashion-mnist, 275 on glove-100, 427 on sift-128, all from
+`full-20261015-215006` — are in `_MEASURED_ROWS_PER_S` now, with 275 as the
+reference rate and gist-960 left to the formula because it was measured at
+M=32 alone. `main` therefore prints seven engines on its per-engine line and
+no disclosure under its total:
+
+```
+  total ~100.4 h across 1 pass(es), 3 M value(s)
+```
+
+The mechanism is unchanged and still covered: `tests/test_estimate.py` and
+`tests/test_e2_percona_wiring.py` exercise the gap list with a probe engine
+nothing could ever have measured, so the `None` path is guarded whatever the
+rate tables gain.
+
 **So the rollout reading is the opposite of what it was.** A printed ingest
 figure is now trustworthy as far as it goes, and it tells you how far that is.
-What you must not do is read `~726 h` for `--profile full --resource-pass both`
-as the whole plan: it is six of the seven engines, and the smoke run is what
-supplies the seventh. Percona has no `_INGEST_ROWS_PER_S` entry and must not be
-given one until a run measures it.
+`--profile full --resource-pass both` is `~796 h`, and that figure covers all
+seven engines: the 726 h this page used to quote was six of them, and the
+69.83 h it excluded was Percona's.
 
 ### 3. The cost envelope, and what D1 cost
 
@@ -606,15 +626,16 @@ What it cost, from `orchestrator/estimate.py` and not from any prose:
 
 | Engines | `[8, 32]` | `[8, 16, 32]` | Added |
 |---|---:|---:|---:|
-| the six with a measured ingest rate | 69.77 h | **93.06 h** | +23.29 h |
+| all seven engines | 75.31 h | **100.44 h** | +25.13 h |
 | the three headline engines | 51.07 h | **68.11 h** | +17.04 h |
 
-**That first row is computed over all SEVEN engines and is nevertheless a
-six-engine quantity, which is why it is labelled that way rather than "all".**
-Percona Server has no measured ingest rate, so `orchestrator/estimate.py`
-names it in `engines_without_ingest_rate` and it contributes nothing to either
-column — the figures are unchanged by its arrival and the label is what moved.
-A run of `main` loads seven engines; this table prices six of them.
+**That first row was `69.77 h / 93.06 h / +23.29 h` and was labelled "the six
+with a measured ingest rate", because it was computed over all seven and was
+nevertheless a six-engine quantity.** Percona Server had no measured ingest
+rate, so `orchestrator/estimate.py` named it in `engines_without_ingest_rate`
+and it contributed nothing to either column. Its rate is in the table now, so
+the row prices every engine `main` loads and the label says so. The second row
+did not move: it is three named engines and Percona is not one of them.
 
 An earlier revision of this page carried the two "added" figures and removed
 them as unsourced, because at that commit nothing in the repo supported them.

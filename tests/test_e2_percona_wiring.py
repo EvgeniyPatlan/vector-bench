@@ -84,20 +84,16 @@ PROSE_CLAIMS = {
             "all six of the engines",
             "every one of the six engines",
         ]),
-    "the ingest figure covers six of the seven": dict(
-        pattern=r"\bsix\b[^.]{0,40}?\bseven\b"
-                r"|\bseven\b[^.]{0,20}?\bminus one\b"
-                r"|\bsix of\b[^.]{0,30}?\bengines?\b",
-        accepts=[
-            "The ingest figure covers six of those seven",
-            "the ingest figure covers six engines of the seven",
-            "six of the seven engines have a measured ingest rate",
-            "that figure is six of seven engines",
-        ],
-        rejects=[
-            "The ingest figure covers all seven engines",
-            "nothing has measured any engine's ingest rate",
-        ]),
+    # "the ingest figure covers six of the seven" WAS HERE, and was deleted
+    # rather than reworded: the claim it guarded has stopped being true.
+    # Percona's M=16 incremental rate is in `_MEASURED_ROWS_PER_S` and
+    # `_INGEST_ROWS_PER_S` now, so the published ingest figure covers all
+    # seven engines and CLAUDE.md no longer splits its two numbers by scope.
+    # What replaces it is a computation and not a vocabulary:
+    # `tests/test_estimate.py`'s CLAUDE.md guard asserts the document's
+    # ingest figure is 69.83 h above the six-engine one, so the old 726 h
+    # cannot satisfy it. A vocabulary cannot do that -- it would accept any
+    # sentence with the right words in it, including a stale one.
     "percona does either build mode": dict(
         pattern=r"Percona(\s+Server)?\b[^.]{0,80}?"
                 r"\b(does either|either mode|both|can do both|does both)\b",
@@ -1286,7 +1282,25 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
     optimistic by 3x is worse than none". 300 rows/s is 2x the measured
     MariaDB figure and 5.5x the measured AliSQL one, and it reached published
     output -- `webui/control.py` passes `KNOWN_ENGINES` straight in.
+
+    **Percona is no longer the example, and the reason is the point of this
+    class.** It moved from *named* to *counted* because a measurement was
+    written down, not because a guess was: B1's census of the archived ops
+    records gave the M=16 `incremental` rate on three corpora -- 339, 275 and
+    427 rows/s from `full-20261015-215006` -- and those went into
+    `_MEASURED_ROWS_PER_S` with 275 as the reference rate. The `None` path
+    they left is still the one this class guards, so every assertion below
+    that needed an unmeasured engine now uses `e2-no-such-engine`, the probe
+    `tests/test_config.py` injects for the same reason and with the same
+    argument: a guard that requires some real engine to be unmeasured fires
+    on the day the last one is measured, which is a guard that fires on a
+    better state and teaches the next author to delete it.
     """
+
+    #: An engine nothing could ever have measured, so the `None` branch stays
+    #: covered whatever the rate tables gain. Spelled as `tests/test_config.py`
+    #: spells it.
+    UNMEASURED = "e2-no-such-engine"
 
     @staticmethod
     def _estimate(engines):
@@ -1298,61 +1312,106 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
 
     def test_an_engine_with_no_rate_returns_none_rather_than_a_number(self):
         from orchestrator.estimate import _effective_rate
-        assert _effective_rate("percona", "glove-100-angular") is None
+        assert _effective_rate(self.UNMEASURED, "glove-100-angular") is None
         # Non-vacuity: a measured engine still gets its number.
         assert _effective_rate("mariadb", "glove-100-angular") == 147.0
+        # And Percona is now one of those, at the figure its glove-100 M=16
+        # `incremental` record carries: 275.04 rows/s, normalized pass,
+        # 1,183,514 rows, `full-20261015-215006`.
+        assert _effective_rate("percona", "glove-100-angular") == 275.0
 
     def test_it_is_named(self):
-        e = self._estimate(["mariadb", "percona"])
-        assert e["engines_without_ingest_rate"] == ["percona"]
+        e = self._estimate(["mariadb", self.UNMEASURED])
+        assert e["engines_without_ingest_rate"] == [self.UNMEASURED]
 
     def test_it_contributes_nothing_to_the_total(self):
         """The alternative -- a key worth 0.0 -- reads as "costs nothing",
         which is the opposite of what is known about an engine building an
-        HNSW graph inside every INSERT."""
+        HNSW graph inside every INSERT. That argument is why the `None` path
+        must keep existing, and it is why Percona's entry had to come from a
+        record rather than from a plausible number."""
         one = self._estimate(["mariadb"])
-        two = self._estimate(["mariadb", "percona"])
+        two = self._estimate(["mariadb", self.UNMEASURED])
         assert two["total_hours"] == one["total_hours"]
-        assert "percona" not in two["per_engine_hours"]
+        assert self.UNMEASURED not in two["per_engine_hours"]
 
-    def test_a_measured_engine_is_not_named(self):
+    def test_a_measured_engine_is_counted_and_percona_is_one(self):
+        """The inversion. Percona used to be this file's unmeasured engine in
+        a test asserting the opposite of every line here."""
         e = self._estimate(["mariadb", "alisql", "pgvector"])
         assert e["engines_without_ingest_rate"] == []
+        two = self._estimate(["mariadb", "percona"])
+        one = self._estimate(["mariadb"])
+        assert two["engines_without_ingest_rate"] == []
+        assert two["per_engine_hours"]["percona"] > 0
+        assert two["total_hours"] > one["total_hours"]
 
     def test_the_six_measured_rates_did_not_move(self):
         """The constraint on the repair: another task re-baselined these
         figures, and if the six moved its numbers and this change would
-        fight."""
+        fight. Percona is the seventh and is asserted beside them rather than
+        in a second dict, so ALL OF THIS table is pinned by one literal.
+
+        Only this one. `_MEASURED_ROWS_PER_S` is per `(engine, dataset)` and
+        is pinned for percona by the assertion below plus
+        `tests/test_estimate.py`'s
+        `test_the_three_entries_are_the_records_they_came_from`; its other
+        engines' entries are not pinned anywhere by value, which is the state
+        this change found and did not widen."""
         from orchestrator import estimate as est_mod
         assert est_mod._INGEST_ROWS_PER_S == {
             "mariadb": 150, "mariadb123": 110, "alisql": 55,
-            "pgvector": 3000, "valkey": 40000, "mongodb": 60000}
+            "pgvector": 3000, "valkey": 40000, "mongodb": 60000,
+            "percona": 275}
 
-    def test_no_rate_was_invented_for_percona(self):
-        """An estimate for an unmeasured engine is a guess presented as a
-        plan. The smoke run supplies the figure."""
+    def test_the_rate_was_measured_for_percona_and_not_invented(self):
+        """It was "no rate was invented for percona", and the distinction it
+        drew is the one that still has to hold: an estimate for an unmeasured
+        engine is a guess presented as a plan. The three keys below are
+        `(dataset, M=16, incremental, 60k/1M-row)` records from one named run,
+        and gist-960-euclidean is deliberately absent because it was measured
+        at M=32 alone. `tests/test_estimate.py` holds the span assertion that
+        a `post`-mode figure fails."""
         from orchestrator import estimate as est_mod
-        assert "percona" not in est_mod._INGEST_ROWS_PER_S
-        assert not [k for k in est_mod._MEASURED_ROWS_PER_S
-                    if k[0] == "percona"]
+        assert est_mod._INGEST_ROWS_PER_S["percona"] == 275
+        assert {k[1]: v for k, v in est_mod._MEASURED_ROWS_PER_S.items()
+                if k[0] == "percona"} == {
+            "fashion-mnist-784-euclidean": 339,
+            "glove-100-angular": 275,
+            "sift-128-euclidean": 427,
+        }
+        assert ("percona", "gist-960-euclidean") not in est_mod._MEASURED_ROWS_PER_S
 
     def test_a_dataset_with_no_row_count_does_not_make_every_engine_a_gap(self):
         """The care `engines_without_query_rate` takes, taken here too: the
         gap list is keyed on the RATE, not on "contributed no hours". `dev`'s
         only dataset has no row count, and every engine would be listed if
-        the test were the latter."""
+        the test were the latter.
+
+        Percona now demonstrates the point from the other side, which is
+        better evidence than it used to be: it has a rate and no row count, so
+        it is absent from the gap list while contributing 0.0 hours -- the
+        exact pair the list would conflate if it were keyed on hours."""
         from orchestrator.estimate import estimate_load_hours
         e = estimate_load_hours(
             {"name": "t", "ann": {}, "ops": {}},
-            ["mariadb", "percona"], ["tiny-16-euclidean"], ["normalized"],
-            ["ann", "ops"])
-        assert e["engines_without_ingest_rate"] == ["percona"]
+            ["mariadb", "percona", self.UNMEASURED], ["tiny-16-euclidean"],
+            ["normalized"], ["ann", "ops"])
+        assert e["engines_without_ingest_rate"] == [self.UNMEASURED]
         assert e["datasets_without_estimate"] == ["tiny-16-euclidean"]
-        assert e["per_engine_hours"] == {"mariadb": 0.0}
+        assert e["per_engine_hours"] == {"mariadb": 0.0, "percona": 0.0}
 
     def test_the_printed_output_says_which_engines_the_total_covers(self):
-        """A reader must not have to reconcile a seven-engine plan against a
-        six-engine total by noticing a name missing from a list."""
+        """A reader must not have to reconcile an eight-engine plan against a
+        seven-engine total by noticing a name missing from a list.
+
+        It was a seven-engine plan and a six-engine total, and Percona was the
+        missing name. Its rate is measured now, so `main` over
+        `KNOWN_ENGINES` prints no disclosure at all -- which is the correct
+        output and would make this test vacuous. The probe engine restores the
+        state the disclosure exists for, and the assertion that `main` alone
+        prints nothing is in `tests/test_estimate.py` beside the figures it
+        moved."""
         import io
         from contextlib import redirect_stdout
         from orchestrator.config import load_profile
@@ -1361,11 +1420,16 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
         profile = load_profile("main")
         buf = io.StringIO()
         with redirect_stdout(buf):
-            print_load_estimate(profile, list(KNOWN_ENGINES),
+            print_load_estimate(profile,
+                                list(KNOWN_ENGINES) + [self.UNMEASURED],
                                 list(profile["datasets"]), ["normalized"],
                                 ["ann", "ops"])
         out = buf.getvalue()
-        assert "No measured ingest rate for percona" in _flat(out)
+        assert f"No measured ingest rate for {self.UNMEASURED}" in _flat(out)
+        # The engine that gained a rate is on the per-engine line instead of
+        # in the disclosure, which is the whole difference this change makes
+        # to what an operator reads.
+        assert "percona ~" in out
         _prose("the total covers only the engines with a rate", out)
         # And it says what a reader should CONCLUDE, not merely that a figure
         # is missing -- the attack this catches is a line that announces the
@@ -1385,8 +1449,8 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
                                         "churn_fractions": [0.1],
                                         "churn_budget_s": 1800,
                                         "max_queries": 200}}
-        e = estimate_load_hours(profile, ["percona"], ["glove-100-angular"],
-                                ["normalized"], ["ops"])
+        e = estimate_load_hours(profile, [self.UNMEASURED],
+                                ["glove-100-angular"], ["normalized"], ["ops"])
         churn = [t for t in e["query_terms"] if t["name"] == "churn re-insert"]
         assert len(churn) == 1
         # Seconds, not hours: 2,000 rows is a few seconds of work even at
@@ -1396,6 +1460,16 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
         assert churn[0]["typical_seconds"] == 0.0
         assert churn[0]["worst_seconds"] > 0
         assert "at a rate nothing here has measured" in churn[0]["basis"]
+        # Percona was the engine this test used, and it now takes the other
+        # branch: a measured load rate, so the re-insert gets a modelled
+        # duration with the rate printed in its basis. The caveat beside that
+        # rate is still the load rate's -- re-insert can be far slower.
+        p = estimate_load_hours(profile, ["percona"], ["glove-100-angular"],
+                                ["normalized"], ["ops"])
+        pchurn = [t for t in p["query_terms"]
+                  if t["name"] == "churn re-insert"][0]
+        assert pchurn["typical_seconds"] > 0
+        assert "at ~275 rows/s" in pchurn["basis"]
         # Non-vacuity: a measured engine gets a duration and a rate.
         m = estimate_load_hours(profile, ["mariadb"], ["glove-100-angular"],
                                 ["normalized"], ["ops"])
