@@ -362,17 +362,27 @@ FORK_PROBE_SAMPLES = 5
 
 #: Bound on the wait for the kernel to agree the probe is single-threaded.
 #:
-#: Measured at 118 us mean and 829 us worst over 500 settles at ten-way load
-#: on an otherwise quiet box, and 4.18 ms worst at twenty-way under spinners at
-#: load 47. So the bound is **479x the worst seen under load**, which is the
-#: figure that matters; quoting 2400x against the quiet worst case overstated
-#: it. Generous on purpose, because EXCEEDING IT IS A FAILURE and not a
-#: relaxation -- a thread still counted after 2 s did not leave. It is also
-#: what a mutant that leaves the thread alive pays per sample, which is
-#: why it is seconds and not
-#: minutes. The mutant is `one_pair` with its `gate.set()` and `thread.join()`
-#: deleted, so the thread is still on `gate.wait` and there is no `join` to
-#: block in: five samples pay the bound, cost 10 s, and then fail.
+#: **The warrant is the MARGIN, not a count of clean runs.** Worst settle
+#: observed: 3.12 ms over 2000 settles at ten-way, and 4.81 ms with the probe
+#: pinned to ONE CPU at `nice 19` against the box's existing load -- so the
+#: tightest margin measured is **416x** this bound. The shape is what makes
+#: that travel: cutting CPU share roughly tenfold worsened the worst case only
+#: 1.5x, because what is being bounded is a thread-exit completion costing
+#: microseconds of KERNEL work, not a quantity that scales with contention.
+#: Reaching 2 s needs some 400x more degradation than could be produced here.
+#:
+#: A zero-expiry rate is the weaker half and is quoted second for that reason:
+#: 75000 samples with no expiry (35000 here, 40000 independently) bounds a rate
+#: under the conditions sampled and does not generalise to another machine,
+#: whereas the margin is an argument about the mechanism. An earlier revision
+#: led with 2400x against a QUIET worst case, which overstated it.
+#:
+#: Generous on purpose, because EXCEEDING IT IS A FAILURE and not a relaxation
+#: -- a thread still counted after 2 s did not leave. It is also what a mutant
+#: that leaves the thread alive pays per sample, which is why it is seconds and
+#: not minutes. That mutant is `one_pair` with its `gate.set()` and
+#: `thread.join()` deleted, so the thread is still on `gate.wait` and there is
+#: no `join` to block in: five samples pay the bound, cost 10 s, and then fail.
 FORK_PROBE_SETTLE_S = 2.0
 
 #: A bare interpreter that forks beside a live thread and again after joining
@@ -507,11 +517,21 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
         against noise that is RARE per sample; it says nothing about a stray
         warning on MOST samples and not all. One lingering past `join()` on 80%
         of samples would have failed the old single-sample test 80% of the time
-        and a floor only where all five coincided. Where there is a kernel
-        count, BOTH shapes of that stray are now caught, and by different
-        assertions: one shorter-lived than `FORK_PROBE_SETTLE_S` is waited out,
-        so every parent is confirmed and any warning fails the strict bound;
-        one longer-lived makes the settle expire, and the expiry itself fails.
+        and a floor only where all five coincided.
+
+        Where there is a kernel count the two shapes of that stray are handled
+        DIFFERENTLY, and only one of them is *caught*. A stray shorter-lived
+        than `FORK_PROBE_SETTLE_S` is ELIMINATED: the settle waits it out, the
+        parent really is single-threaded by the time it forks, no warning is
+        produced and no assertion fires -- such a case passes silently, and
+        correctly, because there is nothing left to detect. Verified: a 50 ms
+        stray on four of five samples passes 5 of 5. A stray that outlives the
+        bound is CAUGHT, by the expiry. And a stray that dirties a parent the
+        kernel did confirm is caught by the strict bound, which is the case the
+        flat floor used to pass. Claiming the strict bound "catches" the
+        short-lived shape would be claiming detection where there is
+        elimination; the distinction is the whole reason the settle exists.
+
         The strict bound also stops a settle that silently stopped waiting,
         which still reports `confirmed` and is then held to five silent forks
         under the very race it stopped closing.
@@ -558,11 +578,22 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
             f"{sum(1 for pair in pairs if pair[2] == value)} {name}"
             for value, name in settle.items())
         # An expiry is a DEFECT, not a platform fact, so it FAILS here instead
-        # of relaxing the bound. `FORK_PROBE_SETTLE_S` is 479x the worst settle
-        # measured under load, so a thread that `join()` had already returned
-        # on, and that the kernel still counted that long afterwards, did not
+        # of relaxing the bound: the bound carries a 416x margin over the worst
+        # settle measured, so a thread that `join()` had already returned on,
+        # and that the kernel still counted that long afterwards, did not
         # leave. Only `unreadable` -- no kernel count to read at all -- is a
-        # box this test has to accommodate.
+        # box this test accommodates.
+        #
+        # **That dichotomy is not total, and the limit is worth naming.**
+        # `unreadable` keys on `OSError` or a missing `Threads:` line, so a
+        # `/proc` that HAS `Threads:` but updates it lazily -- gVisor-style
+        # sandboxes, WSL1, some emulations -- reads as an expiry and fails with
+        # a message blaming a thread that never left. Every sample behind these
+        # figures came from one kernel and one CPython 3.12.3, so they are no
+        # evidence at all about that case. The exposure is small because this
+        # repo already requires a real Linux `/proc` (`read_own_cpu_usec` and
+        # `tests/test_harness.py` read cgroup files directly), but a reader on
+        # such a box should be told to suspect the reader and not the thread.
         #
         # **Demoting on an expiry is what the first version of this rule did,
         # and it inverted the whole point.** A stray thread OUTLIVING the bound
@@ -580,9 +611,10 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
             f"{FORK_PROBE_SETTLE_S}s each, so a thread `join()` had returned "
             f"on was still counted that long afterwards and did not leave. "
             f"Warnings were joined={joined} not_joined={not_joined}. (If this "
-            f"box is pathologically slow rather than leaking a thread, that "
-            f"bound is the thing to re-measure -- it was 479x the worst "
-            f"settle seen at load 47, over 75000 samples with no expiry.)")
+            f"box is pathologically slow, or reports `Threads:` lazily, then "
+            f"the reader is the suspect and not the thread: the bound carried "
+            f"a 416x margin over the worst settle measured, but every such "
+            f"sample came from ONE box, one Linux kernel and CPython 3.12.3.)")
         # No expiry, so the kernel either confirmed every parent or could not
         # be read at all. Confirmed -> every sample must be silent, which is
         # stricter than the one sample this replaces. Unreadable -> the floor,
