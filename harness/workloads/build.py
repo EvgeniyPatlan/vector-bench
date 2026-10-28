@@ -229,21 +229,59 @@ def _server_status(driver) -> dict:
 
     The addition is the `names` check. An engine that declares no gauges --
     `EngineDriver.status_gauges` is `()`, which is six of the seven here --
-    never reaches the driver at all, so no statement is sent to a server that
-    has nothing to answer and the hook is free for everyone who does not use
-    it. That early return is also the ONLY thing standing between "additive"
-    and a `SHOW GLOBAL STATUS` per build per engine.
+    is never ASKED, so the hook is free for everyone who does not use it and
+    a future implementation that opens a connection or logs cannot be
+    triggered by a driver that wants none of it.
 
-    Coerced here rather than trusted: the hook's contract is `Dict[str, int]`
-    and this is the last point before the value becomes a published record
-    field, so a driver that returned a string gets it turned into a number or
-    loses the name.
+    **It is not what keeps the change additive, and an earlier version of
+    this comment claimed it was.** Three independent things do that, and
+    deleting this return changes no record and sends no statement, because
+    `MySQLFamilyDriver.status_counters` would iterate an empty tuple and the
+    base hook touches no cursor at all -- measured, by deleting it. What this
+    return buys is that the driver is not CALLED, which
+    `tests/test_e20_server_status_capture.py` pins directly, since nothing
+    else would notice.
+
+    Coerced per name rather than in one comprehension: a single value that
+    will not become an `int` loses its own name and not the gauges beside it.
+    The comprehension this replaced was inside the `try`, so one bad value
+    discarded the whole reading.
+
+    **Every way this comes back empty prints something, and they are
+    different lines.** The run log is this unit's only field diagnostic -- no
+    test here can run against a server -- so "no gauge declared", "the driver
+    declares one but implements nothing", "the statement was refused", "the
+    server has no such variable" and "the value is not a number" must not
+    share a silence. The last two are printed by
+    `MySQLFamilyDriver.status_counters`; the middle one here; the first is
+    visible in `status_gauges` itself.
     """
     names = tuple(getattr(driver, "status_gauges", ()) or ())
     if not names:
         return {}
+    if type(driver).status_counters is EngineDriver.status_counters:
+        # Declared a gauge and inherited the no-op. A silent `{}` here is
+        # indistinguishable from a server that has no such variable, and the
+        # two call for opposite responses: one is a missing override in this
+        # repository, the other is a fact about the server.
+        print(f"[{driver.name}] declares status gauges {list(names)} but no "
+              f"driver implementation of status_counters, so none is "
+              f"collected")
+        return {}
     try:
         reported = driver.status_counters(names) or {}
-        return {str(name): int(value) for name, value in reported.items()}
-    except Exception:
+    except Exception as exc:
+        # Includes the `ValueError` a malformed `status_gauges` raises, which
+        # is a bug in this repository and has to be findable: without this
+        # line it reads exactly like a server with no such variable. The
+        # first review of this change demonstrated that it did.
+        print(f"[{driver.name}] status read failed: {exc}")
         return {}
+    gauges: dict = {}
+    for name, value in reported.items():
+        try:
+            gauges[str(name)] = int(value)
+        except (TypeError, ValueError) as exc:
+            print(f"[{driver.name}] status value for {str(name)!r} is not an "
+                  f"int ({value!r}): {exc}")
+    return gauges

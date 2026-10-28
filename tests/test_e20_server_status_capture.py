@@ -29,6 +29,12 @@ WHAT THE FIX IS, by symbol:
   particular gauge -- §2.6 records it reading `0` after a restart, because the
   graph loads lazily -- so "absent" and "zero" are two different facts and
   have to stay two different facts.
+* `_matching_status_row` -- the row check, extracted into a named function
+  after the first review found both of its halves untested: `_` is a LIKE
+  wildcard, `Innodb_hnsw_memory_used` contains three of them, and the fixture
+  compared names for equality, so neither the widened-pattern case nor the
+  short-row case could be constructed. Deleting either half left all 29 tests
+  passing. `RecordingCursor` now translates `_` and `%` the way a server does.
 * `PerconaDriver.status_gauges` -- `("Innodb_hnsw_memory_used",)`, the only
   engine in the set that declares one.
 * `harness/workloads/build.py` -- `_server_status`, and one `extra` key,
@@ -162,11 +168,16 @@ class RecordingCursor:
     """
 
     def __init__(self, status: Optional[Dict[str, Any]] = None,
-                 rows: int = N_ROWS, raises: bool = False):
+                 rows: int = N_ROWS, raises: bool = False,
+                 raw_rows: Optional[List[Any]] = None):
         self.statements: List[str] = []
         self._status = dict(status or {})
         self._rows = rows
         self._raises = raises
+        #: Answers a status read with these rows verbatim, bypassing `status`.
+        #: For the malformed-row case, which no dict of names and values can
+        #: express.
+        self._raw_rows = raw_rows
         self._answer: List[tuple] = []
 
     def execute(self, sql, params=None):
@@ -178,14 +189,29 @@ class RecordingCursor:
     def _answer_for(self, sql: str) -> List[tuple]:
         status = STATUS_RE.match(sql)
         if status is not None:
-            # The server matches the LIKE pattern against its own names, and
-            # returns the name in its own casing. Both are reproduced: the
-            # collector is supposed to key the result by the name it ASKED
-            # for, so a fixture that echoed the request verbatim could not
-            # tell that apart from one that trusted the server's string.
-            wanted = status.group(2)
+            if self._raw_rows is not None:
+                return list(self._raw_rows)
+            # **LIKE semantics, not an equality test, and this is the whole
+            # reason this fixture was rewritten.** An earlier version matched
+            # the requested name against its own keys exactly (case-
+            # insensitively), which cannot produce the one input the
+            # collector's name check exists for: a row the server returns
+            # because the PATTERN matched, naming a different variable.
+            # Measured: with that fixture, deleting the name check from
+            # `_matching_status_row` left all 29 tests passing. `_` matches
+            # any single character and `%` any run of them, exactly as the
+            # server does it, so the widened pattern can now actually hit
+            # something.
+            #
+            # The server also returns the name in its own casing, which is
+            # reproduced too: the collector is supposed to key its result by
+            # the name it ASKED for, so a fixture that echoed the request
+            # verbatim could not tell that apart from one that trusted the
+            # server's string.
+            pattern = re.escape(status.group(2)).replace("_", ".").replace(
+                "%", ".*")
             return [(name, value) for name, value in self._status.items()
-                    if name.lower() == wanted.lower()]
+                    if re.fullmatch(pattern, name, re.IGNORECASE)]
         upper = sql.upper()
         if upper.startswith("SHOW CREATE TABLE"):
             return [SHOW_CREATE]
@@ -219,7 +245,8 @@ class RecordingCursor:
 
 
 def wired(cls, *, status: Optional[Dict[str, Any]] = None,
-          raises: bool = False, build_mode: str = "post"):
+          raises: bool = False, build_mode: str = "post",
+          raw_rows: Optional[List[Any]] = None):
     """A real driver of `cls` wired to a recording cursor, with no server.
 
     `connect()` is not called: it needs the `mariadb` connector, which is a
@@ -228,8 +255,7 @@ def wired(cls, *, status: Optional[Dict[str, Any]] = None,
     this function does instead.
     """
     driver = cls(ConnectionSpec(host="h", port=3306))
-    cursor = RecordingCursor(status=status)
-    cursor._raises = raises
+    cursor = RecordingCursor(status=status, raises=raises, raw_rows=raw_rows)
     driver._cur = cursor
     driver._index = IndexSpec(dim=DIM, m=16, metric=ds.EUCLIDEAN,
                               build_mode=build_mode)
@@ -302,6 +328,63 @@ class TestTheStatementIssued:
             with pytest.raises(ValueError):
                 driver.status_counters((bad,))
         assert cursor_of(driver).statements == []
+
+    def test_a_row_the_widened_pattern_dragged_in_is_not_taken(self):
+        """**The headline catch, and it was untested until the first review
+        found it.** `_` is a LIKE wildcard and `Innodb_hnsw_memory_used`
+        contains three of them, so `LIKE 'Innodb_hnsw_memory_used'` also
+        matches `Innodb_hnsw_memoryXused`. The old fixture compared names for
+        equality, so the only input that reaches
+        `_matching_status_row`'s name check could not be constructed, and
+        deleting that check left all 29 tests passing.
+
+        The decoy is FIRST in the status dict on purpose: the collector takes
+        the first matching row, so an unguarded version returns the decoy's
+        value under the real name's key -- a byte count filed as another
+        variable. Both values are distinct so the assertion can tell which
+        one came back."""
+        decoy = "Innodb_hnsw_memoryXused"
+        driver = wired(PerconaDriver, status={decoy: 999,
+                                              GAUGE: MEMORY_USED})
+        got = driver.status_counters((GAUGE,))
+
+        statement = cursor_of(driver).status_statements[0]
+        served = cursor_of(driver)._answer_for(statement)
+        print(f"the fixture's server answered {len(served)} rows: {served}")
+        assert len(served) == 2, (
+            "DEAD PROBE: the fixture did not reproduce LIKE widening, so the "
+            "name check cannot be reached")
+        print(f"HONEST (exact name wins) = {got!r}")
+        print(f"MUTANT (first row wins)  = {{{GAUGE!r}: 999}}")
+        assert got == {GAUGE: MEMORY_USED}
+
+    def test_a_row_too_short_to_hold_a_value_is_skipped_not_fatal(self):
+        """The other half of the same guard, and it fails differently: a
+        1-tuple that reached `row[1]` would raise inside the per-name
+        `except`, which omits the gauge AND reports it as a failed read --
+        losing the good row that follows it in the same result."""
+        driver = wired(PerconaDriver,
+                       raw_rows=[(GAUGE,), (GAUGE, MEMORY_USED)])
+        got = driver.status_counters((GAUGE,))
+        print(f"HONEST (short row skipped) = {got!r}")
+        print(f"MUTANT (length check gone) = {{}} plus a failed-read line")
+        assert got == {GAUGE: MEMORY_USED}
+
+    def test_the_guard_is_reachable_on_its_own(self):
+        """`_matching_status_row` is a named function rather than a condition
+        inside the loop precisely so these cases can be stated directly. A
+        condition that only a live server can reach is a condition nothing
+        tests, which is how the two mutants above survived."""
+        from harness.drivers.mysql_family import _matching_status_row as pick
+        assert pick([(GAUGE, 7)], GAUGE) == (GAUGE, 7)
+        assert pick([("INNODB_HNSW_MEMORY_USED", 7)], GAUGE) is not None
+        assert pick([("Innodb_hnsw_memoryXused", 7)], GAUGE) is None
+        assert pick([(GAUGE,)], GAUGE) is None
+        assert pick([], GAUGE) is None
+        assert pick([(GAUGE,), ("x", 1), (GAUGE, 7)], GAUGE) == (GAUGE, 7)
+        # Not a row at all. Skipped rather than allowed to abort the names
+        # after it.
+        assert pick([None, (GAUGE, 7)], GAUGE) == (GAUGE, 7)
 
     def test_the_result_is_keyed_by_the_name_asked_for(self):
         """Not by the server's string, which is a different object and whose
@@ -437,6 +520,15 @@ class TestOnlyPerconaDeclaresAGauge:
         assert declared["PerconaDriver"] == (GAUGE,)
         assert all(gauges == () for name, gauges in declared.items()
                    if name != "PerconaDriver"), declared
+        # Non-vacuity. Deriving the set from the registry catches a driver
+        # ADDED without thinking about gauges, which is the drift this test
+        # exists for -- but an "all of them" assertion over a registry that
+        # had SHRUNK would pass while saying nothing. The six architectures
+        # that exist today are named so that losing one is a failure here
+        # rather than a quietly weaker test.
+        assert set(declared) >= {"MariaDBDriver", "AliSQLDriver",
+                                 "PostgresDriver", "MongoDriver",
+                                 "ValkeyDriver", "PerconaDriver"}, declared
 
     def test_mariadb_and_alisql_send_no_status_statement_through_build_run(
             self, tmp_path, dataset):
@@ -534,6 +626,44 @@ class OneGauge(FakeDriver):
         return {str(name): MEMORY_USED for name in names}
 
 
+class ZeroGauge(FakeDriver):
+    """Reports the gauge reading zero, which is the single most likely first
+    real reading: `docs/09-adding-percona-server.md` §2.6 records
+    `Innodb_hnsw_memory_used` at `0` after a restart because the graph faults
+    in lazily."""
+
+    status_gauges = (GAUGE,)
+
+    def status_counters(self, names: Sequence[str],
+                        scope: str = "global") -> Dict[str, int]:
+        return {str(name): 0 for name in names}
+
+
+class NeverAsked(FakeDriver):
+    """Declares no gauges and records it if asked anyway.
+
+    The only thing that notices `_server_status`' early return. Deleting that
+    return sends no statement and writes no key -- the family loop iterates an
+    empty tuple and the base hook touches no cursor -- so "the driver is not
+    called" is the whole of what the return buys.
+
+    **It records the call rather than raising, and that distinction is the
+    difference between a live test and a dead one.** The first version of
+    this class raised `AssertionError`, and the mutant survived: the raise
+    lands in `_server_status`' own `except Exception`, which swallows it,
+    prints a failed-read line and returns `{}` -- so the record looked
+    identical and the test passed. A swallowed assertion is not an assertion.
+    `asks` is a class attribute because `_one_build` constructs the driver
+    itself and hands back only the record."""
+
+    asks: List[tuple] = []
+
+    def status_counters(self, names: Sequence[str],
+                        scope: str = "global") -> Dict[str, int]:
+        type(self).asks.append((tuple(names), scope))
+        return {}
+
+
 class SilentGauge(FakeDriver):
     """Declares a gauge the server does not answer for -- the shape a Percona
     build on a server without the variable would take. Assertion 3 at the
@@ -552,6 +682,88 @@ class TestTheRecordIsAdditive:
         built = _one_build(OneGauge)
         print(f"extra = {built['extra']}")
         assert built["extra"][KEY] == {GAUGE: MEMORY_USED}
+
+    def test_a_recorded_zero_reaches_the_record(self):
+        """**The layer a report reads, which the collector's own zero test
+        does not cover.** `build.py` writes the key only when the dict is
+        non-empty, and "non-empty" has to mean non-empty and not truthy: a
+        gauge reading `0` is §2.6's post-restart measurement and the most
+        likely first real reading on the build host. Changing both
+        `if server_status` sites to `if any(server_status.values())` left all
+        29 of the previous tests passing, because nothing drove a zero
+        through `build.run`."""
+        built = _one_build(ZeroGauge)
+        print(f"HONEST (zero recorded)   = {built['extra'].get(KEY)!r}")
+        print(f"MUTANT (truthiness test) = key absent")
+        assert built["extra"][KEY] == {GAUGE: 0}
+
+    def test_a_driver_declaring_no_gauges_is_never_asked(self):
+        """What `_server_status`' early return actually buys, and the only
+        observable it has. The hook is free for the six engines that want
+        none of it -- a future implementation that opens a connection or logs
+        cannot be triggered by a driver that declared nothing.
+
+        Asserted on the recorded call and not on the record, because the
+        record is identical either way: with the return deleted, the driver
+        is asked for an empty tuple and answers `{}`."""
+        NeverAsked.asks = []
+        built = _one_build(NeverAsked)
+        print(f"HONEST (not asked) = {NeverAsked.asks!r}")
+        print(f"MUTANT (asked for ()) = [((), 'global')]")
+        assert NeverAsked.asks == []
+        assert KEY not in built["extra"]
+        assert built["phase"] == records.PHASE_BUILD
+
+    def test_a_declared_gauge_with_no_implementation_says_so(self, capsys):
+        """The fifth way this comes back empty, and the one that used to be
+        silent. A driver that declares a gauge and inherits the base no-op is
+        a missing override in this repository; a server with no such variable
+        is a fact about the server. They produce the same `{}` and call for
+        opposite responses, so the run log has to separate them -- it is the
+        only diagnostic this unit has in the field."""
+        class DeclaresButInherits(FakeDriver):
+            status_gauges = (GAUGE,)
+
+        built = _one_build(DeclaresButInherits)
+        printed = capsys.readouterr().out
+        assert KEY not in built["extra"]
+        assert "no driver implementation" in printed, printed
+        assert GAUGE in printed
+
+    def test_a_hook_that_raises_says_so_rather_than_looking_like_absence(
+            self, capsys):
+        """`status_counters` raising is either a server failure or a
+        `ValueError` from a malformed `status_gauges` -- a bug in this
+        repository. Without a line it is byte-for-byte indistinguishable from
+        a server that has no such variable, which is what the first review
+        demonstrated: the claim that a raise is "findable" was false at this
+        call site."""
+        class Exploding(FakeDriver):
+            status_gauges = (GAUGE,)
+
+            def status_counters(self, names, scope="global"):
+                raise StatusError("the hook itself is broken")
+
+        built = _one_build(Exploding)
+        printed = capsys.readouterr().out
+        assert KEY not in built["extra"]
+        assert "status read failed" in printed, printed
+        assert "the hook itself is broken" in printed
+
+    def test_one_unparseable_value_does_not_lose_the_others(self, capsys):
+        """The coercion is per name. In one comprehension inside the `try` --
+        which is what this replaced -- a single value that would not become an
+        `int` discarded the whole reading, including names that were fine."""
+        class MixedBag(FakeDriver):
+            status_gauges = (GAUGE, "Innodb_other_gauge")
+
+            def status_counters(self, names, scope="global"):
+                return {GAUGE: MEMORY_USED, "Innodb_other_gauge": "nonsense"}
+
+        built = _one_build(MixedBag)
+        printed = capsys.readouterr().out
+        assert built["extra"][KEY] == {GAUGE: MEMORY_USED}
+        assert "is not an int" in printed, printed
 
     def test_a_driver_that_reports_none_gets_no_key_at_all(self):
         built = _one_build(NoGauges)
@@ -644,16 +856,35 @@ class TestNoMeasurementVersionBumpIsOwed:
     copied from anywhere.
 
     No existing number moves and no identity component changes. The version 8
-    block names the identity components by symbol: `OPS_UNIT_FIELDS`
-    (`report/generate.py`), `OPS_UNIT_KEYS` (`workloads/churn_readers.py`),
-    `build_signature` and `memory_stem` (`report/loaders.py`), and
-    `charts.series_key` through the first. Every one of them reads NAMED
-    COLUMNS -- `m`, `build_mode`, `storage_engine`, `resource_pass`, engine,
-    dataset -- except `build_signature`, which reads one `extra` key by name,
-    `extra.source_file`, and that key is written by the ann overlay modules
-    and not by this harness. So a new `extra` key cannot re-partition
-    anything, and the test below pins that rather than asserting it in a
-    docstring.
+    block names them by symbol: `OPS_UNIT_FIELDS` (`report/generate.py`),
+    `OPS_UNIT_KEYS` (`workloads/churn_readers.py`), `build_signature` and
+    `memory_stem` (`report/loaders.py`), and `charts.series_key` through the
+    first.
+
+    **Three of them read `extra`, and an earlier version of this docstring
+    got all three wrong** -- it said `build_signature` read one key, named
+    the wrong writer for it, and filed `series_key` under "named columns
+    only". Corrected, by opening each one:
+
+    * `build_signature` reads **two** `extra` keys, `source_file` and
+      `quantization`.
+    * `extra.source_file` is written by `report/loaders.py` from the ann
+      result path, not by the overlay modules.
+    * `extra.quantization` **is** written by this harness --
+      `MongoDriver.capabilities()` returns it and `build.py`'s
+      `_driver_capabilities` merges it into the very dict this unit appends
+      to.
+    * `charts.series_key` reads a third key, `extra.iterative_scan`, beside
+      the engine and the signature.
+
+    **The verdict survives all of that, and for a better reason than the one
+    it had.** Every identity component reads `extra` by LITERAL KEY NAME --
+    never by enumerating a record's key set -- so a key that none of them
+    names cannot change what any of them returns, however many keys they
+    read and whoever writes them. The test below pins that by running all
+    five over a record with and without the key, `series_key` included; it
+    ran three before, and the one it skipped was the one the prose had
+    wrong.
 
     `ANN_MEASUREMENT_VERSION` is not in question: it is the first field of
     `ann_fingerprint`, which keys `results/annb/<pass>/<fingerprint>/`, and
@@ -668,18 +899,34 @@ class TestNoMeasurementVersionBumpIsOwed:
         assert records.OPS_MEASUREMENT_VERSION == 8
 
     def test_the_new_key_reaches_no_identity_component(self):
-        from report import generate, loaders
+        from report import charts, generate, loaders
         from harness.workloads import churn_readers
         assert KEY not in generate.OPS_UNIT_FIELDS
         assert KEY not in churn_readers.OPS_UNIT_KEYS
-        with_status = {"engine": "percona", "dataset": "glove-100-angular",
-                       "resource_pass": "normalized", "m": 16,
-                       "build_mode": "post", "storage_engine": "InnoDB",
-                       "extra": {KEY: {GAUGE: MEMORY_USED}}}
-        without = dict(with_status, extra={})
+
+        # The `extra` of a record that carries every key an identity
+        # component actually reads, so the comparison is made against a
+        # populated signature rather than an empty one -- an all-None
+        # signature would compare equal under almost any mutation.
+        base_extra = {"source_file": "angular_M_16_quantization_none_400.hdf5",
+                      "quantization": "none",
+                      "iterative_scan": "relaxed_order"}
+        without = {"engine": "percona", "dataset": "glove-100-angular",
+                   "resource_pass": "normalized", "m": 16,
+                   "build_mode": "post", "storage_engine": "InnoDB",
+                   "extra": dict(base_extra)}
+        with_status = dict(without,
+                           extra={**base_extra, KEY: {GAUGE: MEMORY_USED}})
+
         for fn in (loaders.build_signature, loaders.memory_stem,
-                   generate.ops_unit):
-            assert fn(with_status) == fn(without), fn.__name__
+                   loaders.operating_point_key, generate.ops_unit,
+                   charts.series_key):
+            before, after = fn(without), fn(with_status)
+            print(f"{fn.__name__}: {before!r}")
+            assert before == after, fn.__name__
+            # Non-vacuity: a component that returned None for both would
+            # satisfy the equality above without reading anything.
+            assert before is not None and before != (), fn.__name__
 
 
 @pytest.fixture

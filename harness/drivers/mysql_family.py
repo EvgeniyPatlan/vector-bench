@@ -69,12 +69,26 @@ STATUS_SCOPES: Dict[str, str] = {"global": "GLOBAL", "session": "SESSION"}
 #:
 #: Two separate hazards, and the second is the quiet one. A quote or a
 #: semicolon would be injection, which is the obvious one. But `LIKE` also
-#: gives `%` and `_` their own meanings, and `Innodb_hnsw_memory_used` CONTAINS
-#: underscores -- so the pattern this builds is already slightly wider than the
-#: name it was built from, and a name carrying a literal `%` would be wider
-#: still. `status_counters` closes that by matching the row the server returns
-#: against the name it asked for, rather than trusting the pattern to have been
-#: exact.
+#: gives `%` and `_` their own meanings, and `Innodb_hnsw_memory_used` contains
+#: three underscores -- so the pattern this builds is already wider than the
+#: name it was built from: each `_` matches any single character.
+#: `_matching_status_row` closes that by matching the row the server returns
+#: against the name that was asked for, rather than trusting the pattern to
+#: have been exact.
+#:
+#: **How much that insurance is worth, at this pin, stated so nobody mistakes
+#: it for load-bearing.** This pattern rejects `%`, so the only widening is
+#: `_` to any single character, and a false match would need a 23-character
+#: status variable carrying the literal `hnsw` at offset 8 -- while
+#: `docs/09-adding-percona-server.md` §2.6 establishes from
+#: `innobase_system_variables[]` and the status array beside it that the server
+#: registers exactly one HNSW status entry. So no collision exists today. The
+#: check stays because the cost is one comparison and the failure it prevents
+#: is a byte count recorded under another variable's name, which is the kind of
+#: wrong number this repository opens by warning about -- and because the
+#: SECOND thing the match buys is not insurance at all: keying the result by
+#: the name that was asked for keeps the record's key set decidable from this
+#: repository rather than from the server's choice of casing.
 STATUS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -83,16 +97,35 @@ def status_int(value: Any) -> Optional[int]:
 
     Connector/C hands a `SHOW STATUS` value back as `str` for most servers,
     as `bytes` when the column arrives binary, and occasionally already
-    coerced -- and `int(b"17")` is a `TypeError`, not a parse. All three
-    spellings are the same measurement, so all three are accepted here rather
-    than at each call site.
+    coerced. All three spellings are the same measurement, so all three are
+    accepted here rather than at each call site.
+
+    **Not because `int()` refuses bytes -- it does not.** `int(b"17")` is 17
+    and `int(b"  17  ")` is 17; an earlier version of this comment said
+    otherwise and was wrong. What the branches actually buy, each measured:
+
+    * `b"0.000"` -> 0. Bare `int()` raises `ValueError` on a decimal string in
+      either spelling, and some status variables are spelled that way. The
+      decode is what puts bytes onto the string path below, where the
+      `float()` fallback lives.
+    * `"disabled"` -> `None` rather than a `ValueError` raised at the call
+      site.
+    * `True` -> `None`. A bool IS an `int` in Python, so without the first
+      branch a fake or a future connector handing back `True` would record 1.
+    * `""` -> `None`, and `None` -> `None`, where bare `int()` raises
+      `ValueError` and `TypeError` respectively.
+    * a 20-digit byte count -> exact, because `int(text)` is tried BEFORE
+      `int(float(text))`; through float64 it would lose its low bits.
+    * bytes that are not UTF-8 -> `None` rather than a `UnicodeDecodeError`
+      escaping.
 
     `None` for anything that is not a number, because `status_counters`
     returns `Dict[str, int]` and a status variable can perfectly well hold a
     word: `Ssl_cipher` is a string and `Innodb_buffer_pool_dump_status` is a
     sentence. Guessing a number for one of those would put a fabricated
-    integer on a record. Omitting it is the same answer this module gives a
-    variable the server does not expose at all, and for the same reason.
+    integer on a record. Unlike a variable the server does not expose, this
+    one gets a log line at the call site -- the two are different facts and
+    `build.py`'s diagnostic has to tell them apart.
     """
     if isinstance(value, bool):
         # `True` is an int in Python and is not a counter reading. No server
@@ -122,6 +155,49 @@ def status_int(value: Any) -> Optional[int]:
         return int(float(text))
     except (ValueError, OverflowError):
         return None
+
+
+def _matching_status_row(rows: Sequence[Any], name: str) -> Optional[Any]:
+    """The row of a `SHOW ... STATUS LIKE` result that really names `name`.
+
+    `None` when none of them does, which is what "the server does not expose
+    this variable" looks like from here.
+
+    Two rejections, and they fail differently, which is why both are here and
+    why this is a named function rather than a condition inside the loop --
+    a condition that cannot be reached from the caller's fixture cannot be
+    tested, and BOTH of these were untested for exactly that reason until the
+    first review of this change deleted each in turn and watched all 29 tests
+    pass:
+
+    * **A row naming something else.** `_` is a LIKE wildcard, so the pattern
+      `status_counters` builds is wider than the name it was built from and
+      the server may answer with a different variable. Taking it would record
+      one variable's value under another variable's name -- a plausible
+      number in the wrong row, which is worse than no number. See
+      `STATUS_NAME_RE` for how much this is worth at the current pin: no
+      collision exists today, and the check is one comparison.
+    * **A row too short to carry a value.** `SHOW STATUS` returns
+      (Variable_name, Value), but this is the last point before `row[1]`, and
+      a malformed row that reached the subscript would raise inside the
+      caller's per-name `except` -- which omits the gauge AND reports it as a
+      failed read, losing a good row that came after it in the same result.
+
+    The comparison is case-insensitive because status variable names are, and
+    the caller keys its result by the name it asked for rather than by
+    `row[0]`, so the server's casing never reaches a record.
+    """
+    for row in rows:
+        try:
+            if len(row) < 2:
+                continue
+            if str(row[0]).lower() == name.lower():
+                return row
+        except TypeError:
+            # Something that is not a sized, indexable row. Skipped rather
+            # than allowed to abort the names after this one.
+            continue
+    return None
 
 
 def to_binary_f32(vector) -> bytes:
@@ -738,14 +814,22 @@ class MySQLFamilyDriver(EngineDriver):
         it.
 
         **Two failure kinds, kept apart.** A server that cannot answer is
-        operational and is omitted. A `scope` or a `name` this method cannot
-        spell safely is a CALLER bug -- both reach a statement string, and
-        `status_gauges` is a code-declared tuple, so the only way to get here
-        is a typo in this repository -- and raises `ValueError`, the
+        operational and is omitted -- with a log line, because this unit's
+        only field diagnostic is the run log and three different silences
+        would be indistinguishable in it. A `scope` or a `name` this method
+        cannot spell safely is a CALLER bug -- both reach a statement string,
+        and `status_gauges` is a code-declared tuple, so the only way to get
+        here is a typo in this repository -- and raises `ValueError`, the
         discipline `checked_filter_column` uses for exactly the same reason.
-        Raising loses nothing: `build.py`'s call site swallows, so the typo
-        costs the gauge and never the run, and it is findable instead of
-        looking forever like a server that has no such variable.
+        Raising loses nothing: `build.py`'s call site swallows it, prints it
+        and keeps the build's measurement.
+
+        The scope is interpolated from `STATUS_SCOPES`, so it is always an
+        element of a whitelist. **The name is not** -- it is the caller's
+        string, checked against `STATUS_NAME_RE` and then formatted in, which
+        is a pattern match rather than a membership test. That is the weaker
+        of the two guarantees and is worth naming as such: what makes it safe
+        is the character class, not a lookup.
         """
         keyword = STATUS_SCOPES.get(str(scope).lower())
         if keyword is None:
@@ -765,28 +849,27 @@ class MySQLFamilyDriver(EngineDriver):
         for name in wanted:
             try:
                 self._cur.execute(f"SHOW {keyword} STATUS LIKE '{name}'")
-                rows = self._cur.fetchall() or []
+                row = _matching_status_row(self._cur.fetchall() or [], name)
+                value = None if row is None else status_int(row[1])
             except Exception as exc:
                 # After the build, and after it was timed. Nothing measured is
                 # at risk here, so report and carry on.
                 print(f"[{self.name}] status read '{name}' failed: {exc}")
                 continue
-            for row in rows:
-                if len(row) < 2 or str(row[0]).lower() != name.lower():
-                    # `_` is a LIKE wildcard, so the pattern can match a name
-                    # that is not the one asked for. Checked rather than
-                    # assumed -- see STATUS_NAME_RE.
-                    continue
-                value = status_int(row[1])
-                if value is not None:
-                    # Keyed by the name ASKED FOR, not by the server's
-                    # spelling of it. `checked_filter_column` returns the
-                    # whitelisted element for the same reason: the key set of
-                    # the record this lands on has to be decidable from this
-                    # repository, because that is what a report looks a name
-                    # up in.
-                    found[name] = value
-                break
+            if row is None:
+                print(f"[{self.name}] status variable '{name}' is not exposed "
+                      f"by this server")
+                continue
+            if value is None:
+                print(f"[{self.name}] status variable '{name}' reads "
+                      f"{row[1]!r}, which is not a number; omitted")
+                continue
+            # Keyed by the name ASKED FOR, not by the server's spelling of it.
+            # `checked_filter_column` returns the whitelisted element for the
+            # same reason: the key set of the record this lands on has to be
+            # decidable from this repository, because that is what a report
+            # looks a name up in.
+            found[name] = value
         return found
 
     def capabilities(self) -> Dict[str, Any]:
