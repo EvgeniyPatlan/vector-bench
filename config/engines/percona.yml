@@ -192,7 +192,8 @@ server:
     # 0.35 x 112.5 = 39.4 GiB of core -- written into the data volume under
     # state/, on the filesystem the checkout is on, and then copied into
     # results/ before teardown. With it OFF the core is bounded by the rest of
-    # the resident set, which in that run peaked at 48.5 GiB total.
+    # the resident set, which across that run's ops phases peaked at
+    # 48.5 GiB (54.7 GiB counting its ann phases, which this does not serve).
     #
     # Nothing is lost by switching it off: the buffer pool is a cache of pages
     # that are also on disk, and the question a core answers here is which

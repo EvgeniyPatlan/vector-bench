@@ -13,9 +13,12 @@ checked against the tree before being written:
       `is_running` and `container_exists`; both run `docker inspect` and throw
       the rest away. *OOMKilled* is the fact that settles a cgroup OOM against
       an in-process crash with no cooperation from the server at all, and it
-      was never read. The reference run's peak server RSS was 48.5 GiB against
-      a 112.5 GiB container cap, so the cgroup-OOM hypothesis was live and
-      could not be closed.
+      was never read. The reference run's peak server RSS ACROSS ITS OPS
+      PHASES was 48.5 GiB against a 112.5 GiB container cap, so the
+      cgroup-OOM hypothesis was live and could not be closed. (54.7 GiB is
+      that run's percona peak overall, in `gist-960-euclidean-tuned-ann`; the
+      ops scope is the right one here because the ops units are what died,
+      and saying "the run" claimed more than the figure supports.)
   G2  `ContainerSpec` had no ulimit field and `_spec_args` emitted no
       `--ulimit`, so the core size limit was whatever the daemon defaulted to.
   G3  `config/engines/percona.yml`'s `server` blocks did not ask mysqld for a
@@ -75,6 +78,66 @@ def _engine_text():
     with open(ENGINE_PATH) as fh:
         return fh.read()
 
+#: Any sentence that makes a CLAIM about whether a server has taken these
+#: flags, by what it says rather than by one of a handful of spellings. The
+#: four-string blacklist this replaces was defeated twice: "Update: the
+#: rebuild brought mysqld up clean with both of these present" carried none of
+#: the four words, and "SETTLED: a live server has taken both of these"
+#: carried a fifth.
+_CLAIM_RE = re.compile(
+    r"\b(accept\w*|verif\w*|settl\w*|confirm\w*|validat\w*"
+    r"|came up|come up|brought\s+\w+\s+up|up clean|ran clean"
+    r"|has taken|have taken|took both|tested)\b", re.IGNORECASE)
+
+#: What turns such a claim into the honest negative one. A claim sentence
+#: carrying none of these is asserting that a server HAS taken the flags.
+_NEGATION_RE = re.compile(
+    r"\b(never|not|no|cannot|can't|un(verified|accepted|tested|known)"
+    r"|proposed|until|would|nothing|neither)\b", re.IGNORECASE)
+
+#: The caveat itself, in any of the spellings that make the negative claim.
+_CAVEAT_RE = re.compile(
+    r"never been accepted by a running server|has never run"
+    r"|not been verified", re.IGNORECASE)
+
+
+def _comment_prose(lines):
+    """Comment lines joined back into prose, so sentences can be examined.
+
+    A YAML comment is hard-wrapped, so a sentence is split across lines and
+    neither half can be judged on its own.
+    """
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            out.append(stripped.lstrip("#").strip())
+    return " ".join(part for part in out if part)
+
+
+def _sentences(prose):
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", prose)
+            if part.strip()]
+
+
+def _block_above(text, needle):
+    """The contiguous comment block directly above the line holding `needle`.
+
+    This is "the prose a reader meets immediately before the flag", which is
+    what the placement arm has to be about -- a caveat with a contradiction
+    wedged between it and the flag is not a caveat the reader believes.
+    """
+    lines = text.split("\n")
+    index = next(i for i, line in enumerate(lines) if needle in line
+                 and not line.strip().startswith("#"))
+    block = []
+    i = index - 1
+    while i >= 0 and lines[i].strip().startswith("#"):
+        block.append(lines[i])
+        i -= 1
+    return list(reversed(block))
+
+
 
 class _Resolved:
     """The resource figures `server_args` substitutes.
@@ -120,6 +183,14 @@ def _ops_run(tmp_path, engine, dataset="gist-960-euclidean",
          "datasets": str(tmp_path / "datasets"),
          "ops_results": str(run_dir)},
         "r1", dataset, tag)
+
+
+#: What `exit_state` returns for a container that has ended. Both captures
+#: take it now rather than fetching it themselves: `_save_server_log` does one
+#: `docker inspect` and passes it down, and for the core capture it is also
+#: the gate -- see `test_a_live_server_is_not_searched_for_a_core`.
+ENDED = {"exit_code": 134, "oom_killed": False,
+         "finished_at": "2026-10-15T22:22:05Z", "error": ""}
 
 
 def _make_bind_dir(tmp_path, run):
@@ -253,8 +324,17 @@ class TestTheUlimitReachesTheArgvAndNothingElseMoves:
 # ---------------------------------------------------------------------------
 
 class TestTheEngineConfigDeclaresTheCoreUlimit:
-    """Per-engine rather than global, so six configs stay as they are and the
-    value lands in `run-manifest.json` with the rest of the runtime block."""
+    """Per-engine rather than global, so six configs stay as they are.
+
+    NOT so the value reaches the manifest, which an earlier version of this
+    docstring claimed and which is false: `Manifest.set_engine` writes an
+    engine's `source`, `build`, `images` and `presentation` and no `runtime`
+    block at all, `docker_ctl.start` does not print its argv, and nothing
+    `tee`s the console, so the `docker run` line is archived nowhere. The
+    limit in force when a core was written is whatever this file said at the
+    time. `ContainerSpec.ulimits` and the config comment both say so; this one
+    said the opposite and was the only site.
+    """
 
     def test_the_config_declares_it(self):
         from orchestrator.config import load_engine
@@ -344,8 +424,13 @@ class TestTheServerFlagsAskForACore:
         """In `server.common`, so neither pass can be the one that forgot.
 
         A core only matters on the path where the measurement is already lost,
-        and that path exists in both passes -- the reference run's failures
-        were 7 normalized and 6 tuned.
+        and that path exists in both passes. Counted from the seven-engine
+        bundle, the twelve units that wrote no record are 7 normalized and 5
+        tuned. (An earlier version of this docstring said 7 and 6, which sums
+        to the PRE-resume thirteen while taking its normalized half from the
+        post-resume twelve -- the exact confusion
+        `TestTheReferenceRunIsCountedCorrectly` exists to stop. Pre-resume is
+        8 and 5.)
         """
         from orchestrator.config import server_args
         flags = server_args(percona, resource_pass, _Resolved())
@@ -386,50 +471,104 @@ class TestTheServerFlagsAskForACore:
         matching = [f for f in flags if "innodb-buffer-pool-in-core-file" in f]
         assert matching == [BUFFER_POOL_FLAG], matching
 
-    def test_the_comment_says_the_flags_have_never_been_accepted(self):
-        """POLARITY AND PLACEMENT, not presence.
+    def test_the_caveat_is_the_first_prose_a_reader_of_the_flag_meets(self):
+        """PLACEMENT, and stronger than "somewhere above the flag".
 
-        The failure this guards is a later editor deleting the caveat because
-        the flags "obviously work", and the only reason they are not verified
-        is that verifying them needs the rebuild. A guard that required the
-        word "unverified" to appear somewhere in a 350-line config would be
-        satisfied by a sentence about something else entirely, so:
+        The first version of this required only that the caveat appear before
+        the flag. That left the whole comment block between them open, and a
+        contradiction wedged in there -- "Update: the rebuild brought mysqld
+        up clean with both of these present", immediately above the flag --
+        passed. A caveat a reader passes and then reads a retraction of is not
+        a caveat.
 
-          * PLACEMENT -- the caveat has to be in the `server:` block, above
-            the flags it is about, not in the file's header where a reader of
-            the flag will not meet it.
-          * POLARITY -- it has to say the flags have NOT been accepted by a
-            running server. The inverted form, "both flags were accepted by
-            the server", is the thing that must fail.
+        So: the contiguous comment block directly above `--core-file` must
+        BEGIN with the caveat. Anything inserted between them displaces it
+        from first position and fails here.
         """
-        text = _engine_text()
-        server_block = text.split("\nserver:", 1)[1].split(
-            "\nstorage_engines:", 1)[0]
-        assert CORE_FLAG in server_block, "the flag is not in the server block"
-        flag_at = server_block.index(CORE_FLAG)
+        block = _block_above(_engine_text(), CORE_FLAG)
+        assert block, "there is no comment above --core-file at all"
+        sentences = _sentences(_comment_prose(block))
+        assert sentences, "the comment above --core-file carries no prose"
+        print(f"first sentence above the flag: {sentences[0]!r}")
+        assert _CAVEAT_RE.search(sentences[0]), (
+            "the first thing said above --core-file must be that the flags "
+            "have never been accepted by a running server; it currently says "
+            f"{sentences[0]!r}")
+        # The gate is named, so a reader knows what would settle it.
+        assert "dev" in " ".join(sentences), (
+            "the caveat must name the run that settles it")
 
-        # Polarity: the negative claim, in one of the spellings that makes it.
-        caveat = re.search(
-            r"(never been accepted by a running server"
-            r"|has never run|not been verified)", server_block,
-            re.IGNORECASE)
-        assert caveat, (
-            "the server block does not say the flags are unverified; it must, "
-            "because an unknown server variable makes mysqld exit at startup "
-            "and nothing here has started one")
-        # Placement: the caveat leads, the flags follow.
-        assert caveat.start() < flag_at, (
-            "the caveat must come before the flags it is about: a reader who "
-            "stops at the flag has to have read it")
-        # Polarity: nothing may claim the opposite.
-        lowered = server_block.lower()
+    def test_no_sentence_in_the_server_block_claims_a_server_took_the_flags(
+            self):
+        """POLARITY, asserted on the CLAIM rather than on a list of spellings.
+
+        WHAT THIS REPLACES AND WHY. The first version banned four fixed
+        strings, and two rewordings walked past it while asserting exactly
+        what the four were there to forbid:
+
+            "Update: the rebuild brought mysqld up clean with both of these
+             present"                                          -> 54 passed
+            "SETTLED: a live server has taken both of these; the paragraph
+             below is kept for history only"                   -> 54 passed
+
+        A blacklist resists spellings. What has to be resisted is the claim.
+        So every sentence in the `server:` block that says anything about
+        acceptance, verification, settling, confirming or a server coming up
+        must also carry a negation -- which the honest caveat does and an
+        assertion that the flags work does not.
+
+        THE NEGATION MUST COME BEFORE THE CLAIM, in the same sentence, and
+        that is not a detail. A sentence-wide check was the version this file
+        shipped first, and its author's own fifth attack walked past it:
+
+            "In fact these two were accepted by a live server on the build
+             host already, so no further check is needed here."
+                                                               -> 56 passed
+
+        "no further check" supplied the negation token for a sentence
+        asserting the opposite, with the caveat still first in the block so
+        the placement arm was satisfied too. Requiring the negation to
+        PRECEDE the claim token rejects it: "have never been accepted" has
+        one before, "were accepted ... so no further check" has none.
+
+        WHAT THIS STILL CANNOT DO, said rather than left to be discovered by
+        the next reviewer. It is lexical. A claim phrased entirely outside
+        `_CLAIM_RE`'s vocabulary gets through, and so does a negation placed
+        before the claim for the sake of it -- "No, these two were accepted on
+        the build host" passes, and the author checked that rather than
+        assuming it. What the three arms buy is that every hedge tried so far
+        has to get past a placement rule that does not depend on vocabulary,
+        a positional polarity rule, and the four spellings already used; what
+        they do not buy is a decision about whether prose is true, which no
+        text guard can make.
+        """
+        server_block = _engine_text().split("\nserver:", 1)[1].split(
+            "\nstorage_engines:", 1)[0]
+        sentences = _sentences(_comment_prose(server_block.split("\n")))
+        found = 0
+        for sentence in sentences:
+            for claim in _CLAIM_RE.finditer(sentence):
+                found += 1
+                before = sentence[:claim.start()]
+                print(f"  claim {claim.group(0)!r} after {before[-60:]!r}")
+                assert _NEGATION_RE.search(before), (
+                    "this sentence claims a server has taken the flags, and "
+                    "none has -- no image has been built from this engine. "
+                    "If a `dev` run has now accepted them, the caveat comes "
+                    "out with the same change rather than being contradicted "
+                    f"beside it:\n  {sentence!r}")
+        print(f"claim occurrences checked: {found}")
+        assert found, (
+            "nothing in the server block says anything about whether these "
+            "flags have been accepted; the caveat is gone")
+        # The four spellings that have actually been used to walk past an
+        # earlier version of this guard. Kept as a regression arm: the rule
+        # above is the general one, and these are the ones already tried.
+        lowered = " ".join(sentences).lower()
         for wrong in ("both flags were accepted", "verified on the build host",
                       "confirmed by a running server",
                       "accepted by the server"):
             assert wrong not in lowered, wrong
-        # The gate is named, so a reader knows what would settle it.
-        assert "dev" in server_block, (
-            "the caveat must name the run that settles it")
 
     def test_the_comment_carries_the_buffer_pool_arithmetic(self):
         """Why the second flag exists, in numbers rather than in adjectives.
@@ -665,7 +804,7 @@ class TestNeitherCaptureMayRaise:
         from orchestrator import ops_pass
         run = _ops_run(tmp_path, "percona")
         monkeypatch.setattr(ops_pass, "docker_ctl", _Exploding())
-        assert run._save_container_exit_facts() is None
+        assert run._save_container_exit_facts(ENDED) is None
 
     def test_the_core_capture_survives_a_broken_docker(self, tmp_path,
                                                        monkeypatch):
@@ -673,7 +812,7 @@ class TestNeitherCaptureMayRaise:
         run = _ops_run(tmp_path, "percona")
         _make_bind_dir(tmp_path, run)
         monkeypatch.setattr(ops_pass, "docker_ctl", _Exploding())
-        assert run._save_server_core() is None
+        assert run._save_server_core(ENDED) is None
 
     def test_the_whole_capture_chain_survives_a_broken_docker(self, tmp_path,
                                                               monkeypatch):
@@ -689,7 +828,13 @@ class TestNeitherCaptureMayRaise:
         print(f"attempted against a broken docker_ctl: {order}")
         assert "logs" in order, order
         assert "exit_state" in order, order
-        assert "copy_glob_as_root" in order, order
+        # NOT `copy_glob_as_root`, and that is the gate working rather than a
+        # hole: with the daemon broken the exit state is unknown, and the core
+        # lookup only runs for a container that has demonstrably ended.
+        # Skipping it costs nothing -- the copy would have failed against the
+        # same daemon -- and the two tests above are what prove the core
+        # capture cannot raise when it does run.
+        assert "copy_glob_as_root" not in order, order
 
     def test_an_unwritable_run_directory_is_not_an_error(self, tmp_path,
                                                          monkeypatch):
@@ -708,8 +853,8 @@ class TestNeitherCaptureMayRaise:
             raise OSError("read-only file system")
 
         monkeypatch.setattr(ops_pass.os, "makedirs", refuse)
-        assert run._save_container_exit_facts() is None
-        assert run._save_server_core() is None
+        assert run._save_container_exit_facts(ENDED) is None
+        assert run._save_server_core(ENDED) is None
 
 
 class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
@@ -823,14 +968,48 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
         `extra` would put them in the one place the failing phase cannot
         write, and would owe a measurement-version bump for a field that is
         absent exactly when it is wanted.
+
+        STRUCTURAL, NOT A GREP OF THE FILE, and the first version was the
+        grep. `harness/metrics/records.py` is mostly prose -- the
+        measurement-version charter runs to hundreds of comment lines -- so a
+        future note in it explaining WHY `exit_code` is deliberately absent
+        would have fired the guard that exists to protect that decision. This
+        reads the class-level field declarations and the module-level string
+        constants instead, which is what "appeared in the record schema"
+        actually means.
+
+        ALL FOUR FACTS, not three. The grep checked `oom_killed`, `OOMKilled`
+        and `exit_code` and omitted `finished_at`, which is the one of the
+        four a reader is most likely to think harmless.
         """
+        import ast
         import harness.metrics.records as records_mod
-        source = open(records_mod.__file__).read()
-        for needle in ("oom_killed", "OOMKilled", "exit_code"):
-            assert needle not in source, (
-                f"{needle} has appeared in the record schema; the exit facts "
-                f"are run-directory artefacts on purpose -- see this class's "
-                f"docstring")
+        tree = ast.parse(open(records_mod.__file__).read())
+
+        declared = set()
+        constants = set()
+        for node in ast.walk(tree):
+            # Dataclass fields and any other annotated class attribute.
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target,
+                                                              ast.Name):
+                declared.add(node.target.id)
+            # A named constant holding one of these as its VALUE would be the
+            # other way the field arrives -- e.g. an `extra` key name.
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                constants.add(node.value)
+
+        print(f"{len(declared)} declared names, {len(constants)} string "
+              f"constants scanned")
+        for needle in ("exit_code", "oom_killed", "finished_at",
+                       "daemon_error"):
+            assert needle not in declared, (
+                f"{needle!r} is now a declared field of the record schema; "
+                f"the exit facts are run-directory artefacts on purpose -- "
+                f"see this class's docstring")
+            assert needle not in constants, (
+                f"{needle!r} appears as a string literal in records.py, which "
+                f"is how an `extra` key name arrives; the exit facts are "
+                f"run-directory artefacts on purpose")
 
 
 class TestTheCaptureRunsBeforeTeardown:
@@ -952,7 +1131,7 @@ class TestTheCoreCopyGoesThroughAContainerAndLandsWhereExportCanSeeIt:
         calls = []
         monkeypatch.setattr(ops_pass.docker_ctl, "copy_glob_as_root",
                             lambda *a, **k: calls.append((a, k)) or [])
-        run._save_server_core()
+        run._save_server_core(ENDED)
         assert len(calls) == 1, calls
         args, _kwargs = calls[0]
         assert args[0] == bind, args
@@ -969,10 +1148,11 @@ class TestTheCoreCopyGoesThroughAContainerAndLandsWhereExportCanSeeIt:
         """HONEST arm: percona, which declares `runtime.ulimits.core`.
         MUTANT arm: valkey, which does not.
 
-        Looking for a core costs one container per failed phase. Six engines
-        were never asked for one, and `_save_server_error_log` sets the
-        precedent for gating on the declaration: "this is a no-op for them, so
-        their behaviour is unchanged".
+        Looking for a core costs a container start. Six engines were never
+        asked for one, and `_save_server_error_log` sets the precedent for
+        gating on the declaration: "this is a no-op for them, so their
+        behaviour is unchanged". The second gate -- a container that has
+        actually ended -- is `test_a_live_server_is_not_searched_for_a_core`.
         """
         from orchestrator import ops_pass
         results = {}
@@ -983,7 +1163,7 @@ class TestTheCoreCopyGoesThroughAContainerAndLandsWhereExportCanSeeIt:
             calls = []
             monkeypatch.setattr(ops_pass.docker_ctl, "copy_glob_as_root",
                                lambda *a, **k: calls.append(a) or [])
-            run._save_server_core()
+            run._save_server_core(ENDED)
             results[engine] = len(calls)
         print(f"HONEST (percona, core ulimit declared) = {results['percona']}")
         print(f"MUTANT (valkey, none declared)         = {results['valkey']}")
@@ -992,6 +1172,38 @@ class TestTheCoreCopyGoesThroughAContainerAndLandsWhereExportCanSeeIt:
             "whether a container was spawned to look for a core")
         assert results["percona"] == 1
         assert results["valkey"] == 0
+
+    def test_a_live_server_is_not_searched_for_a_core(self, tmp_path,
+                                                      monkeypatch):
+        """HONEST arm: the container has ended. MUTANT arm: it has not.
+
+        `_save_server_log` runs from `run_harness`'s UNCONDITIONAL `finally`,
+        so without this gate every SUCCESSFUL phase would spawn a container to
+        search a datadir the server is still writing to, and print a note
+        about a core that was never going to exist. `--profile full` is 24
+        percona ops units: 24 needless container starts and 24 misleading
+        notes on a healthy run. `exit_state` is None while the server is up,
+        which is the "nothing crashed here" signal already in hand.
+        """
+        from orchestrator import ops_pass
+        results = {}
+        for label, state in (("ended", ENDED), ("still running", None)):
+            directory = tmp_path / label.replace(" ", "-")
+            run = _ops_run(directory, "percona")
+            _make_bind_dir(directory, run)
+            calls = []
+            monkeypatch.setattr(ops_pass.docker_ctl, "copy_glob_as_root",
+                                lambda *a, **k: calls.append(a) or [])
+            run._save_server_core(state)
+            results[label] = len(calls)
+        print(f"HONEST (container ended)      = {results['ended']}")
+        print(f"MUTANT (server still running) = {results['still running']}")
+        assert results["ended"] != results["still running"], (
+            "DEAD PROBE: a live server and a dead one are searched alike, so "
+            "every successful phase pays for a container and prints a note "
+            "about a core that cannot exist")
+        assert results["ended"] == 1
+        assert results["still running"] == 0
 
     def test_a_missing_bind_directory_spawns_no_container(self, tmp_path,
                                                           monkeypatch):
@@ -1003,7 +1215,7 @@ class TestTheCoreCopyGoesThroughAContainerAndLandsWhereExportCanSeeIt:
         calls = []
         monkeypatch.setattr(ops_pass.docker_ctl, "copy_glob_as_root",
                             lambda *a, **k: calls.append(a) or [])
-        _ops_run(tmp_path, "percona")._save_server_core()
+        _ops_run(tmp_path, "percona")._save_server_core(ENDED)
         assert calls == [], calls
 
     def test_copy_glob_as_root_returns_empty_rather_than_raising(
@@ -1137,9 +1349,21 @@ class TestRunScriptStillMountsNoWritablePath:
 
 class TestTheHostCorePatternIsReportedAndNeverWritten:
     """A pipe in `/proc/sys/kernel/core_pattern` -- apport, systemd-coredump --
-    means the kernel hands the core to a helper that does not exist in the
-    container's mount namespace, so NO FILE IS WRITTEN and every other part of
-    this unit is inert. Ubuntu ships exactly that.
+    means the kernel PIPES THE DUMP TO THAT PROGRAM AND WRITES NO FILE on any
+    filesystem, so every other part of this unit is inert. Ubuntu ships
+    exactly that.
+
+    THE MECHANISM, because an earlier version of this docstring had it wrong
+    and the wrong version suggests a fix that does not work. It said the
+    helper "does not exist in the container's mount namespace".
+    `/usr/share/apport/apport` is present on this host, and `core(5)` says the
+    program pathname "is interpreted with respect to the initial mount
+    namespace as it is always executed there. It is not affected by the
+    settings (e.g., root directory, mount namespace, current working
+    directory) of the crashing process" -- which is why `%P` and `%I` exist.
+    The helper runs. What leaves no core is the PIPE: there is no file to
+    collect, so bind-mounting apport into the image or installing it there
+    would change nothing.
 
     The framework must not change it. "A benchmark framework must not modify
     the machine it measures" is CLAUDE.md's rule about host dependencies and it

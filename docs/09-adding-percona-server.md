@@ -996,7 +996,7 @@ source:
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
   # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `ops_pass.py:356` reads the same key
+  # hard-coded default for that engine. `ops_pass.py:389` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
   tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp

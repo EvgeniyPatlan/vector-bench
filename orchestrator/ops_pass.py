@@ -240,14 +240,37 @@ class OpsRun:
         say plainly when it means no core will be produced.
 
         THE FLAGS AND THE ULIMIT ARE NOT SUFFICIENT and that is the point of
-        printing this. A `core_pattern` beginning with `|` hands the core to a
-        helper program -- apport on Ubuntu, systemd-coredump elsewhere -- which
-        does not exist in the container's mount namespace, so the kernel writes
-        NO FILE AT ALL and every other part of the crash-capture chain is
-        inert. An absolute pattern writes the file outside the engine's volume,
-        where the capture cannot reach it either. Both are the normal state of
-        a Linux desktop or a managed server, so an operator who is told only
-        "core-file requested" will conclude the server did not crash.
+        printing this. There are three ways for the host to make the whole
+        chain inert, and `core(5)` is the source for each:
+
+        * A pattern beginning with `|` makes the kernel PIPE THE DUMP TO THAT
+          PROGRAM'S STDIN AND WRITE NO FILE AT ALL -- not into the volume, not
+          anywhere else on any filesystem. The helper then does whatever its
+          own policy says; on Ubuntu that is apport, which may file a crash
+          report or discard it, and either way nothing lands where this capture
+          could read it. AN EARLIER VERSION OF THIS COMMENT SAID THE HELPER
+          "does not exist in the container's mount namespace", AND THAT WAS
+          WRONG in a way that would send an operator down a dead end --
+          `/usr/share/apport/apport` is present on this host, and `core(5)` is
+          explicit that "the program pathname is interpreted with respect to
+          the initial mount namespace as it is always executed there. It is not
+          affected by the settings (e.g., root directory, mount namespace,
+          current working directory) of the crashing process", which is why
+          `%P` and `%I` exist at all. The helper runs. The point is that a pipe
+          produces no file, so bind-mounting apport into the image or baking it
+          in would change nothing.
+        * An ABSOLUTE pattern writes a file, but `core(5)` says paths "are
+          interpreted according to the settings that are active for the
+          crashing process", so it resolves INSIDE THE CONTAINER -- in the
+          container's own writable layer rather than in the bind-backed volume,
+          and that layer goes with `docker rm`.
+        * A RELATIVE pattern that does not begin with `core` -- `%e.core`,
+          `dump-%p` -- writes into mysqld's working directory, which IS the
+          volume, under a name `CORE_FILE_GLOB` does not match.
+
+        All three are ordinary settings on a Linux desktop or a managed server,
+        so an operator who is told only "core-file requested" will conclude the
+        server did not crash.
 
         IT IS READ AND NOT WRITTEN. Changing it would change the behaviour of
         every process on the machine under measurement; CLAUDE.md's rule about
@@ -267,17 +290,27 @@ class OpsRun:
             return
         if pattern.startswith("|"):
             print(f"[ops] core_pattern: {pattern}")
-            print(f"[ops] that is a pipe to a helper the container cannot "
-                  f"reach, so NO CORE will be written however the server "
-                  f"dies. To change it, the operator -- not this framework -- "
-                  f"sets kernel.core_pattern to a bare name such as "
-                  f"`core.%p`.")
+            print(f"[ops] that is a pipe, so the kernel hands the dump to that "
+                  f"program and writes NO FILE to any filesystem -- no core "
+                  f"will reach this run directory however the server dies. "
+                  f"The helper itself runs fine; piping is what leaves no "
+                  f"file, so putting it in the image would change nothing. To "
+                  f"change this, the operator -- not this framework -- sets "
+                  f"kernel.core_pattern to a bare name such as `core.%p`.")
             return
         if pattern.startswith("/"):
             print(f"[ops] core_pattern: {pattern}")
-            print(f"[ops] that is an absolute path, so a core lands outside "
-                  f"the engine's volume and this run directory will not "
-                  f"receive one.")
+            print(f"[ops] that is an absolute path, and it resolves inside the "
+                  f"container -- in its writable layer rather than in the "
+                  f"bind-backed volume -- so the core goes with `docker rm` "
+                  f"and this run directory will not receive one.")
+            return
+        if not pattern.startswith("core"):
+            print(f"[ops] core_pattern: {pattern}")
+            print(f"[ops] that is relative, so the core does land in the "
+                  f"server's data directory, but under a name the capture "
+                  f"looks for as {CORE_FILE_GLOB!r} and will not find. A "
+                  f"pattern starting with `core` is what this collects.")
             return
         print(f"[ops] core_pattern: {pattern} (a core would land in the "
               f"server's data directory and be copied out before teardown)")
@@ -540,6 +573,17 @@ class OpsRun:
         core copy goes last because it is the most expensive and the least
         likely to find anything.
 
+        ONE INSPECT, SHARED. The exit state is read here and passed to both
+        callees rather than fetched twice. It is also what gates the core
+        lookup, and that gate is load-bearing rather than tidy: this method
+        runs from `run_harness`'s UNCONDITIONAL `finally`, so without it every
+        SUCCESSFUL phase would spawn a container to search a live datadir and
+        print a note about a core that was never going to exist --
+        `--profile full` is 24 percona ops units, so 24 needless container
+        starts and 24 misleading notes on a healthy run. `exit_state` is None
+        while the server is still up, which is exactly the "nothing crashed
+        here" signal.
+
         Independent of each other, and none of them can end the run: a server
         whose stdout is empty is exactly the one whose file log matters, so an
         exception from any of them must not skip the rest.
@@ -552,11 +596,16 @@ class OpsRun:
             docker_ctl.save_phase_log(
                 self.paths["run_dir"], self.engine, self.dataset,
                 f"server-{self.tag}", self.resource_pass, text.splitlines())
-        self._save_container_exit_facts()
+        try:
+            exit_state = docker_ctl.exit_state(self.server_name)
+        except Exception:                        # pragma: no cover - defensive
+            exit_state = None
+        self._save_container_exit_facts(exit_state)
         self._save_server_error_log()
-        self._save_server_core()
+        self._save_server_core(exit_state)
 
-    def _save_container_exit_facts(self) -> None:
+    def _save_container_exit_facts(
+            self, state: Optional[Dict[str, Any]]) -> None:
         """Record how the server container ended, before it is removed.
 
         NOT AS RECORD FIELDS, and that is a decision rather than a shortcut.
@@ -578,11 +627,10 @@ class OpsRun:
         EXIST; after `remove` there is nothing to ask.
 
         NOTHING HERE MAY RAISE, the standard `_save_server_error_log` sets.
-        `exit_state` returns None for every daemon-side failure, so the `try`
-        is for the write.
+        `state` is whatever `_save_server_log`'s single inspect produced, and
+        None for every daemon-side failure, so the `try` is for the write.
         """
         try:
-            state = docker_ctl.exit_state(self.server_name)
             if not state:
                 # No file rather than a file saying nothing: `export` ships
                 # the run directory and a reader spends time on whatever is
@@ -616,7 +664,7 @@ class OpsRun:
             print(f"[ops] note: could not record {self.engine}'s container "
                   f"exit state: {exc}", file=sys.stderr)
 
-    def _save_server_core(self) -> None:
+    def _save_server_core(self, state: Optional[Dict[str, Any]]) -> None:
         """Copy a core dump out of the data volume before teardown deletes it.
 
         THE DEFECT THIS EXISTS FOR IS ORDERING, not absence. `teardown` stops
@@ -628,10 +676,17 @@ class OpsRun:
         recover one.
 
         ONLY FOR AN ENGINE THAT ASKED FOR A CORE. `_save_server_error_log`
-        sets the precedent and its reason transfers exactly: looking costs one
-        container per failed phase, and an engine whose config declares no
-        core ulimit was never asked to dump, so for the other six this is a
-        no-op and their behaviour is unchanged.
+        sets the precedent and its reason transfers exactly: looking costs a
+        container, and an engine whose config declares no core ulimit was never
+        asked to dump, so for the other six this is a no-op and their
+        behaviour is unchanged.
+
+        AND ONLY IF THE CONTAINER HAS ACTUALLY ENDED, which is what `state`
+        being non-None means. The caller reaches this from `run_harness`'s
+        UNCONDITIONAL `finally`, so the alternative is one container start and
+        one "no core found" note per SUCCESSFUL phase as well -- 24 of each on
+        `--profile full`, every one of them noise, over a datadir the server is
+        still writing to. A server that is still running has not dumped.
 
         AND ONLY IF THE BIND DIRECTORY IS THERE. `remove_tree_as_root`'s first
         line is the same check and gives the reason: when setup failed before
@@ -661,6 +716,8 @@ class OpsRun:
         """
         try:
             if "core" not in self._ulimits():
+                return
+            if not state:
                 return
             bind_dir = os.path.join(self.paths["engine_state"], "ops",
                                     self.volume)

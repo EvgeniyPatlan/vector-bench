@@ -408,9 +408,13 @@ def exit_state(name: str) -> Optional[Dict[str, Any]]:
     an in-process crash with no cooperation from the server at all -- a server
     killed by its cgroup writes nothing to its own error log, which is exactly
     the case where the error-log capture comes back empty and the absence of
-    evidence reads as evidence of absence. That run's peak server RSS was
-    48.5 GiB against a 112.5 GiB container cap, so the hypothesis was live and
-    unfalsifiable from the artefacts.
+    evidence reads as evidence of absence. That run's peak server RSS ACROSS
+    ITS OPS PHASES was 48.5 GiB against a 112.5 GiB container cap, so the
+    hypothesis was live and unfalsifiable from the artefacts. (Scoped to the
+    ops phases deliberately, and the scope is the whole point of stating it:
+    the run's percona peak is 54.7 GiB, in `gist-960-euclidean-tuned-ann`,
+    and the ann path is not where the units under investigation died. Both
+    figures are from this run's `mem-percona-*.jsonl` timeseries.)
 
     ONE INSPECT, NOT FOUR. The capture chain a failed phase runs already sits
     on 510 s of worst-case timeouts (`copy_file_out` documents the
@@ -790,8 +794,10 @@ _COPY_GLOB_MAX_DEPTH = 2
 #: Bounded in TIME, like `copy_file_out`, and the figure is the one an operator
 #: needs. A core here is bounded by the server's resident set minus whatever
 #: `innodb_buffer_pool_in_core_file=OFF` keeps out of it: the reference run's
-#: peak RSS was 48.5 GiB against a ~39 GiB buffer pool, so ~9 GiB, and 900 s
-#: is a slow disk's worth of that.
+#: peak RSS across its OPS phases was 48.5 GiB against a ~39 GiB buffer pool,
+#: so ~9 GiB, and 900 s is a slow disk's worth of that. (54.7 GiB is that
+#: run's percona peak overall, in an ann phase, which this capture does not
+#: serve.)
 _COPY_GLOB_TIMEOUT_S = 900
 
 
