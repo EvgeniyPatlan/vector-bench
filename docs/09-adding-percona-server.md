@@ -898,7 +898,7 @@ Read three ways:
 **This is decided, not proposed.** The choice was the user's to make, because it
 is a fairness judgement rather than a fact, and it has been made:
 `config/engines/percona.yml` sets `--innodb-hnsw-max-memory=0` (unlimited),
-with `Innodb_hnsw_memory_used` recorded per phase. The two policies below are
+with `Innodb_hnsw_memory_used` collected onto the `index_build` record. The two policies below are
 kept as the justification for it, not as an open question — a reader asking
 "why is this engine's graph budget unlimited when the other two have a cache
 size" needs the whole argument, and a decision whose reasoning has been deleted
@@ -908,8 +908,12 @@ What the policy does **not** change: `--innodb-hnsw-max-memory` must not be fed
 from `graph_cache_bytes`, and the report must state the asymmetry rather than
 paper over it.
 
-1. **`0` (unlimited), with `Innodb_hnsw_memory_used` recorded per phase —
-   CHOSEN.** The graph is then bounded only by the container's memory limit,
+1. **`0` (unlimited), with `Innodb_hnsw_memory_used` collected onto the
+   `index_build` record — CHOSEN.** It is collected there and nowhere else:
+   `ingest`, `concurrency`, `filtered`, `churn` and `ef_calibration` carry no
+   reading, so this audit trail covers one of the six ops phases and the
+   earlier wording "per phase" over-claimed it. Widening it is unlanded work.
+   The graph is then bounded only by the container's memory limit,
    which the orchestrator already sets and already records — so Percona is held
    to the same *total* memory budget as every other engine, measured where the
    other engines' budgets are measured. This is the honest like-for-like, and

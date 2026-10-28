@@ -289,8 +289,16 @@ server:
     # to the same TOTAL budget as every other engine, measured where the
     # others' budgets are measured.
     #
-    # The audit trail for that is `Innodb_hnsw_memory_used`, recorded per
-    # phase, and EVERY FIGURE TAKEN FROM IT MUST CARRY THE CAVEAT that it
+    # The audit trail for that is `Innodb_hnsw_memory_used` -- and it is
+    # THINNER THAN THIS COMMENT USED TO CLAIM. It is collected onto the
+    # `index_build` record and no other: `ingest`, `concurrency`, `filtered`,
+    # `churn` and `ef_calibration` carry no reading, so the trail covers one
+    # of the six ops phases. An audit trail for a fairness decision that
+    # covers a sixth of the run, described as per-phase, is the shape of
+    # defect CLAUDE.md opens by warning about, which is why it is spelled out
+    # here rather than rounded up. Widening it is unlanded work.
+    #
+    # EVERY FIGURE TAKEN FROM IT MUST ALSO CARRY THE CAVEAT that it
     # omits the node map (HNSW::m_nodes, roughly 30-50 bytes per node on the
     # normal heap) and search scratch space. At glove-100's 1,183,514 rows
     # that is 35.5-59.2 MB unreported per vector index. It is a FLOOR on graph

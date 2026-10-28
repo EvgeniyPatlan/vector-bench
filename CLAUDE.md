@@ -209,7 +209,10 @@ These are the reasons the code looks over-defensive. Do not relax them.
   restart. Equal byte counts would therefore compare a cache budget against a wall, and one
   engine would be unable to finish the load where two merely slowed down. It is set to `0`
   (unlimited) so the container's memory limit bounds it like every other engine, and
-  `Innodb_hnsw_memory_used` is recorded per phase — a figure that **omits the node map
+  `Innodb_hnsw_memory_used` is recorded **on the `index_build` record only** — not on
+  `ingest`, `concurrency`, `filtered`, `churn` or `ef_calibration`, so the audit trail covers
+  one of the six ops phases and the other five are uncollected — and it is a figure that
+  **omits the node map
   (~30–50 B/node) and so is a floor on graph memory, not a measurement of it**. See
   `docs/09-adding-percona-server.md` §3.
 - **A profile's `resources:` block deep-merges dict-into-dict.** To *clear* an inherited key
