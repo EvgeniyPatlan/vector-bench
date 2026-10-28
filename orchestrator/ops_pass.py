@@ -72,8 +72,21 @@ CORE_FILE_GLOB = "core*"
 RECOMMENDED_CORE_PATTERN = "core.%p"
 
 
-def core_capture_verdict(pattern: Optional[str],
-                        data_mount: str) -> Tuple[bool, str]:
+#: How far mysqld's working directory sits below the VOLUME's mount point, and
+#: therefore how much of `COPY_GLOB_MAX_DEPTH` a relative `core_pattern` has
+#: already spent before its own directory components are counted.
+#:
+#: One, because `docker/percona/entrypoint-percona.sh` defaults
+#: `VB_DATA_DIR` to `/var/lib/vbench/data` against a `data_mount` of
+#: `/var/lib/vbench`, and mysqld chdirs into its datadir. An engine that put
+#: its datadir somewhere else would need this passed rather than assumed, and
+#: `core_capture_verdict` takes it as an argument for that reason.
+DATADIR_DEPTH_BELOW_MOUNT = 1
+
+
+def core_capture_verdict(
+        pattern: Optional[str], data_mount: str,
+        datadir_depth: int = DATADIR_DEPTH_BELOW_MOUNT) -> Tuple[bool, str]:
     """Whether a core written under `pattern` would reach the run directory.
 
     Returns `(reachable, reason)`. A pure function of the two inputs so every
@@ -103,6 +116,14 @@ def core_capture_verdict(pattern: Optional[str],
     The half of the earlier claim derived from `core(5)` was right and the
     half assumed was wrong, which is in miniature the fault the change this
     belongs to exists to remove.
+
+    AND THE RELATIVE CASE HAS TWO OUTCOMES FOR THE SAME REASON. A relative
+    pattern lands in mysqld's working directory, which is the datadir -- but
+    it may carry directory components of its own, and `cores/core.%p` is then
+    three levels below the mount point and outside the capture's reach. The
+    depth arithmetic therefore runs on BOTH arms; running it on only the
+    absolute one is how this function came to promise a copy-out for a core
+    it could not collect.
     """
     if pattern is None:
         return (False, f"unreadable ({HOST_CORE_PATTERN_PATH}); whether a "
@@ -142,6 +163,23 @@ def core_capture_verdict(pattern: Optional[str],
                 "`docker rm`, or -- if that directory does not exist in the "
                 "image -- no file is written at all. Either way this run "
                 "directory receives nothing")
+    # A RELATIVE PATTERN CAN CARRY A DIRECTORY TOO, and the first version of
+    # this function computed depth on the absolute arm and not here -- so
+    # `cores/core.%p`, which lands three levels under the mount and outside
+    # the capture's reach, was reported as "copied out before teardown". That
+    # is the same false-positive direction as the bug this function was
+    # written to remove, left un-applied to the other arm, and the branch
+    # table could not catch it because there was no branch for it to have a
+    # row against.
+    depth = datadir_depth + len([part for part in directory.split("/")
+                                 if part]) + 1
+    if depth > docker_ctl.COPY_GLOB_MAX_DEPTH:
+        return (False,
+                f"that is relative with a directory in it, so the core lands "
+                f"{depth} levels under the volume's mount point and the "
+                f"capture searches only {docker_ctl.COPY_GLOB_MAX_DEPTH}; it "
+                f"is written and survives teardown, and the copy-out does "
+                f"not find it")
     if not name.startswith("core"):
         return (False,
                 f"that is relative, so the core does land in the server's "
@@ -380,7 +418,11 @@ class OpsRun:
             return
         pattern = host_core_pattern()
         reachable, reason = core_capture_verdict(pattern, data_mount)
-        print(f"[ops] core_pattern: {pattern}")
+        # The value only when there IS one: an unreadable sysctl printed as
+        # `core_pattern: None` reads as a setting rather than as a failure to
+        # look, and the reason already says which.
+        if pattern is not None:
+            print(f"[ops] core_pattern: {pattern}")
         print(f"[ops] {reason}")
         if pattern == RECOMMENDED_CORE_PATTERN:
             return
@@ -398,6 +440,7 @@ class OpsRun:
             note += (", and setting it is the operator's to do, not this "
                      "framework's")
         print(note + ".")
+
     # ------------------------------------------------------------------
 
     def run_harness(self, args: List[str], output_path: str,

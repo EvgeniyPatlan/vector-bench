@@ -1412,8 +1412,9 @@ class TestTheLabRouteThatOpensTheCore:
         checkout is exactly the person who would reintroduce it. This
         assertion costs one line and is the cheaper half of the pair.
         """
-        from orchestrator import cli, ops_pass
         import inspect
+
+        from orchestrator import cli, ops_pass
 
         # The precondition the deletion rests on. Asserted rather than
         # assumed, so this cannot pass by the parameter having been removed

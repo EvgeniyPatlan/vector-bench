@@ -294,8 +294,18 @@ class TestBuildArgConventions:
         assert args == {"PERCONA_TAG"}, args
 
     def test_the_arg_is_wired_to_the_env_var_the_manifest_reads(self):
-        """ops_pass.py:256 puts source.tag into VB_ENGINE_TAG; the image sets it
-        too, and an ARG declared but never used leaves it `unknown`."""
+        """`ops_pass.py`'s `VB_ENGINE_TAG` puts source.tag into the
+        environment the manifest reads; the image sets it too, and an ARG
+        declared but never used leaves it `unknown`.
+
+        A SYMBOL AND NOT A NUMBER. This said `ops_pass.py:256` and the change
+        that re-points it moves `VB_ENGINE_TAG` to 472 -- which is #63's whole
+        argument for the conversion, made again by the first edit above a
+        citation #63 did not convert. It survived that change because it is
+        bare docstring prose with a row in neither `CITED_SYMBOLS` nor the
+        `CITED_IN_REPO` table #63 deleted, so nothing failed and nothing would
+        have.
+        """
         dockerfile = open(os.path.join(DOCKER, "percona", "Dockerfile")).read()
         assert "VB_ENGINE_TAG=${PERCONA_TAG}" in dockerfile
 

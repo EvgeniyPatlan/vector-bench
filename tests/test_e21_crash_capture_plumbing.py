@@ -988,19 +988,43 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
         `records.py` -- measured, not supposed. Scanning that one file can
         never see it. What closes it is scanning the only place such a
         construction can live: every non-test `Record(` in this repository is
-        under `harness/`, `Recorder` is used by `harness/main.py` alone, and
-        `harness/` mentions none of the four words today. That is asserted
-        below, and it is not a coincidence that can quietly stop holding --
-        the harness container mounts `harness/` and nothing else, so it
-        cannot learn a container's exit state without being handed it, which
-        is a deliberate act and not a tidy-up.
+        under `harness/`, and `Recorder` is used by `harness/main.py` alone.
+
+        IN `extra=` AND `Record(` CONTEXT, NOT AS A SUBSTRING. The first
+        version of this searched the whole text of every file under
+        `harness/`, and that is one underscore from a false positive:
+        `harness/workloads/client_process.py` already spells a child
+        process's exit status `exitcode` and discusses "exit status" at
+        length, so an ordinary `exit_code` local in the very module that
+        spawns client processes would have fired a guard whose message is
+        about core dumps. So this reads the AST and looks only at keyword
+        names of `Record(...)` calls and at the string keys of any `extra=`
+        dict -- which is the route, and nothing else.
+
+        WHY THE PREMISE HOLDS ARCHITECTURALLY rather than by convention, and
+        this is the stronger form of the argument: the harness runs in a
+        DIFFERENT CONTAINER from the server. `run_harness` mounts `harness/`,
+        the datasets and the run directory and nothing else, no stage of
+        `docker/percona/Dockerfile` installs a docker client, and the
+        container's own exit state is a fact only the daemon has. So the
+        harness cannot obtain it at all -- not "should not". The no-import
+        rule is the weaker version of the same point and is not what this
+        rests on.
 
         WHAT REMAINS UNCHECKED, so the claim stays the size of the guard: a
         RENAME. Declaring `exited_with` and `ended_at`, or putting them in
-        `extra` under those names, passes both scans. Nothing lexical can
-        catch that, and the argument that makes it not worth chasing is the
-        one in the first paragraph -- a record route of any spelling is
-        useless for a phase that writes no record.
+        `extra` under those names, passes both scans, and nothing lexical can
+        catch it.
+
+        WHAT ACTUALLY PROTECTS THE DECISION IS NOT THIS SCAN, and saying so
+        is the point of the paragraph: it is the four POSITIVE assertions in
+        this class -- that the `server-exit-<tag>` artefact is written, that
+        it states the OOM verdict in words, that its name carries the dataset
+        and the resource pass, and that it precedes the first teardown call.
+        Those are spelling-independent, so a change that moved these facts
+        onto a record under any names at all would redden four tests whatever
+        it called them. This scan is a tripwire on the harmless half, and the
+        rename residual matters less than its own paragraph suggests.
         """
         import ast
         import harness.metrics.records as records_mod
@@ -1037,10 +1061,29 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
             f"scan below only covers harness/, so either it has to widen or "
             f"this is a route the guard no longer sees")
 
-        harness_text = "\n".join(
-            open(path).read() for path in
-            sorted(glob.glob(os.path.join(REPO, "harness", "**", "*.py"),
-                             recursive=True)))
+        # Every keyword name of a `Record(...)` call, and every string key
+        # of an `extra=` dict, anywhere under harness/. The route and nothing
+        # else -- see this class's docstring on why a substring search over
+        # these files is a false positive waiting to happen.
+        record_keywords, extra_keys = set(), set()
+        for path in sorted(glob.glob(os.path.join(REPO, "harness", "**",
+                                                  "*.py"), recursive=True)):
+            tree = ast.parse(open(path).read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "id", None) or getattr(func, "attr", "")
+                for kw in node.keywords:
+                    if kw.arg and name.endswith("Record"):
+                        record_keywords.add(kw.arg)
+                    if kw.arg == "extra" and isinstance(kw.value, ast.Dict):
+                        extra_keys |= {
+                            key.value for key in kw.value.keys
+                            if isinstance(key, ast.Constant)
+                            and isinstance(key.value, str)}
+        print(f"harness/: {len(record_keywords)} Record keywords, "
+              f"{len(extra_keys)} extra keys")
 
         for needle in ("exit_code", "oom_killed", "finished_at",
                        "daemon_error"):
@@ -1052,11 +1095,16 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
                 f"{needle!r} appears as a string literal in records.py, which "
                 f"is how an `extra` key name arrives; the exit facts are "
                 f"run-directory artefacts on purpose")
-            assert needle not in harness_text, (
-                f"{needle!r} appears somewhere under harness/, which is where "
-                f"every Record in this repository is built -- so it can reach "
-                f"a record through `extra` without records.py changing at "
-                f"all. The exit facts are run-directory artefacts on purpose")
+            assert needle not in record_keywords, (
+                f"{needle!r} is now a keyword of a Record(...) call under "
+                f"harness/, which reaches a record without records.py "
+                f"changing at all. The exit facts are run-directory "
+                f"artefacts on purpose")
+            assert needle not in extra_keys, (
+                f"{needle!r} is now a key of an `extra=` dict under "
+                f"harness/, which is the declared escape hatch and reaches a "
+                f"record without records.py changing at all. The exit facts "
+                f"are run-directory artefacts on purpose")
 
 
 class TestTheCaptureRunsBeforeTeardown:
@@ -1447,6 +1495,12 @@ class TestTheHostCorePatternIsReportedAndNeverWritten:
         ("core", True, "data directory"),
         ("core.%p", True, "data directory"),
         ("dump-%p", False, "that is relative"),
+        # The fifth outcome, and the one the first version of this table
+        # could not have caught: "one row per branch" holds while the BRANCH
+        # SET is incomplete. The relative arm did not compute depth, so
+        # `cores/core.%p` -- three levels under the mount and outside the
+        # capture -- was reported as "copied out before teardown".
+        ("cores/core.%p", False, "relative with a directory in it"),
         ("/var/lib/vbench/core.%p", True, "inside the volume at"),
         ("/var/lib/vbench/data/core.%p", True, "inside the volume at"),
         ("/var/lib/vbench/data/sub/core.%p", False, "levels under"),
@@ -1811,11 +1865,23 @@ class TestTheTwoHalvesOfTheCoreRouteAgree:
             %e.core  -> `mysqld.core`  the script looks for it, this never
                                        collects it
 
-        The second is mitigated: `_report_core_pattern` refuses to promise a
-        copy-out for a relative pattern that does not start with `core`, so
-        the operator is told at server start. The first is in
-        `scripts/gdb-backtrace.py`'s globs and is not in this unit's file set
-        -- widening them to `core*` would close it.
+        THE TWO EDGES DIFFER IN CONSEQUENCE, AND CONSEQUENCE SETS THE REPAIR
+        ORDER. They are not symmetric:
+
+          * `%e.core` is UNRECOVERABLE. The capture does not collect it,
+            `teardown` then removes the volume and `remove_tree_as_root`
+            deletes the bind directory, and no version of
+            `scripts/gdb-backtrace.py` can read a file that no longer exists.
+          * `core%p` is RECOVERABLE. The capture DOES collect it, so it is
+            sitting in the run directory; widening that script's globs, or a
+            single `mv`, retrieves it afterwards.
+
+        So `%e.core` is the one to close first, and it is closable from THIS
+        side, because `CORE_FILE_GLOB` is this unit's constant and the script's
+        globs are not. What is in place meanwhile is a warning rather than a
+        fix: `_report_core_pattern` refuses to promise a copy-out for a
+        relative pattern that does not start with `core`, so the operator is
+        told at server start instead of finding an empty directory later.
 
         This test FAILS IF EITHER EDGE CLOSES, which is the point: whoever
         closes one should delete the half of this that stops being true rather

@@ -785,10 +785,12 @@ def remove_tree_as_root(path: str, image: str) -> bool:
     return not os.path.exists(path)
 
 
-#: How deep under the bind directory a match is looked for. PUBLIC, because
-#: it is part of this function's contract rather than an implementation
-#: detail: `ops_pass.core_capture_verdict` has to know it to tell an operator
-#: whether a core written at a given `core_pattern` will actually be found. The volume is
+#: How deep under the bind directory a match is looked for.
+#:
+#: PUBLIC, because it is part of this function's contract rather than an
+#: implementation detail: `ops_pass.core_capture_verdict` has to know it to
+#: tell an operator whether a core written at a given `core_pattern` will
+#: actually be found. The volume is
 #: mounted at the engine's `data_mount` and mysqld chdirs into its datadir one
 #: level below it, so depth 2 covers both the volume root and the datadir while
 #: refusing to walk an InnoDB tree of several hundred thousand files.
