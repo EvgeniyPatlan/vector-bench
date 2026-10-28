@@ -128,7 +128,7 @@ import sys
 import threading
 import time
 import types
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import numpy
 import pytest
@@ -1861,6 +1861,157 @@ class TestTheQuerySetIsNotCopiedPerClient:
 # §7 item 8: /dev/shm
 # ---------------------------------------------------------------------------
 
+#: How one `/dev/shm` mapping is identified by `_shm_spans`: the address span
+#: it covers, and then the file behind it -- device, inode, pathname. The file
+#: half is not decoration; an address span on its own is RECYCLED, and
+#: `test_a_recycled_address_is_still_this_steps_own_page` measures what that
+#: costs.
+_ShmSpan = Tuple[int, int, str, str, str]
+
+
+def _shm_spans() -> FrozenSet[_ShmSpan]:
+    """Every `/dev/shm` mapping THIS process holds, identified one by one.
+
+    The mappings read `/dev/shm/sem.XXXXXX (deleted)` -- deleted because of
+    the `sem_unlink` the class below describes, which is exactly why a
+    directory listing sees nothing and this does.
+
+    `maxsplit=5` keeps the pathname whole: `/proc/self/maps` puts it last and
+    it carries that ` (deleted)` suffix, a space and all.
+    """
+    spans = set()
+    with open("/proc/self/maps") as handle:
+        for line in handle:
+            if "/dev/shm" not in line:
+                continue
+            fields = line.split(maxsplit=5)
+            lo, _, hi = fields[0].partition("-")
+            spans.add((int(lo, 16), int(hi, 16), fields[3], fields[4],
+                       fields[5].strip()))
+    return frozenset(spans)
+
+
+def _shm_added(before: FrozenSet[_ShmSpan],
+               after: FrozenSet[_ShmSpan]) -> int:
+    """Bytes of `/dev/shm` mapping present in `after` and absent from
+    `before` -- the cost of whatever happened between the two readings.
+
+    A set difference and not a subtraction of two totals, which is the whole
+    repair: a mapping that WENT AWAY is in neither term, so nothing a sibling
+    frees can be charged against this step and no step can come back
+    negative.
+    """
+    return sum(hi - lo for lo, hi, _dev, _inode, _path in after - before)
+
+
+def _shm_total() -> int:
+    """The RETIRED reading: every `/dev/shm` mapping summed into one total.
+
+    No measurement uses it. It is kept as the mutant arm of the two
+    interference tests below, for the reason `tests/retired_thread_pool.py`
+    keeps the pool this file replaced: a fix for a race has to be able to
+    show the race, and showing it means running both readers under one
+    constructed interference.
+    """
+    return sum(hi - lo for lo, hi, _dev, _inode, _path in _shm_spans())
+
+
+def _blank_files(spans: FrozenSet[_ShmSpan]) -> FrozenSet[_ShmSpan]:
+    """The same spans with the file half of every key blanked -- which is
+    what a key of the ADDRESS SPAN ALONE would be.
+
+    So the arm that measures what an address-only key costs runs through the
+    real `_shm_added` rather than through a second reader written for the
+    occasion and able to differ from it.
+    """
+    return frozenset((lo, hi, "", "", "") for lo, hi, *_rest in spans)
+
+
+class _ShmInterference:
+    """A sibling THREAD that maps `events` `multiprocessing.Event`s into
+    `/dev/shm` and then unmaps them, each on a cue from the caller.
+
+    A thread and not a child process, on purpose. A child gets its own
+    `/proc/self/maps` and cannot reach this process's reading at all -- which
+    is why the first repair, reading maps instead of the tmpfs's used bytes,
+    looked complete. What it left open is a sibling INSIDE this process, and
+    `multiprocessing` makes one of those whenever a background thread builds
+    or drops a semaphore.
+
+    Both cues are waited on, so the map and the unmap land on the side of the
+    measurement window the caller chose rather than wherever the scheduler
+    would have put them. The race then happens once per call instead of in
+    the fraction of runs that made it a flake.
+    """
+
+    #: Seconds to wait for any cue. A cue that never arrives is an arm that
+    #: measures nothing, so every wait is asserted and the arm fails loudly
+    #: rather than quietly passing.
+    TIMEOUT = 30.0
+
+    def __init__(self, events: int) -> None:
+        self.events = events
+        #: What the thread really mapped, in `_shm_spans`' own terms.
+        self.mapped_spans: FrozenSet[_ShmSpan] = frozenset()
+        #: Any of those still mapped after the unmap cue. Non-empty means the
+        #: interference did not happen.
+        self.still_mapped: FrozenSet[_ShmSpan] = frozenset()
+        self._holder: List[Any] = []
+        self._map_cue = threading.Event()
+        self._mapped = threading.Event()
+        self._drop_cue = threading.Event()
+        self._dropped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def mapped_bytes(self) -> int:
+        """Bytes the thread's own `Event`s mapped -- 20,480 each, five
+        one-page semaphores, and the non-vacuity figure for both arms."""
+        return sum(hi - lo for lo, hi, *_rest in self.mapped_spans)
+
+    def _run(self) -> None:
+        self._map_cue.wait(self.TIMEOUT)
+        before = _shm_spans()
+        self._holder.extend(MP.Event() for _ in range(self.events))
+        self.mapped_spans = _shm_spans() - before
+        self._mapped.set()
+        self._drop_cue.wait(self.TIMEOUT)
+        # Dropping the last reference to a `SemLock` closes its semaphore,
+        # and closing it unmaps the page. Measured over 100 constructed
+        # races: reference counting alone does it, with no `gc.collect()`
+        # anywhere -- which is why `still_mapped` is checked rather than
+        # assumed.
+        del self._holder[:]
+        self.still_mapped = self.mapped_spans & _shm_spans()
+        self._dropped.set()
+
+    def __enter__(self) -> "_ShmInterference":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        # Both cues, so a failed assertion inside the window cannot leave the
+        # thread parked on a wait that nobody is going to set.
+        self._map_cue.set()
+        self._drop_cue.set()
+        self._thread.join(self.TIMEOUT)
+        assert not self._thread.is_alive(), "the interference thread hung"
+
+    def map_now(self) -> None:
+        """Map the `Event`s, and do not return until they are mapped."""
+        self._map_cue.set()
+        assert self._mapped.wait(self.TIMEOUT), (
+            "the interference thread never mapped anything, so the arm "
+            "below would be comparing two readers under no interference")
+
+    def unmap_now(self) -> None:
+        """Unmap them, and do not return until they are gone."""
+        self._drop_cue.set()
+        assert self._dropped.wait(self.TIMEOUT), (
+            "the interference thread never reached its unmap")
+        assert not self.still_mapped, sorted(self.still_mapped)
+
+
 class TestTheShmFootprintIsIndependentOfTheClientCount:
     """`multiprocessing` semaphores live in `/dev/shm`, and a container's
     default is small -- so §7 asks whether this needs the harness container's
@@ -1884,28 +2035,66 @@ class TestTheShmFootprintIsIndependentOfTheClientCount:
     worktree's run cannot reach them. It is also exact rather than merely
     robust: the figures it reports are the published ones to the byte, because
     a POSIX semaphore is one page and `multiprocessing` maps each of them.
+
+    **And process-local is not thread-local, which is the second repair.**
+    Reading this process's own maps and then SUBTRACTING TWO TOTALS still
+    cannot tell "my new mapping appeared" from "someone else's mapping went
+    away": anything running inside this process can map or unmap `/dev/shm`
+    between two readings, and `multiprocessing` does exactly that from
+    background threads. A sibling dropping six `Event`s across the step that
+    allocates no tmpfs pages at all took `pipe_cost` to **-122,880** -- an
+    assertion that is right about pipes, failing on a figure that was never
+    about pipes. So the reading IDENTIFIES mappings instead of summing them.
+    `_shm_spans` snapshots the SET of this process's `/dev/shm` mappings and
+    `_shm_added` charges a step with the mappings present after it and absent
+    before it. The published figures below are unchanged by the move, because
+    on a quiet window the mappings a step adds are exactly the pages it cost.
+
+    **What the span set does and does not guarantee**, because a documented
+    limit is acceptable here and a silent one is not:
+
+    - A sibling's UNMAP cannot move any figure, whether the mapping predates
+      the window or is made and dropped inside it: a freed mapping is in
+      neither term of the difference, and no step can come back negative.
+      That is the whole of the flake, and
+      `test_a_sibling_unmap_cannot_subtract_from_a_step` constructs it rather
+      than waiting for it.
+    - A mapping is keyed by its address span AND the file behind it -- device,
+      inode, pathname. The span alone is not enough, and not for an exotic
+      reason: the kernel hands a span a sibling has just freed straight back
+      to the next mapping. Under that same constructed race, an address-only
+      key reported **16,384** of the 40,960 bytes two `Event`s really cost,
+      because six of their ten pages landed in the hole the sibling left.
+      `test_a_recycled_address_is_still_this_steps_own_page` is that
+      measurement, and the keyed reading is 40,960 in 100 runs of 100.
+    - **The residual, stated rather than implied: a sibling mapping created
+      inside a window and still held at its end IS charged to the step.**
+      `/proc/self/maps` records no owner, so nothing read from it can tell
+      whose a new mapping is. Measured on the same six `Event`s, held instead
+      of dropped: 163,840 where the honest answer is 40,960. The residual
+      inflates and cannot deflate -- it could push `pipe_cost` off zero and
+      fail this test for someone else's allocation, but it cannot hide a page
+      and cannot produce a negative, and it needs a sibling that maps
+      `/dev/shm` inside this one window.
+    - Two narrower ones, for completeness. A real page goes unattributed only
+      if an address span AND the device, inode and pathname at it are all
+      recycled onto one of this test's own mappings inside a single window;
+      measured, 4,000 semaphores created and freed in one process reused no
+      inode number and the numbers rose monotonically. And `/proc/self/maps`
+      is read in chunks rather than snapshotted, so a mapping changing under
+      the read can tear a reading -- which lands in the two directions
+      already named and adds no third.
     """
 
     #: Bytes a `/dev/shm` mapping covers. One page per POSIX semaphore, which
     #: is why the totals below are whole multiples of it.
     PAGE = 4096
 
-    def _used(self) -> int:
-        """Bytes of `/dev/shm` mapped by THIS process, from `/proc/self/maps`.
-
-        The mappings read `/dev/shm/sem.XXXXXX (deleted)` -- deleted because
-        of the `sem_unlink` the class docstring describes, which is exactly
-        why a directory listing sees nothing and this does.
-        """
-        total = 0
-        with open("/proc/self/maps") as handle:
-            for line in handle:
-                if "/dev/shm" not in line:
-                    continue
-                span = line.split()[0]
-                lo, _, hi = span.partition("-")
-                total += int(hi, 16) - int(lo, 16)
-        return total
+    #: Bytes one `multiprocessing.Event` costs in `/dev/shm`: five
+    #: semaphores -- its flag, and its condition's lock and three counters --
+    #: one page each. The figures below are multiples of this because an
+    #: `Event` is the only unit this test can allocate exactly.
+    EVENT_BYTES = 5 * PAGE
 
     def test_two_events_are_the_whole_pools_cost(self):
         """Honest and the design that was rejected, both in bytes.
@@ -1921,27 +2110,35 @@ class TestTheShmFootprintIsIndependentOfTheClientCount:
         measurement, taken per process, and it came back at exactly those
         numbers on a box at 20 busy cores of 20.
 
+        The four readings CHAIN -- every step's `before` is the previous
+        step's `after` -- so each mapping this test makes is charged to
+        exactly one step and none falls in a gap between two windows.
+
         Against the harness container's `shm_size`, which
         `orchestrator/ops_pass.py` takes from the resource pass -- 2g
         normalized, 8g tuned -- so the pool's footprint is five orders of
         magnitude inside it and nothing outside `clients.py` has to change.
         """
-        baseline = self._used()
+        before_pool = _shm_spans()
         pool_cost_holder = [MP.Event(), MP.Event()]
-        pooled = self._used() - baseline
+        after_pool = _shm_spans()
         per_client_holder = [MP.Event() for _ in range(64)]
-        per_client = self._used() - baseline - pooled
+        after_clients = _shm_spans()
         pipes = [MP.Pipe(duplex=False) for _ in range(32)]
-        pipe_cost = self._used() - baseline - pooled - per_client
+        after_pipes = _shm_spans()
+        pooled = _shm_added(before_pool, after_pool)
+        per_client = _shm_added(after_pool, after_clients)
+        pipe_cost = _shm_added(after_clients, after_pipes)
         try:
             assert pooled > 0, (
                 "two Events cost no tmpfs pages at all, so this probe is not "
                 "measuring the thing /dev/shm would run out of")
             assert per_client > 2.0 * pooled, (pooled, per_client)
-            # Still EXACTLY zero, and it can stay exact now that the reading
-            # is this process's own: a pipe maps nothing in /dev/shm, so any
-            # non-zero here is a real change in what a pool costs rather than
-            # a neighbour's tmpfs traffic.
+            # Still EXACTLY zero, and it can stay exact now that a step is
+            # charged with the mappings it ADDED: a pipe maps nothing in
+            # /dev/shm, and neither a neighbour's tmpfs traffic nor a sibling
+            # thread dropping its own semaphores can reach this figure. Only
+            # a real change in what a pool costs can.
             assert pipe_cost == 0, pipe_cost
             # Whole pages, which is the non-vacuity check on the reader
             # itself: a parse that picked up the wrong column would not land
@@ -1953,6 +2150,95 @@ class TestTheShmFootprintIsIndependentOfTheClientCount:
             assert pooled < 2 * 1024 ** 3 / 1000, pooled
         finally:
             del pool_cost_holder, per_client_holder, pipes
+
+    def test_a_sibling_unmap_cannot_subtract_from_a_step(self):
+        """The flake, constructed rather than waited for: the honest reader
+        and the retired one, over one window, under one interference.
+
+        The window is the `pipe_cost` step, because it is the step that
+        allocates no `/dev/shm` at all -- the honest answer is 0, so a
+        sibling's unmap inside it is the whole of the figure. Six `Event`s
+        dropped there take the RETIRED reading to **-122,880**, the number
+        this flake was reported at, and `pipe_cost == 0` then fails for a
+        reason that has nothing to do with pipes. The span-set reading is 0:
+        a mapping that went away appears in neither term.
+
+        A difference of two totals cannot distinguish "my new mapping
+        appeared" from "someone else's mapping went away". That is the
+        defect, and this is it happening on cue.
+        """
+        with _ShmInterference(6) as sibling:
+            sibling.map_now()
+            before_total, before = _shm_total(), _shm_spans()
+            sibling.unmap_now()
+            pipes = [MP.Pipe(duplex=False) for _ in range(32)]
+            try:
+                retired = _shm_total() - before_total
+                span_set = _shm_added(before, _shm_spans())
+            finally:
+                del pipes
+        # Non-vacuity first. An interference thread that mapped nothing would
+        # make both readers agree, for the wrong reason.
+        assert sibling.mapped_bytes == 6 * self.EVENT_BYTES, (
+            f"the interference thread mapped {sibling.mapped_bytes} bytes "
+            f"and not {6 * self.EVENT_BYTES}, so this arm is not the race "
+            f"it describes")
+        assert retired == -sibling.mapped_bytes, (
+            f"the retired reading came back {retired} where the sibling "
+            f"unmapped {sibling.mapped_bytes} bytes; this arm reproduces the "
+            f"flake exactly, so another figure means something else moved on "
+            f"this process's maps inside the window")
+        assert span_set == 0, (
+            f"32 pipes map nothing in /dev/shm, so the span-set reading of "
+            f"the same window has to be 0 and came back {span_set}")
+
+    def test_a_recycled_address_is_still_this_steps_own_page(self):
+        """Why the key carries the file and not the address span alone, as
+        three readings of one window.
+
+        A freed address span goes straight back to the next mapping, so this
+        is the common case and not an exotic one. A sibling drops six
+        `Event`s and the two `Event`s this step then maps land partly in the
+        hole it left: keyed by ADDRESS SPAN ALONE, six of their ten pages
+        read as "present before" and the step costs **16,384** of the 40,960
+        bytes it really cost -- an undercount of a published figure, which is
+        the failure this repository exists to prevent. Keyed by span and file
+        both, it is 40,960 to the byte, in 100 constructed races out of 100.
+        The retired reading is **-81,920**.
+        """
+        with _ShmInterference(6) as sibling:
+            sibling.map_now()
+            before_total, before = _shm_total(), _shm_spans()
+            sibling.unmap_now()
+            pool_cost_holder = [MP.Event(), MP.Event()]
+            try:
+                after = _shm_spans()
+                pooled = _shm_added(before, after)
+                # The same reader with the file half of every key blanked,
+                # which is what a key of the address span alone would be.
+                by_address = _shm_added(_blank_files(before),
+                                        _blank_files(after))
+                retired = _shm_total() - before_total
+            finally:
+                del pool_cost_holder
+        assert sibling.mapped_bytes == 6 * self.EVENT_BYTES, (
+            f"the interference thread mapped {sibling.mapped_bytes} bytes "
+            f"and not {6 * self.EVENT_BYTES}, so this arm is not the race "
+            f"it describes")
+        assert pooled == 2 * self.EVENT_BYTES, (
+            f"two Events cost {pooled} bytes in a window a sibling "
+            f"unmapped into, where they cost {2 * self.EVENT_BYTES} on a "
+            f"quiet one, so the reading is not interference-proof "
+            f"after all")
+        assert by_address < pooled, (
+            f"an address-only key read {by_address} where the step really "
+            f"cost {pooled}. This arm is the whole reason the key carries "
+            f"the file too: if it has stopped undercounting then the kernel "
+            f"has stopped recycling the span, and the class docstring now "
+            f"claims a hazard that no longer exists")
+        assert retired < 0, (
+            f"the retired reading came back {retired}, not negative, so this "
+            f"arm is no longer comparing the two readers under interference")
 
     def test_the_pool_builds_two_flags_and_not_two_per_client(self, base,
                                                               queries):
