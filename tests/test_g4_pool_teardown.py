@@ -330,7 +330,9 @@ class TestStartJoinsItsAttendantsWhenTheBarrierBreaks:
 #: warn from what the arm believes is a single-threaded parent. Measured over
 #: 400 runs of an instrumented copy: every run whose joined arm warned read
 #: `active_count() == 1`, `is_alive() == False` and `/proc/self/status`
-#: `Threads: 2` at fork time, and no clean run read 2. That window was this
+#: `Threads: 2` at fork time, and of the 390 runs that read `Threads: 1` not
+#: one warned. (10 read 2 and 3 of those stayed quiet -- the READ races the
+#: fork too, and that is the harmless direction.) That window was this
 #: file's own flake -- the single-pair probe this replaces returned
 #: `joined=1 not_joined=1` on 4 of 2000 quiet runs (0.20%) and 39 of 3000
 #: under twenty-way load (1.30%), always on the joined arm alone.
@@ -344,7 +346,7 @@ class TestStartJoinsItsAttendantsWhenTheBarrierBreaks:
 #: 0 runs with every sample warning); sampling over the settled probe left 0
 #: of 10000.
 #:
-#: Five pairs and not two, because dirty samples are CORRELATED -- one
+#: Five pairs and not one, because dirty samples are CORRELATED -- one
 #: descheduled instant dirties several -- so `p**5` understates the tail and
 #: the count was picked against the measured distribution instead (dirty
 #: samples per run over 2000 runs: 1845 none, 122 one, 26 two, 5 three, 2
