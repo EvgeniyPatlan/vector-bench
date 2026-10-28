@@ -484,8 +484,11 @@ class TestAbsentIsNotZero:
     ])
     def test_the_spellings_a_connector_may_hand_back(self, raw, expected):
         """A status value arrives as `int`, `str` or `bytes` depending on the
-        connector and the column type, and `int(b'17')` is a `TypeError`. The
-        record field is an int either way."""
+        connector and the column type. Bytes need handling not because `int()`
+        refuses them -- `int(b'17')` is 17 -- but because `status_int` decodes
+        them onto the string path, where the `float()` fallback turns a value
+        like `b"0.000"` into 0 instead of a `ValueError`. The record field is
+        an int either way."""
         driver = wired(PerconaDriver, status={GAUGE: raw})
         assert driver.status_counters((GAUGE,)) == {GAUGE: expected}
 

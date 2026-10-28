@@ -256,8 +256,10 @@ class EngineDriver(abc.ABC):
     #: Valkey and Percona Search inherit "none" and need no edit, which is
     #: what "No hooks" in §4.1 item 4 means.
     repair_path: str = "none"
-    #: Server status variables worth recording per phase, by name, or `()` for
-    #: an engine that exposes none. Declared per DRIVER and not per call site,
+    #: Server status variables worth recording, by name, or `()` for an engine
+    #: that exposes none. Read today by one caller only,
+    #: `harness/workloads/build.py:_server_status`, so the values land on the
+    #: `index_build` record and no other phase's. Declared per DRIVER and not per call site,
     #: so a workload asks `driver.status_gauges` rather than carrying a table
     #: of engine names -- and so the answer to "what happens for the engines
     #: that have no such variable" is a value in this file rather than an

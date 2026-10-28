@@ -971,11 +971,15 @@ class TestTheTiersAreAllPresentAndOrdered:
 # record what the instrument cannot see is at its least trustworthy when it
 # claims a gap that has been closed.
 #
-# The guard is therefore BIDIRECTIONAL and keyed on the tree: it computes
-# whether a collection site exists and then requires the document to say the
-# matching thing. Either side moving fires it. A one-sided check -- "the
-# document names the collector" -- would pass forever once written and would
-# say nothing if the collector were removed.
+# The guard computes from the tree whether a collection site exists, and that
+# half is complete. What it checks in the DOCUMENT is far narrower: four fixed
+# phrases (`PRESENT_TENSE_ABSENCE`), whether a site's file name appears, and
+# whether `extra.server_status` is described with no collector behind it. So
+# a collector added or removed is always noticed, but a present-tense gap
+# claim is caught only if it uses one of those four exact strings -- reworded,
+# it passes. That beats a one-sided check -- "the document names the
+# collector" -- which would pass forever once written and would say nothing if
+# the collector were removed; it is not a reading of the section.
 
 #: The status variable §4.1 is about. Capitalised exactly as the server
 #: registers it, because the document's claim is about a case-sensitive search.
@@ -1037,8 +1041,14 @@ def stale_gap_claims(text: str, sites: Sequence[str]) -> List[str]:
 
     WHAT THIS DOES NOT CHECK, stated because a reviewer is the terminus for
     the rest and that is only acceptable if the limit is written down. It
-    checks the collection claim and the two search claims -- the parts that
-    are decidable from the tree. It does not check that §4.1's description of
+    does not read §4.1's collection claim or its two search claims as claims.
+    It checks the tree for collection sites, and checks the document for four
+    literal strings (`PRESENT_TENSE_ABSENCE`), for a site's file name, and for
+    a description of `extra.server_status`. Stale-gap detection is ONLY those
+    four literal strings: a present-tense gap claim worded any other way --
+    "nothing collects it", "no code reads this gauge" -- passes silently. More
+    phrases would not close that, so none are added; the limit is the
+    statement. It does not check that §4.1's description of
     WHICH phases are collected is right (the words "build phase" could be
     wrong about `harness/workloads/` and this would pass), nor the node-map
     rider's 30-50 bytes, nor the claim about `docs/09`'s mentions, nor whether
