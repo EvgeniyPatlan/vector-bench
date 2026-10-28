@@ -389,8 +389,11 @@ RUN tar -xf /tmp/source.tar -C /src && rm -f /tmp/source.tar
 # CFLAGS CANNOT BE HANDED TO THIS TREE BY `export` ALONE ON A DEBIAN HOST, AND
 # THE cmake LINE BELOW CARRIES THREE FLAGS THAT EXIST ONLY FOR THAT. Every step
 # of the chain is READ from the Percona tree -- at the 9.7.1 base this file was
-# written against, NOT re-derived at the pin 56124b03fdc5954e2401ab4d2c7bf7cb3a767158
-# -- unless it says MEASURED: measured on the build host, not inside this image.
+# written against, and NOT re-derived at the current pin
+# (56124b03fdc5954e2401ab4d2c7bf7cb3a767158), whose base is about four months
+# newer; re-deriving it means a configure, and a configure is a build. A step
+# says MEASURED where it was measured on the build host rather than inside
+# this image:
 #
 #   1. source CMakeLists.txt:747-764 -- for `LINUX_STANDALONE AND
 #      (LINUX_DEB_PLATFORM OR LINUX_RPM_PLATFORM)` (:750) the tree offers a

@@ -52,13 +52,13 @@ simpler reason than the one it gave: **a date never tells you whether you have
 the tip, so compare SHAs.** Every date in the table below is an author date,
 because that is what `git log` shows by default.
 
-### What the commit log says about stability
+### What the pre-merge `vector-mvp` commit log said about stability
 
-Of the twelve newest commits, **four** are crash or assertion fixes and two
-more are the features that brought the vector work to its current state. All
-six carry author dates between 2026-10-02 and 2026-10-13 — note that two are
-*later* than the tip's own author date, which is the rebase above, not an
-error:
+A snapshot of the **branch as it stood before the merge**, kept because its
+reading still holds. Of the twelve newest commits *on that branch*, **four**
+were crash or assertion fixes and two more were the features that brought the
+vector work to the state it was merged in. All six carry author dates between
+2026-10-02 and 2026-10-13, every one of them earlier than the pin's own:
 
 | SHA | Date | What it fixed |
 |---|---|---|
@@ -69,18 +69,18 @@ error:
 | `eebc427aab7b` | 2026-10-02 | PS-11623: assertion in `ddl0loader.cc:273` when an index build aborts on `innodb_hnsw_max_memory` exhaustion |
 | `d436bb1c77d7` | 2026-10-09 | PS-11618: COSINE distance support for vector indexes |
 
-Read as a group that is a branch under daily development whose *recent* failures
-cluster in three places: restart recovery, concurrent DDL against a live search,
-and the memory ceiling. Two of those three are things a four-day benchmark run
-does — it restarts servers between phases and it loads until something stops it
-— which is the argument for the smoke run in [§7](#7-what-only-a-live-server-can-settle)
-rather than an argument against the engine.
+Read as a group, those were the failures of a branch then under daily
+development, and they clustered in three places: restart recovery, concurrent
+DDL against a live search, and the memory ceiling. Two of those three are
+things a four-day benchmark run does — it restarts servers between phases and
+it loads until something stops it — which is the argument for the smoke run in
+[§7](#7-what-only-a-live-server-can-settle), not against the engine.
 
 Three qualifications on reading that table as a risk assessment, all of which
 cut against over-reading it:
 
-- Each row is a **fix**, so the pin contains it. The list says where the bugs
-  were, not where they are.
+- Each row is a **fix** the pin contains, under a *different* SHA because the
+  series was rebased. It says where the bugs were, not where they are.
 - Two are explicitly debug-build assertions (`a86503214416`, `5c30ac32877a` say
   "debug"). `config/engines/percona.yml` will build `RelWithDebInfo` with
   `NDEBUG`, as every other engine here does, so those two cannot fire in a
@@ -1164,7 +1164,7 @@ its `case` ends at `:141` with `*) die "engine '$engine' has no known
 build-arg (alias_of=$base)"`, so a missing entry is an immediate, clear failure
 rather than a silent one. The entry follows the convention at `:129-131` —
 `percona) bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;` — and
-`docker/percona/Dockerfile:725` declares `ARG PERCONA_TAG` to receive it.
+`docker/percona/Dockerfile:728` declares `ARG PERCONA_TAG` to receive it.
 `prepare-sources.sh` must ship a `git archive` of the pinned SHA (`:98` is the
 pattern) and must *not* try to carry submodules.
 
@@ -1368,20 +1368,40 @@ likely to break:
    smoke run's churn phase is the test.
 4. Every phase writing records, the plan check passing on both filter columns,
    and the report rendering with seven series.
-5. **The run must be launched with `--force`.** This is not about the server at
-   all, and it is the one item here that a green run would hide.
-   `ann_fingerprint` is deliberately engine-invariant and holds no source tag,
-   so the re-pin did not move `results/annb/<pass>/<fingerprint>/`;
-   ann-benchmarks skips any configuration whose result file is already on disk
-   and reports that as success. Without `--force` the first run at a new pin
-   reuses the old binary's recall cells, publishes them under the new pin's
-   `engine_version`, and only `stale_ann` in the Validity section says so,
-   after the report is written. So:
+5. **The run must be launched with `--force`, into a fresh run directory.**
+   Neither half is about the server, and both are things a green run would
+   hide.
+
+   *`--force`, for the recall path.* `ann_fingerprint` is deliberately
+   engine-invariant and holds no source tag, so the re-pin did not move
+   `results/annb/<pass>/<fingerprint>/`; ann-benchmarks skips any
+   configuration whose result file is already on disk and reports that as
+   success. Without `--force` the first run at a new pin reuses the old
+   binary's recall cells and publishes them under the new pin's
+   `engine_version`. `ann_pass.run_engine` does say so before the run —
+   `[ann] N existing result file(s) for <engine> / <dataset>;
+   already-computed configurations will be skipped`, printed under a comment
+   whose first five words are "Warn before the fact, not after" — and what
+   `report/generate.py`'s `stale_ann` bucket adds is per-cell attribution in
+   the Validity section afterwards. So:
    `./run-benchmark.sh run --profile smoke --engines percona --force`, or move
    the Percona subtree of that results directory aside first. Bumping
    `ANN_MEASUREMENT_VERSION` instead would move every pass's tree and
    re-measure every recall point for all seven engines and both resource
    passes, which is weeks of ingest to fix one engine's cache.
+
+   *A fresh run directory, for the ops path.* This is the same hazard one
+   layer down and it has no `--force`. The report's provenance table is
+   `report/render.py:_engine_rows`, which prints `source.tag` and
+   `source.commit[:12]` from the manifest — **one value per engine per run
+   directory** — and `orchestrator/manifest.py:set_engine` overwrites that
+   entry from `sources/percona.source.json` at build time without comparing
+   it to what was there. `engine_version` is on every ops record but no
+   reader prints it. So a directory resumed across the rebuild pools
+   `9.7.1-1` and `9.7.2-2` numbers into one `build_signature` and attributes
+   all of them to the new commit, with nothing in the report to tell them
+   apart. Start a new run directory, and never `--resume` one that already
+   holds pre-rebuild Percona ops records.
 
 **What the re-pin to the `9.7` series left behind in this document, stated here
 because nothing else will say it.** The pin table above, §4.3's skeleton and

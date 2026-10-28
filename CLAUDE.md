@@ -181,13 +181,14 @@ These are the reasons the code looks over-defensive. Do not relax them.
   tree and produces a seven-engine recall chart containing one engine. It also holds **no
   source tag**, so a re-pin does not move the tree: once an engine's `source.tag` changes,
   ann-benchmarks skips every configuration whose result file is already on disk and the old
-  binary's recall cells are reused under the new pin's `engine_version`, with only
-  `report/generate.py`'s `stale_ann` bucket saying so — in the Validity section, after the
-  report is written. **Pass `--force` on the first ann run after a re-pin**, which
-  `ann_pass.run_engine` hands through to ann-benchmarks and `--engines <e>` scopes to the one
-  engine, or move that engine's subtree aside. Bumping `ANN_MEASUREMENT_VERSION` is not the
-  remedy: it moves every pass's tree and re-measures every recall point for all seven engines
-  and both resource passes.
+  binary's recall cells are reused under the new pin's `engine_version`. `ann_pass.run_engine`
+  does print `[ann] N existing result file(s) … will be skipped` before the run — "Warn before
+  the fact, not after" — and `report/generate.py`'s `stale_ann` bucket adds the per-cell
+  attribution in the Validity section afterwards. **Pass `--force` on the first ann run after
+  a re-pin**, which `ann_pass.run_engine` hands through to ann-benchmarks and `--engines <e>`
+  scopes to the one engine, or move that engine's subtree aside. Bumping
+  `ANN_MEASUREMENT_VERSION` is not the remedy: it moves every pass's tree and re-measures every
+  recall point for all seven engines and both resource passes.
 - **Filtered ground truth is recomputed** (`harness/datasets.py`) — a `WHERE` predicate changes
   the correct answer set, and reusing unfiltered neighbours scores every engine against the
   wrong targets.

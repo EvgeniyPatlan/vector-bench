@@ -65,10 +65,11 @@ source:
   # The previous pin -- the `vector-mvp` tip of 2026-10-13, which
   # docs/12-percona-feedback-plan.md names and this file deliberately no
   # longer does -- is NOT an ancestor of this one: GitHub's compare of the two
-  # reports `diverged`, 721 ahead and 43 behind. Nothing from that branch tip
-  # is reachable from here, which is why this is a re-pin and not a
-  # fast-forward, and why the cmake flags below are unverified at this base
-  # until a configure has run.
+  # reports `diverged`: measured FROM the old pin, this one is 721 commits
+  # ahead of it and the old pin holds 43 that this one does not. Nothing
+  # from that branch tip is reachable from here, which is why this is a re-pin
+  # and not a fast-forward, and why the cmake flags below are unverified at
+  # this base until a configure has run.
   #
   # MOVING THIS KEY DOES NOT INVALIDATE THE RECALL RESULTS, AND IT SHOULD.
   # `orchestrator/ann_pass.py:ann_fingerprint` is deliberately
@@ -77,13 +78,26 @@ source:
   # ann-benchmarks then skips every configuration whose result file is already
   # on disk and reports that as success, so the old binary's recall cells are
   # reused under the new pin's `engine_version`, and the only thing that says
-  # so is `report/generate.py`'s `stale_ann` bucket, in the Validity section,
-  # after the report is written. So: PASS `--force` ON THE FIRST ann RUN AFTER
+  # so first is `ann_pass.run_engine`, which prints `[ann] N existing result
+  # file(s) ... will be skipped` BEFORE the run -- its comment's first five
+  # words are "Warn before the fact, not after" -- while
+  # `report/generate.py`'s `stale_ann` bucket adds the per-cell attribution in
+  # the Validity section afterwards. So: PASS `--force` ON THE FIRST ann RUN AFTER
   # A RE-PIN -- `./run-benchmark.sh run --profile smoke --engines percona
   # --force` -- or move the Percona subtree of that results directory aside.
   # Bumping `ANN_MEASUREMENT_VERSION` is NOT the remedy: it would move every
   # pass's tree and re-measure every recall point for all seven engines and
   # both resource passes.
+  #
+  # AND THE OPS PATH HAS THE SAME HAZARD WITH NO `--force` FOR IT: the
+  # report's provenance table (`report/render.py:_engine_rows`) prints
+  # `source.tag` and `source.commit[:12]` from the manifest, ONE value per
+  # engine per run directory, and `manifest.py:set_engine` overwrites that
+  # entry from `sources/percona.source.json` at build time without comparing
+  # it. So the first run after a rebuild goes to a FRESH run directory, and a
+  # directory already holding pre-rebuild Percona ops records is never
+  # resumed into -- otherwise two servers' numbers pool into one
+  # `build_signature` under the new commit.
   tag: 56124b03fdc5954e2401ab4d2c7bf7cb3a767158   # tip of PR #6278 on base 9.7
   upstream: https://github.com/percona/percona-server.git
   # No `submodules:` key, deliberately: all four of the pin's submodules are
