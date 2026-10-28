@@ -86,8 +86,23 @@ BUNDLED_LIBRARIES = ("WITH_CURL", "WITH_ZLIB", "WITH_ZSTD")
 # packaging, test and documentation pipeline. A wholesale copy of that list
 # brings these, and each one is a few hundred MB in an image that ships to a
 # benchmark host.
+#
+# `gdb` WAS THE SECOND OF THE FOURTEEN ENTRIES, after valgrind, AND IS
+# DELIBERATELY NOT HERE ANY MORE. Twelve of the twenty-four Percona ops units
+# in run full-20261015-215006 died inside the first INSERT -- exactly half --
+# and nothing in this repository could turn a core into text, so request 1 of
+# docs/12-percona-feedback-plan.md ("get stack traces for the crashes", its
+# §4, NOT request 3, which is filtered search in §7) asked for the backtrace
+# and the Dockerfile's audit note records the reversal. It is installed in the
+# BENCH stage only, which is a per-stage claim and therefore not one this
+# file can make: `apt_packages` below is whole-file on purpose. The question
+# moved to `tests/test_e4_percona_build_flags.py`, which asserts gdb is in
+# `bench`, is in neither `builder` nor `runtime`, and is in exactly one stage
+# -- strictly more than the absence assertion it replaces. Removing a name
+# from this tuple drops a parametrized case silently, which is why the count
+# below is now asserted.
 VENDOR_ONLY_PACKAGES = (
-    "valgrind", "gdb", "doxygen", "doxygen-gui", "graphviz", "devscripts",
+    "valgrind", "doxygen", "doxygen-gui", "graphviz", "devscripts",
     "debhelper", "fakeroot", "ccache", "patchelf", "python3-mysqldb",
     "libeatmydata", "dh-apparmor", "copyright-update",
 )
@@ -303,6 +318,17 @@ class TestTheVendorChoicesThatAreTakenAreTaken:
 
 class TestTheVendorPackagingPipelineIsNotInstalled:
 
+    def test_the_list_is_not_vacuously_short(self):
+        """Non-vacuity for the parametrized test below.
+
+        Every case here is an absence, so emptying the tuple collects nothing
+        and the class looks green over nothing. The floor was added when
+        `gdb` left the list -- a deletion is the smallest edit that makes one
+        of these stop being checked, and it had just happened.
+        """
+        assert len(VENDOR_ONLY_PACKAGES) >= 13, sorted(VENDOR_ONLY_PACKAGES)
+        assert len(set(VENDOR_ONLY_PACKAGES)) == len(VENDOR_ONLY_PACKAGES)
+
     @pytest.mark.parametrize("package", VENDOR_ONLY_PACKAGES)
     def test_the_package_is_absent(self, package, dockerfile_text):
         assert package not in apt_packages(dockerfile_text), (
@@ -370,9 +396,13 @@ class TestTheProbesDiscriminate:
 
     def test_installing_the_vendor_test_pipeline_is_seen(self,
                                                          dockerfile_text):
+        # `ccache` rather than `gdb`, which this file used to name here:
+        # gdb is now installed in the bench stage (see VENDOR_ONLY_PACKAGES),
+        # so adding it to the builder's list would add no NEW name to a
+        # whole-file parse and the count below would be off by one.
         mutant = dockerfile_text.replace(
             "      perl gawk unzip curl",
-            "      perl gawk unzip curl valgrind gdb doxygen patchelf")
+            "      perl gawk unzip curl valgrind ccache doxygen patchelf")
         assert mutant != dockerfile_text, "mutation did not apply"
         honest, mutated = apt_packages(dockerfile_text), apt_packages(mutant)
         assert "valgrind" not in honest
