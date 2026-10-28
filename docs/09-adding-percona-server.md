@@ -1099,8 +1099,10 @@ source:
   # cosmetic choice. `_source_tag` in `orchestrator/engines.py` is
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag` return
-  # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `OpsRun.run_harness` in
+  # the empty string and `prepare_percona` die — it passes `""` as the
+  # default, so there is no hard-coded fallback for THIS engine; the three
+  # other `prepare_*` functions that read the key do pass one.
+  # `OpsRun.run_harness` in
   # `orchestrator/ops_pass.py` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
@@ -1145,8 +1147,12 @@ runtime:
 comment.** `_source_tag` in `orchestrator/engines.py` is
 `return str(source.get("tag") or source.get("version") or "")`. There is no
 `sha` key, so a `source: sha:` block would make it return the empty string and
-`scripts/prepare-sources.sh` fall back to its hard-coded default for that
-engine. `OpsRun.run_harness` in `orchestrator/ops_pass.py` reads the same key
+`prepare_percona` in `scripts/prepare-sources.sh` die: it reads the key with
+`""` as the default and `die`s on an empty value. There is no hard-coded
+fallback for this engine. `prepare_alisql`, `prepare_mariadb` and
+`prepare_pgvector` do pass one (`AliSQL-8.0.44-2`, `mariadb-11.8.8`, `v0.8.6`),
+which is why "it falls back to a default tag" reads as true and is not.
+`OpsRun.run_harness` in `orchestrator/ops_pass.py` reads the same key
 into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive` takes a
 SHA wherever it takes a tag, so the mechanism is unchanged.
 

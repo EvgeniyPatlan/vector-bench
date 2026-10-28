@@ -272,12 +272,13 @@ class TestBuildArgConventions:
     """The Dockerfile has to receive the pin through the ARG the build script
     will pass, and the pin has to be under the key the orchestrator reads.
 
-    Both of these were wrong in the first draft of docs/09, and neither would
-    have failed visibly: a mismatched ARG leaves `VB_ENGINE_TAG=unknown` in the
-    image, and the wrong config key makes `_source_tag()` return the empty
-    string and `prepare-sources.sh` silently fall back to a default tag. The
-    engine would then be built from whatever that default names, and the
-    manifest would not record which commit was measured.
+    Both of these were wrong in the first draft of docs/09. A mismatched ARG
+    fails quietly: the image builds and carries `VB_ENGINE_TAG=unknown`. The
+    wrong config key fails loudly, before any build: `_source_tag()` returns
+    the empty string and `prepare_percona` dies, because it passes `""` as
+    the default and `die`s on an empty value -- unlike the other `prepare_*`
+    functions, which fall back to a hard-coded tag. An earlier revision of
+    this docstring said this engine silently falls back too; it does not.
     """
 
     def test_the_dockerfile_arg_follows_the_build_script_convention(self):
