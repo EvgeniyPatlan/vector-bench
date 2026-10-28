@@ -193,10 +193,10 @@ NOT IN THIS BUNDLE
   the moment it died, which on these workloads runs to tens of gigabytes and
   can only be read against the exact build and machine that wrote it. Sending
   one would be sending something unusable, slowly. Each is still in the run
-  directory on the machine that measured, and what travels from a core is the
-  BACKTRACE taken from it there -- `scripts/gdb-backtrace.py` in this repo
-  produces one, and it is a few kilobytes. Ask for that if a crash is what
-  brought you here.
+  directory on the machine that measured. This bundle contains NO BACKTRACE
+  either: one has to be taken from the core on that machine, and
+  `scripts/gdb-backtrace.py` in this repo produces one in a few kilobytes of
+  text. Ask for that if a crash is what brought you here.
 """
 
 

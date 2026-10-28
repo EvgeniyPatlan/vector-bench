@@ -277,7 +277,8 @@ class TestTheReadmeSaysWhatIsMissing:
         _members, readme, _detail = _bundle(run_dir, tmp_path)
         section = " ".join(_section(readme).split())
         assert "machine that measured" in section
-        assert "BACKTRACE" in section
+        # The bundle carries no backtrace, and must not read as if it did.
+        assert "contains NO BACKTRACE" in section
         assert "gdb-backtrace.py" in section
 
     def test_a_run_with_no_core_gets_no_stray_section(self, run_dir, tmp_path):
