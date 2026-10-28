@@ -370,7 +370,11 @@ FORK_PROBE_SETTLE_S = 2.0
 #:
 #: Each pair builds a FRESH thread, so each joined-arm fork races the window
 #: `FORK_PROBE_SAMPLES` documents independently rather than re-reading one
-#: outcome. Prints one `joined,not_joined,settled` triple per pair.
+#: outcome. Prints one `joined,not_joined,settled` triple per pair, where
+#: `settled` is 1 where the kernel confirmed one thread before the joined-arm
+#: fork, 0 where `FORK_PROBE_SETTLE_S` expired with it still reporting more,
+#: and -1 where there was no count to read -- three values and not a flag,
+#: because "could not read" must not report itself as "confirmed".
 _FORK_WARNING_PROBE = r"""
 import multiprocessing, threading, time, warnings
 MP = multiprocessing.get_context("fork")
@@ -396,11 +400,15 @@ def os_thread_count():
 
 def wait_until_single():
     deadline = time.monotonic() + SETTLE_S
-    while os_thread_count() not in (None, 1):
+    while True:
+        count = os_thread_count()
+        if count is None:
+            return -1
+        if count == 1:
+            return 1
         if time.monotonic() > deadline:
             return 0
         time.sleep(0.0005)
-    return 1
 
 
 def warnings_on_one_fork():
@@ -494,17 +502,22 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
             f"{FORK_PROBE_SAMPLES}: {done.stdout!r}")
         joined = [pair[0] for pair in pairs]
         not_joined = [pair[1] for pair in pairs]
-        # Whether the kernel confirmed a single-threaded parent before each
-        # joined-arm fork. Not asserted on -- no `/proc` is a legitimate box,
-        # and the sampling is what carries the claim there -- but named in the
-        # failure, because "did the settle run" is the first question a failure
-        # here raises.
-        settled = sum(pair[2] for pair in pairs)
+        # How the settle went before each joined-arm fork. Not asserted on --
+        # a box with no `/proc` is legitimate, and the sampling is what carries
+        # the claim there -- but named in the failure, because "did the settle
+        # run" is the first question a failure here raises, and the three cases
+        # answer it differently: all confirmed points at the mechanism having
+        # changed, expiries at a thread that never left, unreadable at a box
+        # where only the sampling was ever in play.
+        settle = {1: "confirmed", 0: "expired", -1: "unreadable"}
+        settled = ", ".join(
+            f"{sum(1 for pair in pairs if pair[2] == value)} {name}"
+            for value, name in settle.items())
         assert min(joined) == 0, (
             f"a fork from a single-threaded parent warned every time "
-            f"({joined} over {FORK_PROBE_SAMPLES} samples, the kernel "
-            f"confirmed one thread before {settled} of them), so this probe "
-            f"is not measuring the thread")
+            f"({joined} over {FORK_PROBE_SAMPLES} samples; the wait for the "
+            f"kernel to report one thread: {settled}), so this probe is not "
+            f"measuring the thread")
         assert min(not_joined) >= 1, (
             f"a fork beside a live thread warned {not_joined} time(s) per "
             f"sample; this interpreter does not warn, so the 54 -> 0 "
