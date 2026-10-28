@@ -129,10 +129,10 @@ build_engine() {
     mariadb)  bargs+=(--build-arg "MARIADB_TAG=${tag}") ;;
     alisql)   bargs+=(--build-arg "ALISQL_TAG=${tag}") ;;
     # The value is a SHA rather than a tag name -- Percona is pinned to a
-    # commit on branch `vector-mvp`, not to a release -- but it travels by the
-    # same `source.tag` key and through the same build arg, because `git
-    # archive` and `docker build --build-arg` neither know nor care which it
-    # is. docker/percona/Dockerfile declares `ARG PERCONA_TAG` to receive it.
+    # commit (the tip of Percona PR #6278 on base `9.7`), not to a release --
+    # but it travels by the same `source.tag` key and through the same build
+    # arg, because `git archive` and `docker build --build-arg` neither know
+    # nor care which it is. docker/percona/Dockerfile declares `ARG PERCONA_TAG` to receive it.
     percona)  bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
     # Nothing compiled: the module is copied out of its own published image.

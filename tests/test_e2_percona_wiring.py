@@ -2315,21 +2315,31 @@ class TestThePinIsOneValueInEveryFileThatSpellsOne:
 # new binary's recall is never measured, and the report publishes the old
 # binary's numbers under the new pin's `engine_version`.
 #
-# The only thing that notices is `report/generate.py`'s `stale_ann` bucket,
-# which compares each record's `extra.source_mtime` against the run's start
-# and lists the cell in the Validity section. That is a flag, not a
-# prevention. The remedy is `--force` on the first ann run after the re-pin,
-# which `ann_pass.run_engine` passes through -- NOT a bump of
-# `ANN_MEASUREMENT_VERSION`, which would move every pass's tree and re-measure
-# every recall point for all seven engines and both resource passes.
+# Two things notice, and neither prevents it. `ann_pass.run_engine` prints
+# "already-computed configurations will be skipped" before the run, and
+# `report/generate.py`'s `stale_ann` bucket compares each record's
+# `extra.source_mtime` against the run's start and lists the cell in the
+# Validity section afterwards. The remedy is to MOVE THE ENGINE'S SUBTREE of
+# the ann results tree aside before the first run at a new pin:
+# `_count_results` counts result files under directories named for the
+# engine, so it returns 0 and ann-benchmarks measures the curve again. NOT
+# `--force`: its help text offers exactly this re-run, but the same flag is
+# the escape hatch on the free-disk refusal in `orchestrator/cli.py`, so
+# passing it disables the one refusal a core-dump campaign most needs -- and
+# for two rounds this file asserted `--force` as the remedy. NOT a fresh run
+# directory: `annb_results` is `results/annb`, a sibling of the run
+# directory, so a new `--run-id` leaves every recall cell where it was. And
+# NOT a bump of `ANN_MEASUREMENT_VERSION`, which would move every pass's tree
+# and re-measure every recall point for all seven engines and both resource
+# passes.
 #
 # So the requirement is written in the three places an operator or an author
 # actually passes through on the way to that run, and asserted here, because
 # a requirement that lives only in a merged pull request body is a
 # requirement nobody will read at the moment it matters.
 
-#: Where the `--force` requirement is written, and why each site.
-FORCE_SITES = {
+#: Where the move-the-subtree-aside requirement is written, and why each site.
+ANN_SUBTREE_SITES = {
     "config/engines/percona.yml":
         "beside the pin itself: moving `source.tag` is the act that creates "
         "the hazard, so the warning belongs in the diff that creates it",
@@ -2393,7 +2403,7 @@ class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
     _CLAIM = "a re-pin leaves the recall cells and the subtree must be moved aside"
     _DIRECTIVE = "a sentence that tells the operator to pass --force"
 
-    @pytest.mark.parametrize("path", sorted(FORCE_SITES))
+    @pytest.mark.parametrize("path", sorted(ANN_SUBTREE_SITES))
     def test_the_subtree_requirement_is_made_at_this_site(self, path):
         """Some ONE paragraph at this site makes the whole claim.
 
@@ -2409,13 +2419,13 @@ class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
         assert hits, (
             f"no single paragraph in {path} still makes the whole claim: "
             f"{self._CLAIM}\n"
-            f"  reason this site was chosen: {FORCE_SITES[path]}\n"
+            f"  reason this site was chosen: {ANN_SUBTREE_SITES[path]}\n"
             f"  pattern: {pattern}\n"
             f"  the pattern is a vocabulary, not a sentence -- if the claim "
             f"is still made and only the wording moved, widen PROSE_CLAIMS "
             f"rather than restoring the old phrasing")
 
-    @pytest.mark.parametrize("path", sorted(FORCE_SITES))
+    @pytest.mark.parametrize("path", sorted(ANN_SUBTREE_SITES))
     def test_this_site_does_not_tell_the_operator_to_pass_force(self, path):
         """The assertion that would have caught two rounds of being wrong.
 
@@ -2451,7 +2461,7 @@ class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
             + "\n  ".join(offenders))
 
     def test_every_site_exists_and_says_why_it_is_a_site(self):
-        for path, reason in sorted(FORCE_SITES.items()):
+        for path, reason in sorted(ANN_SUBTREE_SITES.items()):
             assert reason.strip(), path
             assert os.path.isfile(os.path.join(VB_ROOT, path)), path
 
@@ -2502,7 +2512,7 @@ class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
         largest any site needs today; the bound is what fails if a future
         edit merges the warning back into a wall of comment.
         """
-        for path in sorted(FORCE_SITES):
+        for path in sorted(ANN_SUBTREE_SITES):
             text = open(os.path.join(VB_ROOT, path)).read()
             blocks = [b for b in _paragraphs(text) if "--force" in b]
             assert blocks, path

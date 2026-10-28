@@ -285,8 +285,8 @@ decided each choice) · `10-rollout.md` (what to run after this series, in what 
 two checks that cannot be done as specified) · `11-methodology-roadmap.md` (what the
 measurement methodology cannot yet observe, what it already handles, and in what order to
 address the rest — a roadmap, not a description of the system. **One** of its items is now
-implemented, §4.1's per-phase capture of `Innodb_hnsw_memory_used`; nothing else in it is,
-so read a section as a proposal unless it says otherwise) ·
+implemented, §4.1's capture of `Innodb_hnsw_memory_used`, and only on the `index_build`
+record; nothing else in it is, so read a section as a proposal unless it says otherwise) ·
 `12-percona-feedback-plan.md` (the four things the server team asked for after reading the
 report, the re-pin that gates all of them, and what each costs — also a plan, also
 unimplemented).
