@@ -72,13 +72,22 @@ VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 METHODOLOGY_DOC = os.path.join(VB_ROOT, "docs", "05-methodology.md")
 ENGINES_DIR = os.path.join(VB_ROOT, "config", "engines")
 
-#: "ops-only", however it is spelled. Hyphen, en dash, em dash, a plain space
-#: or any mix: the guard below keys on the TERM, and two of my own attempts to
-#: get past it -- "are ops only anyway" and "are ops\u2013only anyway" -- did so
-#: by changing one character of it while leaving the claim intact. Collapsing
-#: the separator is what makes the check about the claim rather than about the
-#: typography.
-OPS_ONLY = re.compile(r"ops[\s\-\u2010-\u2015\u2212]*only", re.I)
+#: "ops-only", for the separators in this class. Hyphen, the Unicode dashes,
+#: a plain space, the fullwidth and small forms, and the invisible characters
+#: a paste from a word processor leaves behind -- soft hyphen, zero-width
+#: space and joiners, byte-order mark -- in any mix and any case. Two of my
+#: own attempts got past an earlier version by writing "are ops only anyway"
+#: with a space and "are ops\u2013only anyway" with an en dash, and the
+#: reviewer then got past that with a soft hyphen and a zero-width space.
+#:
+#: The class is enumerable, which is why it is widened rather than disclosed:
+#: a separator is one of a finite set of characters, unlike the semantic
+#: walk-arounds the guard below discloses instead. It still carries NO
+#: claim of closure -- a separator outside this set reads as the term to a
+#: human and not to this pattern, and the docstring below says so.
+OPS_ONLY = re.compile(
+    r"ops[\s\-\u00ad\u2010-\u2015\u2043\u2212\u200b-\u200d"
+    r"\ufeff\ufe63\uff0d]*only", re.I)
 
 #: The knob's name as §3 and §4 both spell it, and the needle every row
 #: lookup below uses. Backticked, because `ef_construction` unbackticked also
@@ -590,6 +599,12 @@ class TestTheMethodologyTableSaysTheSameThing:
         reading this cell beside `test_the_cells_claim_about_that_engine_is_
         executable` below, which pins the code the cell is about.
 
+        That one sentence is the WHOLE residue, and the reason it can be is
+        the shape of the check: a necessary condition has exactly one failure
+        mode, being satisfied while the claim is false, so naming that mode
+        names everything it misses. The guard below has no such luck, which
+        is why its disclosure is a list.
+
         Either of this repository's two names for the engine satisfies it --
         "Percona Search" or "mongot" -- because the requirement is that the
         exception be named, not that it be named one way, and refusing a cell
@@ -642,12 +657,24 @@ class TestTheMethodologyTableSaysTheSameThing:
         is such a sentence -- 0 of 6,035 archived recall records carry
         either.
 
-        WHAT THIS DOES NOT COVER: anaphora. "…and `index_bytes` are not
-        recall fields. All three are ops-only." splits the subject and the
-        claim across two sentences, and no pattern here sees that. It is also
-        blind to the claim made without the term at all. Both need a reader;
-        what this closes is the class of edit that keeps the wording and
-        drops a word of the guard's pattern.
+        WHAT THIS DOES NOT AND CANNOT CLOSE, stated as a class rather than
+        as the examples I happened to try, because four rounds of widening
+        this check produced four more ways past it and the pattern will not
+        converge: anaphora, which splits the subject from the claim across
+        two sentences ("…are not recall fields. All three are ops-only.");
+        the claim made without the term at all ("ops-path-only fields"); a
+        negation that sits in the right clause but whose scope is not the
+        predicate, which ASSERTS what it appears to deny ("are not just
+        ops-only but ops-first", and "not merely" and "not only" the same
+        way); and a separator outside the class `OPS_ONLY` enumerates. Each
+        of those needs a reader, and a reader is an acceptable terminus here
+        -- it is this file's own idiom, as `_PROSE_NAME`'s "NOT A GATE" and
+        `generate.BUILD_KIND_UNRECORDED` are -- on the one condition that
+        what is written down is true.
+
+        What this DOES close is the class of edit that keeps the claim's
+        wording and drops a character or a word of the guard's pattern, which
+        is what four of the eight edits past earlier versions did.
 
         Whitespace-normalised, because the document is hard-wrapped and the
         sentence spans a line break.
