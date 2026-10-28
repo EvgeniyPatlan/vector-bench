@@ -1522,3 +1522,307 @@ class TestTheReferenceRunIsCountedCorrectly:
             "in the comment, or the figure cannot be reconciled with the "
             "percona-only export")
         assert "resum" in block.lower(), block[:0] or "no mention of a resume"
+
+
+# ---------------------------------------------------------------------------
+# The seam between this unit and the one that reads the core (#67 / A6)
+# ---------------------------------------------------------------------------
+
+LAB_SCRIPT = os.path.join(REPO, "scripts", "gdb-backtrace.py")
+
+
+def _script_constant(name):
+    """A module-level string or tuple constant out of the lab script's AST.
+
+    Read rather than imported: the script's `main()` expects to be inside the
+    bench container, and importing it here would couple this file to whatever
+    it does at import time.
+    """
+    import ast
+    tree = ast.parse(open(LAB_SCRIPT).read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{LAB_SCRIPT} has no module-level {name}")
+
+
+class TestTheTwoHalvesOfTheCoreRouteAgree:
+    """This unit writes the core; #67's `scripts/gdb-backtrace.py` reads it.
+    They were written by different units against the same seam, so every part
+    of it is asserted against THAT FILE'S OWN CONSTANTS rather than against a
+    comment here.
+
+    The seam has three parts -- the container path, the keyword name, and the
+    filename -- and the third does not fully agree. That is recorded here
+    rather than smoothed over, because the disagreement decides whether a core
+    is ever read.
+    """
+
+    def test_the_container_path_is_the_same_on_both_sides(self, tmp_path,
+                                                          monkeypatch):
+        """`run_script` mounts it; the script looks there. One string, two
+        files, and nothing but this test holding them together."""
+        from orchestrator import ops_pass
+        theirs = _script_constant("ARTIFACTS")
+        artifacts = tmp_path / "results" / "run-1"
+        artifacts.mkdir(parents=True)
+
+        captured = {}
+        monkeypatch.setattr(ops_pass.docker_ctl, "image_exists",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(ops_pass.docker_ctl, "run_foreground",
+                            lambda spec, **k: captured.setdefault("spec", spec)
+                            and 0 or 0)
+        monkeypatch.setattr(ops_pass.OpsRun, "_save_server_log",
+                            lambda self: None)
+        run = _ops_run(tmp_path, "percona")
+        run.run_script("probe.py", [], artifacts_dir=str(artifacts))
+        mounts = [v for v in captured["spec"].volumes if str(artifacts) in v]
+        print(f"theirs={theirs!r} ours={mounts}")
+        assert mounts == [f"{artifacts}:{theirs}:ro"], (
+            f"scripts/gdb-backtrace.py looks in {theirs!r}; this mounts "
+            f"{mounts}")
+
+    def test_the_keyword_name_is_the_one_cmd_lab_passes(self):
+        """`cmd_lab` passes `artifacts_dir=`; `run_script` has to take it.
+
+        This is the seam #67's own ratchet was watching, and the reason it
+        watched by signature rather than by grep: a mismatch here is a
+        TypeError raised minutes after a server came up.
+        """
+        import inspect
+        from orchestrator import cli, ops_pass
+        assert "artifacts_dir" in inspect.signature(
+            ops_pass.OpsRun.run_script).parameters
+        source = open(os.path.join(REPO, "orchestrator", "cli.py")).read()
+        assert "artifacts_dir=artifacts_dir" in source, (
+            "cmd_lab no longer passes artifacts_dir by that name")
+
+    def test_the_recommended_core_pattern_works_end_to_end(self):
+        """The one value both halves handle, asserted on BOTH halves.
+
+        This is the assertion that matters in this class. The capture collects
+        `core*`; the script searches `core`, `core.*`, `*.core`, `core-*`. The
+        sets are different, so a `core_pattern` can satisfy one and not the
+        other -- and the console tells the operator what to set, so what it
+        recommends has to be in the intersection.
+        """
+        import fnmatch
+        from orchestrator.ops_pass import (CORE_FILE_GLOB,
+                                           RECOMMENDED_CORE_PATTERN)
+        theirs = _script_constant("CORE_GLOBS")
+        produced = RECOMMENDED_CORE_PATTERN.replace("%p", "12345")
+        print(f"recommend {RECOMMENDED_CORE_PATTERN!r} -> {produced!r}; "
+              f"ours={CORE_FILE_GLOB!r} theirs={theirs}")
+        assert fnmatch.fnmatch(produced, CORE_FILE_GLOB), (
+            f"the capture would not collect {produced!r}, which is what the "
+            f"console tells the operator to produce")
+        assert any(fnmatch.fnmatch(produced, pattern) for pattern in theirs), (
+            f"scripts/gdb-backtrace.py would not find {produced!r}, which is "
+            f"what the console tells the operator to produce; its globs are "
+            f"{theirs}")
+
+    def test_every_message_that_recommends_a_pattern_recommends_that_one(self):
+        """Placement is not enough here -- a second message naming a different
+        value is how an operator ends up on one of the two edges below. So no
+        message may hard-code a pattern of its own."""
+        import re
+        from orchestrator.ops_pass import RECOMMENDED_CORE_PATTERN
+        source = open(os.path.join(REPO, "orchestrator",
+                                   "ops_pass.py")).read()
+        reporter = source.split("def _report_core_pattern", 1)[1].split(
+            "\n    def ", 1)[0]
+        # The CODE only. The docstring has to be able to name `core` while
+        # explaining which relative patterns are collected; what must not
+        # hard-code a value is a message an operator reads.
+        body = reporter.split('"""', 2)[2]
+        literals = set(re.findall(r"`(core[.%\w-]*)`", body))
+        print(f"pattern literals in the reporter: {sorted(literals)}")
+        assert not literals, (
+            f"these are hard-coded in the console messages instead of coming "
+            f"from RECOMMENDED_CORE_PATTERN ({RECOMMENDED_CORE_PATTERN!r}): "
+            f"{sorted(literals)}")
+        assert "RECOMMENDED_CORE_PATTERN" in reporter
+
+    def test_the_two_filename_sets_do_not_fully_agree_and_the_edges_are_known(
+            self):
+        """THE DISAGREEMENT, asserted so it cannot be forgotten or drift.
+
+        `core*` and the script's four globs overlap but neither contains the
+        other, and both edges are reachable from an ordinary `core_pattern`:
+
+            core%p   -> `core12345`    collected here, the script cannot see it
+            %e.core  -> `mysqld.core`  the script looks for it, this never
+                                       collects it
+
+        The second is mitigated: `_report_core_pattern` refuses to promise a
+        copy-out for a relative pattern that does not start with `core`, so
+        the operator is told at server start. The first is in
+        `scripts/gdb-backtrace.py`'s globs and is not in this unit's file set
+        -- widening them to `core*` would close it.
+
+        This test FAILS IF EITHER EDGE CLOSES, which is the point: whoever
+        closes one should delete the half of this that stops being true rather
+        than leaving a note claiming a gap that is gone.
+        """
+        import fnmatch
+        from orchestrator.ops_pass import CORE_FILE_GLOB
+        theirs = _script_constant("CORE_GLOBS")
+
+        def collected(name):
+            return fnmatch.fnmatch(name, CORE_FILE_GLOB)
+
+        def readable(name):
+            return any(fnmatch.fnmatch(name, p) for p in theirs)
+
+        assert collected("core12345") and not readable("core12345"), (
+            "the `core%p` edge has changed; update this test and the comment "
+            "in ops_pass beside CORE_FILE_GLOB")
+        assert readable("mysqld.core") and not collected("mysqld.core"), (
+            "the `%e.core` edge has changed; update this test and the comment "
+            "in ops_pass beside CORE_FILE_GLOB")
+        # And the agreed middle, which is what the recommendation uses.
+        for name in ("core", "core.12345", "core-12345"):
+            assert collected(name) and readable(name), name
+
+    def test_a_core_in_this_units_layout_is_reachable_by_their_search(
+            self, tmp_path):
+        """The layout is one directory deeper than a flat `/artifacts/core*`.
+
+        `_save_server_core` writes
+        `<run_dir>/cores/<engine>-<dataset>-<phase>-<pass>/<name>`, and the
+        operator passes `--artifacts results/<run-id>`, so the core is two
+        levels below the mount point. The script's `find_cores` uses
+        `os.walk`, which is unbounded in depth -- exercised here against a
+        real directory tree rather than read off the source.
+        """
+        import fnmatch
+        from orchestrator.ops_pass import (CORE_FILE_GLOB,
+                                           RECOMMENDED_CORE_PATTERN)
+        theirs = _script_constant("CORE_GLOBS")
+        name = RECOMMENDED_CORE_PATTERN.replace("%p", "12345")
+        deep = (tmp_path / "cores"
+                / "percona-gist-960-euclidean-m8-incremental-normalized")
+        deep.mkdir(parents=True)
+        (deep / name).write_bytes(b"not really a core")
+        assert fnmatch.fnmatch(name, CORE_FILE_GLOB)
+
+        found = []
+        for directory, _subdirs, names in os.walk(str(tmp_path)):
+            for candidate in names:
+                if any(fnmatch.fnmatch(candidate, p) for p in theirs):
+                    found.append(os.path.join(directory, candidate))
+        print(f"found by their search shape: {found}")
+        assert found == [str(deep / name)], (
+            "a core written in this unit's layout is not reachable by the "
+            "recursive search the backtrace script performs")
+
+
+class TestLabArtifactsReachesTheMountNowThatTheRefusalIsGone:
+    """#67 refused `--artifacts` on a tree whose `run_script` lacked the
+    parameter, because the alternative was a TypeError raised minutes after a
+    server came up. That refusal is deleted in this change, which means the
+    path it was standing in front of is now live and nothing had ever
+    exercised it.
+
+    So this drives `cmd_lab` itself -- the real parser, the real validation,
+    the real path arithmetic -- with only the Docker layer replaced. It is
+    the whole of `lab --artifacts` except the container.
+
+    WHAT IT DOES NOT PROVE, and the first real invocation is what will: that
+    the bench image has gdb in it, that the mount appears inside the
+    container, and that a core is there to read. Those need an image, a
+    server and a crash. What this proves is that the argument survives the
+    journey from argv to the volume list, which is exactly what the deleted
+    refusal existed to guarantee and is no longer there to.
+    """
+
+    def _run_lab(self, tmp_path, monkeypatch, argv):
+        from orchestrator import cli, ops_pass
+
+        root = tmp_path / "repo"
+        (root / "scripts").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(cli, "VB_ROOT", str(root))
+
+        captured = {}
+
+        class FakeRun:
+            server_name, port = "srv", 3306
+
+            def __init__(self, *a, **k):
+                captured["paths"] = a[4] if len(a) > 4 else k.get("paths")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def run_script(self, script, args, **kwargs):
+                captured["script"] = script
+                captured["kwargs"] = kwargs
+                return 0
+
+        monkeypatch.setattr(cli.ops_pass, "OpsRun", FakeRun)
+        monkeypatch.setattr(cli.docker_ctl, "docker_available",
+                            lambda: True)
+        monkeypatch.setattr(cli, "measurement_in_progress", lambda: [])
+        args = cli.build_parser().parse_args(argv)
+        rc = args.func(args)
+        return rc, captured
+
+    def test_the_path_reaches_run_script_as_an_absolute_path(self, tmp_path,
+                                                             monkeypatch):
+        """HONEST arm: `--artifacts` given. MUTANT arm: omitted.
+
+        Absolute because the orchestrator hands host paths to the Docker
+        daemon; a relative one would mount nothing, which is the failure
+        CLAUDE.md records for the web UI's bind.
+        """
+        root = tmp_path / "repo"
+        cores = root / "results" / "run-1" / "cores"
+        cores.mkdir(parents=True)
+
+        rel = os.path.relpath(str(cores), os.getcwd())
+        rc, honest = self._run_lab(
+            tmp_path, monkeypatch,
+            ["lab", "--engine", "percona", "--shell", "--artifacts", rel])
+        assert rc == 0, rc
+        rc, mutant = self._run_lab(
+            tmp_path, monkeypatch, ["lab", "--engine", "percona", "--shell"])
+        assert rc == 0, rc
+
+        print(f"HONEST (--artifacts given) = {honest['kwargs']}")
+        print(f"MUTANT (omitted)           = {mutant['kwargs']}")
+        assert honest["kwargs"] != mutant["kwargs"], (
+            "DEAD PROBE: passing --artifacts made no difference to what "
+            "run_script was given")
+        assert honest["kwargs"]["artifacts_dir"] == str(cores.resolve()), (
+            honest["kwargs"])
+        assert mutant["kwargs"]["artifacts_dir"] is None, mutant["kwargs"]
+
+    def test_a_directory_outside_the_repo_is_still_refused(self, tmp_path,
+                                                           monkeypatch):
+        """The refusal that SURVIVES. `_artifacts_mount_problem` is gone;
+        `_lab_artifacts_problem` is not, and it is the one that matters now --
+        lab mounts this path into a container.
+        """
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        rc, captured = self._run_lab(
+            tmp_path, monkeypatch,
+            ["lab", "--engine", "percona", "--shell", "--artifacts",
+             str(outside)])
+        assert rc == 2, rc
+        assert "kwargs" not in captured, (
+            "the server was started despite the refusal")
+
+    def test_a_missing_directory_is_refused_before_anything_starts(
+            self, tmp_path, monkeypatch):
+        rc, captured = self._run_lab(
+            tmp_path, monkeypatch,
+            ["lab", "--engine", "percona", "--shell", "--artifacts",
+             str(tmp_path / "repo" / "nope")])
+        assert rc == 2, rc
+        assert "kwargs" not in captured

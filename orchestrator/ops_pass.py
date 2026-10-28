@@ -55,6 +55,22 @@ HOST_CORE_PATTERN_PATH = "/proc/sys/kernel/core_pattern"
 # reported at server start instead.
 CORE_FILE_GLOB = "core*"
 
+# What to tell an operator to set, and it is not an arbitrary example. This
+# capture collects `core*`; `scripts/gdb-backtrace.py`, which reads the result,
+# searches for `core`, `core.*`, `*.core` and `core-*`. The two sets are not
+# the same, so only their INTERSECTION works end to end, and the two edges are
+# both real:
+#
+#   core%p   -> `core12345`   collected here, invisible to the backtrace script
+#   %e.core  -> `mysqld.core` sought by that script, never collected here
+#
+# `core.%p` is in both and is what every message here recommends, so an
+# operator who follows the console lands in the agreed set rather than on one
+# of those edges. `tests/test_e21_crash_capture_plumbing.py` asserts the
+# agreement against that script's own constants rather than against this
+# comment.
+RECOMMENDED_CORE_PATTERN = "core.%p"
+
 
 def host_core_pattern() -> Optional[str]:
     """The host's `kernel.core_pattern`, or None if it cannot be read.
@@ -296,7 +312,8 @@ class OpsRun:
                   f"The helper itself runs fine; piping is what leaves no "
                   f"file, so putting it in the image would change nothing. To "
                   f"change this, the operator -- not this framework -- sets "
-                  f"kernel.core_pattern to a bare name such as `core.%p`.")
+                  f"kernel.core_pattern to "
+                  f"{RECOMMENDED_CORE_PATTERN!r}.")
             return
         if pattern.startswith("/"):
             print(f"[ops] core_pattern: {pattern}")
@@ -309,8 +326,9 @@ class OpsRun:
             print(f"[ops] core_pattern: {pattern}")
             print(f"[ops] that is relative, so the core does land in the "
                   f"server's data directory, but under a name the capture "
-                  f"looks for as {CORE_FILE_GLOB!r} and will not find. A "
-                  f"pattern starting with `core` is what this collects.")
+                  f"looks for as {CORE_FILE_GLOB!r} and will not find. "
+                  f"{RECOMMENDED_CORE_PATTERN!r} is the value this chain "
+                  f"handles end to end.")
             return
         print(f"[ops] core_pattern: {pattern} (a core would land in the "
               f"server's data directory and be copied out before teardown)")

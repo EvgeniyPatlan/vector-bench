@@ -1384,47 +1384,51 @@ class TestTheLabRouteThatOpensTheCore:
         from orchestrator.cli import _LAB_OPTIONS
         assert LAB_ARTIFACTS_OPTION in _LAB_OPTIONS, sorted(_LAB_OPTIONS)
 
-    def test_the_compatibility_refusal_collects_itself(self):
-        """A ratchet, because a comment saying "delete this later" is not one.
+    def test_the_compatibility_refusal_is_gone_and_stays_gone(self):
+        """THE RATCHET FIRED, AND THIS IS WHAT IS LEFT OF IT.
 
-        `cli._artifacts_mount_problem()` exists only while
-        `OpsRun.run_script` has no `artifacts_dir` parameter: it turns what
-        would be a TypeError raised minutes after a server came up into an
-        immediate refusal. The change that ADDS that parameter does not
-        touch `orchestrator/cli.py` -- its file set is
-        config/engines/percona.yml, docs/09, orchestrator/docker_ctl.py,
-        orchestrator/engines.py, orchestrator/ops_pass.py and three test
-        files -- so nothing in its path would prompt the cleanup, and the
-        function would sit there returning None forever.
+        It was `test_the_compatibility_refusal_collects_itself`, and it
+        existed because `cli._artifacts_mount_problem()` was load-bearing
+        only while `OpsRun.run_script` had no `artifacts_dir` parameter: it
+        turned a TypeError raised minutes after a server came up into an
+        immediate refusal. The change that adds the parameter did not list
+        `orchestrator/cli.py` in its file set, so nothing in its path would
+        have prompted the cleanup and the function would have sat there
+        returning None forever. The ratchet's job was to fail on the day that
+        happened and hand over a work order.
 
-        So this test fails ON THE DAY the refusal becomes dead code, and
-        says what to delete. That deliberately reddens the change that lands
-        the parameter, which is the only moment anyone is looking at this
-        seam; the failure message is the whole instruction, and the
-        alternative is dead code nobody is told about.
+        It did exactly that. #68 added `artifacts_dir` and this test failed
+        with its three items; the file set was widened by `orchestrator/cli.py`
+        and this file to discharge them inside the same change, so `master`
+        never carried the dead code or the red. All three are done: the
+        function is deleted, `cmd_lab`'s refusal loop is one check instead of
+        two, and the forward `supported` branch that was waiting for this
+        moment is gone -- with it `inspect`, which `cli.py` imported for that
+        one call and nothing else.
+
+        WHAT SURVIVES IS THE NO-RETURN HALF, deliberately. A ratchet that
+        deleted itself entirely would leave nothing saying the shim must not
+        come back, and a reader who meets `--artifacts` failing on an old
+        checkout is exactly the person who would reintroduce it. This
+        assertion costs one line and is the cheaper half of the pair.
         """
+        from orchestrator import cli, ops_pass
         import inspect
 
-        from orchestrator import cli, ops_pass
-
-        supported = "artifacts_dir" in inspect.signature(
-            ops_pass.OpsRun.run_script).parameters
-        if not supported:
-            # The refusal is still load-bearing: assert it refuses, so this
-            # test is not merely waiting.
-            assert cli._artifacts_mount_problem() is not None, (
-                "run_script has no artifacts_dir parameter, yet "
-                "_artifacts_mount_problem() returns None -- the refusal is "
-                "broken and --artifacts would raise a TypeError after the "
-                "server is up")
-            return
+        # The precondition the deletion rests on. Asserted rather than
+        # assumed, so this cannot pass by the parameter having been removed
+        # again -- which would make the shim load-bearing a second time.
+        assert "artifacts_dir" in inspect.signature(
+            ops_pass.OpsRun.run_script).parameters, (
+            "OpsRun.run_script has lost its `artifacts_dir` parameter. The "
+            "refusal this test retired was what turned that into an "
+            "immediate error instead of a TypeError raised after the server "
+            "was up; if the parameter is really going, the refusal and its "
+            "original ratchet have to come back with it")
         assert not hasattr(cli, "_artifacts_mount_problem"), (
-            "OpsRun.run_script now takes `artifacts_dir`, so "
-            "cli._artifacts_mount_problem() can only ever return None and "
-            "the refusal in cmd_lab is dead. Delete all three: the "
-            "function, the `_artifacts_mount_problem()` entry in cmd_lab's "
-            "refusal loop, and this test's `supported` branch along with "
-            "this assertion.")
+            "cli._artifacts_mount_problem() is back. It can only ever return "
+            "None now that `artifacts_dir` is unconditionally present, so it "
+            "is dead code and the refusal in cmd_lab would be a no-op")
 
 
 # ---------------------------------------------------------------------------
