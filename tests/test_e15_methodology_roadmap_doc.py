@@ -951,3 +951,218 @@ class TestTheTiersAreAllPresentAndOrdered:
         text = _plain(_doc())
         assert re.search(r"would support", text, re.I)
         assert re.search(r"Nothing below is a result", text, re.I)
+
+
+# ---------------------------------------------------------------------------
+# §4.1's evidence, checked against the tree rather than against its position
+# ---------------------------------------------------------------------------
+#
+# WHY THIS CLASS EXISTS, and it is the same defect #63 fixed for the citation
+# guards. Before it, the only thing anything asserted about §4.1 was that the
+# string "4.1" appears in §10's sequencing list ahead of "§5" -- its POSITION.
+# So the section could be rewritten freely and the suite stayed green:
+# demonstrated, by rewriting six of its sentences, including its heading and
+# both of its two search claims, and watching all 51 tests pass.
+#
+# That matters more here than for an ordinary stale sentence, because §4.1 does
+# not merely describe a gap -- it offers EVIDENCE for one, a pair of greps
+# reported to return nothing, and an implementation of §4.1 is exactly the
+# event that makes that evidence false. A page whose stated purpose is to
+# record what the instrument cannot see is at its least trustworthy when it
+# claims a gap that has been closed.
+#
+# The guard is therefore BIDIRECTIONAL and keyed on the tree: it computes
+# whether a collection site exists and then requires the document to say the
+# matching thing. Either side moving fires it. A one-sided check -- "the
+# document names the collector" -- would pass forever once written and would
+# say nothing if the collector were removed.
+
+#: The status variable §4.1 is about. Capitalised exactly as the server
+#: registers it, because the document's claim is about a case-sensitive search.
+ROADMAP_GAUGE = "Innodb_hnsw_memory_used"
+
+#: The three directories §4.1's second search names, in its own order. A
+#: status variable recorded anywhere else would not satisfy the claim the
+#: document makes, which is specifically about these.
+COLLECTOR_DIRS = ("harness", "report", "orchestrator")
+
+#: Phrases that assert the gap in the PRESENT tense. The past-tense forms are
+#: deliberately absent from this tuple: the corrected §4.1 still quotes what
+#: the searches used to return, because that is how the gap was found, and a
+#: guard that could not tell "returns nothing" from "returned nothing" would
+#: force the document to delete its own evidence trail.
+PRESENT_TENSE_ABSENCE = (
+    "is collected nowhere",
+    "returns no hit at all",
+    "There is no collection site",
+    "Nothing in it has been implemented",
+)
+
+
+def _collector_sites(needle: str = ROADMAP_GAUGE) -> List[str]:
+    """Every non-test source file under §4.1's three directories naming `needle`.
+
+    Case-sensitive, which is the claim's own terms. Tests are excluded: §4.1's
+    first search covers every `.py` in the tree and explicitly discounts a
+    docstring in `tests/test_e1_percona_design.py` as "not a collection site
+    either", so a mention under `tests/` -- including in THIS file, which names
+    the gauge in `ROADMAP_GAUGE` -- must not satisfy the document's claim. That
+    is the same self-poisoning trap `SELF` exists for above, reached by a
+    different route.
+    """
+    found = []
+    for directory in COLLECTOR_DIRS:
+        base = os.path.join(VB_ROOT, directory)
+        for dirpath, _dirnames, filenames in os.walk(base):
+            for name in sorted(filenames):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path) as handle:
+                        if needle in handle.read():
+                            found.append(os.path.relpath(path, VB_ROOT))
+                except OSError:
+                    continue
+    return sorted(found)
+
+
+def stale_gap_claims(text: str, sites: Sequence[str]) -> List[str]:
+    """What §4.1 claims that the tree contradicts, as a list of problems.
+
+    A pure function of the document text and the measured facts, so the
+    planted arms below can run it over a mutated copy without touching disk --
+    the discipline `TestThePlantedBadReferenceFails` uses, and for the reason
+    given there: a mutant written to a file can leave stale bytecode valid.
+
+    WHAT THIS DOES NOT CHECK, stated because a reviewer is the terminus for
+    the rest and that is only acceptable if the limit is written down. It
+    checks the collection claim and the two search claims -- the parts that
+    are decidable from the tree. It does not check that §4.1's description of
+    WHICH phases are collected is right (the words "build phase" could be
+    wrong about `harness/workloads/` and this would pass), nor the node-map
+    rider's 30-50 bytes, nor the claim about `docs/09`'s mentions, nor whether
+    the named symbols are the ones doing the work rather than merely existing
+    -- `TestEverySymbolTheDocumentNamesStillResolves` establishes only that
+    they resolve somewhere. Those are judgements, and a human makes them.
+    """
+    problems = []
+    plain = _plain(text)
+    collected = bool(sites)
+
+    for phrase in PRESENT_TENSE_ABSENCE:
+        if _plain(phrase) in plain:
+            if collected:
+                problems.append(
+                    f"the document still asserts {phrase!r} in the present "
+                    f"tense, but {len(sites)} file(s) under "
+                    f"{list(COLLECTOR_DIRS)} name {ROADMAP_GAUGE}: {sites}")
+        elif not collected and phrase == "is collected nowhere":
+            problems.append(
+                f"no file under {list(COLLECTOR_DIRS)} names "
+                f"{ROADMAP_GAUGE}, so the gap is open, but the document no "
+                f"longer says {phrase!r}")
+
+    if collected:
+        # The document has to name where the collection happens, or a reader
+        # cannot check the claim that replaced the gap. One real site is
+        # enough; requiring all of them would fail on a refactor that merged
+        # two modules, which is not a stale document.
+        if not any(site in text for site in sites):
+            problems.append(
+                f"the gauge is collected in {sites} and the document names "
+                f"none of those files")
+    else:
+        for site in ("harness/drivers/mysql_family.py",
+                     "harness/workloads/build.py"):
+            if f"{site}`'s `_server_status" in text or "extra.server_status" in text:
+                problems.append(
+                    f"the document describes a collector "
+                    f"(`extra.server_status`) that no file under "
+                    f"{list(COLLECTOR_DIRS)} implements")
+                break
+    return problems
+
+
+class TestSection41AgreesWithTheTree:
+    def test_the_live_document_makes_no_stale_gap_claim(self):
+        sites = _collector_sites()
+        problems = stale_gap_claims(_doc(), sites)
+        print(f"collection sites = {sites}")
+        assert problems == [], problems
+
+    def test_the_gauge_really_is_collected_right_now(self):
+        """Non-vacuity, and the arm that makes the class worth running. Every
+        assertion above is conditional on `_collector_sites()`, so a finder
+        that silently returned `[]` -- a renamed directory, a changed suffix
+        filter -- would take the "gap is open" branch and pass against a
+        document that no longer claims a gap. This pins the fact itself."""
+        sites = _collector_sites()
+        assert sites, (
+            f"no file under {list(COLLECTOR_DIRS)} names {ROADMAP_GAUGE}; "
+            f"either the collector was removed or this finder is broken")
+        assert "harness/drivers/mysql_family.py" in sites
+
+    def test_a_mention_under_tests_does_not_count_as_a_collection_site(self):
+        """This file names the gauge. If `tests/` were indexed, §4.1 could
+        claim a collector that exists only in the guard checking §4.1 --
+        `SELF`'s bug, by another route."""
+        assert _collector_sites() == _collector_sites(ROADMAP_GAUGE)
+        assert not any(site.startswith("tests/")
+                       for site in _collector_sites())
+
+    @pytest.mark.parametrize("phrase", PRESENT_TENSE_ABSENCE)
+    def test_a_planted_present_tense_gap_claim_is_reported(self, phrase):
+        """The mutant, run-time and per phrase: re-assert the closed gap in
+        the present tense and the guard must fire. Parametrised so that a
+        phrase which has quietly stopped being detectable -- a reworded
+        document, a `_plain` that stops normalising -- is named rather than
+        hidden behind a sibling that still works."""
+        planted = _doc() + f"\n\nAnd so {phrase}.\n"
+        problems = stale_gap_claims(planted, _collector_sites())
+        print(f"MUTANT ({phrase!r}) -> {problems}")
+        assert problems, phrase
+
+    def test_a_document_that_forgets_the_collection_site_is_reported(self):
+        """The other direction: the gap is closed, the document says so, but
+        it names no file a reader could check."""
+        stripped = _doc()
+        for site in _collector_sites():
+            stripped = stripped.replace(site, "somewhere in the harness")
+        problems = stale_gap_claims(stripped, _collector_sites())
+        print(f"MUTANT (sites unnamed) -> {problems}")
+        assert problems
+
+    def test_the_checker_fires_the_other_way_on_a_tree_with_no_collector(self):
+        """**The bidirectionality, which is the whole design.** Run the LIVE
+        document against measured facts in which the collector does not exist
+        -- the state this page described for its whole life before this work.
+        The guard must complain that the document stopped claiming a gap that
+        is open, which is what would happen if the collector were reverted and
+        §4.1 were left as it now reads."""
+        problems = stale_gap_claims(_doc(), [])
+        print(f"MUTANT (no collector in tree) -> {problems}")
+        assert problems
+        assert any("the gap is open" in p for p in problems), problems
+
+    def test_the_document_records_which_of_the_two_options_was_taken(self):
+        """§4.1 offered two fixes -- collect it, or strike the claim from all
+        four places. A reader has to be able to tell which happened, because
+        the two leave the tree in opposite states."""
+        plain = _plain(_doc())
+        assert "the first was taken" in plain, (
+            "§4.1 does not say which of its two options was taken")
+        # And it must not overclaim: the build phase only.
+        assert "at the build phase only" in plain, (
+            "§4.1 does not scope the collection to the phase that was built")
+
+    def test_the_opening_no_longer_claims_nothing_is_implemented(self):
+        """The page's own first paragraph carried the blanket claim, which an
+        implementation of any §4 item falsifies. It is listed in
+        `PRESENT_TENSE_ABSENCE` and so is covered by the planted arm above;
+        this asserts the live text directly, because that sentence is the one
+        a reader meets first and the one `CLAUDE.md`'s documentation map
+        repeats."""
+        plain = _plain(_doc())
+        assert "Nothing in it has been implemented" not in plain
+        assert "One item has since been implemented" in plain
