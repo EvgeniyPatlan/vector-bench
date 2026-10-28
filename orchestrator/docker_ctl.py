@@ -785,11 +785,14 @@ def remove_tree_as_root(path: str, image: str) -> bool:
     return not os.path.exists(path)
 
 
-#: How deep under the bind directory a match is looked for. The volume is
+#: How deep under the bind directory a match is looked for. PUBLIC, because
+#: it is part of this function's contract rather than an implementation
+#: detail: `ops_pass.core_capture_verdict` has to know it to tell an operator
+#: whether a core written at a given `core_pattern` will actually be found. The volume is
 #: mounted at the engine's `data_mount` and mysqld chdirs into its datadir one
 #: level below it, so depth 2 covers both the volume root and the datadir while
 #: refusing to walk an InnoDB tree of several hundred thousand files.
-_COPY_GLOB_MAX_DEPTH = 2
+COPY_GLOB_MAX_DEPTH = 2
 
 #: Bounded in TIME, like `copy_file_out`, and the figure is the one an operator
 #: needs. A core here is bounded by the server's resident set minus whatever
@@ -821,7 +824,7 @@ def copy_glob_as_root(bind_dir: str, pattern: str, dest_dir: str,
     So the ENUMERATION, not just the copy, has to happen through a container.
 
     `pattern` is a FILENAME glob, matched at a depth of at most
-    `_COPY_GLOB_MAX_DEPTH` below `bind_dir`, not a path glob: the caller knows
+    `COPY_GLOB_MAX_DEPTH` below `bind_dir`, not a path glob: the caller knows
     what a core is called, not which of the volume's two plausible directories
     the kernel put it in.
 
@@ -859,7 +862,7 @@ def copy_glob_as_root(bind_dir: str, pattern: str, dest_dir: str,
     # -exec rather than a `for` over $(find ...), which word-splits on a
     # filename containing a space. `core_pattern` can be set to one.
     script = (
-        f"find /src -maxdepth {_COPY_GLOB_MAX_DEPTH} "
+        f"find /src -maxdepth {COPY_GLOB_MAX_DEPTH} "
         f"-name {shlex.quote(pattern)} -type f "
         f"-exec cp -p {{}} /dst/ \\; ; "
         f"chown -R {uid}:{gid} /dst"

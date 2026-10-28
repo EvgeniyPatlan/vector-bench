@@ -18,7 +18,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import docker_ctl
 from . import engines as engines_mod
@@ -70,6 +70,85 @@ CORE_FILE_GLOB = "core*"
 # agreement against that script's own constants rather than against this
 # comment.
 RECOMMENDED_CORE_PATTERN = "core.%p"
+
+
+def core_capture_verdict(pattern: Optional[str],
+                        data_mount: str) -> Tuple[bool, str]:
+    """Whether a core written under `pattern` would reach the run directory.
+
+    Returns `(reachable, reason)`. A pure function of the two inputs so every
+    case can be probed, which matters because this is the function the whole
+    crash-capture finding rests on: if it says "a core would land in the
+    server's data directory" and no core ever appears, nothing downstream can
+    tell that from "the server did not crash".
+
+    THE ABSOLUTE CASE HAS THREE OUTCOMES, NOT ONE, and an earlier version of
+    this said only the middle one. `core(5)` says paths "are interpreted
+    according to the settings that are active for the crashing process", so an
+    absolute pattern resolves in the CONTAINER's mount namespace -- and that
+    namespace contains the bind-backed volume at the engine's data mount. So:
+
+      * under the data mount and within `COPY_GLOB_MAX_DEPTH` -- the core
+        lands in the volume, survives `docker rm`, and the capture's
+        `find /src -maxdepth 2` reaches it. This is a WORKING configuration
+        and the earlier text called it broken.
+      * under the data mount but deeper -- written, survives, and missed by
+        the capture's depth bound.
+      * anywhere else -- either it lands in the container's own writable
+        layer and goes with `docker rm`, or, if that directory does not exist
+        in the image, NO FILE IS WRITTEN AT ALL. Neither can be told apart
+        from here, and both mean the run directory receives nothing, so the
+        verdict is the same and the reason names both.
+
+    The half of the earlier claim derived from `core(5)` was right and the
+    half assumed was wrong, which is in miniature the fault the change this
+    belongs to exists to remove.
+    """
+    if pattern is None:
+        return (False, f"unreadable ({HOST_CORE_PATTERN_PATH}); whether a "
+                       f"core can be written is unknown")
+    if pattern.startswith("|"):
+        return (False,
+                "that is a pipe, so the kernel hands the dump to that "
+                "program and writes NO FILE to any filesystem -- no core "
+                "will reach this run directory however the server dies. The "
+                "helper itself runs fine; piping is what leaves no file, so "
+                "putting it in the image would change nothing")
+    directory, _, name = pattern.rpartition("/")
+    if pattern.startswith("/"):
+        mount = data_mount.rstrip("/")
+        if directory == mount or directory.startswith(mount + "/"):
+            depth = len([part for part in
+                         directory[len(mount):].split("/") if part]) + 1
+            if depth > docker_ctl.COPY_GLOB_MAX_DEPTH:
+                return (False,
+                        f"that is an absolute path {depth} levels under "
+                        f"{mount}, and the capture searches only "
+                        f"{docker_ctl.COPY_GLOB_MAX_DEPTH}, so the core is written and "
+                        f"the copy-out does not find it")
+            if not name.startswith("core"):
+                return (False,
+                        f"that is an absolute path inside the volume, so the "
+                        f"core is written and survives teardown -- but under "
+                        f"a name the capture looks for as {CORE_FILE_GLOB!r} "
+                        f"and will not find")
+            return (True,
+                    f"that is an absolute path inside the volume at {mount}, "
+                    f"so the core lands where the copy-out reaches it")
+        return (False,
+                "that is an absolute path outside the engine's volume. It "
+                "resolves in the container's mount namespace, so either it "
+                "lands in the container's own writable layer and goes with "
+                "`docker rm`, or -- if that directory does not exist in the "
+                "image -- no file is written at all. Either way this run "
+                "directory receives nothing")
+    if not name.startswith("core"):
+        return (False,
+                f"that is relative, so the core does land in the server's "
+                f"data directory, but under a name the capture looks for as "
+                f"{CORE_FILE_GLOB!r} and will not find")
+    return (True, "a core would land in the server's data directory and be "
+                  "copied out before teardown")
 
 
 def host_core_pattern() -> Optional[str]:
@@ -233,7 +312,7 @@ class OpsRun:
         print(f"[ops] starting {self.engine} server: cpuset={self.resolved.server_cpuset} "
               f"mem={self.resolved.server_memory_bytes / 1024**3:.1f}GB")
         print(f"[ops] server flags: {' '.join(flags)}")
-        self._report_core_pattern()
+        self._report_core_pattern(data_mount)
         docker_ctl.start(spec)
         docker_ctl.wait_healthy(self.server_name, list(engines_mod.get(self.engine).probe), timeout_s=300)
         print(f"[ops] {self.engine} server ready")
@@ -251,7 +330,7 @@ class OpsRun:
         except Exception:                        # pragma: no cover - defensive
             return {}
 
-    def _report_core_pattern(self) -> None:
+    def _report_core_pattern(self, data_mount: str) -> None:
         """Print the host's `kernel.core_pattern` beside the server flags, and
         say plainly when it means no core will be produced.
 
@@ -300,39 +379,25 @@ class OpsRun:
         if "core" not in self._ulimits():
             return
         pattern = host_core_pattern()
-        if pattern is None:
-            print(f"[ops] core_pattern: unreadable ({HOST_CORE_PATTERN_PATH}); "
-                  f"whether a core can be written is unknown")
+        reachable, reason = core_capture_verdict(pattern, data_mount)
+        print(f"[ops] core_pattern: {pattern}")
+        print(f"[ops] {reason}")
+        if pattern == RECOMMENDED_CORE_PATTERN:
             return
-        if pattern.startswith("|"):
-            print(f"[ops] core_pattern: {pattern}")
-            print(f"[ops] that is a pipe, so the kernel hands the dump to that "
-                  f"program and writes NO FILE to any filesystem -- no core "
-                  f"will reach this run directory however the server dies. "
-                  f"The helper itself runs fine; piping is what leaves no "
-                  f"file, so putting it in the image would change nothing. To "
-                  f"change this, the operator -- not this framework -- sets "
-                  f"kernel.core_pattern to "
-                  f"{RECOMMENDED_CORE_PATTERN!r}.")
-            return
-        if pattern.startswith("/"):
-            print(f"[ops] core_pattern: {pattern}")
-            print(f"[ops] that is an absolute path, and it resolves inside the "
-                  f"container -- in its writable layer rather than in the "
-                  f"bind-backed volume -- so the core goes with `docker rm` "
-                  f"and this run directory will not receive one.")
-            return
-        if not pattern.startswith("core"):
-            print(f"[ops] core_pattern: {pattern}")
-            print(f"[ops] that is relative, so the core does land in the "
-                  f"server's data directory, but under a name the capture "
-                  f"looks for as {CORE_FILE_GLOB!r} and will not find. "
-                  f"{RECOMMENDED_CORE_PATTERN!r} is the value this chain "
-                  f"handles end to end.")
-            return
-        print(f"[ops] core_pattern: {pattern} (a core would land in the "
-              f"server's data directory and be copied out before teardown)")
-
+        # The note goes on EVERY other value, including the ones the capture
+        # does reach. `core%p` is the case that needs it: this capture
+        # collects it and `scripts/gdb-backtrace.py` cannot read it, so
+        # "copied out before teardown" is true and still not enough. This
+        # function deliberately does not know that script's globs -- the
+        # agreement between the two is asserted in
+        # tests/test_e21_crash_capture_plumbing.py -- so the note is
+        # unconditional rather than clever.
+        note = (f"[ops] {RECOMMENDED_CORE_PATTERN!r} is the value this chain "
+                f"handles end to end")
+        if not reachable:
+            note += (", and setting it is the operator's to do, not this "
+                     "framework's")
+        print(note + ".")
     # ------------------------------------------------------------------
 
     def run_harness(self, args: List[str], output_path: str,

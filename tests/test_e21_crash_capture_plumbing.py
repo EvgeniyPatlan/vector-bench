@@ -981,6 +981,26 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
         ALL FOUR FACTS, not three. The grep checked `oom_killed`, `OOMKilled`
         and `exit_code` and omitted `finished_at`, which is the one of the
         four a reader is most likely to think harmless.
+
+        AND `records.py` IS NOT WHERE THE LIKELY ROUTE RUNS. `Record.extra`
+        is the declared escape hatch, so a `Record(..., extra={"exit_code":
+        137, ...})` built anywhere serialises straight through an UNMODIFIED
+        `records.py` -- measured, not supposed. Scanning that one file can
+        never see it. What closes it is scanning the only place such a
+        construction can live: every non-test `Record(` in this repository is
+        under `harness/`, `Recorder` is used by `harness/main.py` alone, and
+        `harness/` mentions none of the four words today. That is asserted
+        below, and it is not a coincidence that can quietly stop holding --
+        the harness container mounts `harness/` and nothing else, so it
+        cannot learn a container's exit state without being handed it, which
+        is a deliberate act and not a tidy-up.
+
+        WHAT REMAINS UNCHECKED, so the claim stays the size of the guard: a
+        RENAME. Declaring `exited_with` and `ended_at`, or putting them in
+        `extra` under those names, passes both scans. Nothing lexical can
+        catch that, and the argument that makes it not worth chasing is the
+        one in the first paragraph -- a record route of any spelling is
+        useless for a phase that writes no record.
         """
         import ast
         import harness.metrics.records as records_mod
@@ -1000,6 +1020,28 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
 
         print(f"{len(declared)} declared names, {len(constants)} string "
               f"constants scanned")
+        # Every place a Record can be built. Asserted rather than assumed,
+        # so the scan below cannot silently stop covering the repository.
+        import glob
+        writers = sorted(
+            path for path in glob.glob(os.path.join(REPO, "**", "*.py"),
+                                       recursive=True)
+            if "Record(" in open(path).read()
+            and os.sep + "tests" + os.sep not in path)
+        outside = [path for path in writers
+                   if os.sep + "harness" + os.sep not in path]
+        print(f"{len(writers)} non-test files construct a Record; "
+              f"{len(outside)} outside harness/")
+        assert not outside, (
+            f"a Record is now built outside harness/: {outside}. The `extra` "
+            f"scan below only covers harness/, so either it has to widen or "
+            f"this is a route the guard no longer sees")
+
+        harness_text = "\n".join(
+            open(path).read() for path in
+            sorted(glob.glob(os.path.join(REPO, "harness", "**", "*.py"),
+                             recursive=True)))
+
         for needle in ("exit_code", "oom_killed", "finished_at",
                        "daemon_error"):
             assert needle not in declared, (
@@ -1010,6 +1052,11 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
                 f"{needle!r} appears as a string literal in records.py, which "
                 f"is how an `extra` key name arrives; the exit facts are "
                 f"run-directory artefacts on purpose")
+            assert needle not in harness_text, (
+                f"{needle!r} appears somewhere under harness/, which is where "
+                f"every Record in this repository is built -- so it can reach "
+                f"a record through `extra` without records.py changing at "
+                f"all. The exit facts are run-directory artefacts on purpose")
 
 
 class TestTheCaptureRunsBeforeTeardown:
@@ -1383,6 +1430,102 @@ class TestTheHostCorePatternIsReportedAndNeverWritten:
                             lambda: pattern)
         _ops_run(tmp_path, engine)._start_server()
 
+    #: Every branch of `core_capture_verdict`, with the outcome and the
+    #: phrase that identifies the branch. A TABLE, because the function has
+    #: six outcomes and the first version of this class probed two of them --
+    #: the pipe and the plain `core` -- so the absolute case and the
+    #: wrong-name case could both have been deleted silently, and the whole
+    #: crash-capture finding rests on this function being right.
+    #:
+    #: The two absolute-path rows under the data mount are the ones an earlier
+    #: version of the code got WRONG: it said an absolute pattern resolves "in
+    #: the container's writable layer rather than in the bind-backed volume",
+    #: and the container's mount namespace contains the volume, so a pattern
+    #: under the data mount lands in it, survives `docker rm` and IS reached.
+    VERDICTS = (
+        ("|/usr/share/apport/apport -p%p", False, "that is a pipe"),
+        ("core", True, "data directory"),
+        ("core.%p", True, "data directory"),
+        ("dump-%p", False, "that is relative"),
+        ("/var/lib/vbench/core.%p", True, "inside the volume at"),
+        ("/var/lib/vbench/data/core.%p", True, "inside the volume at"),
+        ("/var/lib/vbench/data/sub/core.%p", False, "levels under"),
+        ("/var/lib/vbench/data/dump-%p", False, "will not find"),
+        ("/var/crash/core.%p", False, "outside the engine's volume"),
+        (None, False, "unreadable"),
+    )
+
+    @pytest.mark.parametrize("pattern,reachable,phrase", VERDICTS)
+    def test_every_branch_of_the_verdict_is_reached_and_says_which(
+            self, pattern, reachable, phrase):
+        """One row per branch. A branch with no row can be deleted in
+        silence, which for this function means an operator told a core will
+        be collected when it will not -- indistinguishable afterwards from
+        "the server did not crash"."""
+        from orchestrator.ops_pass import core_capture_verdict
+        got, reason = core_capture_verdict(pattern, "/var/lib/vbench")
+        print(f"{pattern!r} -> {got} {reason!r}")
+        assert got is reachable, (pattern, got, reason)
+        assert phrase in reason, (pattern, phrase, reason)
+
+    def test_the_verdicts_are_not_all_the_same(self):
+        """The dead-probe check for the table above: a function that returned
+        one answer for everything would satisfy every row's `phrase` only by
+        accident, and would satisfy none of the `reachable` ones."""
+        outcomes = {reachable for _p, reachable, _ph in self.VERDICTS}
+        assert outcomes == {True, False}, outcomes
+        reasons = {core for core in
+                   (self._reason(p) for p, _r, _ph in self.VERDICTS)}
+        print(f"{len(reasons)} distinct reasons across "
+              f"{len(self.VERDICTS)} rows")
+        assert len(reasons) >= 6, sorted(reasons)
+
+    @staticmethod
+    def _reason(pattern):
+        from orchestrator.ops_pass import core_capture_verdict
+        return core_capture_verdict(pattern, "/var/lib/vbench")[1]
+
+    def test_an_absolute_path_inside_the_volume_is_not_warned_about(
+            self, tmp_path, monkeypatch, capsys):
+        """The branch that had no probe and whose text was wrong.
+
+        HONEST arm: `/var/lib/vbench/data/core.%p`, under the data mount --
+        the capture reaches it, so the operator must NOT be told the run
+        directory will receive nothing. MUTANT arm: `/var/crash/core.%p`,
+        outside it, where that warning is correct.
+        """
+        self._start(tmp_path / "in", monkeypatch, "percona",
+                    "/var/lib/vbench/data/core.%p")
+        honest = capsys.readouterr().out
+        self._start(tmp_path / "out", monkeypatch, "percona",
+                    "/var/crash/core.%p")
+        mutant = capsys.readouterr().out
+        print(f"HONEST (under the data mount) = {honest!r}")
+        print(f"MUTANT (outside it)           = {mutant!r}")
+        assert honest != mutant, (
+            "DEAD PROBE: an absolute pattern inside the volume and one "
+            "outside it read the same, so the operator cannot tell a working "
+            "configuration from a broken one")
+        assert "receives nothing" not in honest, honest
+        assert "receives nothing" in mutant, mutant
+
+    def test_a_relative_pattern_with_the_wrong_name_is_called_out(
+            self, tmp_path, monkeypatch, capsys):
+        """The fourth branch, which also had no probe.
+
+        HONEST arm: `dump-%p` -- written into the data directory under a name
+        the capture does not collect. MUTANT arm: `core.%p`, which it does.
+        """
+        self._start(tmp_path / "bad", monkeypatch, "percona", "dump-%p")
+        honest = capsys.readouterr().out
+        self._start(tmp_path / "good", monkeypatch, "percona", "core.%p")
+        mutant = capsys.readouterr().out
+        print(f"HONEST (dump-%p) = {honest!r}")
+        print(f"MUTANT (core.%p) = {mutant!r}")
+        assert honest != mutant, "DEAD PROBE"
+        assert "will not find" in honest, honest
+        assert "will not find" not in mutant, mutant
+
     def test_a_pipe_is_called_out_as_producing_no_core(self, tmp_path,
                                                        monkeypatch, capsys):
         """HONEST arm: a pipe, the Ubuntu default. MUTANT arm: `core`, the
@@ -1631,19 +1774,31 @@ class TestTheTwoHalvesOfTheCoreRouteAgree:
         from orchestrator.ops_pass import RECOMMENDED_CORE_PATTERN
         source = open(os.path.join(REPO, "orchestrator",
                                    "ops_pass.py")).read()
+        # Both halves: the verdict function holds the reasons and the
+        # reporter holds the note, so a hard-coded value could hide in
+        # either.
         reporter = source.split("def _report_core_pattern", 1)[1].split(
             "\n    def ", 1)[0]
-        # The CODE only. The docstring has to be able to name `core` while
-        # explaining which relative patterns are collected; what must not
-        # hard-code a value is a message an operator reads.
-        body = reporter.split('"""', 2)[2]
-        literals = set(re.findall(r"`(core[.%\w-]*)`", body))
+        verdict = source.split("def core_capture_verdict", 1)[1].split(
+            "\ndef ", 1)[0]
+        literals = set()
+        for chunk in (reporter, verdict):
+            # EXECUTABLE LINES ONLY. A docstring has to be able to name
+            # `core` while explaining which relative patterns are collected,
+            # and a comment has to be able to name `core%p` while explaining
+            # why the note is unconditional. What must not hard-code a value
+            # is a message an operator reads.
+            body = chunk.split('"""', 2)[2]
+            code = "\n".join(line for line in body.split("\n")
+                              if not line.strip().startswith("#"))
+            literals |= set(re.findall(r"`(core[.%\w-]*)`", code))
         print(f"pattern literals in the reporter: {sorted(literals)}")
         assert not literals, (
             f"these are hard-coded in the console messages instead of coming "
             f"from RECOMMENDED_CORE_PATTERN ({RECOMMENDED_CORE_PATTERN!r}): "
             f"{sorted(literals)}")
-        assert "RECOMMENDED_CORE_PATTERN" in reporter
+        assert "RECOMMENDED_CORE_PATTERN" in reporter, (
+            "the reporter no longer interpolates the recommendation")
 
     def test_the_two_filename_sets_do_not_fully_agree_and_the_edges_are_known(
             self):
