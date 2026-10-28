@@ -956,9 +956,9 @@ differently or does not name at all.
   rather than emitting two identical recall curves. So for this engine the
   axis is real on the ops path and silent on the recall path, and dropping it
   here is still right: the ann records genuinely say nothing about it. The
-  build-mode comparison for Percona therefore comes from the ops records —
-  `build_wall_s`, `ingest_wall_s` and `index_bytes`, which are ops-only
-  fields anyway — and not from a pair of recall curves.
+  build-mode comparison for Percona therefore comes from the ops records and
+  not from a pair of recall curves: the recall path is silent about
+  `build_mode`. `index_bytes` is not ops-only; every recall record carries it.
 
 **An empty list has two causes and the report distinguishes them.** "No `M` is
 measured by both paths" is a profile choice: the recall sweep varies `M`
@@ -1019,7 +1019,7 @@ removes. They must accompany any published number.
 
 | Asymmetry | Consequence |
 | --- | --- |
-| **`ef_construction` is not exposed** by MariaDB MHNSW or AliSQL VIDX; pgvector exposes it. | The build-quality sweep can only vary `M` for the MySQL-family engines. pgvector is benchmarked at its default `ef_construction=200` in the normalized pass so it is not given a tuning axis the others lack. |
+| **`ef_construction` is exposed** by pgvector, Valkey and Percona Server, and by no other MySQL-family engine here — not by MariaDB MHNSW and not by AliSQL VIDX. Percona Server is the only engine in this study with both a build-time (`ef_construction`) and a query-time (`innodb_hnsw_ef_search`) effort knob. | The build-quality sweep varies `ef_construction` only for the three that have it, and `M` for every engine but Percona Search, whose index exposes no graph degree (`orchestrator/ann_pass.py` gives it one `M` value and carries it as a label) — so neither claim is about the MySQL family, which has an engine on each side of this line. It is pinned to each engine's default in the normalized pass (pgvector's is `ef_construction=200`) so no engine is given a tuning axis the others lack, and swept only in the tuned pass. §3 of a generated report states this row from the records of the engines that actually ran, so a single-engine report names one engine where this table names three. |
 | **AliSQL requires `READ-COMMITTED`** and `vidx_disabled=OFF`; vector indexes are InnoDB-only. | AliSQL runs at RC. MariaDB and PostgreSQL are run at their defaults in the tuned pass and at RC in the normalized pass where the engine allows it. |
 | **MariaDB supports MyISAM** for vector tables (and its own published benchmark uses MyISAM); AliSQL cannot. | Headline comparison is **InnoDB for both**. MariaDB MyISAM is reported as an additional MariaDB-only curve in the tuned pass, clearly labelled. |
 | **`M` is set differently** — MariaDB via the `mhnsw_default_m` server variable at startup, AliSQL via a per-index DDL option, pgvector via `WITH (m=…)`. | Handled per-driver; the effective `M` is recorded in the manifest, not assumed. |

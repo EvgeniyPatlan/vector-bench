@@ -18,7 +18,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import docker_ctl
 from . import engines as engines_mod
@@ -32,6 +32,175 @@ from .manifest import utcnow
 # mongod is the verbose extreme at a few thousand lines an hour; the others
 # write almost nothing.
 SERVER_LOG_TAIL = 20000
+
+# Where the kernel decides what a core dump is called and whether one is
+# written at all. Read and reported, NEVER written: a benchmark framework must
+# not modify the machine it measures, and this is a machine-wide sysctl that
+# governs every other process on the box. The one-line opt-in is the
+# operator's to make, in the rebuild procedure, not the framework's.
+HOST_CORE_PATTERN_PATH = "/proc/sys/kernel/core_pattern"
+
+# What a core is called. The kernel's own default `core_pattern` is the bare
+# string `core`, and the common customisations append the pid, the executable
+# or both (`core.%p`, `core.%e.%p`), so a prefix match is what covers them.
+# Matched as a FILENAME at a bounded depth under the volume -- see
+# `docker_ctl.copy_glob_as_root` -- because mysqld chdirs into its datadir, one
+# level below the mount point, and a relative `core_pattern` lands in the
+# crashing process's working directory.
+#
+# WHAT THIS CANNOT REACH, said plainly rather than discovered later: a
+# `core_pattern` that is an ABSOLUTE path puts the core outside the engine's
+# volume, where neither this nor anything else in the run directory will find
+# it, and a pattern beginning with `|` writes no file anywhere. Both cases are
+# reported at server start instead.
+CORE_FILE_GLOB = "core*"
+
+# What to tell an operator to set, and it is not an arbitrary example. This
+# capture collects `core*`; `scripts/gdb-backtrace.py`, which reads the result,
+# searches for `core`, `core.*`, `*.core` and `core-*`. The two sets are not
+# the same, so only their INTERSECTION works end to end, and the two edges are
+# both real:
+#
+#   core%p   -> `core12345`   collected here, invisible to the backtrace script
+#   %e.core  -> `mysqld.core` sought by that script, never collected here
+#
+# `core.%p` is in both and is what every message here recommends, so an
+# operator who follows the console lands in the agreed set rather than on one
+# of those edges. `tests/test_e21_crash_capture_plumbing.py` asserts the
+# agreement against that script's own constants rather than against this
+# comment.
+RECOMMENDED_CORE_PATTERN = "core.%p"
+
+
+#: How far mysqld's working directory sits below the VOLUME's mount point, and
+#: therefore how much of `COPY_GLOB_MAX_DEPTH` a relative `core_pattern` has
+#: already spent before its own directory components are counted.
+#:
+#: One, because `docker/percona/entrypoint-percona.sh` defaults
+#: `VB_DATA_DIR` to `/var/lib/vbench/data` against a `data_mount` of
+#: `/var/lib/vbench`, and mysqld chdirs into its datadir. An engine that put
+#: its datadir somewhere else would need this passed rather than assumed, and
+#: `core_capture_verdict` takes it as an argument for that reason.
+DATADIR_DEPTH_BELOW_MOUNT = 1
+
+
+def core_capture_verdict(
+        pattern: Optional[str], data_mount: str,
+        datadir_depth: int = DATADIR_DEPTH_BELOW_MOUNT) -> Tuple[bool, str]:
+    """Whether a core written under `pattern` would reach the run directory.
+
+    Returns `(reachable, reason)`. A pure function of the two inputs so every
+    case can be probed, which matters because this is the function the whole
+    crash-capture finding rests on: if it says "a core would land in the
+    server's data directory" and no core ever appears, nothing downstream can
+    tell that from "the server did not crash".
+
+    THE ABSOLUTE CASE HAS THREE OUTCOMES, NOT ONE, and an earlier version of
+    this said only the middle one. `core(5)` says paths "are interpreted
+    according to the settings that are active for the crashing process", so an
+    absolute pattern resolves in the CONTAINER's mount namespace -- and that
+    namespace contains the bind-backed volume at the engine's data mount. So:
+
+      * under the data mount and within `COPY_GLOB_MAX_DEPTH` -- the core
+        lands in the volume, survives `docker rm`, and the capture's
+        `find /src -maxdepth 2` reaches it. This is a WORKING configuration
+        and the earlier text called it broken.
+      * under the data mount but deeper -- written, survives, and missed by
+        the capture's depth bound.
+      * anywhere else -- either it lands in the container's own writable
+        layer and goes with `docker rm`, or, if that directory does not exist
+        in the image, NO FILE IS WRITTEN AT ALL. Neither can be told apart
+        from here, and both mean the run directory receives nothing, so the
+        verdict is the same and the reason names both.
+
+    The half of the earlier claim derived from `core(5)` was right and the
+    half assumed was wrong, which is in miniature the fault the change this
+    belongs to exists to remove.
+
+    AND THE RELATIVE CASE HAS TWO OUTCOMES FOR THE SAME REASON. A relative
+    pattern lands in mysqld's working directory, which is the datadir -- but
+    it may carry directory components of its own, and `cores/core.%p` is then
+    three levels below the mount point and outside the capture's reach. The
+    depth arithmetic therefore runs on BOTH arms; running it on only the
+    absolute one is how this function came to promise a copy-out for a core
+    it could not collect.
+    """
+    if pattern is None:
+        return (False, f"unreadable ({HOST_CORE_PATTERN_PATH}); whether a "
+                       f"core can be written is unknown")
+    if pattern.startswith("|"):
+        return (False,
+                "that is a pipe, so the kernel hands the dump to that "
+                "program and writes NO FILE to any filesystem -- no core "
+                "will reach this run directory however the server dies. The "
+                "helper itself runs fine; piping is what leaves no file, so "
+                "putting it in the image would change nothing")
+    directory, _, name = pattern.rpartition("/")
+    if pattern.startswith("/"):
+        mount = data_mount.rstrip("/")
+        if directory == mount or directory.startswith(mount + "/"):
+            depth = len([part for part in
+                         directory[len(mount):].split("/") if part]) + 1
+            if depth > docker_ctl.COPY_GLOB_MAX_DEPTH:
+                return (False,
+                        f"that is an absolute path {depth} levels under "
+                        f"{mount}, and the capture searches only "
+                        f"{docker_ctl.COPY_GLOB_MAX_DEPTH}, so the core is written and "
+                        f"the copy-out does not find it")
+            if not name.startswith("core"):
+                return (False,
+                        f"that is an absolute path inside the volume, so the "
+                        f"core is written and survives teardown -- but under "
+                        f"a name the capture looks for as {CORE_FILE_GLOB!r} "
+                        f"and will not find")
+            return (True,
+                    f"that is an absolute path inside the volume at {mount}, "
+                    f"so the core lands where the copy-out reaches it")
+        return (False,
+                "that is an absolute path outside the engine's volume. It "
+                "resolves in the container's mount namespace, so either it "
+                "lands in the container's own writable layer and goes with "
+                "`docker rm`, or -- if that directory does not exist in the "
+                "image -- no file is written at all. Either way this run "
+                "directory receives nothing")
+    # A RELATIVE PATTERN CAN CARRY A DIRECTORY TOO, and the first version of
+    # this function computed depth on the absolute arm and not here -- so
+    # `cores/core.%p`, which lands three levels under the mount and outside
+    # the capture's reach, was reported as "copied out before teardown". That
+    # is the same false-positive direction as the bug this function was
+    # written to remove, left un-applied to the other arm, and the branch
+    # table could not catch it because there was no branch for it to have a
+    # row against.
+    depth = datadir_depth + len([part for part in directory.split("/")
+                                 if part]) + 1
+    if depth > docker_ctl.COPY_GLOB_MAX_DEPTH:
+        return (False,
+                f"that is relative with a directory in it, so the core lands "
+                f"{depth} levels under the volume's mount point and the "
+                f"capture searches only {docker_ctl.COPY_GLOB_MAX_DEPTH}; it "
+                f"is written and survives teardown, and the copy-out does "
+                f"not find it")
+    if not name.startswith("core"):
+        return (False,
+                f"that is relative, so the core does land in the server's "
+                f"data directory, but under a name the capture looks for as "
+                f"{CORE_FILE_GLOB!r} and will not find")
+    return (True, "a core would land in the server's data directory and be "
+                  "copied out before teardown")
+
+
+def host_core_pattern() -> Optional[str]:
+    """The host's `kernel.core_pattern`, or None if it cannot be read.
+
+    None rather than an exception: this is read on the server-start path, and a
+    kernel that does not publish the file, a locked-down /proc or a non-Linux
+    host must not stop a measurement that has nothing to do with core dumps.
+    """
+    try:
+        with open(HOST_CORE_PATTERN_PATH) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 # Readiness probes. Each performs a real query, not just a port check: all three
 # servers accept connections before they are able to serve, and a premature
@@ -174,13 +343,103 @@ class OpsRun:
             volumes=[f"{self.volume}:{data_mount}:rw"],
             command=["server"],
             detach=True,
+            # Empty for six of the seven engines, which keeps their `docker
+            # run` argv byte-identical -- see `ContainerSpec.ulimits`.
+            ulimits=self._ulimits() or None,
         )
         print(f"[ops] starting {self.engine} server: cpuset={self.resolved.server_cpuset} "
               f"mem={self.resolved.server_memory_bytes / 1024**3:.1f}GB")
         print(f"[ops] server flags: {' '.join(flags)}")
+        self._report_core_pattern(data_mount)
         docker_ctl.start(spec)
         docker_ctl.wait_healthy(self.server_name, list(engines_mod.get(self.engine).probe), timeout_s=300)
         print(f"[ops] {self.engine} server ready")
+
+    def _ulimits(self) -> Dict[str, str]:
+        """The engine's declared `--ulimit` entries, as a mapping.
+
+        Empty for every engine whose config declares none, which is six of the
+        seven. The registry holds a tuple of pairs rather than a dict so an
+        `EngineRuntime` stays hashable; this is where it becomes the mapping
+        `ContainerSpec` wants.
+        """
+        try:
+            return dict(engines_mod.get(self.engine).ulimits)
+        except Exception:                        # pragma: no cover - defensive
+            return {}
+
+    def _report_core_pattern(self, data_mount: str) -> None:
+        """Print the host's `kernel.core_pattern` beside the server flags, and
+        say plainly when it means no core will be produced.
+
+        THE FLAGS AND THE ULIMIT ARE NOT SUFFICIENT and that is the point of
+        printing this. There are three ways for the host to make the whole
+        chain inert, and `core(5)` is the source for each:
+
+        * A pattern beginning with `|` makes the kernel PIPE THE DUMP TO THAT
+          PROGRAM'S STDIN AND WRITE NO FILE AT ALL -- not into the volume, not
+          anywhere else on any filesystem. The helper then does whatever its
+          own policy says; on Ubuntu that is apport, which may file a crash
+          report or discard it, and either way nothing lands where this capture
+          could read it. AN EARLIER VERSION OF THIS COMMENT SAID THE HELPER
+          "does not exist in the container's mount namespace", AND THAT WAS
+          WRONG in a way that would send an operator down a dead end --
+          `/usr/share/apport/apport` is present on this host, and `core(5)` is
+          explicit that "the program pathname is interpreted with respect to
+          the initial mount namespace as it is always executed there. It is not
+          affected by the settings (e.g., root directory, mount namespace,
+          current working directory) of the crashing process", which is why
+          `%P` and `%I` exist at all. The helper runs. The point is that a pipe
+          produces no file, so bind-mounting apport into the image or baking it
+          in would change nothing.
+        * An ABSOLUTE pattern writes a file, but `core(5)` says paths "are
+          interpreted according to the settings that are active for the
+          crashing process", so it resolves INSIDE THE CONTAINER -- in the
+          container's own writable layer rather than in the bind-backed volume,
+          and that layer goes with `docker rm`.
+        * A RELATIVE pattern that does not begin with `core` -- `%e.core`,
+          `dump-%p` -- writes into mysqld's working directory, which IS the
+          volume, under a name `CORE_FILE_GLOB` does not match.
+
+        All three are ordinary settings on a Linux desktop or a managed server,
+        so an operator who is told only "core-file requested" will conclude the
+        server did not crash.
+
+        IT IS READ AND NOT WRITTEN. Changing it would change the behaviour of
+        every process on the machine under measurement; CLAUDE.md's rule about
+        host dependencies is the mild version of the same principle. The
+        one-line opt-in belongs in the rebuild procedure, as something the
+        operator does knowingly.
+
+        Only for an engine that asked for a core, so the other six engines'
+        console output is unchanged.
+        """
+        if "core" not in self._ulimits():
+            return
+        pattern = host_core_pattern()
+        reachable, reason = core_capture_verdict(pattern, data_mount)
+        # The value only when there IS one: an unreadable sysctl printed as
+        # `core_pattern: None` reads as a setting rather than as a failure to
+        # look, and the reason already says which.
+        if pattern is not None:
+            print(f"[ops] core_pattern: {pattern}")
+        print(f"[ops] {reason}")
+        if pattern == RECOMMENDED_CORE_PATTERN:
+            return
+        # The note goes on EVERY other value, including the ones the capture
+        # does reach. `core%p` is the case that needs it: this capture
+        # collects it and `scripts/gdb-backtrace.py` cannot read it, so
+        # "copied out before teardown" is true and still not enough. This
+        # function deliberately does not know that script's globs -- the
+        # agreement between the two is asserted in
+        # tests/test_e21_crash_capture_plumbing.py -- so the note is
+        # unconditional rather than clever.
+        note = (f"[ops] {RECOMMENDED_CORE_PATTERN!r} is the value this chain "
+                f"handles end to end")
+        if not reachable:
+            note += (", and setting it is the operator's to do, not this "
+                     "framework's")
+        print(note + ".")
 
     # ------------------------------------------------------------------
 
@@ -287,7 +546,8 @@ class OpsRun:
     def run_script(self, script: str, args: List[str],
                    interactive: bool = False,
                    client_memory_bytes: Optional[int] = None,
-                   timeout_s: int = 4 * 3600) -> int:
+                   timeout_s: int = 4 * 3600,
+                   artifacts_dir: Optional[str] = None) -> int:
         """Run one script from scripts/ against the running server.
 
         The diagnostic counterpart to run_harness. Same two-container shape,
@@ -306,6 +566,21 @@ class OpsRun:
         own ground truth, and those numbers must never be able to reach a
         report and sit in a table beside corpus numbers looking like a
         measurement.
+
+        `artifacts_dir` IS THE ONE EXCEPTION AND IT IS READ-ONLY, which is
+        what keeps the paragraph above true. A lab script that has to open a
+        core dump cannot generate one, so it needs to be shown something a run
+        already produced; mounted `:ro` that is a read of an existing artefact
+        and not a route for a made-up number to reach a report. `:rw` here is
+        exactly the defect the paragraph above describes.
+
+        IT IS AN EXPLICIT PATH AND NOT THE SESSION'S RUN DIRECTORY, which is
+        the version that does not work. A lab session's `run_dir` is
+        `state/lab/<session>`, which `cmd_lab` has just created and which is
+        empty by construction; a core lives in `results/<run-id>/cores/...`,
+        under a run id the lab session cannot name. So the caller supplies the
+        path, and validating it is the caller's job -- `cmd_lab` is where
+        `VB_ROOT` and the operator's argv are both in scope.
         """
         image = self.engine_cfg.get("image", {}).get(
             "bench", f"vector-bench/{self.engine}-bench"
@@ -328,6 +603,8 @@ class OpsRun:
             # be run from inside a benchmark to reach it.
             f"{self.paths['datasets']}:/datasets:ro",
         ]
+        if artifacts_dir:
+            volumes.append(f"{artifacts_dir}:/artifacts:ro")
 
         env = {
             "PYTHONUNBUFFERED": "1",
@@ -414,9 +691,28 @@ class OpsRun:
         not, which is the case that matters when the server died rather than
         merely failed its probe.
 
-        Independent of each other, and neither can end the run: a server whose
-        stdout is empty is exactly the one whose file log matters, so an
-        exception from the first must not skip the second.
+        FOUR CAPTURES NOW, NOT TWO, and the order is deliberate. The container
+        exit facts go first of the three that need the daemon, because they are
+        the cheapest -- one `docker inspect`, bounded at 30 s -- and the only
+        one that cannot be reconstructed from anything else; a second Ctrl-C
+        during the 510 s the error-log chain can take should not cost them. The
+        core copy goes last because it is the most expensive and the least
+        likely to find anything.
+
+        ONE INSPECT, SHARED. The exit state is read here and passed to both
+        callees rather than fetched twice. It is also what gates the core
+        lookup, and that gate is load-bearing rather than tidy: this method
+        runs from `run_harness`'s UNCONDITIONAL `finally`, so without it every
+        SUCCESSFUL phase would spawn a container to search a live datadir and
+        print a note about a core that was never going to exist --
+        `--profile full` is 24 percona ops units, so 24 needless container
+        starts and 24 misleading notes on a healthy run. `exit_state` is None
+        while the server is still up, which is exactly the "nothing crashed
+        here" signal.
+
+        Independent of each other, and none of them can end the run: a server
+        whose stdout is empty is exactly the one whose file log matters, so an
+        exception from any of them must not skip the rest.
         """
         try:
             text = docker_ctl.logs(self.server_name, tail=SERVER_LOG_TAIL)
@@ -426,7 +722,158 @@ class OpsRun:
             docker_ctl.save_phase_log(
                 self.paths["run_dir"], self.engine, self.dataset,
                 f"server-{self.tag}", self.resource_pass, text.splitlines())
+        try:
+            exit_state = docker_ctl.exit_state(self.server_name)
+        except Exception:                        # pragma: no cover - defensive
+            exit_state = None
+        self._save_container_exit_facts(exit_state)
         self._save_server_error_log()
+        self._save_server_core(exit_state)
+
+    def _save_container_exit_facts(
+            self, state: Optional[Dict[str, Any]]) -> None:
+        """Record how the server container ended, before it is removed.
+
+        NOT AS RECORD FIELDS, and that is a decision rather than a shortcut.
+        The case these facts exist for is a phase that wrote NO RECORD AT ALL
+        -- twelve of run full-20261015-215006's twenty-four percona ops units
+        are empty files -- so an `extra` key would be absent in exactly the
+        case it was added for. They go into the run directory beside the two
+        log captures, through the same `save_phase_log`, whose filename carries
+        the dataset for the reason that function's docstring gives.
+
+        It also keeps the measurement version where it is: a run-directory
+        artefact is not an ops number, so nothing a reader already trusts
+        changes meaning and `OPS_MEASUREMENT_VERSION` does not move.
+
+        MUST RUN BEFORE TEARDOWN and does, for the same reason
+        `_save_server_error_log` does: every caller reaches it from a `finally`
+        inside a `with OpsRun(...)` block, and `teardown` -- whose second call
+        is `docker rm` -- is `__exit__`. `docker inspect` needs the container to
+        EXIST; after `remove` there is nothing to ask.
+
+        NOTHING HERE MAY RAISE, the standard `_save_server_error_log` sets.
+        `state` is whatever `_save_server_log`'s single inspect produced, and
+        None for every daemon-side failure, so the `try` is for the write.
+        """
+        try:
+            if not state:
+                # No file rather than a file saying nothing: `export` ships
+                # the run directory and a reader spends time on whatever is
+                # in it. A container that never existed -- the missing-image
+                # path -- is the usual way to get here.
+                return
+            lines = [
+                f"container: {self.server_name}",
+                f"engine: {self.engine}",
+                f"dataset: {self.dataset}",
+                f"phase: {self.tag}",
+                f"resource_pass: {self.resource_pass}",
+                f"exit_code: {state['exit_code']}",
+                # The field this artefact exists for. Printed with its value
+                # on the same line and in words, because "OOMKilled" alone
+                # reads as an assertion that it was.
+                f"oom_killed: {state['oom_killed']} "
+                f"({'the kernel killed it' if state['oom_killed'] else 'not a cgroup OOM'})",
+                f"finished_at: {state['finished_at']}",
+                f"daemon_error: {state['error'] or '(none)'}",
+            ]
+            saved = docker_ctl.save_phase_log(
+                self.paths["run_dir"], self.engine, self.dataset,
+                f"server-exit-{self.tag}", self.resource_pass, lines)
+            if saved:
+                print(f"[ops] server exit facts -> "
+                      f"{os.path.relpath(saved, self.paths['run_dir'])}"
+                      f" (exit {state['exit_code']}, "
+                      f"OOMKilled={state['oom_killed']})")
+        except Exception as exc:                 # pragma: no cover - defensive
+            print(f"[ops] note: could not record {self.engine}'s container "
+                  f"exit state: {exc}", file=sys.stderr)
+
+    def _save_server_core(self, state: Optional[Dict[str, Any]]) -> None:
+        """Copy a core dump out of the data volume before teardown deletes it.
+
+        THE DEFECT THIS EXISTS FOR IS ORDERING, not absence. `teardown` stops
+        the container, removes it, removes the network, removes the volume and
+        then `remove_tree_as_root`s the host directory the volume was backed
+        by -- and `__exit__` is `teardown`. A core written into the engine's
+        data mount is deleted with the run that produced it, so there is no
+        second chance after this point and no amount of later tooling can
+        recover one.
+
+        ONLY FOR AN ENGINE THAT ASKED FOR A CORE. `_save_server_error_log`
+        sets the precedent and its reason transfers exactly: looking costs a
+        container, and an engine whose config declares no core ulimit was never
+        asked to dump, so for the other six this is a no-op and their
+        behaviour is unchanged.
+
+        AND ONLY IF THE CONTAINER HAS ACTUALLY ENDED, which is what `state`
+        being non-None means. The caller reaches this from `run_harness`'s
+        UNCONDITIONAL `finally`, so the alternative is one container start and
+        one "no core found" note per SUCCESSFUL phase as well -- 24 of each on
+        `--profile full`, every one of them noise, over a datadir the server is
+        still writing to. A server that is still running has not dumped.
+
+        AND ONLY IF THE BIND DIRECTORY IS THERE. `remove_tree_as_root`'s first
+        line is the same check and gives the reason: when setup failed before
+        the server wrote anything, the directory is one this process made and
+        spawning a container to look inside it would need the very image whose
+        absence may have caused the failure.
+
+        WHERE IT LANDS: `<run_dir>/cores/<engine>-<dataset>-<phase>-<pass>/`,
+        the same quadruple `save_phase_log` keys its filenames on and for the
+        same reason -- one engine, one phase and one resource pass is not a
+        unit of work, and a four-dataset profile would otherwise overwrite
+        three of four.
+
+        AND WHAT THAT COSTS `export`, which is not handled here and should be
+        known before it surprises someone. `orchestrator/export.py`'s
+        `write_bundle` tars the WHOLE run directory, so a run holding a core
+        produces a bundle carrying it -- gigabytes, in a thing whose stated
+        job is to be "sent to someone who does not have this checkout".
+        `cmd_export` prints the size, so it is visible, but only afterwards. A
+        core is also the wrong artefact to send: it is specific to this
+        machine and this build, and what the server team can act on is the
+        BACKTRACE taken from it. Excluding `cores/` from the bundle is the
+        right fix and belongs to whoever owns `export.py`.
+
+        NOTHING HERE MAY RAISE. `copy_glob_as_root` returns `[]` for every
+        failure; the `try` is for the registry lookup and the path arithmetic.
+        """
+        try:
+            if "core" not in self._ulimits():
+                return
+            if not state:
+                return
+            bind_dir = os.path.join(self.paths["engine_state"], "ops",
+                                    self.volume)
+            if not os.path.isdir(bind_dir):
+                return
+            dest = os.path.join(
+                self.paths["run_dir"], "cores",
+                f"{self.engine}-{self.dataset}-{self.tag}-"
+                f"{self.resource_pass}")
+            image = self.engine_cfg.get("image", {}).get(
+                "runtime", f"vector-bench/{self.engine}-runtime")
+            copied = docker_ctl.copy_glob_as_root(
+                bind_dir, CORE_FILE_GLOB, dest, image)
+            if not copied:
+                # A note rather than silence, and it names the two reasons a
+                # core is absent that are not "the server did not crash", so
+                # an operator does not read the empty directory as evidence.
+                print(f"[ops] note: no {CORE_FILE_GLOB} found in "
+                      f"{self.engine}'s data volume. Either the server did "
+                      f"not dump, or kernel.core_pattern sent the core "
+                      f"somewhere this cannot reach -- the value is printed "
+                      f"at server start.", file=sys.stderr)
+                return
+            for path in copied:
+                print(f"[ops] server core -> "
+                      f"{os.path.relpath(path, self.paths['run_dir'])} "
+                      f"({os.path.getsize(path) / 1024**3:.2f} GiB)")
+        except Exception as exc:                 # pragma: no cover - defensive
+            print(f"[ops] note: could not archive {self.engine}'s core: "
+                  f"{exc}", file=sys.stderr)
 
     def _save_startup_log(self) -> None:
         """`_save_server_log`, but only once there is a container to ask.

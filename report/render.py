@@ -1150,33 +1150,33 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
     work out that it does not apply.
     """
     engines = set((summary or {}).get("engines") or [])
-    # Which engines expose the build-quality knob is a property of the run, not
-    # a constant. It was pgvector alone until valkey-search joined; the rule it
-    # justifies is unchanged, but stating the old reason would be false and a
-    # reader checking it against the build table would catch it.
-    tunable = sorted(engines & {"pgvector", "valkey"})
-    if len(tunable) > 1:
-        ef_row = [
-            "`ef_construction` is exposed by " + " and ".join(
-                _label(e) for e in tunable),
-            "Build quality can be tuned for those two and not for MHNSW or VIDX, "
-            "so it is pinned to the default in the normalized pass and swept only "
-            "in the tuned pass. Two engines of four having the knob is still an "
-            "asymmetry against MariaDB and AliSQL, which have no equivalent.",
-        ]
-    else:
-        ef_row = [
-            "`ef_construction` is exposed only by pgvector",
-            "Build quality can be tuned for pgvector but not for MHNSW or VIDX. "
-            "It is pinned to the default in the normalized pass so pgvector is "
-            "not given an axis the others lack.",
-        ]
-
+    # Which engines expose the build-quality knob is a property of the RUN and
+    # of the drivers in it, never of a literal here. It was pgvector alone
+    # until valkey-search joined, and the `{"pgvector", "valkey"}` literal
+    # that replaced that sentence was wrong again the day Percona Server
+    # landed: a Percona-only run intersected to nothing, fell through to the
+    # single-engine arm and published "exposed only by pgvector" in a report
+    # about the one engine here with BOTH a build-time and a query-time
+    # effort knob -- contradicting `CLAUDE.md`'s invariants bullet, which
+    # names all three, and `config/engines/percona.yml`, which declares the
+    # capability. The discriminator needs no new channel:
+    # `harness/workloads/build.py` merges `_driver_capabilities(driver)` into
+    # every `index_build` record's `extra`, so `extra.ef_construction_tunable`
+    # is the driver's own answer about the engine that actually ran -- and
+    # reading it from the records keeps `report/` importing nothing from
+    # `orchestrator`, which `tests/test_config.py` enforces.
+    tunable = _ef_construction_engines(summary)
+    # The same correction one row down. "pgvector bulk-builds after load;
+    # MHNSW and VIDX build incrementally" was unconditional, so a
+    # Percona-only report spent a row on three engines that did not run and
+    # said nothing about the one that did -- the only engine in the MySQL
+    # family whose `build_mode` is a comparison within itself. Derived from
+    # `extra.separable_build` through `generate.build_kind`, the classifier
+    # that §5's table and the build chart already share, so this row and the
+    # figures below it cannot disagree about what a build was.
     rows = [
-                ef_row,
-                ["pgvector bulk-builds after load; MHNSW and VIDX build incrementally",
-                 "Build cost is reported separately for both modes. A single "
-                 "'build time' comparison would compare different operations."],
+                _ef_construction_row(tunable, sorted(engines)),
+                *_build_mode_rows(summary),
                 ["AliSQL VIDX is InnoDB-only and requires READ COMMITTED",
                  "InnoDB is the headline storage engine for all engines. MariaDB's "
                  "MyISAM results, where present, are a MariaDB-only extra curve."],
@@ -1205,7 +1205,7 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
              "filtered section derives each engine's strategy from that "
              "measurement rather than from its documentation."],
             ["Valkey is installed from packages, not built from source",
-             "Percona ships prebuilt packages, so it carries installed package "
+             "valkey-search ships prebuilt, so it carries installed package "
              "versions instead of a tag, a commit and a `-march`, and the "
              "AVX-512 row above does not describe it."],
         ]
@@ -3450,6 +3450,323 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
             parts.append(
                 f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# §3's two generated rows
+#
+# These helpers belong beside `_known_asymmetries` and are down here instead
+# for a reason that NO LONGER HOLDS, which is why this paragraph says so
+# rather than being deleted with the constraint.
+#
+# WHAT IT WAS. `docs/10-rollout.md` cited three locations in this module by
+# LINE NUMBER, two of them below `_known_asymmetries` -- the "grids meet"
+# sentence in `_consistency_section` and the section-10 heading in
+# `render_markdown` -- and `tests/test_e3_rollout_doc.py` resolved each
+# against that exact line. Inserting anything above them shifted both and put
+# `master` red; `CLAUDE.md` records that happening twice in two days
+# (#41, #43). docs/10 was not that change's to edit, so the call site above
+# was rewritten within its own line count and the bodies went here. Nor did
+# extracting them into a module help: removing ~100 lines near the call site
+# shifts the later citations UP and fails the same guard an insertion does.
+#
+# WHAT CHANGED. #63 converted those citations to SYMBOLS. `CITED_IN_REPO` is
+# now keyed by `(path, symbol)` pairs -- `("report/render.py",
+# "_consistency_section")` and the two beside it -- and resolves them by
+# finding the symbol, so a line number is no longer load-bearing anywhere in
+# this file and these bodies can move freely.
+#
+# THE MOTION IS PENDING AND TRAVELS ALONE. ~240 lines sit ~2,290 lines from
+# their only call site; moving them back beside `_known_asymmetries` is now
+# a legal change and is deliberately not made here. A relocation of that size
+# is the diff shape that hides a substantive edit inside it, and doing it in
+# a change with behaviour in it means re-measuring the suite to achieve
+# nothing observable. Nothing enforces the motion: the citation ratchet in
+# `tests/test_e16_citation_ratchet.py` counts citations and cannot see a
+# block that wants moving, so this paragraph is the record of the debt and
+# should go with the block when it moves.
+# ---------------------------------------------------------------------------
+
+#: How this table names an engine in PROSE, which is not how a chart legend
+#: names it. Every other row here is hand-written English -- "pgvector
+#: bulk-builds", "AliSQL VIDX is InnoDB-only", "Valkey holds the whole
+#: dataset in memory" -- so a row generated from the records has to be able
+#: to say the same words. `_label` is the legend, and "`ef_construction` is
+#: exposed only by PostgreSQL (pgvector)" reads as a label dropped into a
+#: sentence; the sentence this replaces said "pgvector", and
+#: `tests/test_config.py` pins that spelling.
+#:
+#: NOT A GATE, which is the thing to check before adding a map of engine
+#: names to this repo: `_prose_name` falls back to `_label`, so an engine
+#: added after this was written names itself from the manifest instead of
+#: printing its config key, and nothing here has to be kept in step with
+#: `config/engines/*.yml`. `KNOWN_ENGINES` stays whatever that directory
+#: holds.
+_PROSE_NAME = {
+    "mariadb": "MariaDB MHNSW",
+    "mariadb123": "MariaDB 12.3 MHNSW",
+    "alisql": "AliSQL VIDX",
+    "pgvector": "pgvector",
+    "mongodb": "Percona Search",
+    "valkey": "Valkey",
+    "percona": "Percona Server",
+}
+
+#: Which engines expose `ef_construction` when no record says either way.
+#:
+#: Absence is not a denial. `extra.ef_construction_tunable` arrived with
+#: `build.py:_driver_capabilities`, and the engines that expose the knob
+#: exposed it before that key was ever written, so reading silence as "no"
+#: would withdraw a true claim from every run archived before it -- and from
+#: every synthetic summary a test builds without the key. The shape and the
+#: precedent are `generate.FILTER_COLUMN_WHEN_ABSENT`: a statement of fact
+#: about the records that predate the key, not a default.
+#:
+#: A record that DOES carry the key always wins, so this set cannot overrule
+#: a driver: it is consulted only for an engine whose every build record is
+#: silent.
+#:
+#: MEASURED, because both halves of that argument are claims about archived
+#: data. Of the `index_build` records in the reachable archives, 132 carry no
+#: `ef_construction_tunable`: pgvector 38, mariadb 44, alisql 34,
+#: mariadb123 12, mongodb 4. The pgvector 38 are why absence must not be read
+#: as a denial -- a legacy pgvector-only directory would otherwise regenerate
+#: with the knob withdrawn from the one engine that had it. The other 94 are
+#: why absence must not be read as an affirmation either: read that way, a
+#: legacy mariadb-only directory regenerates as "exposed only by MariaDB
+#: MHNSW", which is the original defect with its sign flipped. Both
+#: directions are pinned in
+#: `tests/test_e19_asymmetry_rows_name_the_engines_that_ran.py`, and so is
+#: this set's equality with the engine configs, because a set that may be
+#: widened by a one-word edit is a literal again.
+EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED = frozenset(
+    {"pgvector", "valkey", "percona"})
+
+
+def _prose_name(engine: str) -> str:
+    return _PROSE_NAME.get(engine) or _label(engine)
+
+
+def _prose_list(engines: List[str]) -> str:
+    names = [_prose_name(e) for e in engines]
+    if len(names) <= 2:
+        return " and ".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _capability_states(summary: Optional[Dict[str, Any]],
+                       key: str) -> Dict[str, Any]:
+    """Per engine, the values its `index_build` records state for `key`.
+
+    An engine missing from the result said nothing on any record, which is a
+    third state and not a `False` -- the distinction
+    `generate.build_kind`'s `BUILD_KIND_UNRECORDED` exists for, and the one
+    that decides whether the fallback above is consulted.
+
+    ONLY A REAL BOOLEAN COUNTS AS AN ANSWER, and the discipline is the point
+    rather than defensiveness. This read `bool(extra[key])` on whatever was
+    there, which turns the three states back into two in both directions: a
+    hand-edited or YAML-round-tripped `"false"` is truthy, so a report would
+    have said "exposed only by MariaDB MHNSW" off a string; and a recorded
+    `null` -- which this repo uses deliberately to mean "documented, not
+    observed", as `config/engines/valkey.yml` does for
+    `hybrid_filter_planner` with a comment about exactly this hazard --
+    collapsed to a denial WITHOUT consulting the fallback, which is the one
+    thing the three-state rule exists to prevent.
+
+    So a value that is not `True` or `False` is not an answer: the record is
+    silent for that key and the engine falls to the fallback, the same as a
+    record that never carried it. `harness/metrics/records.py` guards the
+    same shape the same way in `ops_versions_measure_the_same_thing`, with a
+    comment about hand-edited manifests. All 685 values in the reachable
+    archives are real booleans, so nothing in the published numbers moves;
+    this is about what the next hand-edited file does.
+    """
+    states: Dict[str, Any] = {}
+    for record in (summary or {}).get("build") or []:
+        value = (record.get("extra") or {}).get(key)
+        if isinstance(value, bool):
+            states.setdefault(record.get("engine"), set()).add(value)
+    return states
+
+
+def _ef_construction_engines(summary: Optional[Dict[str, Any]]) -> List[str]:
+    """The engines in this run whose records say the build knob is theirs."""
+    states = _capability_states(summary, "ef_construction_tunable")
+    return [engine
+            for engine in sorted(set((summary or {}).get("engines") or []))
+            if (True in states[engine] if engine in states
+                else engine in EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED)]
+
+
+def _ef_construction_row(tunable: List[str],
+                         engines: List[str]) -> List[str]:
+    """§3's `ef_construction` row, in three arms rather than two.
+
+    The third arm is the one a literal set could not reach: a run in which no
+    engine exposes the knob at all. The old code's `else` branch covered both
+    "one engine has it" and "none of them does" and said "only by pgvector"
+    for both, so a MariaDB-and-AliSQL report named an engine that had not run
+    and a Percona report denied the engine that had.
+
+    NO ROW HERE SAYS WHAT THE SWEEP VARIES INSTEAD, and that absence is
+    deliberate. The obvious sentence -- "so the sweep varies `M` alone" --
+    is false for one of the seven engines: `orchestrator/ann_pass.py` gives
+    Percona Search `m_values[:1]` under its own comment, "M is carried, not
+    applied: mongot exposes no graph degree", where every other engine gets
+    the whole grid. `--profile full --engines mongodb` is an ordinary
+    invocation, and in that report this row would have sat three rows above
+    "M is pinned at one value for every other engine and cannot be set here
+    at all" and contradicted it. Writing a second claim about a second knob
+    to explain the first is how this row went wrong in the first place.
+    """
+    others = [e for e in engines if e not in tunable]
+    if not tunable:
+        return [
+            "`ef_construction` is exposed by none of the engines in this run",
+            "Build quality cannot be tuned here at all, so the normalized "
+            "pass has no knob to pin."
+            + (f" {_prose_list(others)} "
+               + ("exposes" if len(others) == 1 else "expose")
+               + " no equivalent." if others else ""),
+        ]
+    tuned = _prose_list(tunable)
+    consequence = (
+        f"Build quality can be tuned for {tuned}, "
+        + (f"and not for {_prose_list(others)}, which "
+           + ("has" if len(others) == 1 else "have")
+           + " no equivalent. " if others else
+           "an axis the engines without the knob do not have. ")
+        + "It is pinned to the default in the normalized pass, so no engine "
+          "is given an axis the others lack, and swept only in the tuned "
+          "pass.")
+    if "percona" in tunable:
+        # `CLAUDE.md`'s invariants bullet, in the row that is about the knob:
+        # the build-time knob is half of what makes this engine the
+        # interesting one, and a reader of a report whose subject is
+        # `ef_construction` has to be told the query-time knob is there too.
+        consequence += (
+            " Percona Server is the only engine in this study with both a "
+            "build-time and a query-time effort knob, so for it the sweep is "
+            "a second axis rather than the only one.")
+    return [
+        ("`ef_construction` is exposed only by " if len(tunable) == 1
+         else "`ef_construction` is exposed by ") + tuned,
+        consequence,
+    ]
+
+
+def _build_mode_engines(summary: Optional[Dict[str, Any]]
+                        ) -> Tuple[List[str], List[str], List[str]]:
+    """Which engines bulk-built, which built incrementally, which did both.
+
+    Four kinds in and three lists out, and the arithmetic is the point.
+
+    An ASYNCHRONOUS build is excluded rather than filed as a bulk one.
+    mongot's `separable_build` is True and its index is built by another
+    process while the writes are still arriving, so calling that a bulk build
+    would contradict the "builds its index asynchronously" row the mongodb
+    block adds a few rows down. `_index_build_kind` splits the same four
+    kinds for §5's table and this follows it.
+
+    An UNRECORDED build -- no `separable_build` key at all -- lands in no
+    list. Nothing in such a record says which operation `build_wall_s` timed,
+    and this row is a claim about an operation.
+
+    That third case is a GUARD rather than a described population, and the
+    difference is worth stating because the fallback above is the other way
+    round. Counted over every archived run reachable here, 817 `index_build`
+    records carry `separable_build` and none is missing it, so no archive
+    exercises this branch; 132 of those same records are missing
+    `ef_construction_tunable` -- 38 of them pgvector's -- which is why
+    `EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED` is backed by data and this is
+    not.
+    """
+    from report.generate import (BUILD_KIND_BULK, BUILD_KIND_INCREMENTAL,
+                                 build_kind)
+    kinds: Dict[str, Any] = {}
+    for record in (summary or {}).get("build") or []:
+        extra = record.get("extra") or {}
+        if (extra.get("async_index_build")
+                or record.get("build_mode") == "async"):
+            continue
+        kinds.setdefault(record.get("engine"), set()).add(build_kind(record))
+    bulk = {e for e, seen in kinds.items() if BUILD_KIND_BULK in seen}
+    incremental = {e for e, seen in kinds.items()
+                   if BUILD_KIND_INCREMENTAL in seen}
+    return (sorted(bulk - incremental), sorted(incremental - bulk),
+            sorted(bulk & incremental))
+
+
+def _build_mode_rows(summary: Optional[Dict[str, Any]]) -> List[List[str]]:
+    """§3's bulk-versus-incremental rows, naming what this run observed.
+
+    Two rows at most. An engine swept over both modes is not a side of the
+    bulk/incremental asymmetry -- it is the asymmetry held inside one engine
+    -- so it gets its own row rather than being named on both sides of the
+    first one.
+
+    A run that observed neither gets no row. The unconditional sentence this
+    replaces is why: in a Percona-only report it described MHNSW, VIDX and
+    pgvector, none of which had run.
+    """
+    bulk, incremental, either = _build_mode_engines(summary)
+    rows: List[List[str]] = []
+    clauses = []
+    if bulk:
+        clauses.append(
+            f"{_prose_list(bulk)} "
+            + ("bulk-builds" if len(bulk) == 1 else "bulk-build")
+            + " after load")
+    if incremental:
+        clauses.append(
+            f"{_prose_list(incremental)} "
+            + ("builds" if len(incremental) == 1 else "build")
+            + " incrementally on every INSERT")
+    if clauses:
+        # The CONSEQUENCE is conditional too, and leaving it unconditional
+        # while deriving the subject was half a fix. Master's sentence says
+        # "reported separately for both modes", which on
+        # `percona-20261021-134142` -- one engine, one mode, incremental --
+        # described a second column the report does not contain, directly
+        # beside a correctly derived subject naming one mode. A row whose two
+        # cells disagree about how many modes ran is worse than the
+        # unconditional row it replaced, because the derivation makes it look
+        # checked.
+        rows.append(["; ".join(clauses),
+                     "Build cost is reported separately for both modes. A "
+                     "single 'build time' comparison would compare different "
+                     "operations."
+                     if bulk and incremental else
+                     "Build cost is reported as the operation that ran. A "
+                     "single 'build time' comparison against the other mode "
+                     "-- in this run or in another -- would compare different "
+                     "operations."])
+    if either:
+        consequence = (
+            "Both modes were measured for it, so that pair is a comparison "
+            "within one implementation rather than against another one.")
+        if "percona" in either:
+            # The half of this that a single ratio hides, and it is not a
+            # detail: `docs/09-adding-percona-server.md` §2 quotes the
+            # vendor's own `index_build.test` -- "First ADD, explicit
+            # INPLACE: rebuilds the table with the column" -- so the bulk
+            # path pays for a base-table rebuild that pgvector's bulk path
+            # does not. Reporting "the bulk build is N times cheaper" with
+            # that inside the number compares two operations and calls the
+            # difference a build cost.
+            consequence += (
+                " For Percona Server the two are not even the same "
+                "operation: its first *ADD VECTOR KEY* rebuilds the base "
+                "table where pgvector's *CREATE INDEX* does not, so a single "
+                "'the bulk build is faster' figure hides a table rebuild "
+                "inside one engine's number.")
+        rows.append([
+            f"{_prose_list(either)} {'does' if len(either) == 1 else 'do'} "
+            "either, so `build_mode` is a comparison within one engine",
+            consequence,
+        ])
+    return rows
 
 
 # ---------------------------------------------------------------------------
