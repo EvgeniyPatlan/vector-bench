@@ -1942,6 +1942,12 @@ SHA_SCAN_SUFFIXES = (".py", ".yml", ".yaml", ".md", ".sh", ".sql", ".js",
 SELF_REL = "tests/test_e2_percona_wiring.py"
 PLAN_DOC = "docs/12-percona-feedback-plan.md"
 
+#: `orchestrator/estimate.py`, which dates its measured ingest rates to the
+#: binary that produced them. Named here rather than edited: the sentence is
+#: a fact about seventeen archived records and not a copy of the pin, and the
+#: file belongs to another unit.
+ESTIMATOR = "orchestrator/estimate.py"
+
 #: Commits other than the pin that this tree may name, as
 #: `{sha: (the files that may name it, why)}`.
 #:
@@ -1969,11 +1975,23 @@ COMMITS_ALLOWED_BESIDE_THE_PIN = {
         "as it was when the plan was written and are deliberately not "
         "maintained -- the plan's own phase 0 says so."),
     "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304": (
-        (PLAN_DOC, SELF_REL),
+        (PLAN_DOC, SELF_REL, ESTIMATOR),
         "the superseded pin: the `vector-mvp` tip of 2026-10-13, left behind "
         "when the vector MVP was merged into the `9.7` series. docs/12 is "
         "the document that argues for that re-pin, so naming the pin it "
-        "moved away from is its subject rather than a stale copy."),
+        "moved away from is its subject rather than a stale copy.\n"
+        "\n"
+        "`orchestrator/estimate.py` is the third entry and it was found by "
+        "this guard rather than by reading: the estimator's rates landed on "
+        "master while the old pin was still live, and its comment says `All "
+        "seventeen records carry engine_version 9.7.1-1-vector-bench at "
+        "engine_tag 02a8b80c. These are therefore rates for the OLD pin`. "
+        "That is a fact about which binary measured seventeen archived "
+        "records, not a copy of the pin, and the sentence is the reason the "
+        "first run at the new pin has something explicit to supersede. The "
+        "file belongs to another unit, so it is declared here and not "
+        "edited -- and the check below means that if that sentence is ever "
+        "removed, this allowance fails rather than lingering."),
 }
 
 #: Of those, the ones that were once this engine's `source.tag`.
