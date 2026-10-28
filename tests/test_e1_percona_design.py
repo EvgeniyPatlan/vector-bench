@@ -298,13 +298,19 @@ class TestBuildArgConventions:
         environment the manifest reads; the image sets it too, and an ARG
         declared but never used leaves it `unknown`.
 
-        A SYMBOL AND NOT A NUMBER. This said `ops_pass.py:256` and the change
-        that re-points it moves `VB_ENGINE_TAG` to 472 -- which is #63's whole
-        argument for the conversion, made again by the first edit above a
-        citation #63 did not convert. It survived that change because it is
+        A SYMBOL AND NOT A NUMBER. This used to cite a line number in
+        `ops_pass.py`, and the change that converted it is an edit above that
+        line -- which is #63's whole argument for the conversion, made again
+        against a citation #63 did not reach. It survived #63 because it is
         bare docstring prose with a row in neither `CITED_SYMBOLS` nor the
         `CITED_IN_REPO` table #63 deleted, so nothing failed and nothing would
         have.
+
+        NO NUMBERS IN THIS PARAGRAPH, deliberately: the earlier version named
+        both the old line and the new one, and the new one went stale inside
+        the same round -- in a docstring whose subject is line numbers going
+        stale. A figure that needs maintaining to stay true does not belong in
+        the explanation of why figures should not be cited.
         """
         dockerfile = open(os.path.join(DOCKER, "percona", "Dockerfile")).read()
         assert "VB_ENGINE_TAG=${PERCONA_TAG}" in dockerfile

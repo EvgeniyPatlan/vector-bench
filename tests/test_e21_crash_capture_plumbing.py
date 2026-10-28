@@ -999,7 +999,35 @@ class TestTheExitFactsAreWrittenWhereAFailedPhaseLeavesThem:
         spawns client processes would have fired a guard whose message is
         about core dumps. So this reads the AST and looks only at keyword
         names of `Record(...)` calls and at the string keys of any `extra=`
-        dict -- which is the route, and nothing else.
+        dict.
+
+        WHAT THAT COSTS, AND IT IS NOT CLOSED BY MORE CODE. The scan sees the
+        LITERAL form only. Three evasions were measured and all three walk
+        past it, because it keys on `isinstance(kw.value, ast.Dict)` and on
+        string `Constant` keys:
+
+            extra=_exit_extra(...)          a Name -- the key set elsewhere
+            extra={**caps, **{"exit_code": 137}}   a non-literal ** merge
+            extra=dict(**caps, exit_code=137)      a Call
+
+        Chasing those with more AST is the wrong move, because what bounds
+        the risk is not the scan. THREE THINGS, and they split cleanly:
+
+          1. The scan covers the literal form, which is what a tidy-up
+             actually looks like, and nothing more.
+          2. THE SERVER'S EXIT STATE CANNOT REACH A RECORD BY ANY ROUTE,
+             literal or otherwise, and that is architectural rather than
+             lexical -- see the paragraph below. No evasion helps, because
+             the harness cannot obtain the fact in the first place.
+          3. The one REACHABLE harm is the NAME being taken by a different
+             fact. `client_process.py` computes a client process's exit code
+             today, so `extra={"exit_code": proc.exitcode}` meaning the
+             CLIENT is plausible, would pass every argument above, and would
+             be read by anyone opening a run directory as the server's. That
+             is precisely the confusion the `server-exit-<tag>` artefact
+             exists to end, and it is why the literal scan is worth keeping
+             even though it is evadable: the evasions are deliberate, and
+             this one would be an accident.
 
         WHY THE PREMISE HOLDS ARCHITECTURALLY rather than by convention, and
         this is the stronger form of the argument: the harness runs in a
