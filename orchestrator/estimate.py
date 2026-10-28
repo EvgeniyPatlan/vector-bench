@@ -49,7 +49,15 @@ from .ops_pass import (DEFAULT_FILTERED_BUDGET_S, _declared_scan_modes,
 # (glove-100: ~320 rows/s at M=8, ~70 at M=32). An estimate that is optimistic
 # by 3x is worse than none, so these are the observed mid-grid numbers.
 _INGEST_ROWS_PER_S = {"mariadb": 150, "mariadb123": 110, "alisql": 55,
-                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000}
+                      "pgvector": 3000, "valkey": 40000, "mongodb": 60000,
+                      # The M=16 `incremental` rate on glove-100-angular,
+                      # which is the corpus `_REFERENCE_DIMS` (100) and
+                      # `_REFERENCE_ROWS` (1,000,000) describe, so it needs no
+                      # unscaling to sit here. Exactly MariaDB's precedent:
+                      # its 150 is its own glove-100 measurement of 147.
+                      # Provenance for this and the three entries below is in
+                      # the comment above `_MEASURED_ROWS_PER_S`.
+                      "percona": 275}
 _DATASET_ROWS = {
     "fashion-mnist-784-euclidean": 60_000,
     "glove-100-angular": 1_183_514,
@@ -107,6 +115,116 @@ _MEASURED_ROWS_PER_S = {
     ("pgvector", "dbpedia-openai-1000k-angular"): 617,
     ("valkey", "dbpedia-openai-1000k-angular"): 30122,
     ("mongodb", "dbpedia-openai-1000k-angular"): 71182,
+    # Percona Server, InnoDB HNSW. The `incremental` build mode at M=16, which
+    # is this table's stated mid-grid convention, read off the archived ops
+    # records of the run `full-20261015-215006`. The census behind them: 17
+    # distinct `phase: ingest` measurements across six runs, deduped on
+    # `(run_id, dataset, M, resource_pass, build_mode, rows)` -- `run_id`
+    # included, because without it two pairs of distinct runs collapse and the
+    # count comes out at fifteen.
+    #
+    # THE PASS IS `normalized` WHEREVER BOTH PASSES MEASURED THE CELL. This
+    # key has no pass axis, and normalized is both the fairness baseline and
+    # the slower of the two in every Percona pair ever measured -- tuned is
+    # 9.8% / 6.0% / 3.8% faster at M=8/16/32 on fashion-mnist -- so the entry
+    # errs pessimistic, which is the direction the comment above this table
+    # requires. The whole pass spread is under 10%, against a factor of ~5
+    # for M.
+    #
+    # ROWS MATTER AS MUCH AS M. These are the 60,000-row and 1M-row
+    # full-corpus loads, not the 20,000-row ones from
+    # `config/profiles/percona.yml`'s `ops.subset_rows`, which ran 13% faster
+    # because HNSW insert cost grows with the node count already indexed.
+    # `estimate_load_hours` multiplies by `_DATASET_ROWS`, so the rate and the
+    # row count describe the same load.
+    ("percona", "fashion-mnist-784-euclidean"): 339,   # 338.94, normalized
+    ("percona", "glove-100-angular"): 275,             # 275.04, normalized
+    # The one entry the pass convention could not be applied to: only the
+    # TUNED pass has an M=16 incremental record for sift-128 (normalized ran
+    # at M=8 and nothing else), so this is a tuned measurement standing in for
+    # a key with no pass axis. By the fashion-mnist M=16 ratio the normalized
+    # figure would be ~6% lower, so this entry is optimistic by about that
+    # much and by nothing else. Taken as measured rather than scaled, because
+    # a scaled figure is interpolation.
+    ("percona", "sift-128-euclidean"): 427,            # 426.53, tuned
+    #
+    # gist-960-euclidean IS DELIBERATELY ABSENT AND MUST STAY ABSENT. It was
+    # measured at exactly one M -- 32, at 48.17 rows/s, 20,760 s for one
+    # reload -- and it is the slowest corpus here, so its single figure in a
+    # table whose convention is "mid-grid" would be a mislabelled number and
+    # not merely a conservative one. The formula fallback gives 70.8 rows/s
+    # where the M=16 rate is ~100 (from the 2.07-2.09 M16/M32 ratio measured
+    # on fashion-mnist and sift-128): 1.41x pessimistic and honestly a model,
+    # against 2.08x pessimistic and dressed as a measurement. Interpolating an
+    # M=16 figure from that ratio is not done; one measurement at one M is not
+    # a grid.
+    #
+    # AND THIS TABLE CANNOT EXPRESS THE BUILD MODE. Every figure above is
+    # `incremental`, Percona's default at this pin. The `post` plain load
+    # measured 2653.0 rows/s -- 7.8x the fashion-mnist entry -- and is in
+    # neither table because no graph is built during it. pgvector, Valkey and
+    # Percona Search are here with `post` figures for the opposite reason:
+    # they never maintain the graph on the write path, so `post` IS their
+    # load. When `capabilities.bulk_vector_index_build` is flipped and `post`
+    # becomes Percona's default, the right rate becomes mode-dependent and
+    # this key cannot say so -- `_ops_units` already reads
+    # `ops.percona_build_modes` and this table does not.
+    #
+    # TWO PROVENANCE FACTS, RECORDED RATHER THAN CORRECTED FOR.
+    #   * All twelve load-bearing records come from a binary built
+    #     `march: native`, not the `x86-64-v3` the cross-engine invariant
+    #     mandates. On this Xeon Gold 6230 `native` admits AVX-512 where
+    #     `x86-64-v3` stops at AVX2 and the HNSW insert path is the
+    #     SIMD-sensitive code, so the direction of concern is that these rates
+    #     are optimistic. The archive offers no clean paired comparison, but
+    #     correcting for the pass with the measured fashion-mnist ratio puts
+    #     an implied `native` tuned-20k figure at ~407 rows/s against two
+    #     `x86-64-v3` measurements of 413-418: a few percent, and if anything
+    #     in the safe direction. Not adjusted for.
+    #   * All seventeen records carry `engine_version 9.7.1-1-vector-bench` at
+    #     `engine_tag 02a8b80c`. These are therefore rates for the OLD pin,
+    #     and once the re-pin and its rebuild land they describe a binary that
+    #     no longer exists. They are kept because a planning estimate from the
+    #     old binary beats the `None` that was here before, and they are dated
+    #     here so the first run at the new pin has something explicit to
+    #     supersede: re-read the fashion-mnist M=16 incremental rate then and
+    #     replace these if it has moved by more than ~10%.
+    #
+    # NO MEASUREMENT-VERSION BUMP, and the reason is not merely that this
+    # module writes no records. It reads none either, at runtime: nothing here
+    # reaches `build_signature`, `memory_stem` or `charts.series_key`, so no
+    # recorded number changes value, meaning or series, which is the whole of
+    # `OPS_MEASUREMENT_VERSION`'s charter.
+    #
+    # The version question that DOES apply points the other way: all three
+    # entries above and the reference rate were READ OFF records stamped
+    # `ops_measurement_version` **7**, while the constant is 8. It resolves,
+    # and the argument is about this field and not about the versions in
+    # general. `ingest_rows_per_s` is SINGLE-WRITER load throughput -- every
+    # one of the seventeen census records carries `ingest_threads: 1` and the
+    # ingest phase has no client pool -- and nothing since version 5, which
+    # widened every row with the `ctag` column, has moved it:
+    #
+    #   * version 6 made the clients OS processes and moved every
+    #     MULTI-CLIENT figure: `qps` and all four latency columns wherever
+    #     `clients > 1`, the four `extra.*concurrency`/`scaling_*` keys, and
+    #     the churn during-writes record's aggregate reader throughput,
+    #     percentiles, p99 ratio and `extra.reinsert_rows_per_s`. TWO OF
+    #     THOSE ARE THROUGHPUT FIGURES and neither is this one: a pool's
+    #     `qps` and a re-insert rate against readers are not a one-writer
+    #     load rate.
+    #   * version 7 moved five one-client `extra.*scaling_status` fields and
+    #     explicitly nothing else -- "No `qps`, no percentile, no efficiency".
+    #   * version 8 moved `storage_engine`, an identity label and not a
+    #     measurement. For Percona it stays populated; InnoDB is real here.
+    #
+    # So these three rates are commensurable with each other and with a load
+    # measured at HEAD. (6 and 7 are the span of the CENSUS, not the
+    # provenance of the entries: its one version-6 record is the `post` plain
+    # load noted above, which is in neither table.) A future bump that does
+    # move `ingest_rows_per_s` -- another column, a different load path, more
+    # than one writer -- makes these a different quantity, and they must then
+    # be re-read rather than carried forward.
 }
 
 

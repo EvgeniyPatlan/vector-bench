@@ -49,18 +49,43 @@
 # identifies the build behind a cell.
 #
 # THE INGEST RATE IS MEASURED -- seventeen times across six runs, counting
-# distinct `(dataset, resource_pass, M, build_mode, rows)` tuples over every
-# `phase: ingest` record carrying an `ingest_rows_per_s`. Sixteen are
-# `incremental`, from 48.17 rows/s (gist-960, tuned, M=32, 1M rows) to 638.11
-# (sift-128, normalized, M=8, 1M rows); the seventeenth is the `post` plain
-# load at 2653.0 rows/s, which is the maximum and a different quantity,
-# because no graph is being built during it. None of it has been written back
-# into `orchestrator/estimate.py`, whose `_MEASURED_ROWS_PER_S` and
-# `_INGEST_ROWS_PER_S` both omit this engine, so `_effective_rate` returns
-# None and `./run-benchmark.sh run --profile percona` still prints an estimate
-# that names the engine in `engines_without_ingest_rate` rather than giving it
-# an hour figure. Measured but unmodelled: the fix is a table entry, not a
-# run, and it is unlanded work rather than the smoke gate's job.
+# distinct `(run_id, dataset, resource_pass, M, build_mode, rows)` tuples over
+# every `phase: ingest` record carrying an `ingest_rows_per_s`.
+#
+# `run_id` IS PART OF THAT KEY AND THE COUNT IS WRONG WITHOUT IT. This file
+# used to name the key without it while asserting seventeen, and the key it
+# named returns FIFTEEN: dropping `run_id` merges the two fashion-mnist
+# normalized 20k runs of 2026-10-15 (383.27 and 384.90 rows/s) and the two
+# tuned 20k runs of 2026-10-20/21 (417.64 and 412.99), discarding two real
+# figures. Two runs that measure the same configuration are two measurements.
+# Fifteen is the number `docs/12-percona-feedback-plan.md` published, and this
+# line is the most likely route for it to come back: anyone who re-runs the
+# census the way a file describes it gets what that key gives and then
+# "fixes" the total. Walk the archive recursively while you are there --
+# `ALL_RESULTS/results/` is a superset of `PS/`, and `PS/` additionally holds
+# a ZERO-BYTE copy of the one unit file the fashion-mnist entry below is
+# derived from, so a PS-only census silently loses it.
+#
+# Sixteen of the seventeen are `incremental`, from 48.17 rows/s (gist-960,
+# tuned, M=32, 1M rows) to 638.11 (sift-128, normalized, M=8, 1M rows); the
+# seventeenth is the `post` plain load at 2653.0 rows/s, which is the maximum
+# and a different quantity, because no graph is being built during it.
+#
+# AND IT IS MODELLED NOW. `orchestrator/estimate.py` carries the M=16
+# `incremental` mid-grid rate for the three datasets that have one -- 339, 275
+# and 427 rows/s on fashion-mnist, glove-100 and sift-128, all from
+# `full-20261015-215006` -- plus 275 as this engine's reference rate.
+# gist-960 was measured at M=32 alone and is deliberately absent, so the
+# formula serves it; the `post` figure is in neither table. `_effective_rate`
+# therefore returns a number for every dataset and nothing names this engine
+# in `engines_without_ingest_rate` any more. Read the comment above
+# `_MEASURED_ROWS_PER_S` for the pass and row-count conventions behind each
+# figure, and for the fact that all seventeen records come from the OLD pin.
+#
+# One thing that did NOT change: `--profile percona` still prints no estimate
+# block at all. Its whole worst case is ~0.3 h and `print_load_estimate`
+# returns early under 1 h, which it did before this engine had a rate too. The
+# hour figure is in the dict the CLI and the web UI read, not on stdout here.
 name: percona
 description: Percona Server alone — ef_construction sweep and both build modes
 

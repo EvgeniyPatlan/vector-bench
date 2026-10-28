@@ -61,6 +61,46 @@ build:
 #     the three and not the others and the build runs with fewer workers than
 #     the manifest records, succeeds, and says nothing.
 #
+# A FOURTH LIMIT ON THE SAME COUNT, WHICH IS NOT A PARALLELISM KEY AT ALL:
+# maintenance_work_mem, set two lines above each chain from
+# {maintenance_bytes}. PostgreSQL 17's CREATE INDEX page states that it "may
+# influence the number of worker processes requested, since parallel workers
+# must have at least a 32MB share of the total maintenance_work_mem budget.
+# There must also be a remaining 32MB share for the leader process." The
+# granted count is therefore capped at floor(maintenance_work_mem / 32MB) - 1
+# where that bites: eight workers need 288 MB, at 256 MB an eight-worker
+# request is granted as seven, and smaller values cut harder. It reaches the
+# HNSW build because ComputeParallelWorkers calls plan_create_index_workers,
+# which is where the clamp lives, and the documented way out of it does not
+# apply here -- that is a table-level `parallel_workers` reloption, and
+# PostgresDriver's CREATE TABLE sets none.
+#
+# It does not bite at today's fractions, so this is a guard and not a live
+# defect: both passes give maintenance_work_mem a tenth of the container
+# limit, so eight workers are covered by any container above about 2.9 GB, and
+# the normalized pass requests no workers to clamp.
+#
+# WHAT IS GUARDED, EXACTLY, because the guard is narrower than the hazard and
+# an earlier draft of this paragraph claimed both halves. The tuned-chain test
+# asserts that this value DERIVES from {maintenance_bytes}B, so a literal in
+# place of the placeholder fails. That is a derivation check and not a
+# magnitude check, and the magnitude is set somewhere this file cannot see:
+# shrink maintenance_fraction in config/resources/tuned.yml and the value here
+# is still {maintenance_bytes}B, the assertion still passes, and the clamp
+# bites anyway -- at 0.01 a 16 GB container yields 160 MB, which grants four
+# workers against a declared eight. THAT IS NOT CAUGHT HERE and the resource
+# file is where it would have to be.
+#
+# A magnitude assertion is deliberately not added: 288 MB is not reachable on
+# a small-RAM host -- a 4 GB box grants six workers against a build_threads of
+# 8 -- so the test would fail legitimately there and re-introduce exactly the
+# host-dependence that asserting the raw placeholder removed. A guard that is
+# red on small machines is one somebody deletes.
+#
+# The key is also kept deliberately OUT of that test's parallelism family,
+# because a memory knob with its own resource-fraction machinery is not a
+# parallelism setting and a predicate that called it one would mis-describe it.
+#
 # THAT RULE IS A POSTGRESQL FACT AND DOES NOT PORT, which matters because
 # this comment is the artefact whoever copies this shape will read.
 # docs/12-percona-feedback-plan.md §5.2 proposes the same treatment for
@@ -140,7 +180,28 @@ build:
 # four GUCs. What is tested is what this repository SENDS:
 # tests/test_config.py::TestEveryPgvectorParallelismKnobIsPinnedOnPurpose
 # asserts each pass's key set and values rather than the presence of a
-# string, so moving a key between the blocks fails against this comment.
+# string, so moving a key between the blocks fails against this comment. Both
+# blocks are also asserted CLOSED over any setting whose name mentions a
+# worker or parallelism: the four above are the whole of it, and pinning a
+# fifth -- autovacuum_max_workers, max_logical_replication_workers, anything
+# like them -- fails that test whatever its value, so it costs an edit there
+# and a reviewer who reads the reason. Note that naming one in this comment is
+# NOT that argument: autovacuum_max_workers appears above, in the sentence
+# about which pool autovacuum draws on, and a substring check mistook that for
+# an explanation.
+#
+# THAT GUARD READS WHAT THE SERVER READS, in every spelling postgres accepts:
+# `-c name=value` as below, `-cname=value`, and a bare `--name=value` with
+# hyphens folded to underscores the way the server's own ParseLongOption folds
+# them. It has to, for two reasons that compound. This file is the only engine
+# config using `-c` pairs -- percona.yml, mariadb.yml, mariadb123.yml and
+# alisql.yml spell their whole server blocks `--name=value` -- so a bare long
+# option is the house habit, not an exotic edit. And
+# docker/pgvector/entrypoint-pgvector.sh appends ${VB_SERVER_ARGS} UNQUOTED
+# into the argv it execs, so such a token word-splits and reaches postgres
+# intact. A guard that recognised only the `-c` form would have let
+# `--max-parallel-workers=16` through while claiming to be closed, and a later
+# duplicate wins at the server exactly as it wins in the test's dict.
 server:
   common:
     - -c

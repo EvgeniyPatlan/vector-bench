@@ -36,6 +36,16 @@ from report.measurement_versions import (  # noqa: F401
     refuse_mixed_measurement_versions,
 )
 
+# Extracted for the same reason. Aliased rather than renamed at the call sites,
+# which read them a dozen times; `report/coercers.py` has the argument for why
+# the conversion happens at all. New code should import it directly.
+from report.coercers import (  # noqa: F401
+    maybe_bool as _maybe_bool,
+    maybe_float as _maybe_float,
+    maybe_int as _maybe_int,
+    maybe_str as _maybe_str,
+)
+
 
 def knn_recall(dataset_distances: numpy.ndarray, run_distances: numpy.ndarray,
                count: int, epsilon: float = 1e-3) -> float:
@@ -172,6 +182,36 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                         # ann-benchmarks records index size in kilobytes.
                         record.setdefault("index_bytes",
                                           int(float(attrs["index_size"]) * 1024))
+                    # The build cost: measured since this framework existed
+                    # and dropped by this reader for just as long, so the
+                    # published claim was the ratio of the KNOB ("16 times the
+                    # build effort") against a measured 2.17x. `build_time` is
+                    # the only timing EVERY engine writes and is the sole
+                    # source of `build_wall_s`. The load is spelled
+                    # `ingest_seconds` by `vb_mysql` and `load_seconds` by the
+                    # pgvector, valkey and mongodb modules, never both at once,
+                    # and is one quantity, so one field reads both;
+                    # `build_seconds` beside them is NOT read, because
+                    # mongodb's includes the load and the other two's do not.
+                    # No rate is derived -- the file holds no row count.
+                    # Absent stays absent rather than 0.0, and a NaN is dropped
+                    # because `json` writes it as the bare token `NaN`, which
+                    # is not JSON and which `allow_nan=False` refuses to emit
+                    # -- the reason the `qps` line above drops one. NOT because
+                    # `generate.py`'s `default=str` would stringify it: by this
+                    # point `maybe_float` has already called `float()`, so
+                    # `default` is never reached. Why each
+                    # of those, with the measured figures:
+                    # tests/test_e18_ann_build_timing_reaches_the_records.py
+                    for field, attributes in (
+                            ("build_wall_s", ("build_time",)),
+                            ("ingest_wall_s", ("ingest_seconds", "load_seconds")),
+                    ):
+                        for attribute in attributes:
+                            value = _maybe_float(attrs.get(attribute))
+                            if value is not None and value == value:
+                                record[field] = value
+                                break
                     if times is not None and len(times):
                         record["latency_p50_ms"] = float(numpy.percentile(times, 50) * 1000)
                         record["latency_p95_ms"] = float(numpy.percentile(times, 95) * 1000)
@@ -343,36 +383,6 @@ def ceiling_pressure(rows: List[Dict[str, Any]],
         "fraction_at_ceiling": at_ceiling / len(values),
         "first_hit_fraction": first / len(values),
     }
-
-
-def _maybe_int(value: Any) -> Optional[int]:
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _maybe_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return str(value)
-
-
-def _maybe_bool(value: Any) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, (bool, numpy.bool_)):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in ("true", "1"):
-        return True
-    if text in ("false", "0"):
-        return False
-    return None
 
 
 def pareto_frontier(points: List[Dict[str, Any]], x: str = "recall_at_k",

@@ -144,15 +144,15 @@
 #      system library.
 #
 #      Vendor packages deliberately NOT taken, with the reason, so the audit
-#      does not have to be redone: valgrind, gdb, doxygen, doxygen-gui,
-#      graphviz, devscripts, debhelper, fakeroot, ccache, patchelf,
-#      python3-mysqldb, libeatmydata, dh-apparmor and copyright-update are
-#      their packaging and test pipeline, not compile inputs; libsystemd-dev
-#      and libjemalloc-dev govern options this tree defaults OFF
-#      (CMakeLists.txt:1655 and :874); libmecab-dev likewise, since
-#      build-binary.sh passes -DWITH_MECAB only when asked (:84); and
-#      `libpam-dev` is the virtual name whose provider we install directly --
-#      see the test that exists for exactly that mistake.
+#      does not have to be redone: valgrind, doxygen, doxygen-gui, graphviz,
+#      devscripts, debhelper, fakeroot, ccache, patchelf, python3-mysqldb,
+#      libeatmydata, dh-apparmor and copyright-update are their packaging and
+#      test pipeline, not compile inputs; libsystemd-dev and libjemalloc-dev
+#      govern options this tree defaults OFF (CMakeLists.txt:1655 and :874);
+#      libmecab-dev likewise, since build-binary.sh passes -DWITH_MECAB only
+#      when asked (:84); and `libpam-dev` is the virtual name whose provider
+#      we install directly -- see the test that exists for exactly that
+#      mistake. ONE REVERSAL: gdb, for request 1; see the bench stage.
 #
 
 ARG BASE_IMAGE=ubuntu:24.04
@@ -758,9 +758,111 @@ FROM runtime AS bench
 LABEL org.opencontainers.image.title="vector-bench Percona Server + ann-benchmarks"
 
 ENV DEBIAN_FRONTEND=noninteractive
+# gdb IS THE ONE ENTRY REVERSED out of the "deliberately NOT taken" audit
+# note above -- the SECOND of its fourteen entries, after valgrind -- and it
+# is here rather than in `runtime` on purpose. TWELVE OF THE TWENTY-FOUR
+# Percona ops units in run full-20261015-215006 died inside the first
+# INSERT: exactly half. The denominator is checkable here --
+# `config/profiles/full.yml` is four datasets and `ops.m_values: [8, 16,
+# 32]`, so twelve units a pass and twenty-four across both -- and the twelve
+# is the plan's count over the archived unit files, twelve of which are
+# empty while twelve carry records; `results/` is gitignored, so that half
+# is READ FROM THE PLAN and not re-counted here. Do not take this figure
+# from `config/engines/percona.yml`'s `error_log` note, which still says
+# "13 of 24": the plan establishes 13 as wrong and the crash-capture change
+# corrects it there.
+#
+# Nothing in this repository could turn such a crash into text, because no
+# image here installed a debugger. (The literal two words that name an apt
+# install step are deliberately not written in this comment: the per-stage
+# package parser in tests/test_e4_percona_build_flags.py matches them
+# anywhere in the file, prose included, and this note poisoned the bench
+# stage's parsed package list until it was reworded. There is now a test for
+# that.) Request 1 of docs/12-percona-feedback-plan.md -- "get stack traces
+# for the crashes", its §4, NOT request 3, which is filtered search against
+# pgvector in §7 -- asks for the backtrace, so the decision is reversed and
+# the note above records it rather than quietly dropping the entry. The
+# note's own reason for existing is that the audit should not have to be
+# redone, and a wrong request number in it sends the next auditor to the
+# wrong section.
+#
+# WHY THE BENCH STAGE AND NOT THE RUNTIME STAGE. The runtime image is the
+# container the ops path MEASURES: `OpsRun._start_server` starts it from
+# `image.runtime`, under the pass's cpuset and memory limit, and a debugger
+# in it is a package in the measured server's own filesystem. The bench
+# image is the one `OpsRun.run_script` starts for a lab script, which is the
+# route that opens a core. `FROM runtime AS bench` means this stage already
+# has the mysqld the debugger needs, so nothing is copied between stages and
+# no runtime layer changes -- `percona-runtime` is byte-for-byte what it
+# would have been without this.
+#
+# THE ONE PLACE THAT IS NOT CLEAN, stated rather than left to be discovered:
+# on the ANN path the engine and the benchmark share ONE container and it is
+# this image -- `overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py` starts
+# the server with `Popen([ENTRYPOINT, "server"])` inside the bench
+# container. So for recall/QPS the server does run in a filesystem that
+# carries gdb. What that costs is disk and nothing else, and the package is
+# the evidence rather than the assumption -- MEASURED with dpkg-query on a
+# noble host, the same base this image uses: gdb 15.1-1ubuntu1~24.04.1 is
+# 10.0 MiB installed, everything it ships outside /usr is
+# /etc/gdb/gdbinit -- 39 bytes, one comment line and no commands -- and an
+# empty /etc/gdb/gdbinit.d/ -- no service, no systemd unit, no apt hook --
+# and its single Recommends is `libc-dbg`, which
+# `--no-install-recommends` leaves out. Of its eighteen Depends the ones
+# this image may not already carry through python3, build-essential and git
+# come to at most 3.7 MiB (libmpfr6 1.2, libsource-highlight4t64 0.7,
+# libgmp10 0.5, libbabeltrace1 0.5, libreadline8t64 0.5, libipt2 0.1,
+# libxxhash0 0.1, libdebuginfod1t64 0.07). So order 15 MiB on an image whose
+# pip layer alone is several hundred; the exact figure is whatever the first
+# build's `docker images` prints. Nothing reads any of it unless a lab
+# script invokes it, and no lab script runs during a measured pass --
+# `cmd_lab` refuses to start beside a measurement for exactly that reason.
+# Resident memory, cpuset and the cgroup accounting the report publishes are
+# untouched: a file nobody opens occupies no page cache inside the limit.
+#
+# ONE GAP IN THAT ARGUMENT, since "nothing executes" is not the whole of it:
+# gdb's Depends put SHARED LIBRARIES in the image, and some are libraries
+# the measuring client links against -- libpython3.12t64, libstdc++6,
+# zlib1g, libexpat1. REASONED, not measured, because resolving them needs
+# an apt this change does not run: every one of them is already installed
+# by this stage's python3-dev and build-essential from the same pocket, so
+# gdb pulls in no library the client did not already link against and
+# replaces no version of one. If a rebuild ever shows apt UPGRADING one of
+# them to satisfy gdb, that is a different change and this paragraph is
+# where the argument has to be remade.
+#
+# WHAT THE BACKTRACE WILL AND WILL NOT CONTAIN, and this is the part the
+# plan gets optimistic about. The build is RelWithDebInfo, but the builder's
+# last step strips it: `strip --strip-debug` over every ELF under
+# /opt/percona. MEASURED on the build host with binutils 2.42 and gdb 15.1,
+# on a toy program compiled -g -O0 and then stripped the same way -- the
+# flag removes every `.debug_*` section and KEEPS `.symtab`:
+#
+#     with DWARF   #0 ... in inner (depth=5, seed=15) at c.c:2
+#                         local_a = 35 / local_b = 50 / p = 0x0
+#     after strip  #0 ... in inner ()
+#                         No symbol table info available.
+#
+# So `thread apply all bt full` returns the call chain by function name --
+# enough to attribute a crash to a code path, which is what request 1 asks
+# for -- and no arguments, no locals and no line numbers. The strip is NOT
+# removed here, and the magnitude of what that would add is NOT measured --
+# which is itself the reason not to flip it in passing. Keeping the debug
+# sections of every ELF under /opt/percona is a large multiple of the
+# stripped tree for a MySQL-family RelWithDebInfo build, and it would land
+# in the runtime image as well, since that is where `COPY --from=builder`
+# puts the tree. Whoever needs variable values rather than a stack should
+# make that change against a build that reports the figure.
+#
+# UNVERIFIED, all of it, because no build of this image has ever succeeded:
+# that noble has a `gdb` candidate, that this layer builds, and that gdb can
+# open a core written by this mysqld. The first
+# `./run-benchmark.sh build --engines percona` is the gate, and it costs no
+# extra build -- the re-pin rebuilds this image anyway.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-dev build-essential git \
-      libmariadb-dev libhdf5-dev pkg-config
+      libmariadb-dev libhdf5-dev pkg-config \
+      gdb
 
 # The same client stack as the MariaDB and AliSQL bench images, for the same
 # reason: MariaDB Connector/C speaks the MySQL protocol, so all three

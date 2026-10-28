@@ -214,19 +214,22 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~726 h of ingest before a single query runs, and ~1,066 h of run time
+--resource-pass both` is ~796 h of ingest before a single query runs, and ~1,135 h of run time
 in the worst case once querying is counted — all seven engines, which is what that command
-measures when `--engines` is omitted. **The ingest figure covers six of those seven**:
-Percona's rate is measured but unmodelled, so the estimator names it in
-`engines_without_ingest_rate` rather than folding it in, and 726 h is a floor by an amount
-nothing here knows. Seventeen `ingest` records across six runs measure it: sixteen
-`incremental`, from 48 rows/s (gist-960, M=32, 1M rows) to 638 (sift-128, M=8, 1M rows), plus
-one `post` plain load at 2,653 rows/s, which is a different quantity because no graph is
-built during it. None has been written into `_MEASURED_ROWS_PER_S` or `_INGEST_ROWS_PER_S` in
-`orchestrator/estimate.py`, so `_effective_rate` returns `None` for this engine and feeding
-that table is unlanded work. Before proposing a run, check `docs/07-planning-a-run.md` and
-the estimate the run prints. Prefer `dev` → `smoke` when validating framework changes; long
-profiles are the user's call, not a default.
+measures when `--engines` is omitted. **Both figures now cover all seven.** The ingest half
+used to cover six: Percona's rate was measured and unmodelled, the estimator named it in
+`engines_without_ingest_rate` rather than folding it in, and the published 726 h was a floor
+by an amount nothing here knew. The amount is **69.83 h**, and 726 h became 796 h when it was
+added. Seventeen `ingest` records across six runs measure the engine: sixteen `incremental`,
+from 48 rows/s (gist-960, M=32, 1M rows) to 638 (sift-128, M=8, 1M rows), plus one `post`
+plain load at 2,653 rows/s, which is a different quantity because no graph is built during it
+and is in neither rate table. What `orchestrator/estimate.py` now carries is the M=16
+`incremental` mid-grid rate on the three corpora that have one — 339, 275 and 427 rows/s —
+with gist-960 left to the formula because it was measured at M=32 alone. They are rates from
+the OLD pin (`engine_version 9.7.1-1-vector-bench`), which the table's comment says, so the
+first run at the new pin has something explicit to supersede. Before proposing a run, check
+`docs/07-planning-a-run.md` and the estimate the run prints. Prefer `dev` → `smoke` when
+validating framework changes; long profiles are the user's call, not a default.
 
 Runs are resumable, checkpointed per `(pass, engine, dataset, phase)` and, inside an ops
 phase, per `(M, build_mode)`:
@@ -271,8 +274,17 @@ unimplemented).
 
 09, 10 and 11 are guarded: `tests/test_e1_percona_design.py`, `tests/test_e3_rollout_doc.py`
 and `tests/test_e15_methodology_roadmap_doc.py` fail when the document drifts from the tree.
-12 is not guarded yet, and its own phase 0 says so. **09 and 10 cite `file:line` and 11 cites
-symbols only** — and if you are adding a document, copy 11. Line citations in 09 and 10 have
-rotted twice in two days and put `master` red both times (#41, #43), both times because a
-later round of edits in the same change moved lines after the citations were derived. A line
-number dies to any edit above it; a symbol name dies only to a rename.
+12 is not guarded yet, and its own phase 0 says so. **All three cite symbols only — never a
+line number — and each guard ratchets its document to zero, over one shared pattern.** That
+pattern and the frozen fixture that proves it still sees every form live in
+`tests/test_e15_methodology_roadmap_doc.py`, and the other two guards import them: there were
+three near-copies before, they were not identical, and the narrow ones could not see MTR
+`.result`/`.test` paths, `.yy` grammars, extensionless files or bare `:N` continuations. A
+gutter number reproduced inside a fenced block is the one form no pattern over code-font spans
+can see, so it has a separate check. If you are adding a document, copy 11;
+`docs/11-methodology-roadmap.md` §0 is where the policy and its reasoning live. 09 and 10 cited `file:line` until they were converted, and those citations rotted twice
+in two days and put `master` red both times (#41, #43), both times because a later round of
+edits in the same change moved lines after the citations were derived. A line number dies to
+any edit above it; a symbol name dies only to a rename. The vendor half was worse and nothing
+reported it: 09's guard deny-listed every Percona path by name, so on the order of 164 line
+references into a tree that is not in this checkout were checked by nothing at all.

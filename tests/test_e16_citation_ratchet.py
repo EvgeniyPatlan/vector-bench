@@ -13,14 +13,23 @@ checked and found unmoved, moved the one in
 `tests/test_t3c_filtered.py::TestTheReportKeepsTheTwoColumnsApart` and listed it
 in neither.
 
-`docs/09-adding-percona-server.md` and `docs/10-rollout.md` cite by line and
-are each guarded: `tests/test_e1_percona_design.py` and
-`tests/test_e3_rollout_doc.py` carry a `CITED_IN_REPO` table that says, for
-every citation in the document, what the cited line is expected to contain,
-and re-open the file to check it. That mechanism works. It is also the reason
-it cannot be extended here: it needs the table. A comment has no table. There
-is nowhere to write down what a comment's citation claims is at that line
-except beside the citation itself, in prose, where nothing can read it.
+`docs/09-adding-percona-server.md` and `docs/10-rollout.md` USED TO cite by
+line, and were each guarded: `tests/test_e1_percona_design.py` and
+`tests/test_e3_rollout_doc.py` carried a `CITED_IN_REPO` table that said, for
+every citation in the document, what the cited line was expected to contain,
+and re-opened the file to check it. That mechanism worked. **Both documents
+have since been converted to symbol citations and both tables are gone**, so
+the documents no longer make the citations this file counts and
+`CITED_IN_REPO` no longer exists in either guard.
+
+The reason the mechanism could not be extended here is unchanged and is why
+this file still exists: it needed a table. A comment has no table. There is
+nowhere to write down what a comment's citation claims is at that line except
+beside the citation itself, in prose, where nothing can read it. What HAS
+changed is the standing: a line citation in a Python comment is now the last
+place in this repository where the form survives at all, so the census below
+is no longer a floor under a practice the documents share -- it is the whole
+of it.
 
 WHY RANGE-CHECKING IS NOT THE GUARD, MEASURED BEFORE THIS FILE WAS WRITTEN
 --------------------------------------------------------------------------
@@ -49,11 +58,15 @@ WHAT COUNTS, AND WHAT DOES NOT
 **Comments and docstrings only.** A line citation inside an ordinary string
 literal is not counted, and the reason is not convenience:
 
-* `CITED_IN_REPO` in the two document guards is a dict of citations, each with
-  the anchor it is expected to match and a test that re-opens the line.
-  Counting those would make this file fail whenever `docs/09` or `docs/10`
-  legitimately gains a guarded citation -- punishing the one citation form in
-  this repository that *is* checked.
+* `CITED_IN_REPO` in the two document guards WAS a dict of citations, each
+  with the anchor it was expected to match and a test that re-opened the line.
+  Counting those would have made this file fail whenever `docs/09` or
+  `docs/10` legitimately gained a guarded citation -- punishing the one
+  citation form in this repository that was checked. Both tables are gone now,
+  replaced by `CITED_SYMBOLS` keyed on `(path, symbol)`, so there are no
+  guarded line citations left to punish; the rule is kept because the
+  reasoning still applies to any table of the same shape, and because the
+  third bullet below needs it.
 * `tests/test_e15_methodology_roadmap_doc.py` builds a deliberately bad
   document containing the banned form, to prove its detector can see one.
   Planting a failure is how guards here are shown to work; a census that
@@ -428,13 +441,19 @@ def vacuity_problems(files: List[str], counts: Dict[str, int]) -> List[str]:
 #: which is the event it exists to report. Renaming a file fails here with its
 #: old name, loudly, and the fix is to move the entry.
 #:
-#: **One caveat worth recording: every entry currently equals its file's exact
-#: count, so the slack the design leans on is zero everywhere.** "A repair is
-#: free" is true of the comparison and is exercised only by
-#: `TestAPlantedCitationIsCounted`, not by anything in the tree. The first
-#: real repair will prove it for real, and will leave an entry above its file
-#: -- which `test_no_ceiling_is_slack_by_more_than_the_file_holds` tolerates
-#: deliberately, and only refuses once the file holds none at all.
+#: **Every entry equals its file's exact count, so the slack the design leans
+#: on is zero everywhere.** That was first written as a caveat awaiting its
+#: first real repair, and the repair has happened: converting `docs/09` and
+#: `docs/10` to symbol citations took 13 counted citations out of the two
+#: document guards, 23 -> 14 and 6 -> 2.
+#:
+#: **It did not leave slack, and that was a deliberate choice rather than the
+#: design working.** `test_no_ceiling_is_slack_by_more_than_the_file_holds`
+#: tolerates an entry above its file and only refuses once the file holds none
+#: at all, so 23 over 14 would have passed -- nine free citations in a file
+#: whose own guard now refuses every one in the document it checks. "A repair
+#: is free" is a statement about the comparison, not a licence to bank the
+#: difference. A repair should come with its ceiling.
 CITATION_CEILINGS: Dict[str, int] = {
     "harness/drivers/base.py": 9,
     "harness/drivers/mongo.py": 1,
@@ -453,8 +472,16 @@ CITATION_CEILINGS: Dict[str, int] = {
     "tests/test_c4_pgvector_ingest.py": 2,
     "tests/test_e10_report_unit_join_keys.py": 2,
     "tests/test_e13_percona_churn_repair_is_a_noop.py": 1,
-    "tests/test_e1_percona_design.py": 23,
-    "tests/test_e3_rollout_doc.py": 6,
+    # 23 -> 14 when docs/09 was converted: the table of citations the
+    # document made went with it, and three more became symbols or took
+    # the revision-scoped form. Lowered in the same change, because a
+    # ceiling left at 23 over a file holding 14 is nine free citations in
+    # a file whose whole job is now to refuse them, and
+    # `test_no_ceiling_is_slack_by_more_than_the_file_holds` only fires
+    # at zero.
+    "tests/test_e1_percona_design.py": 14,
+    # 6 -> 2, same change, same reason.
+    "tests/test_e3_rollout_doc.py": 2,
     "tests/test_e4_percona_build_flags.py": 21,
     "tests/test_e5_percona_make_output_sync.py": 1,
     "tests/test_e6_percona_vendor_alignment.py": 1,
@@ -468,6 +495,27 @@ CITATION_CEILINGS: Dict[str, int] = {
     "tests/test_t4b_readers.py": 4,
     "tests/test_t5b_stats.py": 1,
 }
+
+#: The two guards whose own documents now ratchet to ZERO line citations, and
+#: for which a ceiling above the file is therefore not grandfathered slack but
+#: a reopened hole.
+#:
+#: WHY THESE TWO ARE DIFFERENT from every other entry above. The census
+#: tolerates slack on purpose: a repair should not fail this file, and
+#: `test_no_ceiling_is_slack_by_more_than_the_file_holds` only refuses once a
+#: file holds none at all. That is right for a file whose citations are
+#: incidental. It is wrong for these two, because each one IS the guard that
+#: refuses every line citation in the document it checks -- banked allowance
+#: there is free citations in the one place the repository has decided there
+#: will be none.
+#:
+#: Measured, not supposed: raising `tests/test_e1_percona_design.py` back from
+#: 14 to 23 after the conversion passed the whole suite. That mutant survived
+#: until this list existed.
+RATCHETED_TO_ZERO = (
+    "tests/test_e1_percona_design.py",
+    "tests/test_e3_rollout_doc.py",
+)
 
 TOTAL_CEILING = sum(CITATION_CEILINGS.values())
 
@@ -716,6 +764,59 @@ class TestNoFileGainedALineCitation:
             "these files no longer hold any line citation, so their entries "
             "are pure allowance, so remove them\n  "
             + "\n  ".join(dead))
+
+    def test_a_document_guards_ceiling_is_exact(self):
+        """No banked slack in the two files that refuse citations for a living.
+
+        The test above tolerates a ceiling above its file and only refuses at
+        zero, which is the right rule for a file whose citations are
+        incidental and the wrong one for these two: each is the guard that
+        ratchets its document to zero, so allowance there is free citations in
+        the one place the repository has decided there will be none.
+
+        This is a mutant that survived. Converting docs/09 and docs/10 took 13
+        counted citations out of these two files; the ceilings were lowered in
+        the same change, and raising
+        `tests/test_e1_percona_design.py` back from 14 to 23 afterwards passed
+        the whole suite. "A repair is free" is a statement about the
+        comparison, not a licence to bank the difference -- so for these two a
+        repair comes with its ceiling or it fails here.
+        """
+        _files, counts = census()
+        wrong = []
+        for rel in RATCHETED_TO_ZERO:
+            ceiling = CITATION_CEILINGS.get(rel)
+            live = counts.get(rel, 0)
+            if ceiling != live:
+                wrong.append(f"{rel}: ceiling {ceiling}, file holds {live}")
+        assert not wrong, (
+            "a document guard's ceiling must equal its exact count, because a "
+            "ceiling above it is allowance in the file that refuses every "
+            "citation in the document it checks. Lower it in the same commit "
+            "as the repair:\n  " + "\n  ".join(wrong))
+
+    def test_the_ratcheted_files_are_really_the_document_guards(self):
+        """Non-vacuity for the list above: an empty or stale tuple would make
+        the exactness check pass over nothing."""
+        assert len(RATCHETED_TO_ZERO) == 2, RATCHETED_TO_ZERO
+        for rel in RATCHETED_TO_ZERO:
+            assert os.path.isfile(os.path.join(VB_ROOT, rel)), rel
+            assert rel in CITATION_CEILINGS, rel
+            # Each must actually contain a zero-ratchet assertion, or it
+            # is not a file this rule is about.
+            #
+            # MATCHED AS A PATTERN, because the literal substring could not
+            # grow. It was `"contains_no_line_citation" in source`, and
+            # `tests/test_e15_methodology_roadmap_doc.py`'s ratchet is named
+            # `test_docs_11_contains_no_path_line_citation` -- which does not
+            # contain that substring, so the rule could never have been
+            # extended to the third document guard without silently
+            # rejecting it. Moot while the tuple has two entries and exactly
+            # the kind of thing that is not moot later.
+            source = open(os.path.join(VB_ROOT, rel)).read()
+            assert re.search(
+                r"def test_docs_\d+_contains_no_(?:path_)?line_citation",
+                source), rel
 
     def test_this_file_makes_none_of_the_citations_it_counts(self):
         """The ban is unconditional, which is only possible because this file
