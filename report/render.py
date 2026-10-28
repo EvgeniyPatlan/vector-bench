@@ -3455,34 +3455,36 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
 # ---------------------------------------------------------------------------
 # §3's two generated rows
 #
-# These helpers belong beside `_known_asymmetries`, and they are down here
-# instead for one reason, written down because it otherwise reads as
-# carelessness: `docs/10-rollout.md` cites THREE locations in this module BY
-# LINE NUMBER -- the ops-measurement-version row in `_environment_rows`, the
-# "grids meet" sentence in `_consistency_section`'s docstring, and the
-# "## 10. Consistency checks" heading inside `render_markdown` -- and
-# `tests/test_e3_rollout_doc.py::TestEveryCitationIntoThisRepoIsChecked`
-# resolves each of them against that exact line. The last two are below
-# `_known_asymmetries`, so inserting anything there shifts both and puts
-# `master` red -- `CLAUDE.md` records that happening twice in two days
-# (#41, #43), both times because edits moved lines under a citation derived
-# earlier. docs/10 is not this change's to edit, and nothing after
-# `render_markdown` is cited, so the call site above keeps its line count and
-# the bodies live here.
+# These helpers belong beside `_known_asymmetries` and are down here instead
+# for a reason that NO LONGER HOLDS, which is why this paragraph says so
+# rather than being deleted with the constraint.
 #
-# EXTRACTING THEM INTO A MODULE DOES NOT HELP, which is the first thing a
-# reader will propose: removing ~100 lines near the call site shifts the two
-# later citations UP, which fails the same guard a plain insertion does.
-# Net-zero above the first of them was the only option inside this change's
-# file set that adds code at all.
+# WHAT IT WAS. `docs/10-rollout.md` cited three locations in this module by
+# LINE NUMBER, two of them below `_known_asymmetries` -- the "grids meet"
+# sentence in `_consistency_section` and the section-10 heading in
+# `render_markdown` -- and `tests/test_e3_rollout_doc.py` resolved each
+# against that exact line. Inserting anything above them shifted both and put
+# `master` red; `CLAUDE.md` records that happening twice in two days
+# (#41, #43). docs/10 was not that change's to edit, so the call site above
+# was rewritten within its own line count and the bodies went here. Nor did
+# extracting them into a module help: removing ~100 lines near the call site
+# shifts the later citations UP and fails the same guard an insertion does.
 #
-# FOLLOW-UP, with the condition that clears it: ~240 lines now sit ~2,290
-# lines from their only call site. When docs/10 cites those two anchors by
-# SYMBOL instead of by line -- the citation conversion -- this block should
-# move back up beside `_known_asymmetries` in the same change, and this
-# comment should go with it. Nothing enforces that: the citation ratchet in
+# WHAT CHANGED. #63 converted those citations to SYMBOLS. `CITED_IN_REPO` is
+# now keyed by `(path, symbol)` pairs -- `("report/render.py",
+# "_consistency_section")` and the two beside it -- and resolves them by
+# finding the symbol, so a line number is no longer load-bearing anywhere in
+# this file and these bodies can move freely.
+#
+# THE MOTION IS PENDING AND TRAVELS ALONE. ~240 lines sit ~2,290 lines from
+# their only call site; moving them back beside `_known_asymmetries` is now
+# a legal change and is deliberately not made here. A relocation of that size
+# is the diff shape that hides a substantive edit inside it, and doing it in
+# a change with behaviour in it means re-measuring the suite to achieve
+# nothing observable. Nothing enforces the motion: the citation ratchet in
 # `tests/test_e16_citation_ratchet.py` counts citations and cannot see a
-# block that wants moving, so this paragraph is the only record of the debt.
+# block that wants moving, so this paragraph is the record of the debt and
+# should go with the block when it moves.
 # ---------------------------------------------------------------------------
 
 #: How this table names an engine in PROSE, which is not how a chart legend

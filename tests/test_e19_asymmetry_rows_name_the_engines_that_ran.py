@@ -72,6 +72,14 @@ VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 METHODOLOGY_DOC = os.path.join(VB_ROOT, "docs", "05-methodology.md")
 ENGINES_DIR = os.path.join(VB_ROOT, "config", "engines")
 
+#: "ops-only", however it is spelled. Hyphen, en dash, em dash, a plain space
+#: or any mix: the guard below keys on the TERM, and two of my own attempts to
+#: get past it -- "are ops only anyway" and "are ops\u2013only anyway" -- did so
+#: by changing one character of it while leaving the claim intact. Collapsing
+#: the separator is what makes the check about the claim rather than about the
+#: typography.
+OPS_ONLY = re.compile(r"ops[\s\-\u2010-\u2015\u2212]*only", re.I)
+
 #: The knob's name as §3 and §4 both spell it, and the needle every row
 #: lookup below uses. Backticked, because `ef_construction` unbackticked also
 #: appears in prose about the sweep.
@@ -549,40 +557,55 @@ class TestTheMethodologyTableSaysTheSameThing:
         doc = open(METHODOLOGY_DOC).read()
         assert "can only vary `M` for the MySQL-family engines" not in doc
 
-    def test_the_cell_cannot_mention_m_without_naming_the_exception(self):
-        """The cell may not talk about `M` without naming the engine `M`
-        does not reach.
+    def test_the_cell_names_the_engine_the_sweep_does_not_reach(self):
+        """§4's cell must name Percona Search. Unconditionally.
 
-        "The build-quality sweep varies `M` for every engine" is false for
-        Percona Search, which `orchestrator/ann_pass.py` gives `m_values[:1]`
-        and which cannot apply the value at all -- the same shape of error as
-        the `ef_construction` half it replaced, one knob over.
+        Everything this cell can say about the build-quality sweep across the
+        engine set has that engine as a counter-example:
+        `orchestrator/ann_pass.py` gives it `m_values[:1]` under its own
+        comment, "M is carried, not applied: mongot exposes no graph degree",
+        and `report/render.py` says "Percona Search exposes no graph degree"
+        in a row of its own. So the requirement is not conditional on how the
+        cell is worded, and three successive conditional versions of this
+        assertion were each walked past with the false claim restored and
+        every test green:
 
-        THE CHECK IS A SUBSTRING, NOT A PATTERN OVER PROSE, and it is written
-        that way because two regexes failed here first. A verb-adjacency
-        trigger missed "varies `ef_construction` only for the three that have
-        it, and `M` for every engine"; widening it to a determiner-plus-
-        "engine" universal then missed both "`M` for all seven engines" (a
-        numeral between the determiner and the noun) and "`M` is applied
-        right across the engine set" (no adjacency at all, verb on the wrong
-        side). Each restored a false claim with all 38 tests green. A widened
-        regex over prose is still a regex over prose, so this asserts the
-        invariant instead: mention of the knob requires mention of the
-        exception, in any wording. The §3 guard beside it has always been
-        this shape -- `"`M`" not in the row` -- and caught its mutant first
-        time.
+        * a trigger on the verb adjacent to the knob missed "varies
+          `ef_construction` only for the three that have it, and `M` for
+          every engine";
+        * a determiner-plus-"engine" universal missed "`M` for all seven
+          engines", where a numeral sits between the determiner and the noun;
+        * the same universal missed "`M` is applied right across the engine
+          set", which has no adjacency at all;
+        * and keying on the token `` `M` `` missed "the graph degree", which
+          is this repository's own term for it -- the wording this very cell
+          used until the round that introduced the guard.
 
-        The cost is that a true sentence about `M` must also name Percona
-        Search. That is the right cost for this cell: every claim it can make
-        about `M` across the engine set is a claim that engine is a
-        counter-example to.
+        WHAT THIS CHECK DOES NOT COVER, stated because the last three
+        docstrings here each claimed more than they delivered: it is a
+        necessary condition on the cell, not a reading of the claim. A cell
+        that names the engine and then asserts the sweep reaches it anyway --
+        "for every engine, including Percona Search" -- satisfies this and is
+        false. Nothing mechanical catches that; what catches it is a reviewer
+        reading this cell beside `test_the_cells_claim_about_that_engine_is_
+        executable` below, which pins the code the cell is about.
+
+        Either of this repository's two names for the engine satisfies it --
+        "Percona Search" or "mongot" -- because the requirement is that the
+        exception be named, not that it be named one way, and refusing a cell
+        that said "mongot" would be a guard firing on correct prose.
+
+        The cost is that a true, narrowly-scoped sentence about `M` in this
+        cell must also name that engine. That is accepted: the subject of
+        the cell is a different knob, and the cell carried a false claim
+        about this one in two of three review rounds.
         """
         row = [line for line in _methodology_section_4().splitlines()
                if EF in line][0]
-        if "`M`" in row:
-            assert "Percona Search" in row, (
-                "§4's cell mentions `M` without naming the one engine that "
-                "cannot apply it")
+        assert "Percona Search" in row or "mongot" in row, (
+            "§4's cell does not name the one engine the build-quality sweep "
+            "does not reach; every claim it makes about the sweep across the "
+            "engine set has that engine as a counter-example")
 
     def test_2_7_does_not_call_the_cost_fields_ops_only(self):
         """§2.7's stated reason for reading build mode off the ops records
@@ -592,14 +615,42 @@ class TestTheMethodologyTableSaysTheSameThing:
         work and stays false after it -- and the real reason is the one the
         two sentences above it already give.
 
-        Pinned by POLARITY ON EVERY MENTION rather than by one phrase. The
-        first version of this guard refused the exact string "are ops-only
-        fields", and deleting the single word "fields" walked through it with
-        the claim intact. So the rule is now about the term and not about a
-        sentence: wherever "ops-only" appears in this paragraph it must be
-        inside a denial, which is the shape `tests/test_e3_rollout_doc.py`
-        uses for the claims it guards. Whitespace-normalised, because the
-        document is hard-wrapped and the sentence spans a line break.
+        Three things about the check, each of them a walk-around that
+        happened:
+
+        ONE PHRASE WAS NOT ENOUGH. The first version refused the exact string
+        "are ops-only fields", and deleting the single word "fields" walked
+        through it with the claim intact. So the rule is about the term.
+
+        THE NEGATION MUST BE IN THE SAME CLAUSE AS THE TERM. A plain window
+        accepted "are not recall fields; all three are ops-only", where the
+        `not` inside the window negates something else and the ops-only claim
+        is an unqualified affirmation. `[^.;]` in the pattern is what refuses
+        that -- and the example's own semicolon is what it trips on.
+
+        THE TERM IS MATCHED, NOT ITS TYPOGRAPHY. Two of my own attempts got
+        past an earlier version of this check by writing "ops only" with a
+        space and "ops-only" with an en dash -- one character each, claim
+        intact, every test green. `OPS_ONLY` collapses the separator.
+
+        THE WHOLE DOCUMENT IS SCANNED, not the one paragraph, because moving
+        the sentence out of the paragraph was otherwise a walk-around on its
+        own. SUBJECT-SCOPED to sentences naming `index_bytes`, which is the
+        shape `tests/test_e1_percona_design.py` argues for at length: a ban
+        that does not name its subject fires on a true sentence about
+        something else, and "`build_wall_s` and `ingest_wall_s` are ops-only"
+        is such a sentence -- 0 of 6,035 archived recall records carry
+        either.
+
+        WHAT THIS DOES NOT COVER: anaphora. "…and `index_bytes` are not
+        recall fields. All three are ops-only." splits the subject and the
+        claim across two sentences, and no pattern here sees that. It is also
+        blind to the claim made without the term at all. Both need a reader;
+        what this closes is the class of edit that keeps the wording and
+        drops a word of the guard's pattern.
+
+        Whitespace-normalised, because the document is hard-wrapped and the
+        sentence spans a line break.
         """
         doc = " ".join(open(METHODOLOGY_DOC).read().split())
         para = doc.split(
@@ -608,12 +659,17 @@ class TestTheMethodologyTableSaysTheSameThing:
         assert re.search(r"silent about `build_mode`|says nothing about "
                          r"`build_mode`", para), (
             "§2.7 no longer gives the reason that is true of either tree")
-        for mention in re.finditer(r"ops-only", para):
-            before = para[max(0, mention.start() - 40):mention.start()]
-            assert re.search(r"\b(not|never|no longer|nor)\b", before), (
-                "§2.7 asserts something is ops-only without negating it: "
-                f"...{before[-60:]}ops-only... -- `index_bytes` is on every "
-                "one of the 6,035 archived recall records")
+        for sentence in re.split(r"(?<=[.!?])\s+", doc):
+            if "index_bytes" not in sentence or not OPS_ONLY.search(sentence):
+                continue
+            for mention in OPS_ONLY.finditer(sentence):
+                clause = sentence[max(0, mention.start() - 20):mention.start()]
+                assert re.search(
+                    r"\b(not|never|no longer|nor)\b[^.;]*$", clause), (
+                    "a sentence naming `index_bytes` calls it ops-only "
+                    f"without negating it in the same clause: {sentence!r} "
+                    "-- `index_bytes` is on every one of the 6,035 archived "
+                    "recall records")
 
     def test_the_cells_claim_about_that_engine_is_executable(self):
         """`CLAUDE.md`: documentation asserting engine behaviour should be
