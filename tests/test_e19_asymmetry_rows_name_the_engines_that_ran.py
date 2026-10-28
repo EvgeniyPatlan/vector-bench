@@ -657,24 +657,34 @@ class TestTheMethodologyTableSaysTheSameThing:
         is such a sentence -- 0 of 6,035 archived recall records carry
         either.
 
-        WHAT THIS DOES NOT AND CANNOT CLOSE, stated as a class rather than
-        as the examples I happened to try, because four rounds of widening
-        this check produced four more ways past it and the pattern will not
-        converge: anaphora, which splits the subject from the claim across
-        two sentences ("…are not recall fields. All three are ops-only.");
-        the claim made without the term at all ("ops-path-only fields"); a
-        negation that sits in the right clause but whose scope is not the
-        predicate, which ASSERTS what it appears to deny ("are not just
-        ops-only but ops-first", and "not merely" and "not only" the same
-        way); and a separator outside the class `OPS_ONLY` enumerates. Each
-        of those needs a reader, and a reader is an acceptable terminus here
-        -- it is this file's own idiom, as `_PROSE_NAME`'s "NOT A GATE" and
+        WHAT IT COVERS, which is the only honest way to say what it does
+        not. This fires only when both operands appear as matched -- the
+        subject as the exact token `index_bytes`, the predicate as
+        `OPS_ONLY`. A sentence that states either operand any other way is
+        outside it: a pronoun or a prose name for the field ("the two wall
+        clocks and the index size are ops-only"), a different spelling or
+        escaping of either -- a Markdown-escaped underscore renders
+        identically and `INDEX_BYTES` differs only in case -- or the claim
+        made without the term. Separately, a negation in the right clause whose
+        scope is not the predicate asserts what it appears to deny ("not just
+        ops-only but ops-first"; "not merely" and "not only" the same way).
+        Each needs a reader, and a reader is an acceptable terminus here --
+        it is this file's own idiom, as `_PROSE_NAME`'s "NOT A GATE" and
         `generate.BUILD_KIND_UNRECORDED` are -- on the one condition that
         what is written down is true.
 
-        What this DOES close is the class of edit that keeps the claim's
-        wording and drops a character or a word of the guard's pattern, which
-        is what four of the eight edits past earlier versions did.
+        That paragraph replaced a list of five enumerated escapes, and the
+        replacement is the lesson of five review rounds rather than tidying.
+        A way past this guard was found in every one of them, four of those
+        past a list introduced as a class. Two sentences describing the check
+        cannot go stale the same way, because THEY ARE THE IMPLEMENTATION --
+        two matched operands and a clause window -- so there is nothing left
+        to enumerate around. Anaphora and the absent term, which that list
+        named as separate escapes, are both instances of one thing: an
+        operand not matched as written. Neither operand's matching is
+        widened to chase this; widening the predicate's was defensible
+        because a separator is a finite set of characters, and doing the same
+        to the subject would start the sequence again on a third surface.
 
         Whitespace-normalised, because the document is hard-wrapped and the
         sentence spans a line break.
