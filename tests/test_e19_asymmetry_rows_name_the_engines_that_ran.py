@@ -115,6 +115,10 @@ def _records(spec: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
             extra: Dict[str, Any] = {}
             if "tunable" in how:
                 extra["ef_construction_tunable"] = how["tunable"]
+            if "tunable_raw" in how:
+                # Whatever a hand-edited or round-tripped file can put there,
+                # which is not restricted to a boolean.
+                extra["ef_construction_tunable"] = how["tunable_raw"]
             if how.get("async_build"):
                 extra["async_index_build"] = True
             if how.get("separable") is not None:
@@ -404,6 +408,35 @@ class TestTheFallbackIsPinnedInBothDirections:
         assert "none" in exposed.lower()
         assert "MariaDB" not in exposed
 
+    def test_a_string_is_not_an_answer_in_either_direction(self):
+        """`bool("false")` is `True`, so reading the key without a type check
+        hands the knob to an engine that does not have it off a string -- the
+        published sentence being "exposed only by MariaDB MHNSW". A value
+        that is not a boolean is not an answer: the record is silent and the
+        fallback decides, which for this engine is a denial."""
+        exposed = _exposed_by(
+            _text({"mariadb": {"tunable_raw": "false", "separable": [False]}}))
+        assert "none" in exposed.lower()
+        assert "MariaDB" not in exposed
+
+    def test_a_recorded_null_falls_to_the_fallback_rather_than_denying(self):
+        """This repo records `null` to mean "documented, not observed" --
+        `config/engines/valkey.yml` does it for `hybrid_filter_planner`, with
+        a comment about a claim that reached the report for weeks. Read as a
+        `False` it would withdraw the knob from an engine that has it
+        WITHOUT consulting the fallback, which is the whole point of keeping
+        silence a third state."""
+        exposed = _exposed_by(
+            _text({"pgvector": {"tunable_raw": None, "separable": [True]}}))
+        assert "pgvector" in exposed
+
+    def test_a_real_boolean_still_beats_the_fallback(self):
+        """The type check must not quietly turn every record silent."""
+        exposed = _exposed_by(
+            _text({"pgvector": {"tunable": False, "separable": [True]}}))
+        assert "pgvector" not in exposed
+        assert "none" in exposed.lower()
+
     def test_a_legacy_single_engine_directory_is_not_handed_the_knob(self):
         """The regeneration above, as the sentence a reader would see."""
         text = _text({"mariadb": {"separable": [False]}})
@@ -516,40 +549,40 @@ class TestTheMethodologyTableSaysTheSameThing:
         doc = open(METHODOLOGY_DOC).read()
         assert "can only vary `M` for the MySQL-family engines" not in doc
 
-    def test_the_cell_does_not_claim_the_m_sweep_covers_every_engine(self):
-        """The second false claim this cell acquired while being repaired.
+    def test_the_cell_cannot_mention_m_without_naming_the_exception(self):
+        """The cell may not talk about `M` without naming the engine `M`
+        does not reach.
 
         "The build-quality sweep varies `M` for every engine" is false for
         Percona Search, which `orchestrator/ann_pass.py` gives `m_values[:1]`
         and which cannot apply the value at all -- the same shape of error as
         the `ef_construction` half it replaced, one knob over.
 
-        Conditional rather than a banned phrase: the cell may drop the claim
-        or state it with its exception, and only the unqualified version
-        fails. A guard that fires on correct prose teaches the next author to
-        delete it.
+        THE CHECK IS A SUBSTRING, NOT A PATTERN OVER PROSE, and it is written
+        that way because two regexes failed here first. A verb-adjacency
+        trigger missed "varies `ef_construction` only for the three that have
+        it, and `M` for every engine"; widening it to a determiner-plus-
+        "engine" universal then missed both "`M` for all seven engines" (a
+        numeral between the determiner and the noun) and "`M` is applied
+        right across the engine set" (no adjacency at all, verb on the wrong
+        side). Each restored a false claim with all 38 tests green. A widened
+        regex over prose is still a regex over prose, so this asserts the
+        invariant instead: mention of the knob requires mention of the
+        exception, in any wording. The §3 guard beside it has always been
+        this shape -- `"`M`" not in the row` -- and caught its mutant first
+        time.
 
-        THE TRIGGER IS THE UNIVERSAL, NOT AN ADJACENCY, and that is measured
-        rather than chosen. The first version of this assertion looked for
-        the verb immediately followed by the knob, and a reworded mutant
-        walked straight through it:
-        "varies `ef_construction` only for the three that have it, and `M`
-        for every engine" puts another knob between the verb and the subject
-        and makes exactly the same false claim. What is false is `M` plus a
-        universal over the engine set, in any word order, so that is what
-        this looks for.
+        The cost is that a true sentence about `M` must also name Percona
+        Search. That is the right cost for this cell: every claim it can make
+        about `M` across the engine set is a claim that engine is a
+        counter-example to.
         """
         row = [line for line in _methodology_section_4().splitlines()
                if EF in line][0]
-        universal = re.search(
-            r"`M`[^|]{0,60}\b(every|all|each)\s+engine"
-            r"|\b(every|all|each)\s+engine[^|]{0,60}`M`"
-            r"|(varies|varying|sweeps|swept over)\s+`M`", row)
-        if universal:
+        if "`M`" in row:
             assert "Percona Search" in row, (
-                "the cell claims `M` is swept across the engine set without "
-                "naming the engine that cannot apply it: "
-                f"{universal.group()!r}")
+                "§4's cell mentions `M` without naming the one engine that "
+                "cannot apply it")
 
     def test_2_7_does_not_call_the_cost_fields_ops_only(self):
         """§2.7's stated reason for reading build mode off the ops records
@@ -559,10 +592,13 @@ class TestTheMethodologyTableSaysTheSameThing:
         work and stays false after it -- and the real reason is the one the
         two sentences above it already give.
 
-        Pinned by polarity on the affirmation, not by the corrected text:
-        the paragraph may say what it likes about these fields as long as it
-        does not assert they are ops-only, and it must still carry the
-        reason that is true either way. Whitespace-normalised, because the
+        Pinned by POLARITY ON EVERY MENTION rather than by one phrase. The
+        first version of this guard refused the exact string "are ops-only
+        fields", and deleting the single word "fields" walked through it with
+        the claim intact. So the rule is now about the term and not about a
+        sentence: wherever "ops-only" appears in this paragraph it must be
+        inside a denial, which is the shape `tests/test_e3_rollout_doc.py`
+        uses for the claims it guards. Whitespace-normalised, because the
         document is hard-wrapped and the sentence spans a line break.
         """
         doc = " ".join(open(METHODOLOGY_DOC).read().split())
@@ -572,9 +608,12 @@ class TestTheMethodologyTableSaysTheSameThing:
         assert re.search(r"silent about `build_mode`|says nothing about "
                          r"`build_mode`", para), (
             "§2.7 no longer gives the reason that is true of either tree")
-        assert not re.search(r"\bare ops-only fields\b", para), (
-            "§2.7 asserts the cost fields are ops-only; `index_bytes` is on "
-            "every archived recall record")
+        for mention in re.finditer(r"ops-only", para):
+            before = para[max(0, mention.start() - 40):mention.start()]
+            assert re.search(r"\b(not|never|no longer|nor)\b", before), (
+                "§2.7 asserts something is ops-only without negating it: "
+                f"...{before[-60:]}ops-only... -- `index_bytes` is on every "
+                "one of the 6,035 archived recall records")
 
     def test_the_cells_claim_about_that_engine_is_executable(self):
         """`CLAUDE.md`: documentation asserting engine behaviour should be

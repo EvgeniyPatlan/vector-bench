@@ -1205,7 +1205,7 @@ def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
              "filtered section derives each engine's strategy from that "
              "measurement rather than from its documentation."],
             ["Valkey is installed from packages, not built from source",
-             "Percona ships prebuilt packages, so it carries installed package "
+             "valkey-search ships prebuilt, so it carries installed package "
              "versions instead of a tag, a commit and a `-march`, and the "
              "AVX-512 row above does not describe it."],
         ]
@@ -3560,13 +3560,31 @@ def _capability_states(summary: Optional[Dict[str, Any]],
     third state and not a `False` -- the distinction
     `generate.build_kind`'s `BUILD_KIND_UNRECORDED` exists for, and the one
     that decides whether the fallback above is consulted.
+
+    ONLY A REAL BOOLEAN COUNTS AS AN ANSWER, and the discipline is the point
+    rather than defensiveness. This read `bool(extra[key])` on whatever was
+    there, which turns the three states back into two in both directions: a
+    hand-edited or YAML-round-tripped `"false"` is truthy, so a report would
+    have said "exposed only by MariaDB MHNSW" off a string; and a recorded
+    `null` -- which this repo uses deliberately to mean "documented, not
+    observed", as `config/engines/valkey.yml` does for
+    `hybrid_filter_planner` with a comment about exactly this hazard --
+    collapsed to a denial WITHOUT consulting the fallback, which is the one
+    thing the three-state rule exists to prevent.
+
+    So a value that is not `True` or `False` is not an answer: the record is
+    silent for that key and the engine falls to the fallback, the same as a
+    record that never carried it. `harness/metrics/records.py` guards the
+    same shape the same way in `ops_versions_measure_the_same_thing`, with a
+    comment about hand-edited manifests. All 685 values in the reachable
+    archives are real booleans, so nothing in the published numbers moves;
+    this is about what the next hand-edited file does.
     """
     states: Dict[str, Any] = {}
     for record in (summary or {}).get("build") or []:
-        extra = record.get("extra") or {}
-        if key in extra:
-            states.setdefault(record.get("engine"), set()).add(
-                bool(extra[key]))
+        value = (record.get("extra") or {}).get(key)
+        if isinstance(value, bool):
+            states.setdefault(record.get("engine"), set()).add(value)
     return states
 
 
@@ -3616,7 +3634,7 @@ def _ef_construction_row(tunable: List[str],
         + (f"and not for {_prose_list(others)}, which "
            + ("has" if len(others) == 1 else "have")
            + " no equivalent. " if others else
-           "which is an axis the engines without the knob do not have. ")
+           "an axis the engines without the knob do not have. ")
         + "It is pinned to the default in the normalized pass, so no engine "
           "is given an axis the others lack, and swept only in the tuned "
           "pass.")
