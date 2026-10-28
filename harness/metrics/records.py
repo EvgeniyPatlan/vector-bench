@@ -465,10 +465,20 @@ SCHEMA_VERSION = 1
 # because for MariaDB a second storage-engine series IS a real within-engine
 # comparison.
 #
-# THE PATH IS ORDINARY, NOT CONTRIVED. `--profile full` is ~1,066 h, so
+# THE PATH IS ORDINARY, NOT CONTRIVED. `--profile full --resource-pass both`
+# is ~1,135 h -- the figure `orchestrator/estimate.py` computes and CLAUDE.md's
+# "Cost awareness" publishes, worst case once querying is counted -- so
 # resumption is the norm, and `report/measurement_versions.py` names this
 # hazard in its own words -- "a resumed run that appended to a file written by
-# older code". A run whose pgvector M=8 unit completed before this change and
+# older code". That figure read ~1,066 h here for as long as the estimator
+# excluded Percona's ingest: its rate was measured and unmodelled, so
+# `engines_without_ingest_rate` named the engine instead of folding it in, and
+# both halves of the pair were a floor by 69.83 h. Nothing asserts the number
+# in this comment, which is exactly why it rotted while CLAUDE.md's copy
+# moved; the point it supports does not depend on the value, only on it being
+# long enough that nobody runs it in one sitting.
+#
+# A run whose pgvector M=8 unit completed before this change and
 # whose M=16 unit runs after it puts both spellings in one run directory;
 # `Manifest.set_config` carries the existing version forward, so without a
 # bump no refusal fires and `series_key` splits pgvector on every chart that
