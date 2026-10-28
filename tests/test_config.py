@@ -4041,6 +4041,16 @@ class TestTheServerSideOfAnOpsPhaseIsKept:
             # to end the run. valkey declares no runtime.error_log, so this
             # returns without touching docker.
             _save_server_error_log = ops_pass.OpsRun._save_server_error_log
+            # And two more, for the same reason. The exit facts come from one
+            # `docker inspect` of a container named "gone", which returns
+            # None; the core capture returns before touching docker because
+            # valkey declares no runtime.ulimits. Both must swallow whatever
+            # they meet -- see their docstrings -- so adding them here widens
+            # what this test covers rather than weakening it.
+            _save_container_exit_facts = (
+                ops_pass.OpsRun._save_container_exit_facts)
+            _save_server_core = ops_pass.OpsRun._save_server_core
+            _ulimits = ops_pass.OpsRun._ulimits
 
         import orchestrator.docker_ctl as dc
         original = dc.logs

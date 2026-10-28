@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import ast
 import getpass
-import inspect
 import json
 import os
 import re
@@ -1547,27 +1546,6 @@ def _lab_artifacts_problem(path: str) -> Optional[str]:
     return None
 
 
-def _artifacts_mount_problem() -> Optional[str]:
-    """Whether this tree's `run_script` can mount an artefacts directory.
-
-    The parameter is added by the crash-capture change that also saves the
-    core; this flag is useless without it and the two land separately. Asked
-    rather than assumed because the alternative is a TypeError raised AFTER
-    the server is up, which for the MySQL family is several minutes of an
-    operator's time to be told about a keyword argument. Deleting this check
-    is correct as soon as `artifacts_dir` is unconditionally present.
-    """
-    if "artifacts_dir" in inspect.signature(
-            ops_pass.OpsRun.run_script).parameters:
-        return None
-    return ("--artifacts needs OpsRun.run_script's `artifacts_dir` "
-            "parameter, which this tree does not have yet.\nIt arrives with "
-            "the crash-capture change that saves the core in the first "
-            "place; until then\nthere is nothing to mount and nothing to "
-            "read. Run the script without --artifacts to\nsee what it says "
-            "about that.")
-
-
 #: lab's own options. Listed rather than read off the parser at call time,
 #: which would mean either module-level mutable state or reaching into
 #: argparse's privates; a test asserts this matches the subparser exactly, so a
@@ -1628,11 +1606,16 @@ def cmd_lab(args: argparse.Namespace) -> int:
             return 2
 
     if args.artifacts:
-        for problem in (_lab_artifacts_problem(args.artifacts),
-                        _artifacts_mount_problem()):
-            if problem:
-                print(problem, file=sys.stderr)
-                return 2
+        # One check, not two. The second was `_artifacts_mount_problem()`,
+        # which asked whether this tree's `run_script` could mount anything
+        # at all; it is gone because `artifacts_dir` is now unconditionally
+        # present, which is what #68 landed and what
+        # tests/test_e4_percona_build_flags.py's
+        # `test_the_compatibility_refusal_collects_itself` fired to say.
+        problem = _lab_artifacts_problem(args.artifacts)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
 
     # argparse.REMAINDER takes everything after the script name, which is what
     # lets a script have any flags it likes -- and also means a lab flag typed
@@ -1690,13 +1673,19 @@ def cmd_lab(args: argparse.Namespace) -> int:
     client_memory = (int(args.client_memory_gb * GB)
                      if args.client_memory_gb else None)
 
-    # Passed as **kwargs and only when asked for, so a tree whose
-    # `run_script` has no such parameter behaves exactly as it did and the
-    # refusal above is the only thing --artifacts changes there. Both
+    # An absolute path, because the orchestrator hands host paths to the
+    # Docker daemon and a relative one would mount nothing -- the same reason
+    # CLAUDE.md gives for the web UI's bind. None when the flag is absent,
+    # which `run_script` reads as "mount nothing".
+    #
+    # Passed plainly rather than as **kwargs. It was conditional while
+    # `run_script` might not take the parameter at all; it always takes it
+    # now, so the conditional was the other half of the compatibility shim
+    # that `test_the_compatibility_refusal_collects_itself` fired about. Both
     # branches get it: opening a core by hand in the bench container is
     # `lab --shell`, and that is the likelier first move of the two.
-    artifacts = ({"artifacts_dir": os.path.abspath(args.artifacts)}
-                 if args.artifacts else {})
+    artifacts_dir = (os.path.abspath(args.artifacts) if args.artifacts
+                     else None)
 
     try:
         with ops_pass.OpsRun(args.engine, engine_cfg, resolved,
@@ -1708,10 +1697,11 @@ def cmd_lab(args: argparse.Namespace) -> int:
                 print(f"[lab] harness importable; scripts in /opt/scripts\n")
                 return run.run_script("", [], interactive=True,
                                       client_memory_bytes=client_memory,
-                                      **artifacts)
+                                      artifacts_dir=artifacts_dir)
             return run.run_script(args.script, args.script_args,
                                   client_memory_bytes=client_memory,
-                                  timeout_s=args.timeout, **artifacts)
+                                  timeout_s=args.timeout,
+                                  artifacts_dir=artifacts_dir)
     except KeyboardInterrupt:
         # OpsRun.__exit__ has already torn the pair down by the time this is
         # caught; saying so is the difference between a clean stop and an

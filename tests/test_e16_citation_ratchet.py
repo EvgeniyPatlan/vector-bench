@@ -478,8 +478,10 @@ CITATION_CEILINGS: Dict[str, int] = {
     # ceiling left at 23 over a file holding 14 is nine free citations in
     # a file whose whole job is now to refuse them, and
     # `test_no_ceiling_is_slack_by_more_than_the_file_holds` only fires
-    # at zero.
-    "tests/test_e1_percona_design.py": 14,
+    # at zero. 14 -> 13 when the `ops_pass.py` line citation in
+    # `test_the_arg_is_wired_to_the_env_var_the_manifest_reads` became a
+    # symbol, lowered in that same change for the same reason.
+    "tests/test_e1_percona_design.py": 13,
     # 6 -> 2, same change, same reason.
     "tests/test_e3_rollout_doc.py": 2,
     "tests/test_e4_percona_build_flags.py": 21,
