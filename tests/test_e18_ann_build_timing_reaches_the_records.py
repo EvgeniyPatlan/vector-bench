@@ -177,6 +177,27 @@ is one a chart sorts as text or drops on a comparison, and nothing anywhere
 says so. `float()` at the boundary is what makes the record's type the
 record's own.
 
+A NaN is a separate matter, is dropped by `load_annb_results` rather than
+here, and is NOT dropped for the reason one revision of the loader comment
+gave. It claimed `default=str` would stringify it; `maybe_float` calls
+`float()` before that check, so the value is a plain `float` by then and
+`default` is never reached -- measured with a `default` that would have
+returned a sentinel and which recorded zero calls. What happens instead is
+that `json` writes the bare token `NaN`, which `allow_nan=False` refuses to
+emit and a strict reader rejects. Measured in `jq`, the tool the schema
+charter in `harness/metrics/records.py` has in mind when it promises that
+"the raw data can be queried with anything that reads JSON lines":
+
+    .build_wall_s renders as        null
+    .build_wall_s | type says       "number"
+    .build_wall_s == null is        false
+    select(.build_wall_s > 100)     silently drops the row
+    jq's exit status                0
+
+The row is lost with no diagnostic and cannot be found again by testing for
+null -- only `isnan` sees it. That is worse than a parse error, and it is why
+the `qps` line above drops a NaN too.
+
 `tests/test_e14_per_pass_manifest.py` and `tests/test_e17_report_scope.py`
 monkeypatch `load_annb_results` away wholesale for the same reason. That is
 the right call where the loader is not the subject; here it is the subject.
@@ -1005,17 +1026,28 @@ class TestAnnBuildsStayOffTheOpsBuildCostChart:
         labels = {s["label"] for s in captured}
         assert labels and all("pgvector" in str(label) for label in labels), \
             labels
-        # NOT asserted: that 283.275, the ann build time, is on no panel.
-        # That assertion was here and it was vacuous -- a recall record has no
-        # `extra.separable_build`, so `generate.build_kind` returns
-        # BUILD_KIND_UNRECORDED and BOTH time panels return None for it even
-        # under the leak. What the leak actually publishes is a series in the
-        # legend and the subtitle sentence asserted in the test below, which
-        # is where the harm is.
+        # Both are asserted; only ONE of them is a guard, and an earlier
+        # revision of this file deleted the wrong one. Measured under a
+        # verified-applied unfiltered selection:
+        #
+        #   283.275 (the ann build time) reaches NO panel -- a recall record
+        #       has no `extra.separable_build`, so `generate.build_kind`
+        #       returns BUILD_KIND_UNRECORDED and both TIME panels return
+        #       None for it even under the leak. This assertion is therefore
+        #       vacuous today. It stays as a forward guard, for the day a
+        #       record arrives carrying `separable_build` onto the ann path,
+        #       and is labelled so nobody mistakes it for what catches the
+        #       leak.
+        #   249856 * 1024 (the ann container's index size) DOES reach the ops
+        #       index-size panel, as three `percona / M=8|16|32` series. That
+        #       is the live assertion: a figure measured inside the bench
+        #       container, plotted on an axis of ops-harness quantities.
         plotted = {y for s in captured for _x, y in s["points"]}
         assert 283.275 not in plotted, (
-            "vacuous historically, kept as a regression guard in case a "
-            "future record carries separable_build onto the ann path")
+            "vacuous today, kept as a forward guard in case a future record "
+            "carries separable_build onto the ann path")
+        assert 249856 * 1024 not in plotted, (
+            "the ann container's index size reached the ops index-size panel")
 
 
 # ---------------------------------------------------------------------------
@@ -1064,10 +1096,23 @@ class TestTheCoercersMovedWithoutLoss:
         taken at 793 because 7 lines is not room to work in, and landing this
         one at 798 and calling it done would repeat that mistake rather than
         learn from it.
+
+        **The file is at 779 against this 780, so there is ONE line of
+        margin** -- and the change set that set this tripwire spent four of
+        the five it had, on the corrected NaN comment below. That is the
+        original ceiling finding one level down, recorded rather than smoothed
+        over. There are still 21 lines to the repo's real 800 ceiling, so
+        tripping this is a prompt and not a breach: raise it by a line or two
+        with a reason, or take the next extraction, and do not quietly widen
+        it to 800.
         """
         path = os.path.join(VB_ROOT, "report", "loaders.py")
         lines = len(open(path).read().splitlines())
-        assert lines <= 780, f"report/loaders.py is back up to {lines} lines"
+        assert lines <= 780, (
+            f"report/loaders.py is at {lines} lines against this unit's 780 "
+            f"tripwire; the repo ceiling is 800 and is enforced elsewhere. "
+            f"This is a prompt, not a breach: raise it deliberately with a "
+            f"reason, or take the next extraction the way coercers.py was.")
 
     def test_the_new_module_does_not_import_the_orchestrator(self):
         """`report/` runs in a bench image that mounts `report/` and
