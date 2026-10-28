@@ -162,32 +162,69 @@ PROSE_CLAIMS = {
         # requirement, for the ops path, and it is stated beside this one.
         #
         # ANCHORED AT \A for the reason the entry below documents.
+        #
+        # BOTH HALVES ARE SENTENCE-LEVEL, AND THE FIRST VERSION WAS NOT. It
+        # asked for four tokens anywhere in the block, and two of this file's
+        # own mutants then SURVIVED: deleting the remedy sentence from
+        # CLAUDE.md left "Re-measure" and "recall" elsewhere in the same
+        # twenty-line bullet, and deleting the hazard sentence left
+        # "ann-benchmarks caches by algorithm" -- the bullet's original
+        # opening, which is a true statement about caching and not about this
+        # pin. A block larger than the claim can satisfy a conjunction out of
+        # sentences that have nothing to do with each other, which is the
+        # same defect `_paragraphs` exists to stop, one level further in.
+        #
+        # So the trigger must meet the hazard INSIDE ONE SENTENCE -- it is
+        # the pin moving that causes the reuse -- and the act must meet the
+        # object inside one sentence, because "move the pin" and "the results
+        # tree is shared" are each true alone and neither is the instruction.
+        # `(?:(?!\.)[^.])*?` is what keeps a match inside a sentence; either
+        # order is accepted, because English puts them both ways.
         pattern=r"\A"
-                r"(?=.*\b(?:re-?pin(?:ned|ning)?|new pin|pin (?:move|change)[sd]?"
-                r"|moves? the pin|moved the pin|source\.tag)\b)"
-                r"(?=.*\b(?:reuse[sd]?|reusing|cached|cache|stale"
-                r"|skip(?:s|ped)?|already (?:on disk|measured)"
-                r"|where it was|left behind)\b)"
+                r"(?=.*\b(?:re-?pin(?:ned|ning)?|new pin"
+                r"|pin (?:move|change)[sd]?|moves? the pin|moved the pin"
+                r"|source\.tag)\b(?:(?!\.)[^.])*?"
+                r"\b(?:reuse[sd]?|reusing|cached?|caches|stale"
+                r"|skip(?:s|ped)?|already on disk|where it was"
+                r"|left behind)\b"
+                r"|.*\b(?:reuse[sd]?|reusing|cached?|caches|stale"
+                r"|skip(?:s|ped)?|already on disk|where it was"
+                r"|left behind)\b(?:(?!\.)[^.])*?"
+                r"\b(?:re-?pin(?:ned|ning)?|new pin"
+                r"|pin (?:move|change)[sd]?|moves? the pin|moved the pin"
+                r"|source\.tag)\b)"
                 r"(?=.*\b(?:mov(?:e|es|ed|ing)|aside|renam\w+|delet\w+"
-                r"|re-?measur\w+|re-?comput\w+)\b)"
-                r"(?=.*\b(?:subtree|results tree|ann tree|result files"
-                r"|recall cells?|curve)\b)",
+                r"|re-?measur\w+|re-?comput\w+)\b(?:(?!\.)[^.])*?"
+                r"\b(?:subtree|results tree|ann tree|result files"
+                r"|recall cells?|curve)\b"
+                r"|.*\b(?:subtree|results tree|ann tree|result files"
+                r"|recall cells?|curve)\b(?:(?!\.)[^.])*?"
+                r"\b(?:mov(?:e|es|ed|ing)|aside|renam\w+|delet\w+"
+                r"|re-?measur\w+|re-?comput\w+)\b)",
         accepts=[
             "After a re-pin the recall cells on disk are reused, so move "
             "that engine's subtree of the ann results tree aside before the "
-            "run; not --force, which also disables the free-disk refusal.",
-            "Because source.tag changed, the cached result files are "
+            "run.",
+            "Because source.tag changed the cached result files are "
             "skipped; moving the engine's subtree aside makes the curve get "
             "measured again.",
-            "A new pin leaves every recall cell where it was. Move the "
+            "A new pin leaves every recall cell where it was, so move the "
             "subtree aside and the curve is re-measured.",
         ],
         rejects=[
-            # Each drops exactly one leg.
+            # Each drops one leg.
             "After a re-pin the recall cells are reused. Nothing to do.",
             "Move the subtree aside before the run.",
             "The cached result files are skipped; move the subtree aside.",
             "A re-pin changes the engine_version on every record.",
+            # The two shapes that survived the block-level version: the
+            # vocabulary present, scattered over sentences that do not make
+            # the claim between them.
+            "A re-pin does not move the tree. ann-benchmarks caches by "
+            "algorithm. Re-measure the engine if you want its real recall.",
+            "ann-benchmarks caches by algorithm and index parameters only. "
+            "Move that engine's subtree aside. The tree is keyed by the "
+            "resource pass.",
         ]),
     "a sentence that tells the operator to pass --force": dict(
         # NOT A CLAIM TO BE MADE -- a shape to be ABSENT. The test below

@@ -82,19 +82,19 @@ source:
   # file(s) ... will be skipped` BEFORE the run -- its comment's first five
   # words are "Warn before the fact, not after" -- while
   # `report/generate.py`'s `stale_ann` bucket adds the per-cell attribution in
-  # the Validity section afterwards.
-  #
-  # A FRESH RUN DIRECTORY DOES NOT FIX THIS, and that is the trap. `paths` in
-  # `orchestrator/cli.py` puts `ops_results` at the run directory but
-  # `annb_results` at `results/annb`, a SIBLING of it -- CLAUDE.md's invariant
-  # says the tree is shared across runs on purpose. So a new `--run-id` gives
-  # a clean ops tree and leaves every recall cell exactly where it was.
-  #
-  # THE REMEDY IS TO MOVE THIS ENGINE'S SUBTREE ASIDE before the first run at
-  # a new pin: `results/annb/<pass>/<fingerprint>/<dataset>/<k>/percona/`.
+  # the Validity section afterwards. So, before the first run at a new pin,
+  # MOVE THIS ENGINE'S SUBTREE OF THE ANN RESULTS TREE ASIDE:
+  # `results/annb/<pass>/<fingerprint>/<dataset>/<k>/percona/`.
   # `_count_results` counts `.hdf5` files under directories named for the
   # engine, so moving them makes it return 0 and ann-benchmarks measures the
   # curve again.
+  #
+  # A FRESH RUN DIRECTORY DOES NOT DO IT, and that is the trap. `paths` in
+  # `orchestrator/cli.py` puts `ops_results` at the run directory but
+  # `annb_results` at `results/annb`, a SIBLING of it -- CLAUDE.md's invariant
+  # says the tree is shared across runs on purpose. So a new `--run-id` gives
+  # a clean ops tree and leaves every recall cell exactly where it was. It is
+  # a separate requirement, for the ops path, and it is below.
   #
   # DO NOT REACH FOR `--force` INSTEAD, even though its help text offers
   # precisely this ("re-run ann-benchmarks points that already have results").
