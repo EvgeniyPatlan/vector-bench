@@ -350,20 +350,26 @@ class TestStartJoinsItsAttendantsWhenTheBarrierBreaks:
 #: 0 runs with every sample warning); sampling over the settled probe left 0
 #: of 10000.
 #:
-#: Five pairs and not one, because WITHOUT the settle the dirty samples are
-#: CORRELATED -- one
-#: descheduled instant dirties several, so `p**5` understates the tail and
-#: the count was picked against the measured distribution instead (dirty
+#: Five pairs and not one. Without the settle the dirty samples came back
+#: OVER-DISPERSED on the run that chose k -- one descheduled instant dirties
+#: several -- so `p**5` could understate the tail. That dispersion is
+#: load-dependent rather than a property of the window: an independent
+#: ten-way sample came back binomial-consistent. Either way k was picked
+#: against a measured distribution and not a model (dirty
 #: samples per run over 2000 runs: 1845 none, 122 one, 26 two, 5 three, 2
 #: four, 0 five).
 FORK_PROBE_SAMPLES = 5
 
 #: Bound on the wait for the kernel to agree the probe is single-threaded.
 #:
-#: Measured at 118 us mean and 829 us worst over 500 settles at ten-way load,
-#: so this is ~2400x the worst observed -- generous because exceeding it is not
-#: a failure, only a fall back to the sampling. It is also what a mutant that
-#: leaves the thread alive pays per sample, which is why it is seconds and not
+#: Measured at 118 us mean and 829 us worst over 500 settles at ten-way load
+#: on an otherwise quiet box, and 4.18 ms worst at twenty-way under spinners at
+#: load 47. So the bound is **479x the worst seen under load**, which is the
+#: figure that matters; quoting 2400x against the quiet worst case overstated
+#: it. Generous on purpose, because EXCEEDING IT IS A FAILURE and not a
+#: relaxation -- a thread still counted after 2 s did not leave. It is also
+#: what a mutant that leaves the thread alive pays per sample, which is
+#: why it is seconds and not
 #: minutes. The mutant is `one_pair` with its `gate.set()` and `thread.join()`
 #: deleted, so the thread is still on `gate.wait` and there is no `join` to
 #: block in: five samples pay the bound, cost 10 s, and then fail.
@@ -476,26 +482,39 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
         must be silent, which is STRICTER than the single sample this replaces.
         Nothing is being tolerated there -- a reading of 1 cannot go stale,
         because after `join()` nothing creates a thread -- so a warning in that
-        tier would refute that monotonicity rather than report a busy box.
-        Measured: 0 of 35000 samples.
+        tier would refute that reasoning rather than report a busy box.
 
-        Where the kernel could not confirm every parent -- no `/proc`, or the
-        bound expired -- the bound drops to the FLOOR, `min(joined) == 0`, and
-        one-sidedness is what makes that sound: an OS thread the kernel has not
+        **And it is DOMINANCE rather than a shared counter that makes the tier
+        sound.** `wait_until_single` reads `/proc/self/status`, which is not
+        what the warning reads: CPython 3.12.3 contains no `/proc/self/status`
+        string at all. It does not need to be. A dying thread unlinks its
+        Python thread state before its OS thread can exit, so the kernel's
+        count is the LAST of the candidate counters to drop; a kernel count of
+        1 therefore implies every counter the warning could consult reads 1
+        too, whichever one it is. Measured: 0 warnings in 35000 confirmed
+        samples here, and 0 in 40000 independently.
+
+        An EXPIRY is not a third tier, it is a failure, for the reason the
+        assertion records: only a box with no kernel count to read -- no
+        `/proc` -- drops to the FLOOR, `min(joined) == 0`. One-sidedness is
+        what makes the floor sound there: an OS thread the kernel has not
         finished reaping is one MORE thread at fork time, so the window can
         only ADD a warning and never remove one the live thread would have
-        caused. The minimum is then the noise-free reading.
+        caused, and the minimum is the noise-free reading.
 
-        **What the floor alone would NOT catch, which is why it is the fallback
-        and not the rule.** One-sidedness justifies a floor against noise that
-        is RARE per sample; it says nothing about a stray thread that warns on
-        MOST samples and not all. One lingering past `join()` on 80% of samples
-        would have failed the old single-sample test 80% of the time and this
-        floor only where all five coincide. The confirmed tier is what keeps
-        that case caught on any box with `/proc`, and it is also what stops a
-        settle that silently stopped waiting from going unnoticed: such a
-        settle still reports `confirmed`, which demands all five be silent and
-        fails under the very race it stopped closing.
+        **A floor alone would not catch a stray thread, which is why it is
+        confined to the no-`/proc` box.** One-sidedness justifies a floor
+        against noise that is RARE per sample; it says nothing about a stray
+        warning on MOST samples and not all. One lingering past `join()` on 80%
+        of samples would have failed the old single-sample test 80% of the time
+        and a floor only where all five coincided. Where there is a kernel
+        count, BOTH shapes of that stray are now caught, and by different
+        assertions: one shorter-lived than `FORK_PROBE_SETTLE_S` is waited out,
+        so every parent is confirmed and any warning fails the strict bound;
+        one longer-lived makes the settle expire, and the expiry itself fails.
+        The strict bound also stops a settle that silently stopped waiting,
+        which still reports `confirmed` and is then held to five silent forks
+        under the very race it stopped closing.
 
         Either tier refutes what the single sample refuted. An interpreter that
         warned on EVERY fork -- the "this probe is not measuring the thread"
@@ -533,20 +552,46 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
         not_joined = [pair[1] for pair in pairs]
         # How the settle went before each joined-arm fork -- 1 the kernel
         # confirmed one thread, 0 the bound expired with it reporting more, -1
-        # there was no count to read. It picks the tier AND it names the cause
-        # in the failure, which the three cases answer differently: all
-        # confirmed points at the mechanism having changed, expiries at a
-        # thread that never left, unreadable at a box where only the sampling
-        # was ever in play.
+        # there was no count to read.
         settle = {1: "confirmed", 0: "expired", -1: "unreadable"}
         settled = ", ".join(
             f"{sum(1 for pair in pairs if pair[2] == value)} {name}"
             for value, name in settle.items())
+        # An expiry is a DEFECT, not a platform fact, so it FAILS here instead
+        # of relaxing the bound. `FORK_PROBE_SETTLE_S` is 479x the worst settle
+        # measured under load, so a thread that `join()` had already returned
+        # on, and that the kernel still counted that long afterwards, did not
+        # leave. Only `unreadable` -- no kernel count to read at all -- is a
+        # box this test has to accommodate.
+        #
+        # **Demoting on an expiry is what the first version of this rule did,
+        # and it inverted the whole point.** A stray thread OUTLIVING the bound
+        # made the settle expire, the expiry dropped the run to the floor, and
+        # the floor then passed on whichever sample the stray had left clean --
+        # so the `/proc` visibility that was supposed to enable the catch was
+        # exactly what disabled it. Measured on that version: `joined=[0, 1, 1,
+        # 1, 1]` with `settles=[1, 0, 0, 0, 0]` PASSED 3 of 3 runs, ignoring 12
+        # dirty samples of 15, where the single sample it replaced would have
+        # failed on 80% of runs. A pass prints nothing, so it was silent too.
+        expired = [i for i, pair in enumerate(pairs) if pair[2] == 0]
+        assert not expired, (
+            f"the wait for the kernel to report one thread expired on "
+            f"sample(s) {expired} of {FORK_PROBE_SAMPLES} after "
+            f"{FORK_PROBE_SETTLE_S}s each, so a thread `join()` had returned "
+            f"on was still counted that long afterwards and did not leave. "
+            f"Warnings were joined={joined} not_joined={not_joined}. (If this "
+            f"box is pathologically slow rather than leaking a thread, that "
+            f"bound is the thing to re-measure -- it was 479x the worst "
+            f"settle seen at load 47, over 75000 samples with no expiry.)")
+        # No expiry, so the kernel either confirmed every parent or could not
+        # be read at all. Confirmed -> every sample must be silent, which is
+        # stricter than the one sample this replaces. Unreadable -> the floor,
+        # which is all the one-sided argument can honestly support.
         confirmed = all(pair[2] == 1 for pair in pairs)
         rule = ("every sample, because the kernel confirmed a single-threaded "
                 "parent before each" if confirmed else
-                "the quietest sample, because the kernel could not confirm "
-                "every parent")
+                "the quietest sample, because this box has no kernel thread "
+                "count to read")
         assert (max(joined) if confirmed else min(joined)) == 0, (
             f"a fork from a single-threaded parent warned: {joined} over "
             f"{FORK_PROBE_SAMPLES} samples, read across {rule}; the wait for "
@@ -556,6 +601,10 @@ class TestTheLeakedAttendantIsWhatCPythonWarnsAbout:
             f"a fork beside a live thread warned {not_joined} time(s) per "
             f"sample; this interpreter does not warn, so the 54 -> 0 "
             f"measurement `_join_attendants` cites cannot be read off it")
+        # Documentation and not detection: implied by the two bounds above in
+        # either tier, and deliberately kept to state the separation the test
+        # is named for, as the single-sample `joined != not_joined` it replaces
+        # also did.
         assert min(joined) < min(not_joined)
 
 
