@@ -9,8 +9,10 @@ WHAT THESE TESTS CAN AND CANNOT ESTABLISH
 They cannot establish anything about Percona Server. No server is reachable from
 a test run, and a test asserting "Percona requires a BIGINT UNSIGNED primary key"
 would only be asserting that a document contains a sentence. Every claim about
-the engine is sourced to a file:line on the pinned SHA in docs/09 and is settled
-by reading that tree, not here.
+the engine is sourced in docs/09 to a named symbol or MTR test on the pinned
+SHA, in prose, and is settled by reading that tree, not here. docs/09 §0 is the
+citation policy and the block below "Citations: symbols, never line numbers" is
+what holds the document to it.
 
 What they do establish is that the artefacts agree with each other and with the
 document: that the DDL the overlay module emits is the DDL the document says it
@@ -34,6 +36,7 @@ an empty string as against a correct file.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import re
@@ -47,6 +50,16 @@ DOCKER = os.path.join(VB_ROOT, "docker")
 OVERLAY = os.path.join(VB_ROOT, "overlay", "ann-benchmarks")
 ALGORITHMS = os.path.join(OVERLAY, "ann_benchmarks", "algorithms")
 PERCONA_DOC = os.path.join(VB_ROOT, "docs", "09-adding-percona-server.md")
+
+
+def _doc_09() -> str:
+    """docs/09 as text, for the citation guards.
+
+    A function and not the `doc` fixture: the citation pipeline below is also
+    run against synthetic documents, so it takes text rather than reading the
+    file, and the helpers that do read it need a module-level reader.
+    """
+    return open(PERCONA_DOC, encoding="utf-8").read()
 
 # The SHA docs/09 pins. Repeated here so that a test can check the document, the
 # module docstring and this file all name the same commit -- the value is the
@@ -1159,10 +1172,26 @@ class TestTheDocument:
 
     def test_the_pinned_sha_is_the_same_in_every_file_that_names_one(self, doc):
         """A pin that differs between the document and the code it describes is
-        not a pin."""
+        not a pin.
+
+        THE SECOND ASSERTION IS NOT REDUNDANT, and it was nearly lost. The set
+        comparison alone is satisfied by a SHA in `percona/module.py` with
+        docs/09 naming none at all -- so a document that dropped its pin would
+        pass. That half used to live in
+        `test_foreign_citations_are_skipped_explicitly`, as a repeated
+        forty-character literal, and the citation conversion deleted that test
+        along with the foreign-citation machinery it belonged to. It is here
+        now, spelled `PINNED_SHA` rather than repeated, so the pin has one
+        definition in this file instead of two that can drift -- which is the
+        argument the comment above `PINNED_SHA` already makes about three
+        copies.
+        """
         module = open(os.path.join(ALGORITHMS, "percona", "module.py")).read()
         shas = set(re.findall(r"\b[0-9a-f]{40}\b", doc + module))
         assert shas == {PINNED_SHA}, shas
+        assert PINNED_SHA in doc, (
+            "docs/09 names no 40-character SHA; §0's pin table is where the "
+            "document commits to having been read against a specific tree")
 
     @pytest.fixture(scope="class")
     def section1(self, doc):
@@ -1185,8 +1214,12 @@ class TestTheDocument:
         assert "innodb_hnsw_ef_search" in section1
         # Placement: the answer leads, the evidence follows. A section that
         # buried the verdict under hedging would fail here.
-        first_citation = re.search(r"\.result:\d+|\.cc:\d+|\.test:\d+",
-                                   section1)
+        # The evidence form changed with the citation policy: §1's sources
+        # are vendor files, so they are named in italics rather than in code
+        # font, and the first one is the placement marker the old
+        # `.cc:<line>` search was.
+        first_citation = re.search(
+            r"\*[A-Za-z0-9_./-]+\.(?:result|test|yy|cc|h|md)\*", section1)
         assert first_citation, "the section cites nothing"
         assert yes.start() < first_citation.start()
         # Polarity: none of the phrasings that would mean the opposite.
@@ -1218,16 +1251,24 @@ class TestTheDocument:
         token `max(ef_search, k)` while arguing against implementing the clamp,
         because the old regex accepted either spelling.
 
-        `max(ef, LIMIT)` is the server's own help string (ha_innodb.cc:1208)
-        and `base.py:469` is the hook that has to be overridden; the attack
-        carried neither. Requiring the quoted forms is the same technique that
-        already works for the bounds.
+        `max(ef, LIMIT)` is the server's own help string, quoted from the
+        declaration this section reproduces, and
+        `EngineDriver.effective_ef` in `harness/drivers/base.py` is the hook
+        that has to be overridden; the attack carried neither. Requiring the
+        quoted forms is the same technique that already works for the bounds.
+        The hook used to be required as `8a82da8:harness/drivers/base.py:469`;
+        it is required by name now, and by the name of the file it is in, so
+        the pair survives an edit above it. That superseded number is written
+        in the revision-scoped form `tests/test_e16_citation_ratchet.py`
+        prescribes for a dead citation -- it is the spelling `git show` takes,
+        so it names a line that cannot move rather than one that already
+        has.
         """
         assert "effective_ef" in section1
         assert "max(ef, LIMIT)" in section1, (
             "the clamp must be quoted in the server's own spelling, not "
             "paraphrased")
-        assert "base.py:469" in section1
+        assert "harness/drivers/base.py" in section1
         assert "ef_construction" in section1
 
     def test_it_recommends_implementing_the_clamp_rather_than_inheriting(
@@ -1251,7 +1292,7 @@ class TestTheDocument:
             **must** implement `effective_ef` as `max(ef, k)`    -> FAILED
 
         `override` is if anything the more precise verb -- `effective_ef` is an
-        inherited concrete method with a default at `base.py:469`, so
+        inherited concrete method with a default on `EngineDriver`, so
         overriding is literally what happens -- and `must` is strictly stronger
         than `should`. A guard that fires on correct prose teaches the next
         author to weaken or delete it, which is how the vacuity shapes reached
@@ -1286,8 +1327,8 @@ class TestTheDocument:
         banned `needs no edit` anywhere in §1, and that is subject-blind: it
         fires on a true sentence about something else, for instance
 
-            "`base.py:469`'s inherited default is correct for every other
-             engine here and **needs no edit**"
+            "`EngineDriver.effective_ef`'s inherited default is correct for
+             every other engine here and **needs no edit**"
 
         which is correct prose about a different subject, and "needs no edit"
         is exactly the phrase that recurs in a change-list document. A ban has
@@ -1310,14 +1351,17 @@ class TestTheDocument:
 
     def test_it_cites_more_than_a_token(self, section1):
         """A citation floor, because the hedge attack's tell was that every
-        file:line went away while the verdict stayed.
+        citation went away while the verdict stayed.
 
-        Raised from 4 to 6. §1 carries 7, and the second attack met a `>= 4`
-        floor exactly -- a threshold three below the real count is a licence to
-        delete three citations silently. One of slack, not three.
+        The floor used to count `file:line` spellings. It now counts the
+        ITALICISED VENDOR SOURCES the conversion replaced them with -- the
+        same claim about the same section, over the citation form §0 now
+        requires. Kept at 6 with §1 carrying more: the second attack on this
+        section met a `>= 4` floor exactly, and a threshold three below the
+        real count is a licence to delete three citations silently.
         """
-        citations = re.findall(r"[\w/.-]+\.(?:result|test|cc|h|md):\d+",
-                               section1)
+        citations = re.findall(
+            r"\*([A-Za-z0-9_./-]+\.(?:result|test|yy|cc|h|md))\*", section1)
         assert len(citations) >= 6, citations
 
     def test_the_sysvar_declaration_is_quoted_not_paraphrased(self, section1):
@@ -1325,7 +1369,7 @@ class TestTheDocument:
         this section -- scope, default and both bounds in one place -- so the
         section quotes it rather than restating it."""
         assert "MYSQL_THDVAR_ULONG" in section1
-        assert "ha_innodb.cc:" in section1
+        assert "*ha_innodb.cc*" in section1
 
     # -- the prose is cross-checked against that quote ------------------
     #
@@ -1531,14 +1575,33 @@ class TestTheDocument:
                 engine
 
     def test_it_records_where_ann_pass_refuses_an_unknown_engine(self, doc):
-        """§4.10's whole point is that Percona lands on this `raise`. If the line
-        moves, the follow-on task is sent to the wrong place."""
+        """§4.10's whole point is that Percona lands on this `raise`.
+
+        The section used to reproduce the line with its gutter number and this
+        test parsed the number back out. The number is gone: the section
+        quotes the statement, names the function it is in, and the
+        `CITED_SYMBOLS` row for `render_config` is what re-opens it. What
+        stays here is the part that row cannot express -- that the quotation
+        §4.10 prints is the statement `render_config` really ends with, and
+        that it is the LAST thing in the function rather than one branch among
+        several.
+        """
+        section = doc.split("### 4.10", 1)[1].split("\n## ", 1)[0]
+        assert 'raise ValueError(f"unknown engine: {engine}")' in section
+        assert "render_config" in section
         source = open(os.path.join(VB_ROOT, "orchestrator",
-                                   "ann_pass.py")).read().splitlines()
-        claimed = int(re.search(r"^(\d+)\s+raise ValueError\(f\"unknown engine",
-                                doc, re.MULTILINE).group(1))
-        assert "raise ValueError" in source[claimed - 1]
-        assert "unknown engine" in source[claimed - 1]
+                                   "ann_pass.py")).read()
+        body = source.split("def render_config", 1)[1].split("\ndef ", 1)[0]
+        statement = 'raise ValueError(f"unknown engine: {engine}")'
+        assert statement in body
+        # "Percona matched none of them and landed on the `raise`" is a claim
+        # about ORDER: the raise is the dispatch's fallback, so it comes after
+        # every engine branch. Checked as an order rather than as "the last
+        # line of the function", which it is not -- a `return` follows it.
+        last_branch = body.rindex("elif engine ==")
+        assert last_branch < body.index(statement), (
+            "§4.10 says an unknown engine falls through every branch to this "
+            "raise, and the raise now precedes a branch")
 
     def test_no_mysql_family_branch_in_ann_pass_emits_ef_construction(self,
                                                                       doc):
@@ -1582,7 +1645,7 @@ class TestTheDocument:
         Polarity, not presence: the section has to say it DOES compact.
         """
         section = doc.split("### 2.7", 1)[1].split("## 3.", 1)[0]
-        assert "handler0alter.cc:1393-1404" in section
+        assert "*handler0alter.cc*" in section
         assert "**does compact**" in section
         for wrong in ("does **not** compact graph tombstones",
                       "`OPTIMIZE TABLE` is not it"):
@@ -1603,316 +1666,1311 @@ class TestTheDocument:
                                    "build.py")).read()
         assert 'index.build_mode == "incremental"' in source
         assert 'build_mode == "post"' not in source
-        assert "Lines 93-95" in doc
+        # The three lines §2.5 reproduces used to be cited as "Lines 93-95";
+        # they are now quoted and attributed to the function they are in, and
+        # the `CITED_SYMBOLS` row for `build.py`'s `run` re-opens them. What
+        # this test keeps asserting is that the document still attributes the
+        # quotation rather than leaving it floating.
+        section = doc.split("### 2.5", 1)[1].split("### 2.6", 1)[0]
+        assert "`harness/workloads/build.py`" in section
+        assert "`run`" in section
 
 
-#: Every `path:line` citation in docs/09 that points into THIS repo, with a
-#: string that must appear in the cited line or range.
-#:
-#: WHY THIS TABLE EXISTS. The document carried about twenty-one such citations
-#: and exactly two of them were checked. The other nineteen rotted silently,
-#: and that is not theoretical: merging #12 and #13 invalidated two of them in
-#: a day. `postgres.py:481` came to point at a sentence of prose, and the one
-#: guard that existed caught it -- which is the whole argument for having the
-#: rest. Three more were stale that nobody had flagged, found only by walking
-#: every citation: `churn.py:310-311` (moved to 484-485 by T4b),
-#: `docs/07-planning-a-run.md:478` (moved to 481), and the inline line numbers
-#: inside §4.8's quoted `_detect_march` block.
-#:
-#: The key is the citation AS THE DOCUMENT SPELLS IT, so the completeness test
-#: below can match the two against each other. Both directions are then
-#: covered: a number that changes in the document without changing here fails
-#: completeness, and a number that no longer matches the file fails its anchor.
-#:
-#: Anchors are chosen to be the thing the document is pointing AT, not merely
-#: a string that happens to be nearby. Where a citation has no such thing it
-#: goes in NO_ANCHOR with a reason rather than getting a weak anchor invented
-#: for it to make a row pass.
-CITED_IN_REPO = {
-    # doc spelling                   -> (real path, anchor)
-    "base.py:239-258":
-        ("harness/drivers/base.py", 'repair_path: str = "none"'),
-    "base.py:255-256":
-        ("harness/drivers/base.py", "Valkey and Percona Search inherit"),
-    "base.py:469":
-        ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "harness/drivers/base.py:420-466":
-        ("harness/drivers/base.py", "def prepare_churn"),
-    "harness/drivers/base.py:469":
-        ("harness/drivers/base.py", "def effective_ef(self, ef: int, k: int)"),
-    "churn.py:525-526":
-        ("harness/workloads/churn.py", "what = driver.maintain()"),
-    "harness/workloads/build.py:12-16":
-        ("harness/workloads/build.py", "ingest_wall_s"),
-    "harness/datasets.py:492":
-        ("harness/datasets.py", "1,183,514 training rows"),
-    "harness/main.py:248-266":
-        ("harness/main.py", "def _detect_march"),
-    "harness/drivers/mysql_family.py:58":
-        ("harness/drivers/mysql_family.py", "def to_binary_f32"),
-    # The anchor moved WITH the code, and that is the citation's job. §4.1
-    # replaced the hard-coded `id INT PRIMARY KEY` with `Dialect.pk_type`, so
-    # the literal the document used to point at no longer exists in this file
-    # -- it exists in the dialect default instead. Pointing the row at the
-    # interpolation keeps it checking the line §2.2 is talking about.
-    "harness/drivers/mysql_family.py:234":
-        ("harness/drivers/mysql_family.py",
-         "id {self.dialect.pk_type} PRIMARY KEY"),
-    "mysql_family.py:162-172":
-        ("harness/drivers/mysql_family.py", "host=self.spec.host"),
-    "postgres.py:689":
-        ("harness/drivers/postgres.py", "def _driver_classes()"),
-    "ops_pass.py:256":
-        ("orchestrator/ops_pass.py", "VB_ENGINE_TAG"),
-    # Moved from 63-65 by `runtime.error_log`, which added a field to
-    # `EngineRuntime` above it. Re-derived with grep, not by arithmetic.
-    "orchestrator/engines.py:84-86":
-        ("orchestrator/engines.py", "def _source_tag"),
-    "docs/07-planning-a-run.md:505":
-        ("docs/07-planning-a-run.md", "60,000-row smoke"),
-    # Found only once `_CITE_RE` learned to see extensionless filenames --
-    # see the note on that pattern. It is the citation that sat at `:113`,
-    # 51 lines wrong, for this document's whole life.
-    "docker/percona/Dockerfile:725":
-        ("docker/percona/Dockerfile", "ARG PERCONA_TAG=unknown"),
-    "docker/alisql/entrypoint-alisql.sh:94":
-        ("docker/alisql/entrypoint-alisql.sh", 'local u; u="$(user_args)"'),
-    "docker/mariadb/entrypoint-mariadb.sh:95":
-        ("docker/mariadb/entrypoint-mariadb.sh", 'local u; u="$(user_args)"'),
-    "vb_mysql.py:96":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "id INT PRIMARY KEY"),
-    "vb_mysql.py:237":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py", "unix_socket"),
-    "vb_mysql.py:400":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "force_index_hint"),
-    "vb_mysql.py:428-436":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "CHARACTER_OCTET_LENGTH"),
-    "overlay/.../vb_mysql.py:51":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "def to_binary_f32"),
-    "overlay/.../vb_mysql.py:96":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "id INT PRIMARY KEY"),
-    "overlay/.../vb_mysql.py:538-564":
-        ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
-         "/opt/mariadb/.march"),
-    "overlay/.../algorithms/alisql/module.py:22-24":
-        ("overlay/ann-benchmarks/ann_benchmarks/algorithms/alisql/module.py",
-         "Field_vector::store()"),
-}
+# ---------------------------------------------------------------------------
+# Citations: symbols, never line numbers
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS REPLACED, AND WHY IT HAD TO BE REPLACED RATHER THAN REPAIRED.
+#
+# docs/09 used to cite `path`-colon-line, and this file re-opened every cited
+# line and compared it against what the document claimed was there. The table
+# was real coverage and it caught real rot. It also had two defects that no
+# amount of repair could reach:
+#
+# 1. A LINE NUMBER DIES TO ANY EDIT ABOVE IT. Line citations in docs/09 and
+#    docs/10 went stale twice in two days and put `master` red both times
+#    (#41, #43). Neither was a careless edit to a document: in both cases a
+#    later round of edits inside the SAME change moved lines below the point
+#    where the citations had been derived. The repair for one moved others,
+#    which is how the second failure happened.
+# 2. THE HALF NOBODY CHECKED WAS THE BIGGER HALF. The old parser saw 70 of
+#    this document's ~198 citations; `FOREIGN_MARKERS` then deny-listed every
+#    vendor path by name, correctly, because the pinned Percona tree is not in
+#    this checkout. What was left was 31 occurrences, 27 of them distinct,
+#    pointing into this repository. The other ~164 vendor line references were
+#    checked by NOTHING -- not even for being in range -- and would have gone
+#    stale in silence at the re-pin, in a document whose §0 provenance table
+#    commits it to having been read against a specific tree. A citation that
+#    cannot go red is a decoration that reads like coverage.
+#
+# So the document cites symbols, and the guard has three layers in place of
+# one. Each is named here because each is a different strength:
+#
+# * THE RATCHET (`TestTheDocumentMakesNoLineCitation`). docs/09 must contain
+#   ZERO line citations of any form. One assertion replacing twenty-seven
+#   parameterised ones, and strictly stronger about the thing that was
+#   rotting. The pattern is WIDER than the one it replaces -- MTR `.result`
+#   and `.test` paths, `.yy` grammars, extensionless files and bare `:N`
+#   continuations were all invisible to the old one -- and it is proved
+#   against `CITATION_FIXTURE`, a frozen string carrying one of each form,
+#   because a negative assertion over a pattern that matched nothing would
+#   pass against a document full of citations. That is the same vacuity the
+#   old `_CITE_RE`'s own note recorded being caught by.
+#
+# * THE SYMBOL TABLE (`CITED_SYMBOLS`). Every claim docs/09 makes about the
+#   CONTENTS of something in this repository is a row keyed by
+#   `(path, symbol)` and carrying the string the document points at. The test
+#   opens the file, locates that symbol's declaration, and asserts the string
+#   is inside it. Same strength as the old line check -- it is still the
+#   contents being compared -- keyed by a name instead of a number, so it
+#   survives an edit above it.
+#
+# * EXISTENCE OVER EVERYTHING ELSE. Every code-font path in docs/09 resolves
+#   to a file in this tree and every code-font symbol appears somewhere in it,
+#   using `tests/test_e15_methodology_roadmap_doc.py`'s classifier rather than
+#   a second copy of it, so the three guarded documents agree about what a
+#   path is and what a symbol is.
+#
+# WHAT IS WEAKER, STATED RATHER THAN IMPLIED. A vendor symbol citation is
+# checked by nothing. It was checked by nothing before; what changed is that
+# it now names a function, a class or an MTR test a reader holding the pinned
+# tree can find by searching, instead of a line number that is wrong. There is
+# no `FOREIGN_MARKERS` any more and there is nothing for one to do: the policy
+# puts vendor material in prose, so a code-font path into the vendor tree is
+# not a citation this guard has to classify -- it is a violation the path arm
+# fails on. That is the one place this conversion is strictly stronger about
+# the vendor half, and it is the only one.
 
-#: Citations the document makes as a bare `:N` continuation of the file named
-#: in the sentence before -- "`postgres.py:689` … the dict at `:701-707`".
-#: The auto-parser cannot see these, because the path is not in the backticks,
-#: so they are covered deliberately rather than discovered. They are the four
-#: that point into this repo; the rest are Percona sources.
-#:
-#: This is the honest limit of the completeness check: a NEW bare continuation
-#: could be added without a row and nothing would notice. Naming the limit
-#: here is the point of writing it down.
-BARE_CONTINUATIONS = {
-    ("harness/drivers/postgres.py", 698, 698):
-        "from .mysql_family import",
-    # NOTE the `and` in the old form of this value -- `'"PerconaDriver"' and
-    # "return {"` evaluates to its RIGHT operand, so the anchor was only ever
-    # `return {` and the PerconaDriver half was never checked. Both are
-    # asserted now, as a tuple the test iterates.
-    ("harness/drivers/postgres.py", 701, 713):
-        ("return {", '"PerconaDriver": PerconaDriver'),
-    ("harness/drivers/postgres.py", 710, 730):
-        "def _driver_table()",
-    # Re-derived with `grep -n`, not by arithmetic: the ops harness gained
-    # `--no-bulk-vector-index-build` in `parse_args` and a declaration hook
-    # inside `driver_factory`, which moved everything in `main()` below them.
-    ("harness/main.py", 342, 342):
-        "args.march or _detect_march()",
-    # The GUTTER NUMBERS in the fenced block of docs/09 §4.8, which the
-    # citation parser cannot see at all: they are line labels inside a
-    # ```python fence, not `path:line` citations. That block has rotted
-    # before, and both times the range citation beside it absorbed the drift
-    # because the anchor stayed inside the stale window -- a 19-line window
-    # tolerates 18 lines of it. This row pins the three lines the block
-    # reproduces, so a shift above them fails here instead.
-    ("harness/main.py", 267, 269):
-        ('for path in ("/opt/mariadb/.march"',
-         '"/opt/pgvector-artifacts/.march"',
-         '"/opt/percona/.march"'),
-}
 
-#: Local citations with no sensible anchor, and why. Empty, and that is a
-#: finding rather than a default: every citation the document makes into this
-#: repo points at a named thing -- a def, a literal, a sentence -- so none
-#: needed a weak anchor invented for it.
-NO_ANCHOR: Dict[str, str] = {}
+#: Where a symbol may resolve, and the suffixes read into the index. Imported
+#: rather than restated: docs/09, docs/10 and docs/11 are three documents under
+#: one citation policy, and three copies of the classifier would be three
+#: chances for them to disagree about what a path is.
+from .test_e15_methodology_roadmap_doc import (  # noqa: E402
+    CITATION_FIXTURE, CITATION_FIXTURE_EXPECTED, INDEXED_SUFFIXES,
+    ROOT_SOURCES, SOURCE_DIRS, _LINE_CITATION_RE, _YAML_KEY_RE, _WORD_RE,
+    _declared_in_python, classify, line_citations)
 
-#: Paths that belong to the pinned Percona tree. They cannot be checked from
-#: here and must not be: they are pinned by SHA
-#: (02a8b80c70b0ccf6c9035d8a2307e7fa988cc304), so a local file of the same name
-#: would be the wrong file, and checking against one would be worse than not
-#: checking at all. Verified by reading that tree, which is what §0's
-#: provenance table commits the document to.
-#:
-#: A deny-list by name, deliberately, and not "whatever does not resolve
-#: locally". Resolving by existence would misclassify a Percona source that
-#: happens to share a filename with a repo file as local, and then check the
-#: document against the wrong file -- which is the one outcome worse than not
-#: checking. The cost is that a newly cited Percona file must be added here,
-#: and `test_every_local_citation_has_a_row` is what makes that cost visible:
-#: it is how `ddl0loader.cc:273` was caught sitting unclassified in §0's commit
-#: table the first time this guard ran.
-FOREIGN_MARKERS = (
-    "percona-hnsw", "ha_innodb", "handler0alter", "field.cc", "field.h",
-    "item_create", "sys_vars.cc", "vec0vec", "vector_constants",
-    "CMakeLists", "keyring_kmip", "mysql-test", "MYSQL_VERSION",
-    # Cited in §4.1 for the three servers' EXPLAIN grammars. Invisible to
-    # `_CITE_RE` today because `.yy` is not in its extension list; listed
-    # anyway so that widening the parser classifies it instead of failing.
-    "sql_yacc",
-    "ddl0loader",
+#: Generated and gitignored, per CLAUDE.md -- not walked for the index and not
+#: searched for a path. A file under one of these does not exist on a fresh
+#: checkout, so neither a symbol nor a path may resolve against it.
+GENERATED_DIRS = ("sources", "work", "results", "datasets", "state")
+
+#: The three document guards exclude ALL THREE of themselves from the symbol
+#: index, and the reason is measured rather than supposed.
+#: `tests/test_e15_methodology_roadmap_doc.py` records it: the first run of its
+#: planted arm PASSED the live document and FAILED the plant, because `tests/`
+#: is indexed and the planted name was spelled in the guard. These files spell
+#: symbol names while describing what they would reject, so any one of them in
+#: the index can certify a citation into thin air.
+GUARD_FILES = (
+    "tests/test_e1_percona_design.py",
+    "tests/test_e3_rollout_doc.py",
+    "tests/test_e15_methodology_roadmap_doc.py",
 )
 
-#: Every `path:N[-M]` citation in backticks. The second alternative is for
-#: extensionless filenames, and `Dockerfile` is the one this document cites.
-#:
-#: **IT WAS ADDED BECAUSE THE OMISSION HID A LIVE ERROR.** The parser saw 60 of
-#: this document's 72 citations; eleven of the misses were foreign `.result` and
-#: `.test` paths that `_is_foreign` would have skipped anyway, and exactly one
-#: was in-repo: the `docker/percona/Dockerfile` citation, which sat in §4.7
-#: reading `:113` -- wrong by 51 lines, pointing at `ENV DEBIAN_FRONTEND`, with
-#: nothing in this file able to see it. (No line number is given for it here on
-#: purpose: this is a narrative about a citation that has since been corrected
-#: and has since moved, and a number in prose that nothing checks is exactly
-#: the rot the row below exists to stop. The live, checked number is in
-#: CITED_IN_REPO.) A completeness guard that cannot see a whole
-#: CLASS of citation reports coverage it does not have, which is the same shape
-#: as the vacuity it exists to catch.
-#:
-#: Group numbering is unchanged: the inner alternation is non-capturing, so
-#: group 1 is still the path and 2/3 the line range.
-_CITE_RE = re.compile(
-    r"`((?:[A-Za-z0-9_./-]+\.(?:py|sh|js|yml|md|cc|h|txt)"
-    r"|[A-Za-z0-9_./-]*Dockerfile)):(\d+)(?:-(\d+))?`")
+#: A commit SHA is not a symbol, and `_SYMBOL_RE` cannot tell the difference:
+#: `a86503214416` is a run of hex that happens to start with a letter. docs/09
+#: quotes twelve-character SHAs in §0's commit table and in §7, in code font,
+#: and they resolve nowhere by design. Excluded by SHAPE rather than by an
+#: allowlist of the particular SHAs, deliberately -- an allowlist would have to
+#: be edited every time the pin moves, which is the one edit this document
+#: makes most often and the one a guard must not fight.
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+#: A fenced block is a QUOTATION and is reproduced verbatim, so the backticks
+#: inside one are the source's, not this document's. The vendor comment §2.7
+#: quotes spells `online` in backticks; classifying that as a citation would
+#: ask this repository to contain a symbol named `online` because Percona's
+#: source does. Fences are therefore stripped before classification -- and NOT
+#: before the ratchet, which scans the whole file, because a line citation
+#: smuggled into a fence is still a line citation.
+_FENCE_RE = re.compile(r"^```.*?^```", re.S | re.M)
 
 
-def _doc_citations():
-    """Every `path:N[-M]` citation in docs/09, as the document spells it."""
-    text = open(PERCONA_DOC).read()
-    out = set()
-    for m in _CITE_RE.finditer(text):
-        lo, hi = m.group(2), m.group(3)
-        out.add("%s:%s%s" % (m.group(1), lo, "-" + hi if hi else ""))
+def _tree_files():
+    """Every text file a citation may resolve against, repo-relative."""
+    out = []
+    for name in ROOT_SOURCES:
+        if os.path.isfile(os.path.join(VB_ROOT, name)):
+            out.append(name)
+    for top in SOURCE_DIRS + ("docs",):
+        for root, dirs, files in os.walk(os.path.join(VB_ROOT, top)):
+            dirs[:] = [d for d in dirs
+                       if d not in ("__pycache__", ".git", ".pytest_cache")
+                       and d not in GENERATED_DIRS]
+            for filename in files:
+                out.append(os.path.relpath(os.path.join(root, filename),
+                                           VB_ROOT))
     return out
 
 
-def _is_foreign(citation):
-    return any(marker in citation for marker in FOREIGN_MARKERS)
+_TREE = []
 
 
-class TestEveryCitationIntoThisRepoIsChecked:
-    """Turn a document that rots into one that reports its own rot.
+def tree_files():
+    if not _TREE:
+        _TREE.extend(_tree_files())
+    return _TREE
 
-    The `march` AST guard replaced a docstring hole by reading the thing it
-    was asserting about; this does the same for line numbers. Twenty-six
-    citations, each opened and matched, instead of two.
+
+def resolve_path(spelling):
+    """`(resolved, candidates)` for a path as a document spells it.
+
+    A document may abbreviate: §2.5 writes `build.py` where the file is
+    `harness/workloads/build.py`, and spelling it out everywhere would make
+    several sentences unreadable. An abbreviation is resolved by UNIQUE
+    SUFFIX, which is a real check and not a loophole -- it fails when the file
+    is renamed, when it is deleted, and when a second file of the same name
+    makes the citation ambiguous. The ellipsis form the document used to use
+    (`overlay/.../vb_mysql.py`) resolves to nothing under this rule, which is
+    why it is gone: a citation a reader cannot paste into a search is not
+    better than a line number.
+    """
+    if os.path.isfile(os.path.join(VB_ROOT, spelling)):
+        return spelling, [spelling]
+    hits = [f for f in tree_files()
+            if f == spelling or f.endswith("/" + spelling)]
+    return (hits[0] if len(hits) == 1 else None), hits
+
+
+_INDEX = {}
+
+
+def symbol_index():
+    """Every name this tree mentions, with the guard files excluded."""
+    if _INDEX:
+        return _INDEX
+    excluded = {os.path.join(VB_ROOT, g) for g in GUARD_FILES}
+    mentioned, declared, read = set(), set(), []
+    for rel in tree_files():
+        if not rel.endswith(INDEXED_SUFFIXES):
+            continue
+        full = os.path.join(VB_ROOT, rel)
+        if full in excluded or rel.startswith("docs/"):
+            continue
+        try:
+            source = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        read.append(rel)
+        mentioned.update(_WORD_RE.findall(source))
+        if rel.endswith(".py"):
+            declared.update(_declared_in_python(source))
+        elif rel.endswith((".yml", ".yaml")):
+            declared.update(_YAML_KEY_RE.findall(source))
+    _INDEX["mentioned"] = mentioned
+    _INDEX["declared"] = declared
+    _INDEX["files"] = read
+    return _INDEX
+
+
+def doc_spans(text):
+    """`(paths, symbols, prose)` for the document's own prose.
+
+    Fenced quotations are stripped first and SHA-shaped spans are moved out of
+    the symbol set, both for the reasons given above.
+    """
+    paths, symbols, prose = classify(_FENCE_RE.sub("", text))
+    shas = {s for s in symbols if _SHA_RE.match(s)}
+    return paths, symbols - shas, prose | shas
+
+
+# -- the line-citation ratchet ----------------------------------------------
+#
+# THE PATTERN AND ITS FIXTURE ARE IMPORTED, NOT DEFINED HERE. They used to be
+# defined here and in `tests/test_e15_methodology_roadmap_doc.py`, which
+# carried a comment saying its copy was "kept deliberately identical" to
+# `tests/test_e3_rollout_doc.py`'s -- three copies of one policy, and they
+# were not identical: the other two were narrow enough to miss 130 of this
+# document's 199 line references on `8a82da8`. There is one definition now,
+# in the guard for the document that states the policy, and this file and
+# docs/10's guard both use it. The direction is forced: this file already
+# imports `classify` from there, so defining the pattern here and importing
+# it back would be a circular import between two test modules.
+
+#: A line inside a fenced block that opens with a bare number, which is the
+#: shape of a reproduced source gutter.
+#:
+#: Fences are matched with `lstrip()` and not anchored at column 0, and that is
+#: the whole reason this guard exists rather than a hand scan. The hand scan
+#: this change first used anchored `^```, and docs/09 §1's `search.test`
+#: excerpt sits inside a bullet, so its fence is indented two spaces and the
+#: entire block was invisible. Four vendor line numbers survived a commit whose
+#: message said all the blocks were clean, eleven lines under a sentence saying
+#: the numbers were gone, and the citation directly above them had been
+#: converted in the same change.
+_GUTTER_LINE_RE = re.compile(r"^\s*\d+(\s\s|\s*$)")
+
+#: Lines that open with a number inside a fence and are NOT gutters, each with
+#: what the number is. Spelled as the whole line so an entry cannot widen into
+#: a licence: a reproduced result row and an EXPLAIN row both legitimately
+#: begin with a value, and a scan that refused them would push the document
+#: into paraphrasing recorded output, which is the one thing §0 says a
+#: `.result` file is preferred FOR.
+RECORDED_VALUE_LINES = {
+    "40  40":
+        "§1's sysvar result: the global and session columns of a SELECT, both "
+        "reading 40. The document's point is that number.",
+    "40  200":
+        "§1's sysvar result, after SET SESSION: global 40, session 200.",
+    "1  SIMPLE      t1    NULL       ALL  v1            NULL NULL    NULL X    "
+    "100.00   Using filesort":
+        "§4.1's EXPLAIN row. The leading 1 is the `id` column, and the row is "
+        "the full-table-scan plan that defeats a name-only index check.",
+}
+
+# -- locating a symbol's declaration ----------------------------------------
+
+def _preceding_comments(lines, start):
+    """The contiguous comment block immediately above line `start` (1-based).
+
+    Part of the body on purpose. This repository's convention is that the
+    rationale for a constant lives in the `#:` block above it -- the version
+    charter above `OPS_MEASUREMENT_VERSION`, the measured-rates note above
+    `_INGEST_ROWS_PER_S` -- and most of what these two documents quote is in
+    those blocks rather than in the statement. Excluding them would force the
+    documents to quote code they are not talking about.
+    """
+    i = start - 1
+    while i > 0 and lines[i - 1].lstrip().startswith("#"):
+        i -= 1
+    return i
+
+
+def _python_symbol_body(source, symbol):
+    lines = source.splitlines()
+    if symbol == "<module>":
+        tree = ast.parse(source)
+        doc = ast.get_docstring(tree)
+        return doc if doc else None
+    want = symbol.split(".")
+    found = []
+
+    def walk(node, stack):
+        for child in ast.iter_child_nodes(node):
+            name = None
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)):
+                name = child.name
+            elif isinstance(child, ast.Assign):
+                target = child.targets[0]
+                if isinstance(target, ast.Name):
+                    name = target.id
+                elif isinstance(target, ast.Attribute):
+                    name = target.attr
+            elif isinstance(child, ast.AnnAssign) and isinstance(
+                    child.target, ast.Name):
+                name = child.target.id
+            if name is not None:
+                qualified = stack + [name]
+                if qualified[-len(want):] == want:
+                    lo = _preceding_comments(lines, child.lineno)
+                    hi = getattr(child, "end_lineno", child.lineno)
+                    found.append("\n".join(lines[lo:hi]))
+            if isinstance(child, ast.ClassDef):
+                walk(child, stack + [child.name])
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                    ast.If, ast.Try, ast.With, ast.For,
+                                    ast.While)):
+                walk(child, stack)
+
+    try:
+        walk(ast.parse(source), [])
+    except SyntaxError:
+        return None
+    return "\n".join(found) if found else None
+
+
+def _yaml_symbol_body(source, symbol):
+    """A YAML key's own line plus everything nested under it.
+
+    Dotted spellings (`ann.m_values`) are matched on the LAST component and
+    then checked for depth, which is enough here and avoids this growing into
+    a YAML parser: `pyyaml` would lose the comments, and the comments are what
+    both documents quote.
+    """
+    key = symbol.split(".")[-1]
+    lines = source.splitlines()
+    pattern = re.compile(r"^(\s*)" + re.escape(key) + r"\s*:")
+    out = []
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        lo = _preceding_comments(lines, i + 1)
+        hi = i + 1
+        while hi < len(lines):
+            nxt = lines[hi]
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            hi += 1
+        out.append("\n".join(lines[lo:hi]))
+    return "\n".join(out) if out else None
+
+
+def _shell_symbol_body(source, symbol):
+    """A shell function, or a variable the file exports or assigns."""
+    lines = source.splitlines()
+    fn = re.compile(r"^\s*(?:function\s+)?" + re.escape(symbol) + r"\s*\(\)")
+    nxt_fn = re.compile(r"^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\)")
+    out = []
+    for i, line in enumerate(lines):
+        if fn.match(line):
+            lo = _preceding_comments(lines, i + 1)
+            hi = i + 1
+            while hi < len(lines) and not nxt_fn.match(lines[hi]):
+                hi += 1
+            out.append("\n".join(lines[lo:hi]))
+    if out:
+        return "\n".join(out)
+    assign = re.compile(r"^\s*(?:export\s+|local\s+)?" + re.escape(symbol)
+                        + r"=")
+    hits = [i for i, line in enumerate(lines) if assign.match(line)]
+    if hits:
+        return "\n".join(lines[_preceding_comments(lines, i + 1):i + 1]
+                         for i in hits)
+    return None
+
+
+def _markdown_symbol_body(source, symbol):
+    """A section, named by its heading text, down to the next heading of the
+    same or a shallower level.
+
+    A heading is the only thing in a document that a sibling document can
+    point at and that survives an edit -- §-numbers are stable here by
+    convention (docs/10 §6 records why §2.0 of docs/05 is numbered 2.0), and a
+    renumbering is a deliberate act a reader can follow. Fenced blocks are
+    skipped because MTR output quoted in docs/09 starts lines with `#`.
+    """
+    lines = source.splitlines()
+    heads, fenced = [], False
+    for i, line in enumerate(lines):
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if not fenced:
+            m = re.match(r"(#{1,6}) ", line)
+            if m:
+                heads.append((i, len(m.group(1)), line))
+    for pos, (i, level, line) in enumerate(heads):
+        if symbol not in line:
+            continue
+        hi = len(lines)
+        for j, lvl, _text in heads[pos + 1:]:
+            if lvl <= level:
+                hi = j
+                break
+        return "\n".join(lines[i:hi])
+    return None
+
+
+def _generic_symbol_body(source, symbol):
+    """A Dockerfile ARG/ENV, or any line that declares the token.
+
+    The fallback, and narrow on purpose: it returns the declaring line and the
+    comments above it, not the whole file, so an anchor that happens to appear
+    somewhere else cannot satisfy a row.
+    """
+    lines = source.splitlines()
+    pattern = re.compile(r"^\s*(?:ARG|ENV|LABEL)?\s*" + re.escape(symbol)
+                         + r"\s*[=: ]")
+    out = []
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            lo = _preceding_comments(lines, i + 1)
+            out.append("\n".join(lines[lo:i + 1]))
+    return "\n".join(out) if out else None
+
+
+def symbol_body(path, symbol):
+    """The declaration of `symbol` in `path`, or None if it is not there.
+
+    None is the failure a row must report, and it must report it with the
+    FILE'S NAME: a row naming a symbol that no longer exists is the renamed
+    case, which is the one case a symbol citation is supposed to catch, and
+    "assert anchor in None" would say nothing about where to look.
+    """
+    full = os.path.join(VB_ROOT, path)
+    source = open(full, encoding="utf-8", errors="replace").read()
+    if path.endswith(".py"):
+        return _python_symbol_body(source, symbol)
+    if path.endswith((".yml", ".yaml")):
+        return _yaml_symbol_body(source, symbol)
+    if path.endswith(".sh"):
+        return _shell_symbol_body(source, symbol)
+    if path.endswith(".md"):
+        return _markdown_symbol_body(source, symbol)
+    return _generic_symbol_body(source, symbol)
+
+# ---------------------------------------------------------------------------
+# What docs/09 claims about this repository's contents
+# ---------------------------------------------------------------------------
+
+#: `(path, symbol)` -> the string, or strings, docs/09 says is inside that
+#: symbol. The successor to the old `CITED_IN_REPO`, carrying every one of its
+#: anchors and the four `BARE_CONTINUATIONS` rows folded in, re-keyed from a
+#: line spelling to the symbol the line sat in.
+#:
+#: THE KEY IS A SYMBOL AND THE VALUE IS STILL THE CONTENTS, which is the part
+#: worth being precise about: this is not "the symbol exists", it is "the
+#: symbol exists AND the document is right about what is in it". The only
+#: thing that changed is what survives an edit above it.
+#:
+#: Paths are spelled in full here even where the document abbreviates, because
+#: a table is not prose and an unambiguous key is worth more than a short one.
+#:
+#: The value may be one anchor or a tuple of them. The tuple form is kept from
+#: the old table for the reason recorded there: a value written `'a' and 'b'`
+#: evaluates to `'b'`, so a row that read as two assertions made one, and the
+#: half silently dropped was the half about the entry a follow-on task had to
+#: add.
+#:
+#: An anchor must not span a line break unless the body it is matched against
+#: contains that break -- bodies are joined with newlines, so a wrapped
+#: sentence is matched by quoting the clause that fits on one line.
+CITED_SYMBOLS = {
+    # -- §2.7's churn hooks, and §1's clamp -----------------------------
+    ("harness/drivers/base.py", "EngineDriver.repair_path"):
+        ('repair_path: str = "none"', "Valkey and Percona Search inherit"),
+    ("harness/drivers/base.py", "EngineDriver.prepare_churn"):
+        "def prepare_churn",
+    ("harness/drivers/base.py", "EngineDriver.wait_index_synced"):
+        "def wait_index_synced",
+    ("harness/drivers/base.py", "EngineDriver.effective_ef"):
+        "def effective_ef(self, ef: int, k: int)",
+    ("harness/workloads/churn.py", "run"):
+        "what = driver.maintain()",
+
+    # -- §2.5's build-mode defect ---------------------------------------
+    # The module docstring is the thing §2.5 block-quotes, so `<module>` is
+    # the symbol: a docstring has no name of its own, and matching the quote
+    # against the whole file would let any sentence in `build.py` satisfy it.
+    ("harness/workloads/build.py", "<module>"):
+        ("ingest_wall_s",
+         "pgvector's bulk build is N× cheaper than its own"),
+    # The three lines §2.5 used to cite as "Lines 93-95" plus the two the
+    # paragraph after them pointed at by bare number. All five are in one
+    # function, which is why five line citations became one row.
+    ("harness/workloads/build.py", "run"):
+        ('incremental = driver.capabilities().get("incremental_index", True)',
+         'if index.build_mode == "incremental":',
+         "driver.create_index(index)",
+         "effective_build = build_seconds if not incremental "
+         "else load.wall_seconds"),
+
+    # -- §2.1, §2.2, §4.1: the dialect ----------------------------------
+    ("harness/drivers/mysql_family.py", "to_binary_f32"):
+        "def to_binary_f32",
+    ("harness/drivers/mysql_family.py",
+     "MySQLFamilyDriver._create_table_ddl"):
+        "id {self.dialect.pk_type} PRIMARY KEY",
+    ("harness/drivers/mysql_family.py", "MySQLFamilyDriver.connect"):
+        "host=self.spec.host",
+    # §4.1's two claims about the plan check: that the index-name test is a
+    # substring test, and that the format is spelled out. Both are inside the
+    # one method, and the second is the free hardening the section argues for.
+    ("harness/drivers/mysql_family.py",
+     "MySQLFamilyDriver.explain_uses_vector_index"):
+        ("used = self.dialect.index_name in plan",
+         "EXPLAIN FORMAT=TRADITIONAL"),
+    ("harness/drivers/mysql_family.py", "MySQLFamilyDriver.capabilities"):
+        ('"incremental_index"', '"ef_construction_tunable"'),
+
+    # -- §4.2's registry, with both bare continuations folded in --------
+    ("harness/drivers/postgres.py", "_driver_classes"):
+        ("def _driver_classes()",
+         "from .mysql_family import",
+         '"PerconaDriver": PerconaDriver'),
+    ("harness/drivers/postgres.py", "_driver_table"):
+        "def _driver_table()",
+
+    # -- §4.3's `tag` key, and where it reaches the manifest ------------
+    ("orchestrator/engines.py", "_source_tag"):
+        'return str(source.get("tag") or source.get("version") or "")',
+    ("orchestrator/ops_pass.py", "OpsRun.run_harness"):
+        "VB_ENGINE_TAG",
+
+    # -- §4.8's two march readers, both tuples --------------------------
+    # The gutter numbers in §4.8's fenced block are gone; the three paths the
+    # block reproduces are the anchors, which is what the old
+    # `BARE_CONTINUATIONS` row pinned by line and is now pinned by symbol.
+    ("harness/main.py", "_detect_march"):
+        ('for path in ("/opt/mariadb/.march"',
+         '"/opt/pgvector-artifacts/.march"',
+         '"/opt/percona/.march"'),
+    ("harness/main.py", "main"):
+        "args.march or _detect_march()",
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
+     "VBMySQLBase._image_march"):
+        "/opt/mariadb/.march",
+
+    # -- §2.1, §2.2, §7: the ann overlay's copies -----------------------
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py", "to_binary_f32"):
+        "def to_binary_f32",
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
+     "Dialect.create_table"):
+        "id INT PRIMARY KEY",
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
+     "VBMySQLBase._conn_kwargs"):
+        "unix_socket",
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py", "VBMySQLBase.hint"):
+        "force_index_hint",
+    ("overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py",
+     "VBMySQLBase._dim_from_table"):
+        "CHARACTER_OCTET_LENGTH",
+    ("overlay/ann-benchmarks/ann_benchmarks/algorithms/alisql/module.py",
+     "<module>"):
+        "Field_vector::store()",
+
+    # -- §4.10's branches, which used to be nine bare line numbers ------
+    # Moved here from `tests/test_e10_failures_explain_themselves.py`, which
+    # held them as positions in a file and is the test that caught §4.10
+    # labelling Percona's own branch as mongodb's. The branch CONDITION is
+    # both the citation and the anchor now, so the label and the thing it
+    # labels are the same string and cannot disagree.
+    ("orchestrator/ann_pass.py", "render_config"):
+        ('raise ValueError(f"unknown engine',
+         'if engine in MARIADB_ENGINES + ("alisql",)',
+         'elif engine == "pgvector":',
+         'elif engine == "valkey":',
+         'elif engine == "percona":',
+         'elif engine == "mongodb":',
+         'for build_mode in ann.get("pgvector_build_modes", ["post"]):',
+         'for build_mode in ann.get("valkey_build_modes", ["post"]):',
+         '"efConstruction": ef_constructions'),
+
+    # -- §4.4's registry golden values ----------------------------------
+    ("tests/test_engine_registry.py", "GOLDEN_ORDER"):
+        '"mariadb", "alisql", "pgvector", "mariadb123"',
+
+    # -- §4.7's scripts -------------------------------------------------
+    ("docker/percona/Dockerfile", "PERCONA_TAG"):
+        "ARG PERCONA_TAG=unknown",
+    ("scripts/build-images.sh", "build_engine"):
+        ("has no known build-arg",
+         'percona)  bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;'),
+    ("scripts/lib.sh", "assert_not_vendor_repo"):
+        'die "refusing to write inside read-only vendor repo: $canon"',
+    ("scripts/prepare-sources.sh", "prepare_percona"):
+        "git archive",
+
+    # -- §4.9's entrypoint defect, in all three files -------------------
+    ("docker/alisql/entrypoint-alisql.sh", "start_server"):
+        'local u; u="$(user_args)"',
+    ("docker/mariadb/entrypoint-mariadb.sh", "start_server"):
+        'local u; u="$(user_args)"',
+    ("docker/percona/entrypoint-percona.sh", "start_server"):
+        'local u; u="$(user_args)"',
+    ("docker/alisql/entrypoint-alisql.sh", "user_args"):
+        '[[ "$(id -u)" -eq 0 ]] && printf',
+
+    # -- §3's supplied row count, and the sibling document it quotes ----
+    ("harness/datasets.py", "tag_threshold_for"):
+        "1,183,514 training rows",
+    ("docs/07-planning-a-run.md", "8. A note on the numbers in this document"):
+        "60,000-row smoke",
+}
+
+#: Repository code files docs/09 NAMES but makes no claim about the contents
+#: of, with what covers each instead. Every entry is asserted to be cited by
+#: the document and asserted NOT to have a `CITED_SYMBOLS` row, so an entry
+#: that acquires a row is a contradiction rather than a silent overlap.
+#:
+#: THE HONEST LIMIT OF THE FORWARD CHECK, named here because it is the same
+#: limit the old `BARE_CONTINUATIONS` note recorded about itself: this list
+#: says the document makes no CONTENTS claim about these files, and nothing can
+#: check that. A sentence asserting something about `orchestrator/cli.py` could
+#: be added tomorrow and no test would ask for a row. What the list does buy is
+#: that a NEW path cited by the document fails here until somebody decides
+#: which side of the line it is on, which is the decision that used to be made
+#: by not noticing.
+PATHS_WITHOUT_A_CLAIM = {
+    "config/engines/percona.yml":
+        "§4.3 proposes this file rather than quoting it, and the claims §3 "
+        "and §4.6 do make about it -- the memory flag, the capability keys -- "
+        "are checked against the file itself by TestGraphMemoryFallback and "
+        "TestBuildArgConventions.",
+    "config/engines/mariadb.yml":
+        "named in §4.3 as the config task C1 had already stripped: history, "
+        "not a claim about its current contents.",
+    "config/engines/alisql.yml":
+        "named in §4.3 as the file the proposed config is modelled on.",
+    "config/profiles/smoke.yml":
+        "§4.6 names its 20,000-row subset; that figure is §3's input table, "
+        "where it is marked supplied.",
+    "config/profiles/main.yml":
+        "named in §4.6 as a profile the memory policy has to be right for.",
+    "config/profiles/percona.yml":
+        "named in §4.6 as the profile to write; it is the follow-on task's.",
+    "config/profiles/full.yml":
+        "named in §2.5 as one of the profiles carrying "
+        "`pgvector_build_modes`; the key, not the file, is the claim.",
+    "config/resources/normalized.yml":
+        "§3 names its `graph_cache_fraction` to say what feeding Percona's "
+        "ceiling from it would do -- an argument about a policy, not a "
+        "quotation.",
+    "orchestrator/cli.py":
+        "§4.10 records that it had to change and says nothing about what is "
+        "in it.",
+    "orchestrator/estimate.py":
+        "§4.6 names `_INGEST_ROWS_PER_S` and `_effective_rate` as the reason "
+        "Percona has no entry. docs/10 §5 item 2 is where that file's "
+        "contents are quoted, and tests/test_e3_rollout_doc.py checks them.",
+    "overlay/ann-benchmarks/ann_benchmarks/algorithms/percona/module.py":
+        "the module this task wrote. Its emitted DDL, query, metric map, "
+        "ef_search statement, range checks and plan marker are CALLED and "
+        "asserted on by the test classes above, which is stronger than any "
+        "quotation would be.",
+    "overlay/ann-benchmarks/ann_benchmarks/algorithms/percona/config.yml":
+        "checked by TestOverlayConfig, which loads it.",
+    "overlay/ann-benchmarks/ann_benchmarks/algorithms/pgvector/module.py":
+        "§4.10 names it and valkey's as the two modules that DO read "
+        "`build_mode`, which is a claim about the string being present; "
+        "TestOverlayConfig's siblings in tests/test_config.py own those files.",
+    "overlay/ann-benchmarks/ann_benchmarks/algorithms/valkey/module.py":
+        "as above.",
+    "docker/percona/init.sql":
+        "\u00a74.7 marks it done and \u00a77 item 2 says what it does NOT contain. "
+        "The "
+        "claims are negative -- no `mysql_native_password` line, no "
+        "measurement parameter -- and a negative claim about a file is not a "
+        "quotation from a symbol in it. "
+        "TestInitSqlDoesNotAskForARemovedPlugin and TestGraphMemoryFallback "
+        "check them against the file, each paired with a positive assertion "
+        "that the needle is findable.",
+    "docker/alisql/init.sql":
+        "named in \u00a77 item 2 as the file whose line must NOT be copied; "
+        "the "
+        "same negative claim, checked the same way.",
+    "tests/test_c1_engine_sql.py":
+        "§4.3 names it as the test a new `sql:` block would fail. That is a "
+        "claim about a task in flight, not about a file's contents.",
+    "tests/test_e1_percona_design.py":
+        "this file. §6 describes it, and a row would be this guard checking "
+        "itself -- the shape docs/11 §0 records as worse than no guard at all.",
+    "tests/test_e10_failures_explain_themselves.py":
+        "§4.10 names it as the guard on its branch list: a pointer to a test, "
+        "not a quotation from one.",
+    "tests/test_e15_methodology_roadmap_doc.py":
+        "§6 names it as the source of the classifier this file imports.",
+    "webui/static/fields.js":
+        "§4.5 deliberately cites no location in it and says why: the two maps "
+        "grow by a line per engine, so a citation into them rots on every "
+        "addition while pointing at nothing a reader could not find by name "
+        "in a twelve-line file.",
+}
+
+#: Paths docs/09 names that do not exist and must not, with the reason. Same
+#: mechanism as `ABSENT_PATHS` in tests/test_e15_methodology_roadmap_doc.py,
+#: and for the same reason: asserted absent rather than skipped, so a file that
+#: lands makes the sentence saying it has not fail here instead of misleading a
+#: reader.
+ABSENT_PATHS = {
+    "run-manifest.json":
+        "written into a run directory by orchestrator/manifest.py and never "
+        "committed; `results/` is gitignored. §3 names it as where a declared "
+        "knob lands. If this resolves, somebody checked a run artefact in.",
+}
+
+#: Code-font spans that look like a symbol, are not one, and could not be
+#: reworded out without making a sentence worse. Each is asserted NOT to
+#: resolve: an entry that resolves is a real symbol being excused, which is how
+#: an escape hatch becomes a hole.
+#:
+#: Empty, and that is a finding rather than a default. Every vendor identifier
+#: docs/09 names moved into italics with the conversion, which §0 states as a
+#: rule -- so none needed an entry. The vendor-looking names that stayed in
+#: code font stayed because this repository really does name them:
+#: `innodb_hnsw_max_memory` is a flag in `config/engines/percona.yml` and
+#: `ER_CAPACITY_EXCEEDED` is in the overlay module.
+VOCABULARY = {}
+
+def cited_repo_files(text):
+    """Every file in this repository the document names, resolved.
+
+    Over ALL code-font spans and not only the ones `_PATH_RE` accepts, because
+    `docker/percona/Dockerfile` has no extension and `_PATH_RE` is anchored on
+    one. A span that resolves to no file, or to more than one, is not in this
+    set -- `TestEverySymbolAndPathResolves` is where those are reported.
+    """
+    spans = {s.strip() for s in re.findall(r"`([^`\n]+)`",
+                                           _FENCE_RE.sub("", text))}
+    out = {}
+    for span in spans:
+        if "/" not in span and "." not in span:
+            continue
+        # A directory in code font is prose about a tree -- `harness/`,
+        # `docker/percona/` -- and `os.path.isfile` is what keeps one out of
+        # this set. The classifier reaches the same conclusion by a different
+        # route, recognising a path only by its extension, and
+        # tests/test_e15_methodology_roadmap_doc.py records the consequence:
+        # a deep directory citation into a generated tree is as uncheckable
+        # as a file citation into one, and is not flagged.
+        if span.endswith("/"):
+            continue
+        resolved, _hits = resolve_path(span)
+        if resolved:
+            out.setdefault(resolved, set()).add(span)
+    return out
+
+
+class TestTheCitationParsersFoundSomething:
+    """Floors and sentinels, because every assertion below is over a set.
+
+    A parser that matched nothing would make this whole section pass against
+    an empty document. One guard in this series shipped green because it
+    scanned zero files, and the old `_CITE_RE`'s own note records a live error
+    hidden by a pattern that could not see a whole class of citation. Both
+    failure modes are the same shape and both are checked here.
     """
 
-    def test_the_parser_finds_the_citations(self):
-        """Non-vacuity: a regex that matched nothing would make every
-        assertion below pass over an empty set."""
-        found = _doc_citations()
-        assert len(found) >= 50, len(found)
-        assert "postgres.py:689" in found
-        assert any(_is_foreign(c) for c in found)
+    def test_the_index_read_real_files(self):
+        idx = symbol_index()
+        assert len(idx["files"]) >= 150, len(idx["files"])
+        assert len(idx["mentioned"]) >= 5000, len(idx["mentioned"])
+        assert len(idx["declared"]) >= 1500, len(idx["declared"])
 
-    def test_every_local_citation_has_a_row(self):
-        """Completeness, and the half that makes this closed rather than a
-        snapshot: a citation added to the document later, or a number edited
-        in the document without editing the table, lands here.
+    def test_the_index_holds_things_it_must_hold(self):
+        """Sentinels by KIND, one per route into the index, so a route that
+        quietly produced nothing is visible: a function, a constant, a class
+        and a YAML key."""
+        idx = symbol_index()
+        for name in ("to_binary_f32", "OPS_MEASUREMENT_VERSION",
+                     "PerconaDriver", "bulk_vector_index_build"):
+            assert name in idx["declared"], name
+            assert name in idx["mentioned"], name
+
+    def test_the_index_reads_none_of_the_three_document_guards(self):
+        """Measured, not supposed, and all three rather than this one.
+
+        tests/test_e15_methodology_roadmap_doc.py records what happens when a
+        guard's index includes the guard: its planted bad symbol RESOLVED,
+        because the plant's names were spelled in the file doing the
+        resolving, so the arm passed the live document and failed the plant.
+        These three files describe each other -- this one imports that one's
+        classifier -- so any one of them left in the index can certify a
+        citation that exists nowhere but in a test.
         """
-        found = {c for c in _doc_citations() if not _is_foreign(c)}
-        covered = set(CITED_IN_REPO) | set(NO_ANCHOR)
-        missing = sorted(found - covered)
-        assert not missing, (
-            "docs/09 cites these repo locations and nothing checks them: "
-            + ", ".join(missing))
+        read = set(symbol_index()["files"])
+        for guard in GUARD_FILES:
+            assert guard not in read, guard
 
-    def test_no_row_cites_something_the_document_dropped(self):
-        """The other direction: a row for a citation the document no longer
-        makes is dead weight that reads as coverage."""
-        found = _doc_citations()
-        stale = sorted(c for c in set(CITED_IN_REPO) | set(NO_ANCHOR)
-                       if c not in found)
-        assert not stale, (
-            "these rows cite locations docs/09 no longer mentions: "
-            + ", ".join(stale))
+    def test_the_index_does_not_read_the_documentation(self):
+        """`docs/` is excluded on purpose: a symbol that exists only in prose
+        must not resolve, or this becomes a check that docs/09 agrees with
+        docs/05. Both mechanisms are asserted, because
+        tests/test_e15_methodology_roadmap_doc.py records that naming one of
+        two is dead against a change to the other."""
+        read = symbol_index()["files"]
+        assert not any(f.startswith("docs/") for f in read)
+        assert ".md" not in INDEXED_SUFFIXES
 
-    @pytest.mark.parametrize("citation", sorted(CITED_IN_REPO))
-    def test_the_citation_points_at_what_the_document_says(self, citation):
-        path, anchor = CITED_IN_REPO[citation]
-        spec = citation.rsplit(":", 1)[1]
-        lo, _, hi = spec.partition("-")
-        lo, hi = int(lo), int(hi or lo)
-        full = os.path.join(VB_ROOT, path)
-        assert os.path.isfile(full), f"{path} does not exist"
-        lines = open(full).read().splitlines()
-        assert hi <= len(lines), (
-            f"docs/09 cites {citation} but {path} has {len(lines)} lines")
-        body = "\n".join(lines[lo - 1:hi])
-        assert anchor in body, (
-            f"docs/09 cites {citation} for {anchor!r}; "
-            f"{path}:{lo}-{hi} now reads: {body.strip()[:120]!r}")
+    def test_the_index_reads_nothing_from_a_generated_tree(self):
+        """A symbol that resolves only against a fetched vendor tree resolves
+        for the author and for nobody else. `sources/` is where the Percona
+        tree would sit if it were ever fetched here."""
+        read = symbol_index()["files"]
+        for prefix in GENERATED_DIRS:
+            assert not any(f.startswith(prefix + "/") for f in read), prefix
+        ignore = open(os.path.join(VB_ROOT, ".gitignore")).read()
+        rules = {line.strip() for line in ignore.splitlines()}
+        for prefix in GENERATED_DIRS:
+            assert "/" + prefix + "/" in rules, prefix
+        # Non-vacuity: a `rules` set that came back empty would certify any
+        # prefix at all.
+        assert "/nonexistent-zq/" not in rules
 
-    @pytest.mark.parametrize("key", sorted(BARE_CONTINUATIONS))
-    def test_the_bare_continuations_still_point_where_they_did(self, key):
-        """The `:N` citations the auto-parser cannot see.
+    def test_the_classifier_found_paths_and_symbols(self):
+        """Floors with about a tenth of slack, and no exact counts.
 
-        A value may be one anchor or a tuple of them. The tuple form exists
-        because the single-string form invited `'a' and 'b'`, which Python
-        evaluates to `'b'` -- so a row that read as two assertions made one,
-        and the half that was silently dropped was the half about the entry
-        the follow-on task had to add.
+        An exact figure in a comment is checked by nobody and is false two
+        commits later -- which is the #41/#43 mechanism, and writing it inside
+        the file that exists to stop it is how this series learned the lesson
+        twice.
         """
-        path, lo, hi = key
-        anchors = BARE_CONTINUATIONS[key]
+        paths, symbols, prose = doc_spans(_doc_09())
+        assert len(paths) >= 45, sorted(paths)
+        assert len(symbols) >= 180, len(symbols)
+        assert prose, "nothing classified as prose; the classifier widened"
+
+    def test_the_classifier_strips_fenced_quotations(self):
+        """The fence rule, measured. docs/09 quotes a Percona source comment
+        that spells `online` in backticks; counting that as a citation would
+        ask this repository to declare a symbol because the vendor's source
+        does."""
+        paths, symbols, _prose = doc_spans(
+            "prose `harness/main.py`\n\n```\n/* `no_such_symbol_zq` and "
+            "`no/such/file_zq.py` */\n```\n")
+        assert paths == {"harness/main.py"}
+        assert "no_such_symbol_zq" not in symbols
+
+    def test_a_commit_sha_is_not_classified_as_a_symbol(self):
+        """§0's commit table quotes twelve-character SHAs in code font. They
+        are hex, they start with a letter often enough, and `_SYMBOL_RE`
+        cannot tell them from an identifier."""
+        _paths, symbols, prose = doc_spans("`a86503214416` and `effective_ef`")
+        assert symbols == {"effective_ef"}
+        assert "a86503214416" in prose
+
+    def test_the_document_names_the_repository_files_it_claims_about(self):
+        """The resolver, exercised on the document rather than on a fixture."""
+        found = cited_repo_files(_doc_09())
+        assert len(found) >= 35, sorted(found)
+        for sentinel in ("harness/drivers/mysql_family.py",
+                         "docker/percona/Dockerfile",
+                         "overlay/ann-benchmarks/ann_benchmarks/vb_mysql.py"):
+            assert sentinel in found, sentinel
+
+    def test_the_suffix_resolver_refuses_what_it_should(self):
+        """Unique-suffix resolution is the one convenience in this scheme, so
+        its edges are pinned: an abbreviation resolves, a missing file does
+        not, and an ambiguous one does not either -- `module.py` names six
+        files under `overlay/` and must come back unresolved rather than
+        picking one."""
+        assert resolve_path("build.py")[0] == "harness/workloads/build.py"
+        assert resolve_path("harness/main.py")[0] == "harness/main.py"
+        assert resolve_path("no_such_file_zq.py")[0] is None
+        resolved, hits = resolve_path("module.py")
+        assert resolved is None and len(hits) > 1, hits
+
+
+class TestTheDocumentMakesNoLineCitation:
+    """The policy, executable. This is the keystone: a policy stated only in
+    prose is a policy until the first hurry."""
+
+    def test_docs_09_contains_no_line_citation(self):
+        found = line_citations(_doc_09())
+        assert not found, (
+            "docs/09 cites a line number, which its own §0 forbids -- line "
+            "citations in this repository rotted twice in two days (#41, "
+            "#43) and the vendor ones rotted unseen. Name the symbol "
+            "instead: " + ", ".join(sorted(set(found))))
+
+    def test_the_detector_sees_every_form_it_has_to_see(self):
+        """Non-vacuity, and not optional: the assertion above is NEGATIVE, and
+        a negative assertion passes just as happily against a broken pattern
+        as against a clean document.
+
+        The fixture is a frozen literal rather than a slice of a document,
+        because a fixture read out of the tree can come back empty and an
+        empty fixture turns this test into the vacuity it exists to catch.
+        """
+        found = line_citations(CITATION_FIXTURE)
+        assert len(found) == CITATION_FIXTURE_EXPECTED, found
+        joined = " ".join(found)
+        # One assertion per form, so a pattern that lost ONE of the four
+        # widenings fails with the form it lost named.
+        assert "foo.py:12" in joined
+        assert "bar/baz.result:13-15" in joined           # MTR result
+        assert "sql_yacc.yy:9" in joined                  # grammar
+        assert "docker/percona/Dockerfile:725" in joined  # no extension
+        assert ":701-707" in joined                       # bare continuation
+        assert "r/x.result:3-5, :13-17, :23-26" in joined  # several ranges
+
+    def test_the_detector_does_not_fire_on_correct_prose(self):
+        """The other failure mode. A guard that fires on correct writing
+        teaches the next author to delete it, which is how the vacuity shapes
+        reached this repository in the first place."""
+        assert not line_citations(
+            "`max(ef, k)` `p50/p95/max` `harness/main.py` `x86-64-v3` "
+            "`effective_ef()` `{'cause': 'vector'}` `M = 6.0`")
+
+    def test_the_policy_is_stated_in_the_document(self):
+        """The reason, not only the rule. A rule whose reason lives in a test
+        file gets relaxed by the next author to find it inconvenient."""
+        doc = _doc_09()
+        assert "#41" in doc and "#43" in doc, (
+            "docs/09 §0 must justify the policy with the two pull requests "
+            "that repaired the rot; without them it is a style preference")
+        assert re.search(r"invalidated by \*\*any\*\* edit", doc)
+        assert re.search(
+            r"only by a\s*\*\*rename\*\*|\*\*only by a\s*rename\*\*", doc)
+
+    def test_the_illustration_of_the_banned_form_is_not_in_code_font(self):
+        """The one place docs/09 has to SHOW a line citation is the paragraph
+        banning it, and the ban is a pattern over code-font spans. Italics
+        rather than an allowlist, exactly as docs/11 §0 chose: a carve-out in
+        the ban is a carve-out, and the document would then be the one file
+        permitted to make the citation it forbids."""
+        assert re.search(r"\*some/file\.py:123\*", _doc_09()), (
+            "docs/09 §0 must illustrate the banned form in italics; in code "
+            "font it trips its own ban")
+
+    def test_the_document_records_what_the_old_form_could_not_check(self):
+        """§6's load-bearing admission. The conversion's real argument is not
+        that line numbers rot -- it is that the vendor two thirds of them were
+        checked by nothing and would have rotted in silence at the re-pin. A
+        later tidy-up that drops this leaves the conversion looking like
+        housekeeping."""
+        doc = _doc_09()
+        assert re.search(r"checked by nothing", doc, re.I)
+        assert "164" in doc, (
+            "§0 and §6 state the size of the unchecked half; without a figure "
+            "the sentence is an impression")
+        assert re.search(r"cannot go red", doc, re.I)
+
+    def test_no_fenced_block_prints_a_gutter_number(self):
+        """The form the ratchet cannot see, with its own check.
+
+        A gutter number is not inside a code-font span, so `_LINE_CITATION_RE`
+        -- which is deliberately a pattern over code-font spans -- cannot see
+        one. That left the whole class to the author, and the author got it
+        wrong: this change cleared eight of the ten blocks that carried
+        gutters, said in a commit message that all of them were clean, and
+        left four vendor line numbers in §1 eleven lines below a sentence
+        asserting they were gone. The hand scan missed them because it
+        anchored the fence at column 0 and that block is indented inside a
+        bullet.
+
+        So the class is closed here instead of trusted. Reproducing a source
+        with its gutters is citing it by line with extra steps: the numbers go
+        stale at a re-pin exactly as a citation does, and nothing about a
+        fenced block makes them easier to check.
+        """
+        fenced = False
+        offenders = []
+        blocks = 0
+        for n, line in enumerate(_doc_09().splitlines(), 1):
+            if line.lstrip().startswith("```"):
+                if not fenced:
+                    blocks += 1
+                fenced = not fenced
+                continue
+            if not fenced or not _GUTTER_LINE_RE.match(line):
+                continue
+            if line.strip() in RECORDED_VALUE_LINES:
+                continue
+            offenders.append(f"{n}: {line.strip()[:70]}")
+        # Non-vacuity: the scan has to have read the document's fences at all.
+        assert blocks >= 18, blocks
+        assert not offenders, (
+            "docs/09 reproduces source gutter numbers inside a fenced block. "
+            "They are line citations the ratchet cannot see and they rot at a "
+            "re-pin like any other. Delete the prefixes and keep the lines:\n  "
+            + "\n  ".join(offenders))
+
+    def test_the_recorded_value_lines_are_named_and_still_there(self):
+        """The escape hatch, in both directions.
+
+        An entry that no longer appears is dead allowance -- the next line to
+        open with that number would be waved through -- and an entry with no
+        reason is an exemption nobody can audit. Both are checked, which is
+        the shape `VOCABULARY` and `ABSENT_PATHS` use for the same reason.
+        """
+        doc = _doc_09()
+        for line, reason in RECORDED_VALUE_LINES.items():
+            assert reason.strip(), line
+            assert any(raw.strip() == line for raw in doc.splitlines()), (
+                f"RECORDED_VALUE_LINES carries {line!r} and docs/09 no longer "
+                f"has that line; delete the entry rather than leaving an "
+                f"allowance behind")
+
+    def test_the_gutter_scan_sees_an_indented_fence(self):
+        """The defect that let the four through, as a test rather than a note.
+
+        The scan that missed them anchored the fence at column 0. This asserts
+        the opposite behaviour on a fence indented inside a bullet, which is
+        exactly where docs/09 §1's excerpt lives.
+        """
+        indented = "- a bullet:\n  ```\n  127  --echo # knob\n  ```\n"
+        fenced = False
+        seen = []
+        for line in indented.splitlines():
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced and _GUTTER_LINE_RE.match(line):
+                seen.append(line.strip())
+        assert seen == ["127  --echo # knob"], seen
+
+class TestEverySymbolAndPathResolves:
+    """The existence layer: coarser than the table below, over everything."""
+
+    def test_every_cited_path_resolves_to_one_file(self):
+        paths, _symbols, _prose = doc_spans(_doc_09())
+        bad = []
+        for path in sorted(paths):
+            if path in ABSENT_PATHS:
+                continue
+            resolved, hits = resolve_path(path)
+            if resolved is None:
+                why = f"ambiguous, {hits}" if hits else "no such file"
+                bad.append(f"{path}: {why}")
+        assert not bad, (
+            "docs/09 cites these paths and this tree cannot resolve them. A "
+            "vendor path belongs in prose, not in code font -- §0 says so:\n  "
+            + "\n  ".join(bad))
+
+    def test_every_cited_symbol_appears_in_the_tree(self):
+        _paths, symbols, _prose = doc_spans(_doc_09())
+        bad = sorted(s for s in symbols
+                     if s not in VOCABULARY
+                     and s not in symbol_index()["mentioned"])
+        assert not bad, (
+            "docs/09 names these symbols in code font and nothing in this "
+            "tree has them -- renamed, never existed, or a vendor name that "
+            "belongs in italics per §0: " + ", ".join(bad))
+
+    def test_enough_symbols_resolve_to_a_declaration(self):
+        """The half that keeps the half above from being satisfied by prose. A
+        word match accepts a symbol surviving only inside a comment, and a
+        design document is unusually likely to name one."""
+        _paths, symbols, _prose = doc_spans(_doc_09())
+        declared = sorted(s for s in symbols
+                          if s in symbol_index()["declared"])
+        assert len(declared) >= 120, (
+            f"only {len(declared)} of {len(symbols)} cited symbols resolve to "
+            f"a declaration")
+
+    def test_the_vocabulary_escapes_are_named_and_do_not_resolve(self):
+        """An escape hatch that excuses a real symbol is a hole, not a hatch."""
+        idx = symbol_index()
+        for span, reason in VOCABULARY.items():
+            assert reason.strip(), span
+            assert span not in idx["mentioned"], (
+                f"{span} is in VOCABULARY and resolves in the tree; it is a "
+                f"citation, not vocabulary -- delete the entry")
+        assert VOCABULARY == {}, (
+            "VOCABULARY has entries; name them in the round report rather "
+            "than letting them sit unchecked: " + ", ".join(VOCABULARY))
+
+    @pytest.mark.parametrize("path", sorted(ABSENT_PATHS))
+    def test_a_deliberately_absent_path_is_still_absent(self, path):
+        assert ABSENT_PATHS[path].strip(), path
+        assert not os.path.exists(os.path.join(VB_ROOT, path)), (
+            f"{path} now exists; docs/09 describes it as generated rather "
+            f"than committed: {ABSENT_PATHS[path]}")
+
+    @pytest.mark.parametrize("path", sorted(ABSENT_PATHS))
+    def test_a_deliberately_absent_path_is_actually_cited(self, path):
+        """A row for a path the document stopped naming reads as coverage and
+        is not."""
+        paths, _symbols, _prose = doc_spans(_doc_09())
+        assert path in paths, (
+            f"ABSENT_PATHS carries {path} and docs/09 no longer names it")
+
+    def test_no_vendor_path_is_cited_in_code_font(self):
+        """§0's second rule, as a check rather than as a promise.
+
+        This is the ONE place the conversion is strictly stronger about the
+        vendor half, and it is why `FOREIGN_MARKERS` is gone rather than
+        ported: a deny-list of vendor filenames existed to say "these are not
+        checked". Under the policy a vendor path in code font is a violation,
+        not a category, so the path arm above fails on it and there is nothing
+        left for a deny-list to do. The spellings below are the ones the old
+        deny-list carried, asserted against the live document.
+        """
+        paths, _symbols, _prose = doc_spans(_doc_09())
+        retired_deny_list = (
+            "percona-hnsw", "ha_innodb", "handler0alter", "field.cc",
+            "field.h", "item_create", "sys_vars.cc", "vec0vec",
+            "vector_constants", "CMakeLists", "keyring_kmip", "mysql-test",
+            "sql_yacc", "ddl0loader",
+        )
+        offenders = sorted(p for p in paths
+                           if any(m in p for m in retired_deny_list))
+        assert not offenders, (
+            "these vendor paths are in code font in docs/09; §0 requires them "
+            "in prose, because a backticked path there means a path in this "
+            "repository: " + ", ".join(offenders))
+        # Non-vacuity: the document still TALKS about those files, in italics,
+        # so a conversion that deleted the vendor evidence would fail here.
+        doc = _doc_09()
+        for vendor in ("*ha_innodb.cc*", "*handler0alter.cc*", "*field.cc*",
+                       "*percona-hnsw.md*", "*vec0vec.h*",
+                       "*vector_constants.h*", "*sys_vars.cc*",
+                       "*sql_yacc.yy*", "*item_create.cc*",
+                       "*CMakeLists.txt*", "*ddl0loader.cc*"):
+            assert vendor in doc, (
+                f"docs/09 no longer names {vendor} at all; the conversion was "
+                f"supposed to move vendor material into prose, not delete it")
+
+
+class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
+    """The symbol table: the old line check, re-keyed.
+
+    Not "the symbol exists" -- the symbol is located and the string the
+    document points at is asserted to be inside it. That is the same strength
+    as re-opening a line range, which is the point: the conversion must not
+    buy survivability by giving up the contents check.
+    """
+
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_symbol_holds_what_the_document_says(self, key):
+        path, symbol = key
+        anchors = CITED_SYMBOLS[key]
         if isinstance(anchors, str):
             anchors = (anchors,)
-        lines = open(os.path.join(VB_ROOT, path)).read().splitlines()
-        assert hi <= len(lines), f"{path} has {len(lines)} lines"
-        body = "\n".join(lines[lo - 1:hi])
+        full = os.path.join(VB_ROOT, path)
+        assert os.path.isfile(full), f"{path} does not exist"
+        body = symbol_body(path, symbol)
+        assert body is not None, (
+            f"docs/09 cites {symbol!r} in {path} and that file no longer "
+            f"declares it -- renamed, or moved to another file. This is the "
+            f"failure a symbol citation exists to catch.")
         for anchor in anchors:
             assert anchor in body, (
-                f"{path}:{lo}-{hi} no longer contains {anchor!r}; it reads "
-                f"{body.strip()[:120]!r}")
+                f"docs/09 cites {path}'s {symbol!r} for {anchor!r}; that "
+                f"symbol now reads: {body.strip()[:160]!r}")
 
-    def test_foreign_citations_are_skipped_explicitly(self):
-        """The Percona sources are pinned by SHA and are not in this checkout.
+    def test_every_repo_code_file_the_document_names_is_accounted_for(self):
+        """Completeness, forward: the half that makes this closed rather than
+        a snapshot. A file the document starts naming lands here until
+        somebody decides whether it carries a claim."""
+        named = cited_repo_files(_doc_09())
+        with_rows = {path for path, _symbol in CITED_SYMBOLS}
+        unaccounted = sorted(
+            path for path in named
+            if path not in with_rows
+            and path not in PATHS_WITHOUT_A_CLAIM
+            and not path.startswith("docs/")
+            # THE CARVE-OUT, AND WHY IT IS NARROWER THAN IT LOOKS. The old
+            # forward check was keyed on CITATIONS and had no exemption: every
+            # `path:line` into this repo needed a row. This one is keyed on
+            # FILES, so it needs one, because both documents name sibling
+            # documents and the root files constantly -- `CLAUDE.md` for an
+            # invariant, `README.md` for a profile table, `docs/05` and
+            # `docs/07` for a figure's provenance -- and requiring a contents
+            # row for each would force a row for every passing reference.
+            #
+            # What the exemption does NOT do is leave those uncovered. The rows
+            # that matter are still here: this guard carries three `.md`
+            # rows and docs/09's carries one, each opening a named section of
+            # a sibling document and matching the sentence quoted from it.
+            # The exemption
+            # only removes the REQUIREMENT, and it removes it for the class of
+            # reference that is a pointer rather than a claim.
+            #
+            # The honest cost: a contents claim about a `docs/` path with no row
+            # is not detected, exactly as a contents claim about a file in
+            # PATHS_WITHOUT_A_CLAIM is not. Both are the same limit and it
+            # is the one this check cannot close.
+            and path != "CLAUDE.md")
+        assert not unaccounted, (
+            "docs/09 names these repository files and nothing says whether it "
+            "claims anything about them. Give each a CITED_SYMBOLS row or a "
+            "PATHS_WITHOUT_A_CLAIM reason: " + ", ".join(unaccounted))
 
-        Asserted rather than left implicit, because "we check every citation"
-        would otherwise be false in a way nobody could see: a local file
-        sharing a name with a Percona source would be the wrong file, and
-        checking against it would be worse than not checking.
+    def test_no_row_cites_a_file_the_document_dropped(self):
+        """Completeness, reverse: a row for something the document no longer
+        names is dead weight that reads as coverage. It is how
+        `ddl0loader.cc:273` was caught sitting unclassified the first time the
+        old guard ran."""
+        named = cited_repo_files(_doc_09())
+        stale = sorted({path for path, _symbol in CITED_SYMBOLS}
+                       - set(named))
+        assert not stale, (
+            "these rows cite files docs/09 no longer names: "
+            + ", ".join(stale))
+
+    def test_every_identifier_row_names_a_symbol_the_document_cites(self):
+        """The other half of reverse completeness, at symbol granularity.
+
+        Scoped to identifier-shaped symbols, and the scope is the honest part:
+        a `.md` row's symbol is a section HEADING, which the citing document
+        points at as "§3" rather than by quoting the heading, so requiring the
+        heading text in docs/09 would fire on correct prose. Those rows are
+        covered by the path half above and by their own anchor check.
         """
-        foreign = {c for c in _doc_citations() if _is_foreign(c)}
-        assert len(foreign) >= 25, sorted(foreign)
-        for citation in foreign:
-            assert citation not in CITED_IN_REPO, citation
-        doc = open(PERCONA_DOC).read()
-        assert "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304" in doc
+        _paths, symbols, _prose = doc_spans(_doc_09())
+        bad = []
+        for path, symbol in sorted(CITED_SYMBOLS):
+            if path.endswith(".md") or symbol == "<module>":
+                continue
+            leaf = symbol.rsplit(".", 1)[-1]
+            if leaf not in symbols:
+                bad.append(f"{path}:{symbol}")
+        assert not bad, (
+            "these rows name symbols docs/09 does not cite in code font, so "
+            "the row is checking something the document stopped saying: "
+            + ", ".join(bad))
 
-    def test_no_anchor_set_is_documented_rather_than_silent(self):
-        """If a citation ever has no sensible anchor, saying so is the finding.
+    @pytest.mark.parametrize("path", sorted(PATHS_WITHOUT_A_CLAIM))
+    def test_a_path_without_a_claim_is_named_and_really_has_no_row(self, path):
+        assert PATHS_WITHOUT_A_CLAIM[path].strip(), path
+        with_rows = {p for p, _symbol in CITED_SYMBOLS}
+        assert path not in with_rows, (
+            f"{path} is listed as carrying no contents claim and also has a "
+            f"CITED_SYMBOLS row; one of the two is wrong")
+        assert path in cited_repo_files(_doc_09()), (
+            f"{path} is listed as named-without-a-claim and docs/09 no longer "
+            f"names it; delete the entry")
 
-        Currently empty, which is itself worth asserting: it means no citation
-        was waved through.
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_anchors_are_not_empty(self, key):
+        """`CITED_SYMBOLS`'s values ARE the assertions, and nothing checked
+        that one existed.
+
+        `assert "" in body` is true of every body, so a row whose anchor was
+        an empty string -- or a tuple containing one, which is the likelier
+        typo -- would pass against anything the symbol happened to contain and
+        read as coverage. Every other escape hatch in this file is asserted
+        non-empty (`VOCABULARY`, `ABSENT_PATHS`, `PATHS_WITHOUT_A_CLAIM` all
+        check their reasons); this was the table it was missing from, and it
+        is the table that matters most. Inherited from the line-citation
+        version, which had it too.
+
+        A floor on LENGTH as well as on emptiness, because a one- or
+        two-character anchor is the same defect slightly diluted: `"("` is in
+        most function bodies.
         """
-        for citation, reason in NO_ANCHOR.items():
-            assert reason.strip(), citation
-        assert NO_ANCHOR == {}, (
-            "NO_ANCHOR has entries; name them in the round report rather than "
-            "letting them sit unchecked: " + ", ".join(NO_ANCHOR))
+        anchors = CITED_SYMBOLS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
+        assert anchors, f"{key} has no anchor at all"
+        for anchor in anchors:
+            assert isinstance(anchor, str), (key, anchor)
+            assert len(anchor.strip()) >= 6, (
+                f"{key}'s anchor {anchor!r} is too short to be evidence; an "
+                f"anchor this small is satisfied by most bodies")
+
+    def test_the_symbol_locator_can_fail(self):
+        """The locator is what every row above rests on, so it is proved able
+        to come back empty. A locator that returned the whole file would make
+        every anchor pass, which is the vacuity this file has already been
+        bitten by: a guard that sliced a function's TEXT was satisfied by the
+        method's docstring and stayed green with the real tuple emptied.
+        """
+        assert symbol_body("harness/main.py", "no_such_symbol_zq") is None
+        body = symbol_body("harness/main.py", "_detect_march")
+        assert body is not None and "/opt/percona/.march" in body
+        # And it is a SLICE, not the file: `main`'s body must not leak in.
+        assert "args.march or _detect_march()" not in body
+
+    def test_the_locator_handles_every_file_kind_the_table_uses(self):
+        """One assertion per resolver, because each is a different parser and
+        a silent None from any of them would be reported as a renamed symbol
+        rather than as a broken locator."""
+        checks = (
+            ("harness/drivers/base.py", "EngineDriver.repair_path",
+             'repair_path: str = "none"'),                       # python
+            ("harness/workloads/build.py", "<module>",
+             "ingest_wall_s"),                                   # docstring
+            ("scripts/lib.sh", "assert_not_vendor_repo",
+             "refusing to write inside read-only vendor repo"),   # shell
+            ("config/engines/percona.yml", "capabilities",
+             "bulk_vector_index_build"),                          # yaml
+            ("docker/percona/Dockerfile", "PERCONA_TAG",
+             "ARG PERCONA_TAG"),                                  # generic
+            ("docs/07-planning-a-run.md",
+             "8. A note on the numbers in this document",
+             "60,000-row smoke"),                                 # markdown
+        )
+        for path, symbol, needle in checks:
+            body = symbol_body(path, symbol)
+            assert body is not None, (path, symbol)
+            assert needle in body, (path, symbol, body[:120])
+
+    def test_the_comment_block_above_a_declaration_is_part_of_its_body(self):
+        """Measured, because several rows depend on it: this repository puts
+        the rationale for a constant in the `#:` block above it, and that is
+        what the documents quote."""
+        body = symbol_body("harness/drivers/base.py",
+                           "EngineDriver.repair_path")
+        assert "Valkey and Percona Search inherit" in body
+        assert 'repair_path: str = "none"' in body
 
 
 class TestTheMemoryArithmeticReproduces:
@@ -2009,7 +3067,7 @@ class TestTheMemoryArithmeticReproduces:
         doc = open(PERCONA_DOC).read()
         section = doc.split("## 3. `innodb_hnsw_max_memory`", 1)[1].split(
             "## 4.", 1)[0]
-        assert "Docs/percona-hnsw.md:1567-1568" in section
+        assert "*percona-hnsw.md*" in section
         assert "lower bound" in section
         # The projection, with both ends, and marked as a projection.
         assert "35.5 to 59.2 MB" in section

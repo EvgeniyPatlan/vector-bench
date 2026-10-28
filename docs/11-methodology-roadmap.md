@@ -25,14 +25,19 @@ constant, a config key, a path — and never a line number.** `wait_index_synced
 `OPS_MEASUREMENT_VERSION`, `harness/workloads/churn_readers.py`: never
 *some/file.py:123*.
 
-This is a deliberate departure from `docs/09-adding-percona-server.md` and
-`docs/10-rollout.md`, which cite `path:line` and are each guarded by a test
-that re-opens the cited line and compares it against what the document claims
-is there — `tests/test_e1_percona_design.py` for the first,
-`tests/test_e3_rollout_doc.py` for the second. **That mechanism works, it is
-not being retired, and it is how the rot below was found at all.** But the rot
-kept happening: line citations in those two documents went stale twice in two
-days and put `master` red both times, repaired in pull requests #41 and #43.
+When this page was written this was a deliberate departure from
+`docs/09-adding-percona-server.md` and `docs/10-rollout.md`, which cited
+`path:line` and were each guarded by a test that re-opened the cited line and
+compared it against what the document claimed was there —
+`tests/test_e1_percona_design.py` for the first,
+`tests/test_e3_rollout_doc.py` for the second. **That mechanism worked, and it
+is how the rot below was found at all.** **Both documents have since been
+converted**, so this is no longer a departure from anything: symbol citations
+are the repository's only citation form for a document, and those two guards
+now check symbols with the same mechanism this page's does. But the rot
+kept happening while they did not: line citations in those two documents
+went stale twice in two days and put `master` red both times, repaired in
+pull requests #41 and #43.
 Neither failure was somebody editing a document carelessly. In both cases a
 later round of edits *inside the same change* moved lines below the point where
 the citations had been derived, and the guard — correctly — fired on the
@@ -74,8 +79,11 @@ as a path or a symbol, and asserts that every path exists (or is one of the
 small set declared deliberately absent) and that every symbol still appears
 somewhere in the tree. It also asserts that **this document contains no
 `path:line` citation at all**, which is the policy itself as an executable
-statement, and it checks the same pattern against `docs/10-rollout.md` to prove
-the detector can see one. Its parsers each carry a floor on what they found, so
+statement, and it runs the same pattern against a frozen fixture made of
+them to prove the detector can see one. That fixture used to be
+`docs/10-rollout.md`, which was full of them; it is not any more, and a
+non-vacuity fixture must not be something another document can stop being.
+Its parsers each carry a floor on what they found, so
 a parser that silently matched nothing fails instead of passing over an empty
 set — one guard in this series shipped green because it scanned zero files, and
 that failure mode is worth more care than the thing being guarded.

@@ -14,8 +14,8 @@ about an engine is marked supplied in its own §0 and is settled by the source i
 cites, not here.
 
 They also cannot re-derive the archived corpus count in §1. That tree lives
-outside this repository -- `tests/test_config.py:1499` resolves it relative to
-the checkout's parent, which in a git worktree is not where it sits -- so the
+outside this repository -- `tests/test_config.py` resolves it relative to the
+checkout's parent, which in a git worktree is not where it sits -- so the
 figure is pinned to the comment it is quoted from and
 `TestTheArchivedCorpusFigureIsPinnedToItsSource` checks the quote rather than the
 files. That is the one figure in docs/10 that is not recomputed.
@@ -23,9 +23,13 @@ files. That is the one figure in docs/10 that is not recomputed.
 What they do establish is that every other figure in the document is the one this
 repository holds at test time:
 
-* every `file:line` citation opens its file and matches an anchor, in both
-  directions -- a number edited in the document without its row here fails
-  completeness, and a row whose anchor has moved fails its own check;
+* docs/10 makes no line citation at all, over a pattern proved against a
+  frozen fixture carrying one of each form it has to catch;
+* every symbol docs/10 cites into this repository resolves in the tree, and
+  every claim it makes about a named symbol's CONTENTS is checked by opening
+  that symbol, in both directions -- a file the document starts naming with
+  nothing checking it fails completeness, and a row whose anchor has moved
+  fails its own check;
 * the measurement version, the equivalence set, the client-bound threshold and
   its arithmetic, both profiles' `churn_readers`, every driver's `repair_path`
   and churn-hook overrides, and the estimator's fallback and its ratio are all
@@ -408,212 +412,234 @@ def _claim(name: str):
 
 
 # ---------------------------------------------------------------------------
-# §1, §2, §4, §5: every file:line citation docs/10 makes into this repo
+# §1, §2, §4, §5: every claim docs/10 makes about this repository's contents
 # ---------------------------------------------------------------------------
 #
-# WHY THIS TABLE EXISTS. docs/09 landed the same guard in #15 after finding that
-# nineteen of its twenty-one citations were unchecked and that merging two PRs in
-# one day had invalidated two of them. docs/10 cites across `harness/`,
-# `orchestrator/`, `report/`, `config/profiles/` and two other documents, and
-# every one of those is under active change in this series -- T5b alone will move
-# `report/generate.py`.
+# WHAT THIS REPLACED. docs/10 cited `path`-colon-line and this file re-opened
+# every cited line. The table was real coverage -- 51 distinct citations, all
+# of them into this repository, every one checked -- and it kept firing on
+# correct documents, because a line number dies to ANY edit above it. Line
+# citations here and in docs/09 went stale twice in two days and put `master`
+# red both times (#41, #43), and in both cases a later round of edits inside
+# the SAME change moved lines below the point where the citations had been
+# derived. This file's own preamble to that table recorded the mechanism
+# happening to the table's own comment: two numbers in prose ABOUT the table
+# said `48-49` and `43-51` until an import line was added above
+# `_INGEST_ROWS_PER_S` and moved both by one.
 #
-# The key is the citation AS THE DOCUMENT SPELLS IT, so the completeness test
-# below can match the two sets against each other. Both directions are covered:
-# a number that changes in the document without changing here fails completeness,
-# and a number that no longer matches the file fails its anchor.
-#
-# Anchors are the thing the document points AT, not a string that happens to be
-# nearby. An anchor must not span a line break, because the body is joined with
-# newlines -- `estimate.py:49-50` is cited as `44-52` for exactly that reason,
-# the sentence it is quoted for breaking across the two lines.
-#
-# Those two numbers are a THIRD reference to the same lines, and nothing checks
-# them: the guard below compares `CITED_IN_REPO`'s keys against docs/10 and
-# never reads this comment. They said `48-49` and `43-51` until an import line
-# was added above `_INGEST_ROWS_PER_S` and moved both by one -- the same
-# one-line death that put master red in #41 and #43, surviving here because it
-# was in prose about the table rather than in the table.
-CITED_IN_REPO = {
-    # doc spelling                            -> (real path, anchor)
-    # Was `:261`, anchored on `OPS_MEASUREMENT_VERSION = 5`. G3 made the
-    # concurrency clients OS processes, which changes what every multi-client
-    # figure measures, and the constant moved to 6 in the same commit --
-    # atomically, because a version 5 record from the process pool would mean
-    # something different from a version 5 record in the 2026-10-14 run.
-    # There was no edit that bumped the constant and left this row green, and
-    # that is the row doing its job rather than a row in the way.
-    "harness/metrics/records.py:506":
-        ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION = 8"),
-    "harness/metrics/records.py:513":
-        ("harness/metrics/records.py", "IMPLICIT_OPS_MEASUREMENT_VERSION = 1"),
-    "harness/metrics/records.py:240-246":
-        ("harness/metrics/records.py",
-         "239 ops record files and 2,134 ops records"),
-    "harness/metrics/records.py:229-234":
-        ("harness/metrics/records.py", "CHANGES WHAT IT MEASURES"),
-    "harness/metrics/records.py:253-260":
-        ("harness/metrics/records.py", "is a diagnostic, not a guard"),
-    "harness/metrics/records.py:544":
-        ("harness/metrics/records.py",
-         "OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({"),
-    "harness/metrics/stats.py:49":
-        ("harness/metrics/stats.py", "def bootstrap_ci"),
-    "report/measurement_versions.py:148":
-        ("report/measurement_versions.py",
-         "if not unmatched and len(groups) < 2:"),
-    "report/measurement_versions.py:187-191":
-        ("report/measurement_versions.py",
-         "These versions denote the same measurement"),
-    "report/generate.py:1213-1214":
-        ("report/generate.py",
-         'print(f"[report] {exc}", file=sys.stderr)'),
-    "report/render.py:357-358":
-        ("report/render.py", '"Ops measurement version"'),
-    "orchestrator/manifest.py:291":
-        ("orchestrator/manifest.py",
-         '"ops_measurement_version": OPS_MEASUREMENT_VERSION'),
-    # These two changed FILE, not just line. G3 split `clients.py`, which
-    # stood at 791 lines of the repo's 800-line ceiling, and
-    # `CLIENT_BOUND_UTIL` went to `pool_window.py` beside
-    # `PoolWindow.client_bound` -- its only reader, which is the placement
-    # `metrics/latency.py` argues for `SERVED_CONCURRENCY_FLOOR`. `clients.py`
-    # re-exports it, and `tests/test_g3_process_clients.py` pins that the
-    # re-export does NOT share the name, so a mutation aimed at
-    # `clients.CLIENT_BOUND_UTIL` is recorded as dead rather than reported as
-    # a guard that held.
-    "harness/workloads/pool_window.py:58":
-        ("harness/workloads/pool_window.py", "CLIENT_BOUND_UTIL = 0.80"),
-    "harness/workloads/pool_window.py:184":
-        ("harness/workloads/pool_window.py",
-         "return self.client_cpu_util > CLIENT_BOUND_UTIL"),
-    "harness/workloads/clients.py:34-45":
-        ("harness/workloads/clients.py", "flattens at 2.06 cores"),
-    "harness/workloads/clients.py:47-55":
-        ("harness/workloads/clients.py", "synthetic SHAPE may not reproduce"),
-    "harness/workloads/calibrate.py:102-109":
-        ("harness/workloads/calibrate.py",
-         'STATUS_FLOOR_ABOVE_TARGET = "floor_above_target"'),
-    "harness/workloads/churn.py:279-280":
-        ("harness/workloads/churn.py",
-         "readers are off, which is the one"),
-    "harness/workloads/churn_readers.py:156-157":
-        ("harness/workloads/churn_readers.py", "if readers <= 0:"),
-    "harness/drivers/base.py:258":
-        ("harness/drivers/base.py", 'repair_path: str = "none"'),
-    "harness/drivers/base.py:254-257":
-        ("harness/drivers/base.py", "Valkey and Percona Search inherit"),
-    "harness/drivers/base.py:435-448":
-        ("harness/drivers/base.py", "def wait_index_synced"),
-    "harness/drivers/postgres.py:172":
-        ("harness/drivers/postgres.py", 'repair_path = "vacuum_analyze"'),
-    # The second repair path, added when Percona Server landed. Cited beside
-    # pgvector's so §4 item 4's "two engines" is a pointer and not a count a
-    # reader has to take on trust.
-    "harness/drivers/mysql_family.py:770":
-        ("harness/drivers/mysql_family.py", 'repair_path = "index-replace"'),
-    "harness/datasets.py:456-468":
-        ("harness/datasets.py", "1.04%-3.47% of the rows (median 1.43%)"),
-    # Was `:139`, anchored on `_INGEST_ROWS_PER_S.get(engine, 300)` -- the
-    # defect §5 item 2 was written about. That line is gone: the fallback now
-    # returns None, and the section cites the repaired call instead. The
-    # anchor deliberately has NO default argument in it, so the old spelling
-    # coming back fails this row rather than satisfying it.
-    #
-    # Then `:162`, and now `:280`: the call did not move, the table above it
-    # grew. Percona's three measured entries, the provenance comment that
-    # dates them to the pin they were taken at and the measurement-version
-    # verdict beside it pushed everything below the tables down by 118 lines.
-    # This row is the reason that shift could not silently invalidate the
-    # document -- it fired on the shift twice while this change was being
-    # written, once per revision of that comment.
-    "orchestrator/estimate.py:280":
-        ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S.get(engine)"),
-    "orchestrator/estimate.py:44":
-        ("orchestrator/estimate.py",
-         "Measured ingest rates, rows/s, on a Xeon Gold 6230."),
-    "orchestrator/estimate.py:44-52":
-        ("orchestrator/estimate.py", "by 3x is worse than none"),
-    "orchestrator/estimate.py:51":
-        ("orchestrator/estimate.py", '"mariadb": 150'),
-    "config/profiles/main.yml:200":
-        ("config/profiles/main.yml", "churn_readers: 4"),
-    "config/profiles/dev.yml:77":
-        ("config/profiles/dev.yml", "churn_readers: 0"),
-    "docs/05-methodology.md:490-497":
-        ("docs/05-methodology.md",
-         "The selectivity recorded is the one that was delivered"),
-    "docs/05-methodology.md:1039-1040":
-        ("docs/05-methodology.md", "config.ops_measurement_version"),
-    "config/profiles/main.yml:110":
-        ("config/profiles/main.yml", "m_values: [8, 16, 32]"),
-    "config/profiles/main.yml:84-87":
-        ("config/profiles/main.yml",
-         "+17.04 h of ingest for"),
-    "report/crosscheck.py:335":
-        ("report/crosscheck.py", "def consistency_checks"),
-    "report/crosscheck.py:113":
-        ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE = 0.01"),
-    "report/render.py:3397":
-        ("report/render.py", "## 10. Consistency checks"),
-    # These two cited the stale sentences until they were corrected; they now
-    # cite the corrected ones. The anchor is the same phrase in both files,
-    # which is deliberate: it is the polarity-bearing clause, so a row that
-    # still matched after a wrong rewrite would be a row worth nothing.
-    "report/render.py:3022":
-        ("report/render.py",
-         "the grids meet, so an empty section there is the fault case"),
-    "docs/05-methodology.md:971":
-        ("docs/05-methodology.md",
-         "the grids meet, so an empty section there is the fault case"),
-    "docs/09-adding-percona-server.md:700":
-        ("docs/09-adding-percona-server.md",
-         "is not a cache, and that is a fairness problem"),
-    "docs/09-adding-percona-server.md:754-793":
-        ("docs/09-adding-percona-server.md",
-         "These figures are projections, not measurements."),
-    "docs/09-adding-percona-server.md:859-862":
-        ("docs/09-adding-percona-server.md",
-         "the gate cannot surface this at all"),
+# So docs/10 cites symbols, and the machinery is imported from
+# `tests/test_e1_percona_design.py` rather than copied. ONE implementation for
+# the two documents under one policy, deliberately: the previous arrangement
+# had two `_CITE_RE`s that were supposed to be identical, and
+# `tests/test_e15_methodology_roadmap_doc.py` carries a third with a comment
+# explaining that it is kept "deliberately identical" to one of them. Three
+# patterns that must agree are three chances to disagree. The classifier
+# itself lives in the docs/11 guard and is imported by both of the others, so
+# all three documents resolve a path and a symbol the same way.
+from .test_e1_percona_design import (  # noqa: E402
+    CITATION_FIXTURE, CITATION_FIXTURE_EXPECTED, GENERATED_DIRS, GUARD_FILES,
+    cited_repo_files, doc_spans, line_citations, resolve_path, symbol_body,
+    symbol_index)
+
+
+def _symbol_text(path: str, symbol: str) -> str:
+    """A symbol's declaration, or a failure naming the file and the symbol.
+
+    The successor to `_cited_body(path, "lo-hi")`, which several tests below
+    used to quote a comment out of a module by line. Those calls were line
+    arithmetic inside the guard that enforces the no-line-number policy, and
+    they rotted the same way: an insertion anywhere above the range moved it.
+    They are symbols now, and the coarsening is real and stated -- a function
+    body is wider than a five-line window, so where the narrower region
+    mattered the test below asserts the ORDER of two anchors inside the body
+    rather than their distance.
+    """
+    body = symbol_body(path, symbol)
+    assert body is not None, (
+        f"{path} no longer declares {symbol!r}; docs/10 cites it, and a "
+        f"renamed symbol is the one failure a symbol citation exists to catch")
+    return body
+
+
+#: `(path, symbol)` -> the string, or strings, docs/10 says is inside that
+#: symbol. Every anchor from the old `CITED_IN_REPO` is here, re-keyed from a
+#: line spelling to the symbol that line sat in. The value may be a tuple,
+#: which is how several citations into one function collapse into one row.
+#:
+#: STILL THE CONTENTS, not the existence: the symbol is located and the string
+#: is asserted to be inside it. The conversion changed what survives an edit,
+#: not what is being compared.
+#:
+#: Markdown rows name a SECTION HEADING. A heading is the only thing in a
+#: sibling document that this one can point at and that survives an edit, and
+#: §6 of this document records why the §-numbers are stable by convention
+#: (docs/05's §2.0 is numbered 2.0 precisely so that nothing below it was
+#: renumbered).
+CITED_SYMBOLS = {
+    # -- §1's measurement versions ---------------------------------------
+    # Four citations into one comment block, which is the version charter
+    # above the constant. The old table had them as four line ranges; they are
+    # one row because they are one piece of writing, and `symbol_body`
+    # includes the `#:` block above a declaration for exactly this case.
+    ("harness/metrics/records.py", "OPS_MEASUREMENT_VERSION"):
+        ("OPS_MEASUREMENT_VERSION = 8",
+         "239 ops record files and 2,134 ops records",
+         "CHANGES WHAT IT MEASURES",
+         "is a diagnostic, not a guard"),
+    ("harness/metrics/records.py", "IMPLICIT_OPS_MEASUREMENT_VERSION"):
+        "IMPLICIT_OPS_MEASUREMENT_VERSION = 1",
+    ("harness/metrics/records.py", "OPS_MEASUREMENT_EQUIVALENT_VERSIONS"):
+        "OPS_MEASUREMENT_EQUIVALENT_VERSIONS = frozenset({",
+    ("harness/metrics/stats.py", "bootstrap_ci"):
+        "def bootstrap_ci",
+    ("report/measurement_versions.py", "refuse_mixed_measurement_versions"):
+        "if not unmatched and len(groups) < 2:",
+    ("report/measurement_versions.py", "_SAME_MEASUREMENT_FACT"):
+        "These versions denote the same measurement",
+    ("report/generate.py", "main"):
+        'print(f"[report] {exc}", file=sys.stderr)',
+
+    # -- §2 and §4 item 1: the reader pool and the client-bound flag -----
+    ("config/profiles/dev.yml", "churn_readers"):
+        "churn_readers: 0",
+    ("harness/workloads/churn_readers.py", "_reader_count"):
+        "if readers <= 0:",
+    ("harness/workloads/churn.py", "run"):
+        ("readers are off, which is the one", "if reader_count:"),
+    ("harness/workloads/pool_window.py", "CLIENT_BOUND_UTIL"):
+        "CLIENT_BOUND_UTIL = 0.80",
+    ("harness/workloads/pool_window.py", "PoolWindow.client_bound"):
+        "return self.client_cpu_util > CLIENT_BOUND_UTIL",
+    ("harness/workloads/clients.py", "<module>"):
+        ("flattens at 2.06 cores", "synthetic SHAPE may not reproduce"),
+
+    # -- §2 step C and §4 item 2: the calibration statuses ---------------
+    ("harness/workloads/calibrate.py", "STATUS_FLOOR_ABOVE_TARGET"):
+        'STATUS_FLOOR_ABOVE_TARGET = "floor_above_target"',
+    ("harness/workloads/calibrate.py", "STATUS_TARGET_UNREACHED"):
+        'STATUS_TARGET_UNREACHED = "target_unreached"',
+
+    # -- §4 item 3: the selectivity overshoot ----------------------------
+    ("harness/datasets.py", "FilterThreshold"):
+        "1.04%-3.47% of the rows (median 1.43%)",
+
+    # -- §4 item 4: the repair paths and the index-sync hook -------------
+    ("harness/drivers/base.py", "EngineDriver.repair_path"):
+        ('repair_path: str = "none"', "Valkey and Percona Search inherit"),
+    ("harness/drivers/base.py", "EngineDriver.wait_index_synced"):
+        "def wait_index_synced",
+    ("harness/drivers/postgres.py", "PostgresDriver.repair_path"):
+        'repair_path = "vacuum_analyze"',
+    ("harness/drivers/mysql_family.py", "PerconaDriver.repair_path"):
+        'repair_path = "index-replace"',
+    ("config/engines/percona.yml", "capabilities"):
+        "bulk_vector_index_build",
+
+    # -- §4 item 5 and §2 step E: the consistency section ----------------
+    ("report/crosscheck.py", "consistency_checks"):
+        "def consistency_checks",
+    ("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE"):
+        "CROSSCHECK_MIN_TOLERANCE = 0.01",
+    ("report/render.py", "render_markdown"):
+        "## 10. Consistency checks",
+    ("report/render.py", "_consistency_section"):
+        "the grids meet, so an empty section there is the fault case",
+
+    # -- §4 item 7: the manifest -----------------------------------------
+    ("orchestrator/manifest.py", "Manifest.__init__"):
+        '"ops_measurement_version": OPS_MEASUREMENT_VERSION',
+    ("report/render.py", "_environment_rows"):
+        '"Ops measurement version"',
+
+    # -- §5 items 2 and 3: the estimator and the cost table --------------
+    ("orchestrator/estimate.py", "_INGEST_ROWS_PER_S"):
+        ("Measured ingest rates, rows/s, on a Xeon Gold 6230.",
+         "by 3x is worse than none",
+         '"mariadb": 150'),
+    ("orchestrator/estimate.py", "_effective_rate"):
+        "_INGEST_ROWS_PER_S.get(engine)",
+    # `m_values` appears twice in this file, under `ann` and under `ops`, and
+    # the YAML locator concatenates both blocks -- so the anchors are chosen
+    # to belong to the `ann` one and to nothing else.
+    ("config/profiles/main.yml", "m_values"):
+        ("m_values: [8, 16, 32]", "+17.04 h of ingest for"),
+    ("config/profiles/main.yml", "churn_readers"):
+        "churn_readers: 4",
+
+    # -- the two sibling documents this page quotes ----------------------
+    ("docs/05-methodology.md", "The two filter modes"):
+        "The selectivity recorded is the one that was delivered",
+    ("docs/05-methodology.md", "2.7 Cross-checking the two measurement paths"):
+        "the grids meet, so an empty section there is the fault case",
+    ("docs/05-methodology.md", "5. Reproducibility"):
+        "config.ops_measurement_version",
+    ("docs/09-adding-percona-server.md",
+     "is not a cache, and that is a fairness problem"):
+        "This is the finding most likely to change what gets run",
+    ("docs/09-adding-percona-server.md",
+     "What the default costs, with the inputs named"):
+        "These figures are projections, not measurements.",
+    ("docs/09-adding-percona-server.md",
+     "The policy: `innodb_hnsw_max_memory = 0`"):
+        "the gate cannot surface this at all",
 }
 
-#: Local citations with no sensible anchor, and why. Empty, and that is a
-#: finding rather than a default: every citation docs/10 makes into this repo
-#: points at a named thing, so none needed a weak anchor invented for it.
-NO_ANCHOR: Dict[str, str] = {}
+#: Repository files docs/10 NAMES but makes no claim about the contents of,
+#: with what covers each instead. Asserted cited and asserted row-less, so an
+#: entry that acquires a row is a contradiction rather than a silent overlap.
+#:
+#: Same honest limit as the sibling table in tests/test_e1_percona_design.py:
+#: this says the document makes no CONTENTS claim about these files, and
+#: nothing can check that. What it buys is that a NEW file named by the
+#: document fails here until somebody decides which side of the line it is on.
+PATHS_WITHOUT_A_CLAIM = {
+    "config/profiles/smoke.yml":
+        "§2 step C's claim is that it does NOT pin `ops.churn_readers`, so it "
+        "inherits the default of 4. A negative claim about a file has no "
+        "symbol to open; TestTheProfileReaderCountsAreRead loads both "
+        "profiles and recomputes the inheritance.",
+    "tests/fake_driver.py":
+        "§0 and §4 item 1 name it to say what a figure measured against it is "
+        "a measurement OF -- this harness, not an engine. That is a claim "
+        "about provenance, not about its contents.",
+    "tests/test_stats.py":
+        "named in §1 as the test that landed beside `bootstrap_ci`.",
+    "tests/test_e2_percona_wiring.py":
+        "named in \u00a75 item 2, after #62 landed, as one of the two files "
+        "that "
+        "exercise the gap list with a probe engine nothing could ever have "
+        "measured. A claim about what a test covers, not about its contents "
+        "-- and this entry is here because the forward check demanded it on "
+        "the rebase onto #62 rather than because anyone remembered to look.",
+    "tests/test_estimate.py":
+        "named in §5 item 3 as what pins both cost bases; "
+        "TestTheDecisionD1IsDecidedAndItsCostIsRecomputed recomputes the "
+        "table from the estimator rather than quoting that file.",
+    "tests/verify-alisql-traps.sh":
+        "§2 step B names it as a script the operator runs against a live "
+        "server. Nothing in a test run can reach one.",
+    "tests/test_e3_rollout_doc.py":
+        "this file. §6 describes it, and a row would be this guard checking "
+        "itself -- the shape docs/11 §0 records as worse than no guard at all.",
+}
 
-#: The project specification is not in this repository and must not be resolved
-#: against a local file of the same name. Named rather than inferred from "does
-#: not exist locally": resolving by existence would misclassify a spec citation
-#: as local the moment somebody dropped a SPEC.md into the tree, and then check
-#: the document against the wrong file -- the one outcome worse than not
-#: checking. Everything the document quotes from it is marked supplied in §0 and
-#: reproduced verbatim, which is what makes it auditable without the file.
-FOREIGN_MARKERS = ("SPEC.md",)
+#: Paths docs/10 names BECAUSE THEY DO NOT EXIST, with the reason. Asserted
+#: absent rather than skipped -- the same mechanism, and the same single entry,
+#: as `ABSENT_PATHS` in tests/test_e15_methodology_roadmap_doc.py, which is
+#: where the reasoning is written out at length.
+ABSENT_PATHS = {
+    "harness/workloads/rate.py":
+        "T5c, the open-loop latency workload: optional in the spec and never "
+        "written. §1's PR 5 row says so, and docs/11 §6 is the design for it. "
+        "If this file appears, §1 is wrong and has to say what landed.",
+}
 
-_CITE_RE = re.compile(
-    r"`([A-Za-z0-9_./-]+\.(?:py|sh|js|yml|md|cc|h|txt)):(\d+)(?:-(\d+))?`")
-
-
-def _doc_citations():
-    """Every `path:N[-M]` citation in docs/10, as the document spells it."""
-    out = set()
-    for m in _CITE_RE.finditer(_doc()):
-        lo, hi = m.group(2), m.group(3)
-        out.add("%s:%s%s" % (m.group(1), lo, "-" + hi if hi else ""))
-    return out
-
-
-def _is_foreign(citation):
-    return any(marker in citation for marker in FOREIGN_MARKERS)
-
-
-def _cited_body(path: str, spec: str) -> str:
-    lo, _, hi = spec.partition("-")
-    lo, hi = int(lo), int(hi or lo)
-    lines = open(os.path.join(VB_ROOT, path)).read().splitlines()
-    assert hi <= len(lines), f"{path} has {len(lines)} lines, not {hi}"
-    return "\n".join(lines[lo - 1:hi])
+#: Code-font spans that look like a symbol and are not one. Empty, and that is
+#: a finding rather than a default: every identifier docs/10 puts in code font
+#: is a thing in this tree, and the one external source it quotes -- the
+#: project specification -- is named in italics as *SPEC.md*, which is what
+#: retired `FOREIGN_MARKERS`.
+VOCABULARY = {}
 
 
 _MERGE_SUBJECT_RE = re.compile(r"Merge pull request #(\d+) from \S+/(\S+)")
@@ -745,76 +771,315 @@ class TestTheClaimPatternsAreNeitherBrittleNorVacuous:
         assert not unused, unused
 
 
-class TestEveryCitationIntoThisRepoIsChecked:
-    """Turn a document that rots into one that reports its own rot."""
+class TestTheCitationParsersFoundSomething:
+    """Floors and sentinels for the imported machinery, run against docs/10.
 
-    def test_the_parser_finds_the_citations(self):
-        """Non-vacuity: a regex that matched nothing would make every
-        assertion below pass over an empty set."""
-        found = _doc_citations()
-        assert len(found) >= 30, len(found)
-        # Sentinels by FILE and not by line: keyed to `records.py:261` this
-        # fired when a reword widened that citation to a range and updated its
-        # row, which is a correct edit. The parser's job is to find citations,
-        # not to find one particular line.
-        for prefix in ("harness/metrics/records.py:",
-                       "report/measurement_versions.py:",
-                       "config/profiles/"):
-            assert any(c.startswith(prefix) for c in found), prefix
-        assert any(_is_foreign(c) for c in found)
+    The parsers are shared with tests/test_e1_percona_design.py and are
+    exercised there too. These are not duplicates of those: the floors here
+    are docs/10's, and a classifier that silently stopped seeing this
+    document's spans would pass that file's floors and fail these.
+    """
 
-    def test_every_local_citation_has_a_row(self):
-        """Completeness, and the half that makes this closed rather than a
-        snapshot: a citation added to the document later, or a number edited in
-        the document without editing the table, lands here."""
-        found = {c for c in _doc_citations() if not _is_foreign(c)}
-        covered = set(CITED_IN_REPO) | set(NO_ANCHOR)
-        missing = sorted(found - covered)
-        assert not missing, (
-            "docs/10 cites these repo locations and nothing checks them: "
-            + ", ".join(missing))
+    def test_the_classifier_found_paths_and_symbols(self):
+        paths, symbols, prose = doc_spans(_doc())
+        assert len(paths) >= 30, sorted(paths)
+        assert len(symbols) >= 55, len(symbols)
+        assert prose, "nothing classified as prose; the classifier widened"
 
-    def test_no_row_cites_something_the_document_dropped(self):
-        """The other direction: a row for a citation the document no longer
-        makes is dead weight that reads as coverage."""
-        found = _doc_citations()
-        stale = sorted(c for c in set(CITED_IN_REPO) | set(NO_ANCHOR)
-                       if c not in found)
-        assert not stale, (
-            "these rows cite locations docs/10 no longer mentions: "
-            + ", ".join(stale))
+    def test_the_document_names_the_repository_files_it_claims_about(self):
+        found = cited_repo_files(_doc())
+        assert len(found) >= 25, sorted(found)
+        for sentinel in ("harness/metrics/records.py",
+                         "report/crosscheck.py",
+                         "config/profiles/main.yml"):
+            assert sentinel in found, sentinel
 
-    @pytest.mark.parametrize("citation", sorted(CITED_IN_REPO))
-    def test_the_citation_points_at_what_the_document_says(self, citation):
-        path, anchor = CITED_IN_REPO[citation]
-        full = os.path.join(VB_ROOT, path)
-        assert os.path.isfile(full), f"{path} does not exist"
-        body = _cited_body(path, citation.rsplit(":", 1)[1])
-        assert anchor in body, (
-            f"docs/10 cites {citation} for {anchor!r}; "
-            f"{path} now reads there: {body.strip()[:140]!r}")
+    def test_the_index_reads_none_of_the_three_document_guards(self):
+        """The self-poisoning exclusion, asserted from this file as well as
+        from the one that builds the index. docs/10 names a guard class and a
+        fake driver, so the exclusion is load-bearing here too, and a test
+        that only lives beside the implementation is a test nobody runs when
+        the importer changes."""
+        read = set(symbol_index()["files"])
+        for guard in GUARD_FILES:
+            assert guard not in read, guard
 
-    def test_foreign_citations_are_skipped_explicitly(self):
-        """The spec is not in this checkout, and the document says so.
+    def test_the_index_reads_nothing_from_a_generated_tree(self):
+        read = symbol_index()["files"]
+        for prefix in GENERATED_DIRS:
+            assert not any(f.startswith(prefix + "/") for f in read), prefix
 
-        Asserted rather than left implicit, because "we check every citation"
-        would otherwise be false in a way nobody could see.
+
+class TestTheDocumentMakesNoLineCitation:
+    """The policy, executable."""
+
+    def test_docs_10_contains_no_line_citation(self):
+        found = line_citations(_doc())
+        assert not found, (
+            "docs/10 cites a line number, which its own §0 forbids -- line "
+            "citations in this repository rotted twice in two days (#41, "
+            "#43). Name the symbol instead: "
+            + ", ".join(sorted(set(found))))
+
+    def test_the_detector_sees_every_form_it_has_to_see(self):
+        """Non-vacuity, over the frozen fixture rather than over a document.
+
+        THIS IS WHERE THE OLD ARRANGEMENT BROKE. docs/11's guard proved its
+        own detector by running it against docs/10 and asserting at least
+        thirty matches -- "docs/10 is made of these". That was true and it was
+        a dependency between two documents' citation styles: converting this
+        page would have reddened the docs/11 guard for no defect at all. A
+        frozen literal cannot be converted out from under a test.
         """
-        foreign = {c for c in _doc_citations() if _is_foreign(c)}
-        assert len(foreign) >= 5, sorted(foreign)
-        for citation in foreign:
-            assert citation not in CITED_IN_REPO, citation
+        found = line_citations(CITATION_FIXTURE)
+        assert len(found) == CITATION_FIXTURE_EXPECTED, found
+
+    def test_the_detector_does_not_fire_on_correct_prose(self):
+        assert not line_citations(
+            "`max(0.01, 2 x the ops 95% CI half-width)` `p50/p95/max` "
+            "`report/crosscheck.py` `ops.churn_readers: 4`")
+
+    def test_the_policy_is_stated_in_the_document(self):
+        doc = _doc()
+        assert "#41" in doc and "#43" in doc, (
+            "docs/10 §0 must justify the policy with the two pull requests "
+            "that repaired the rot; without them it is a style preference")
+        assert re.search(r"invalidated by \*\*any\*\* edit", doc)
+        assert re.search(r"only by a rename", doc)
+
+    def test_the_illustration_of_the_banned_form_is_not_in_code_font(self):
+        assert re.search(r"\*some/file\.py:123\*", _doc()), (
+            "docs/10 §0 must illustrate the banned form in italics; in code "
+            "font it trips its own ban")
+
+    def test_the_specification_is_never_cited_in_code_font(self):
+        """What retired `FOREIGN_MARKERS`, and why there is nothing for one to
+        do any more.
+
+        The deny-list existed to say "SPEC.md is not in this checkout, so do
+        not resolve a citation into it against a local file of the same name".
+        Under the policy the specification is named in prose -- *SPEC.md* --
+        so a backticked one is a violation the path arm fails on, not a
+        category to be skipped. The old entry's reasoning survives as the
+        assertion below: if a SPEC.md ever lands in the tree, this still fails
+        rather than quietly resolving against it.
+        """
+        assert "`SPEC.md" not in _doc(), (
+            "docs/10 cites the specification in code font; §0 requires it in "
+            "prose, because a backticked path there means a path in this "
+            "repository")
         assert not os.path.exists(os.path.join(VB_ROOT, "SPEC.md")), (
-            "SPEC.md now exists in the repo; the spec citations in docs/10 "
-            "must move out of FOREIGN_MARKERS and get anchors")
+            "SPEC.md now exists in this repo; the spec references in docs/10 "
+            "can and should become checkable citations")
+        # Non-vacuity: the document still quotes the spec, in italics, and
+        # still marks every quotation supplied.
+        assert "*SPEC.md*" in _doc()
         assert "supplied" in _doc()
 
-    def test_no_anchor_set_is_documented_rather_than_silent(self):
-        for citation, reason in NO_ANCHOR.items():
-            assert reason.strip(), citation
-        assert NO_ANCHOR == {}, (
-            "NO_ANCHOR has entries; name them in the round report rather than "
-            "letting them sit unchecked: " + ", ".join(NO_ANCHOR))
+
+class TestEverySymbolAndPathResolves:
+    """The existence layer: coarser than the table below, over everything."""
+
+    def test_every_cited_path_resolves_to_one_file(self):
+        paths, _symbols, _prose = doc_spans(_doc())
+        bad = []
+        for path in sorted(paths):
+            if path in ABSENT_PATHS:
+                continue
+            resolved, hits = resolve_path(path)
+            if resolved is None:
+                bad.append(
+                    f"{path}: "
+                    + (f"ambiguous, {hits}" if hits else "no such file"))
+        assert not bad, (
+            "docs/10 cites these paths and this tree cannot resolve them:\n  "
+            + "\n  ".join(bad))
+
+    def test_every_cited_symbol_appears_in_the_tree(self):
+        _paths, symbols, _prose = doc_spans(_doc())
+        bad = sorted(s for s in symbols
+                     if s not in VOCABULARY
+                     and s not in symbol_index()["mentioned"])
+        assert not bad, (
+            "docs/10 names these symbols in code font and nothing in this "
+            "tree has them -- renamed, or never existed: " + ", ".join(bad))
+
+    def test_enough_symbols_resolve_to_a_declaration(self):
+        """The half that keeps the half above from being satisfied by prose."""
+        _paths, symbols, _prose = doc_spans(_doc())
+        declared = sorted(s for s in symbols
+                          if s in symbol_index()["declared"])
+        assert len(declared) >= 45, (
+            f"only {len(declared)} of {len(symbols)} cited symbols resolve to "
+            f"a declaration: {declared}")
+
+    def test_the_vocabulary_escapes_are_named_and_do_not_resolve(self):
+        idx = symbol_index()
+        for span, reason in VOCABULARY.items():
+            assert reason.strip(), span
+            assert span not in idx["mentioned"], (
+                f"{span} is in VOCABULARY and resolves in the tree; it is a "
+                f"citation, not vocabulary -- delete the entry")
+        assert VOCABULARY == {}, (
+            "VOCABULARY has entries; name them in the round report rather "
+            "than letting them sit unchecked: " + ", ".join(VOCABULARY))
+
+    @pytest.mark.parametrize("path", sorted(ABSENT_PATHS))
+    def test_a_deliberately_absent_path_is_still_absent(self, path):
+        assert ABSENT_PATHS[path].strip(), path
+        assert not os.path.exists(os.path.join(VB_ROOT, path)), (
+            f"{path} now exists; docs/10 describes it as absent and has to be "
+            f"updated: {ABSENT_PATHS[path]}")
+
+    @pytest.mark.parametrize("path", sorted(ABSENT_PATHS))
+    def test_a_deliberately_absent_path_is_actually_cited(self, path):
+        paths, _symbols, _prose = doc_spans(_doc())
+        assert path in paths, (
+            f"ABSENT_PATHS carries {path} and docs/10 no longer names it")
+
+
+class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
+    """The symbol table: the old line check, re-keyed.
+
+    Not "the symbol exists" -- the symbol is located and the string the
+    document points at is asserted to be inside it, which is the same
+    comparison the line check made.
+    """
+
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_symbol_holds_what_the_document_says(self, key):
+        path, symbol = key
+        anchors = CITED_SYMBOLS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
+        full = os.path.join(VB_ROOT, path)
+        assert os.path.isfile(full), f"{path} does not exist"
+        body = symbol_body(path, symbol)
+        assert body is not None, (
+            f"docs/10 cites {symbol!r} in {path} and that file no longer "
+            f"declares it -- renamed, or moved to another file. This is the "
+            f"failure a symbol citation exists to catch.")
+        for anchor in anchors:
+            assert anchor in body, (
+                f"docs/10 cites {path}'s {symbol!r} for {anchor!r}; that "
+                f"symbol now reads: {body.strip()[:160]!r}")
+
+    def test_every_repo_code_file_the_document_names_is_accounted_for(self):
+        """Completeness, forward."""
+        named = cited_repo_files(_doc())
+        with_rows = {path for path, _symbol in CITED_SYMBOLS}
+        unaccounted = sorted(
+            path for path in named
+            if path not in with_rows
+            and path not in PATHS_WITHOUT_A_CLAIM
+            and not path.startswith("docs/")
+            # THE CARVE-OUT, AND WHY IT IS NARROWER THAN IT LOOKS. The old
+            # forward check was keyed on CITATIONS and had no exemption: every
+            # `path:line` into this repo needed a row. This one is keyed on
+            # FILES, so it needs one, because both documents name sibling
+            # documents and the root files constantly -- `CLAUDE.md` for an
+            # invariant, `README.md` for a profile table, `docs/05` and
+            # `docs/07` for a figure's provenance -- and requiring a contents
+            # row for each would force a row for every passing reference.
+            #
+            # What the exemption does NOT do is leave those uncovered. The rows
+            # that matter are still here: this guard carries three `.md`
+            # rows and docs/09's carries one, each opening a named section of
+            # a sibling document and matching the sentence quoted from it.
+            # The exemption
+            # only removes the REQUIREMENT, and it removes it for the class of
+            # reference that is a pointer rather than a claim.
+            #
+            # The honest cost: a contents claim about a `docs/` path with no row
+            # is not detected, exactly as a contents claim about a file in
+            # PATHS_WITHOUT_A_CLAIM is not. Both are the same limit and it
+            # is the one this check cannot close.
+            and path != "CLAUDE.md"
+            and path != "README.md")
+        assert not unaccounted, (
+            "docs/10 names these repository files and nothing says whether it "
+            "claims anything about them. Give each a CITED_SYMBOLS row or a "
+            "PATHS_WITHOUT_A_CLAIM reason: " + ", ".join(unaccounted))
+
+    def test_no_row_cites_a_file_the_document_dropped(self):
+        """Completeness, reverse: a row for something the document no longer
+        names is dead weight that reads as coverage."""
+        named = cited_repo_files(_doc())
+        stale = sorted({path for path, _symbol in CITED_SYMBOLS}
+                       - set(named))
+        assert not stale, (
+            "these rows cite files docs/10 no longer names: "
+            + ", ".join(stale))
+
+    def test_every_identifier_row_names_a_symbol_the_document_cites(self):
+        """The other half of reverse completeness, at symbol granularity.
+
+        Scoped to identifier-shaped symbols. A `.md` row's symbol is a section
+        heading, which this document points at as "§2.7" rather than by
+        quoting the heading, and a YAML key may be reached through a dotted
+        path the document never spells; both are covered by the path half
+        above and by their own anchor check.
+        """
+        _paths, symbols, _prose = doc_spans(_doc())
+        bad = []
+        for path, symbol in sorted(CITED_SYMBOLS):
+            if path.endswith((".md", ".yml", ".yaml")) or symbol == "<module>":
+                continue
+            leaf = symbol.rsplit(".", 1)[-1]
+            if leaf not in symbols:
+                bad.append(f"{path}:{symbol}")
+        assert not bad, (
+            "these rows name symbols docs/10 does not cite in code font, so "
+            "the row is checking something the document stopped saying: "
+            + ", ".join(bad))
+
+    @pytest.mark.parametrize("path", sorted(PATHS_WITHOUT_A_CLAIM))
+    def test_a_path_without_a_claim_is_named_and_really_has_no_row(self, path):
+        assert PATHS_WITHOUT_A_CLAIM[path].strip(), path
+        with_rows = {p for p, _symbol in CITED_SYMBOLS}
+        assert path not in with_rows, (
+            f"{path} is listed as carrying no contents claim and also has a "
+            f"CITED_SYMBOLS row; one of the two is wrong")
+        assert path in cited_repo_files(_doc()), (
+            f"{path} is listed as named-without-a-claim and docs/10 no longer "
+            f"names it; delete the entry")
+
+    @pytest.mark.parametrize("key", sorted(CITED_SYMBOLS))
+    def test_the_anchors_are_not_empty(self, key):
+        """`CITED_SYMBOLS`'s values ARE the assertions, and nothing checked
+        that one existed.
+
+        `assert "" in body` is true of every body, so a row whose anchor was
+        an empty string -- or a tuple containing one, which is the likelier
+        typo -- would pass against anything the symbol happened to contain and
+        read as coverage. Every other escape hatch in this file is asserted
+        non-empty (`VOCABULARY`, `ABSENT_PATHS`, `PATHS_WITHOUT_A_CLAIM` all
+        check their reasons); this was the table it was missing from, and it
+        is the table that matters most. Inherited from the line-citation
+        version, which had it too.
+
+        A floor on LENGTH as well as on emptiness, because a one- or
+        two-character anchor is the same defect slightly diluted: `"("` is in
+        most function bodies.
+        """
+        anchors = CITED_SYMBOLS[key]
+        if isinstance(anchors, str):
+            anchors = (anchors,)
+        assert anchors, f"{key} has no anchor at all"
+        for anchor in anchors:
+            assert isinstance(anchor, str), (key, anchor)
+            assert len(anchor.strip()) >= 6, (
+                f"{key}'s anchor {anchor!r} is too short to be evidence; an "
+                f"anchor this small is satisfied by most bodies")
+
+    def test_the_symbol_locator_can_fail(self):
+        """Proved able to come back empty, from this file as well, because
+        every row above rests on it and a locator that returned the whole file
+        would make every anchor pass."""
+        assert symbol_body("report/crosscheck.py", "no_such_symbol_zq") is None
+        body = symbol_body("report/crosscheck.py", "CROSSCHECK_MIN_TOLERANCE")
+        assert body is not None and "CROSSCHECK_MIN_TOLERANCE = 0.01" in body
+        assert "def consistency_checks" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +1169,7 @@ class TestTheRefusalIsCalledAndNotDescribed:
     def test_the_refusal_is_a_non_zero_exit_and_not_a_caveat(self):
         """§1 says there is no report at all, which is stronger than "the
         chart is refused" and is the half an operator plans around."""
-        body = _cited_body("report/generate.py", "1208-1214")
+        body = _symbol_text("report/generate.py", "main")
         assert "MixedMeasurementVersions" in body
         assert "return 2" in body
         _claim("the refusal costs the whole report, not one chart")
@@ -925,7 +1190,8 @@ class TestTheArchivedCorpusFigureIsPinnedToItsSource:
     NUMBERS = ("239", "2,134")
 
     def test_the_document_and_the_comment_agree(self):
-        comment = _cited_body("harness/metrics/records.py", "240-246")
+        comment = _symbol_text("harness/metrics/records.py",
+                               "OPS_MEASUREMENT_VERSION")
         doc = _doc()
         for number in self.NUMBERS:
             assert number in comment, (
@@ -1193,8 +1459,8 @@ class TestItemFiveLeftTheTableForAReasonThatStillHolds:
         # The three things §4 item 5 tells the reader to look at. Named
         # individually because "the section exists" is not advice.
         assert "coverage" in section.lower(), section[:200]
-        assert "report/crosscheck.py:113" in section
-        assert "report/crosscheck.py:335" in section
+        assert "`CROSSCHECK_MIN_TOLERANCE`" in section
+        assert "`consistency_checks` in `report/crosscheck.py`" in section
 
     def test_the_document_records_why_the_row_left(self):
         """An audit trail, not a deletion. The next reader of §3 should be able
@@ -1364,8 +1630,9 @@ class TestTheStatementsTheDocumentFlaggedAreCorrected:
     def test_the_document_names_both_places(self):
         section = _doc().split("### 5. \"Consistency checks pass", 1)[1]
         section = section.split("\n### ", 1)[0]
-        assert "report/render.py:3022" in section
-        assert "docs/05-methodology.md:971" in section
+        assert "`_consistency_section`" in section
+        assert "`report/render.py`" in section
+        assert "`docs/05-methodology.md` §2.7" in section
 
 
 # ---------------------------------------------------------------------------
@@ -1401,7 +1668,7 @@ class TestTheClientBoundArithmeticIsRecomputed:
         -- so a changed threshold, a changed comment or a changed flag each
         fail here rather than leaving a plausible sentence in place."""
         from harness.workloads import clients
-        comment = _cited_body("harness/workloads/clients.py", "34-45")
+        comment = _symbol_text("harness/workloads/clients.py", "<module>")
         cores = re.search(r"flattens at ([\d.]+) cores", comment)
         cpus = re.search(r"of a (\w+)-CPU client container", comment)
         assert cores and cpus, comment
@@ -1431,7 +1698,7 @@ class TestTheClientBoundArithmeticIsRecomputed:
         plain = _plain(_doc())
         assert "tests/fake_driver.py" in plain
         assert "may not reproduce" in plain
-        comment = _cited_body("harness/workloads/clients.py", "47-55")
+        comment = _symbol_text("harness/workloads/clients.py", "<module>")
         assert "synthetic SHAPE may not reproduce" in comment
 
 
@@ -1585,13 +1852,25 @@ class TestTheChurnHooksAreReadFromTheDrivers:
         assert _reader_count(0, queries, factory, "e") == 0
         assert _reader_count(4, queries, factory, "e") == 4
         assert _reader_count(4, queries, None, "e") == 0
-        # The gate. `reader_baseline` stays None without it, and the record is
-        # written only when both windows exist -- which is the sentence
-        # churn.py:250-251 states and this document quotes.
-        gate = _cited_body("harness/workloads/churn.py", "281-285")
-        assert "if reader_count:" in gate, gate
-        guarded = _cited_body("harness/workloads/churn.py", "405")
-        assert "reader_baseline is not None" in guarded, guarded
+        # The gate. `reader_baseline` stays None without it, and the record
+        # is written only when both windows exist -- which is what the
+        # comment above `reader_baseline` in `churn.run` states and this
+        # document quotes.
+        #
+        # ONE BODY INSTEAD OF TWO LINE WINDOWS, and the coarsening is
+        # recovered as an ORDER claim. The two citations used to be five-line
+        # and one-line slices; `run` is one function and contains both, so a
+        # pair of `in` tests over it would be weaker than what they replaced.
+        # The gate has to come BEFORE the guarded write, which is the whole
+        # content of "no readers means no during-writes record", so that is
+        # what is asserted.
+        body = _symbol_text("harness/workloads/churn.py", "run")
+        assert "if reader_count:" in body, body[:200]
+        assert "reader_baseline is not None" in body, body[:200]
+        assert (body.index("if reader_count:")
+                < body.index("reader_baseline is not None")), (
+            "the reader-count gate no longer precedes the during-writes "
+            "record it guards")
         _claim("no readers means no during-writes record")
 
 
@@ -1684,7 +1963,7 @@ class TestTheMethodologyGapsAreDerived:
         alone. Parsed from both sides rather than written twice, because this
         repo's commonest defect is a number corrected in one of its two homes.
         """
-        body = _cited_body("harness/datasets.py", "456-468")
+        body = _symbol_text("harness/datasets.py", "FilterThreshold")
         source = re.search(
             r"nominal 1% delivered ([\d.]+)%-([\d.]+)% of the rows "
             r"\(median ([\d.]+)%\)", body)
@@ -1800,7 +2079,8 @@ class TestTheEstimatorFallbackIsRecomputed:
     def test_the_comment_still_sets_the_rule_the_fallback_breaks(self):
         """Without this sentence §5 item 2 is a preference, not a
         contradiction."""
-        body = _cited_body("orchestrator/estimate.py", "43-51")
+        body = _symbol_text("orchestrator/estimate.py",
+                            "_INGEST_ROWS_PER_S")
         assert "Measured ingest rates" in body
         assert "by 3x is worse than none" in body
         assert "3x" in _doc()
@@ -1901,7 +2181,7 @@ class TestTheDecisionD1IsDecidedAndItsCostIsRecomputed:
         disagree about one number is this repo's commonest defect -- and here
         the document is derived while the comment is written by hand."""
         from orchestrator.cli import KNOWN_ENGINES
-        comment = _cited_body("config/profiles/main.yml", "84-87")
+        comment = _symbol_text("config/profiles/main.yml", "m_values")
         said = re.findall(r"\+(\d+\.\d\d) h", comment)
         assert len(said) >= 2, comment
         now = _profile("main.yml")
@@ -1979,7 +2259,9 @@ class TestTheMemoryTableIsCitedAndNotRestated:
     def test_it_cites_the_section_and_states_the_conclusion(self):
         """The paired positive: not restating is only right if the document
         still tells the operator where to look and what it means."""
-        assert "docs/09-adding-percona-server.md:754-793" in _doc()
+        flat = re.sub(r"\s+", " ", _doc())
+        assert ("`docs/09-adding-percona-server.md` §3's *What the default "
+                "costs, with the inputs named*" in flat)
         _claim("a green smoke is not evidence about the memory policy")
 
 

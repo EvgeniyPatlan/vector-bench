@@ -1863,153 +1863,186 @@ class TestAPartialSweepIsNotACompleteOne:
 # The citations this change moved, and could not see moving
 # ---------------------------------------------------------------------------
 
-#: What each bare `:N` in docs/09 §4.10 is pointing at, read out of the
-#: section's own prose.
+#: What docs/09 §4.10 says about `render_config`, as the strings the section
+#: quotes rather than as positions in a file.
 #:
-#: WHY THIS IS HERE AT ALL. `tests/test_e1_percona_design.py` guards every
-#: citation in that document of the form `path:N` -- but §4.10 writes nine of
-#: them as a BARE `:N`, taking the file from its heading, and the guard's
-#: pattern needs a path. So the one section devoted to `ann_pass.py` was the
-#: one section whose pointers into it were unchecked, and all nine went stale
-#: the moment this change put an import block above `render_config`. They were
-#: found by hand, which is the thing this table exists to stop happening
-#: again. Numbers are not asserted here: the anchor is, and the test re-derives
-#: the number the way a reader would.
+#: WHY THIS IS HERE AT ALL, AND WHAT CHANGED. §4.10 used to write nine
+#: citations as a BARE `:N`, taking the file from its heading, and
+#: `tests/test_e1_percona_design.py`'s citation guard needed a path in the
+#: backticks -- so the one section devoted to `ann_pass.py` was the one
+#: section whose pointers into it were unchecked, and all nine went stale the
+#: moment a change put an import block above `render_config`. They were found
+#: by hand, which is what this table was written to stop happening again.
 #:
-#: Each anchor must occur ONCE in `ann_pass.py` -- that is what makes "the
-#: section cites it" a checkable claim. (How often the SECTION cites it is a
-#: different count and does not matter: `:150` is quoted three times.) The two
-#: `efConstruction` citations have no unique anchor and get their own test.
-SECTION_4_10_ANCHORS = (
-    "def render_config",
+#: The section cites symbols now. Three consequences, and the third is the
+#: reason this class is shorter than it was:
+#:
+#: * There are no numbers left to go stale, so the "re-derive it with grep -n"
+#:   failure message has nothing to ask for.
+#: * The parenthetical ENGINE LABELS are gone, because the citation is the
+#:   branch condition itself. §4.10 said "`:206` (mongodb)" against Percona's
+#:   own branch for two revisions, directly under a sentence saying Percona
+#:   had no branch; a label that is the thing it labels cannot disagree with
+#:   it. That whole failure mode is now unreachable rather than guarded.
+#: * What is LEFT to check is membership, order and placement: that each
+#:   quoted condition is a branch of `render_config`, that the section lists
+#:   them in the order the function tests them, and that the three
+#:   `efConstruction` lines sit one per branch. The permutation this class was
+#:   extended to catch -- swapping two engines -- is an order claim, so it is
+#:   still checked as one.
+#:
+#: The anchors live in `CITED_SYMBOLS` in `tests/test_e1_percona_design.py`,
+#: which asserts each of these strings is inside `render_config`. This class
+#: asserts the three things a per-symbol anchor cannot: order, uniqueness and
+#: which branch a repeated line belongs to.
+SECTION_4_10_BRANCHES = (
     'if engine in MARIADB_ENGINES + ("alisql",)',
     'elif engine == "pgvector":',
-    'ann.get("pgvector_build_modes"',
     'elif engine == "valkey":',
-    'ann.get("valkey_build_modes"',
     'elif engine == "percona":',
-    # Added when §4.10's list was corrected: it had labelled percona's branch
-    # as mongodb's, so mongodb's real branch was cited nowhere.
     'elif engine == "mongodb":',
 )
+
+#: The two build-mode loops §4.10 quotes, and the engine each belongs to.
+SECTION_4_10_BUILD_MODE_LOOPS = {
+    "pgvector": 'for build_mode in ann.get("pgvector_build_modes", ["post"]):',
+    "valkey": 'for build_mode in ann.get("valkey_build_modes", ["post"]):',
+}
 
 
 def _section_4_10():
     with open(os.path.join(REPO, "docs", "09-adding-percona-server.md")) as fh:
         doc = fh.read()
-    return doc.split("### 4.10")[1].split("\n### ")[0]
+    return doc.split("### 4.10")[1].split("\n## ")[0]
 
 
-def _ann_pass_lines():
+def _render_config_body():
     with open(os.path.join(REPO, "orchestrator", "ann_pass.py")) as fh:
-        return fh.read().splitlines()
+        source = fh.read()
+    return source.split("def render_config", 1)[1].split("\ndef ", 1)[0]
 
 
-class TestSection410StillPointsIntoAnnPass:
-    """Nine pointers into a file this change reorganised, none of them guarded.
+class TestSection410StillDescribesRenderConfig:
+    """Nine pointers into a file this change reorganised, now by name.
 
-    The section is `### 4.10 orchestrator/ann_pass.py`, so its bare `:N`
-    citations mean lines of that file. Two of them are the same string
-    (`"efConstruction": ef_constructions`, which occurs three times in the
-    file), so those are checked by position within their branch rather than by
-    uniqueness.
+    The section is `### 4.10 orchestrator/ann_pass.py`, so everything it
+    quotes is a line of that file. Nothing here reads a number.
     """
 
-    def test_the_section_still_cites_the_file_by_line(self):
-        """Non-vacuity: if the citations were ever rewritten into another form
-        the tests below would pass by finding nothing."""
-        cited = re.findall(r"`:(\d+)`", _section_4_10())
-        assert len(cited) >= 10, cited
-        # One per anchor, plus the THREE `efConstruction` lines -- the
-        # string occurs three times, so none of them is uniquely
-        # anchorable and they get their own test below.
-        assert len(set(cited)) == len(SECTION_4_10_ANCHORS) + 3, \
-            sorted(set(cited))
+    def test_the_section_still_quotes_the_branches(self):
+        """Non-vacuity: if the quotations were ever rewritten into another
+        form the tests below would pass by finding nothing."""
+        section = _section_4_10()
+        for branch in SECTION_4_10_BRANCHES:
+            assert branch in section, branch
+        for loop in SECTION_4_10_BUILD_MODE_LOOPS.values():
+            assert loop in section, loop
+        assert '"efConstruction": ef_constructions' in section
+        assert 'raise ValueError(f"unknown engine: {engine}")' in section
+        # And it must carry no line citation of its own any more -- the form
+        # it used for all nine. Checked here as well as in the document-wide
+        # ratchet, because this section is where the form was invisible.
+        assert not re.search(r"`:\d+", section), (
+            "§4.10 is back to citing bare line numbers, which is the form "
+            "that left all nine of its pointers unchecked")
 
-    @pytest.mark.parametrize("anchor", sorted(SECTION_4_10_ANCHORS))
-    def test_each_cited_line_holds_what_the_section_says(self, anchor):
-        """Every anchor the section names must sit on a line it cites."""
-        lines = _ann_pass_lines()
-        cited = {int(n) for n in re.findall(r"`:(\d+)`", _section_4_10())}
-        found = {n for n, line in enumerate(lines, 1) if anchor in line}
-        assert len(found) == 1, (
-            f"{anchor!r} occurs {len(found)} times in ann_pass.py; §4.10's "
-            f"citation of it is only checkable while it is unique")
-        assert found & cited, (
-            f"docs/09 §4.10 describes {anchor!r} at one of {sorted(cited)}, "
-            f"but it is at {sorted(found)}. Re-derive the citation with "
-            f"grep -n against orchestrator/ann_pass.py as it now stands.")
+    @pytest.mark.parametrize("branch", SECTION_4_10_BRANCHES)
+    def test_each_quoted_branch_is_a_branch_of_render_config(self, branch):
+        """Every condition the section quotes must occur exactly once in the
+        function -- that is what makes "the section cites it" checkable."""
+        body = _render_config_body()
+        assert body.count(branch) == 1, (
+            f"{branch!r} occurs {body.count(branch)} times in "
+            f"render_config; §4.10's quotation of it is only checkable while "
+            f"it is unique")
 
-    def test_every_labelled_citation_falls_inside_the_branch_it_names(self):
-        """One rule that kills both residual shapes in this guard.
+    def test_the_section_lists_the_branches_in_the_order_they_are_tested(self):
+        """The permutation this class was extended to catch.
 
-        The assertions above are set membership -- "this anchor is on some
-        cited line" -- which cannot see a PERMUTATION: swapping the pgvector
-        and valkey numbers left everything passing. And nothing read the
-        parenthetical labels at all, so §4.10 said "`:206` (mongodb)" against
-        Percona's own branch, two revisions after Percona was inserted at
-        mongodb's old position, directly under a sentence saying Percona had
-        no branch.
-
-        Both are the same error: a number that names the wrong engine. So the
-        rule is positional, not a lookup -- every `` `:N` (engine) `` pair in
-        the section must have N inside that engine's own branch. It stays
-        number-free here, it catches a swap, and it catches a mislabel.
+        Set membership cannot see a swap: exchanging the pgvector and valkey
+        citations left the old version passing. The section's list is an
+        ordered claim -- "its branches, in the order the function tests them"
+        -- so it is checked as one, in both the document and the function.
         """
-        lines = _ann_pass_lines()
-        starts = {}
-        for n, line in enumerate(lines, 1):
-            match = re.match(r'\s*elif engine == "(\w+)":', line)
-            if match:
-                starts[match.group(1)] = n
-        assert set(starts) >= {"pgvector", "valkey", "percona", "mongodb"}, starts
-        # Each branch runs to the next one, in file order.
-        ordered = sorted(starts.items(), key=lambda kv: kv[1])
-        ends = {}
-        for index, (engine, start) in enumerate(ordered):
-            following = (ordered[index + 1][1] if index + 1 < len(ordered)
-                         else len(lines) + 1)
-            ends[engine] = following
+        section = _section_4_10()
+        body = _render_config_body()
+        in_doc = [section.index(b) for b in SECTION_4_10_BRANCHES]
+        in_code = [body.index(b) for b in SECTION_4_10_BRANCHES]
+        assert in_doc == sorted(in_doc), (
+            "§4.10 lists render_config's branches out of order; it claims to "
+            "list them in the order the function tests them")
+        assert in_code == sorted(in_code), (
+            "render_config's branches are no longer in the order §4.10 lists "
+            "them; the section has to be re-read against the function")
 
-        pairs = re.findall(r"`:(\d+)`\s*\n?\s*\((\w+)\)", _section_4_10())
-        assert len(pairs) >= 5, pairs
-        for number, engine in pairs:
-            number = int(number)
-            assert engine in starts, (
-                f"§4.10 labels `:{number}` as {engine!r}, which is not a "
-                f"branch of render_config at all")
-            assert starts[engine] <= number < ends[engine], (
-                f"§4.10 labels `:{number}` as {engine}, but {engine}'s branch "
-                f"is lines {starts[engine]}-{ends[engine] - 1}. Re-derive it "
-                f"with grep -n against orchestrator/ann_pass.py.")
+    def test_the_raise_is_the_fallback_every_branch_misses(self):
+        """§4.10's whole point: Percona matched none of them and landed here.
 
-    def test_all_three_ef_construction_citations_are_inside_their_branches(self):
+        An ORDER claim, which is what "landed on the `raise`" means
+        mechanically -- the raise comes after the last engine branch. It is
+        not the last statement in the function, and an earlier draft of this
+        test asserted that it was and failed on the `return` beneath it.
+        """
+        body = _render_config_body()
+        statement = 'raise ValueError(f"unknown engine: {engine}")'
+        assert statement in body
+        assert body.rindex("elif engine ==") < body.index(statement)
+
+    @pytest.mark.parametrize("engine", sorted(SECTION_4_10_BUILD_MODE_LOOPS))
+    def test_each_build_mode_loop_sits_in_its_own_branch(self, engine):
+        """The loop §4.10 attributes to an engine has to be inside that
+        engine's branch and not in a sibling's."""
+        body = _render_config_body()
+        loop = SECTION_4_10_BUILD_MODE_LOOPS[engine]
+        assert body.count(loop) == 1, (engine, body.count(loop))
+        start, end = _branch_span(body, engine)
+        assert start < body.index(loop) < end, (
+            f"§4.10 attributes {loop!r} to {engine}, and it is outside "
+            f"{engine}'s branch")
+
+    def test_all_three_ef_construction_lines_are_one_per_branch(self):
         """`"efConstruction": ef_constructions` occurs THREE times now.
 
         §4.10's bullet said "the two that do are ..." in the present tense
-        long after Percona's branch had added a third -- the same staleness
-        the section's preamble was corrected for in the commit that introduced
-        it. The bullet is past tense now and cites all three, so each cited
-        line must fall inside the branch that emits it. The string is not
-        unique, which is why these three cannot be covered by
-        `SECTION_4_10_ANCHORS`.
+        long after Percona's branch had added a third. The bullet says three
+        and names the percona one as the third, so each occurrence must fall
+        inside one of the three branches that emit it, one each.
         """
-        lines = _ann_pass_lines()
-        cited = {int(n) for n in re.findall(r"`:(\d+)`", _section_4_10())}
-        at = [n for n, line in enumerate(lines, 1)
-              if '"efConstruction": ef_constructions' in line]
+        section = _section_4_10()
+        body = _render_config_body()
+        at = [m.start() for m in
+              re.finditer(r'"efConstruction": ef_constructions', body)]
         assert len(at) == 3, at
-        branches = {}
-        for n, line in enumerate(lines, 1):
-            match = re.match(r'\s*elif engine == "(\w+)":', line)
-            if match:
-                branches[match.group(1)] = n
-        ordered = sorted(branches.values()) + [len(lines) + 1]
-        for name in ("pgvector", "valkey", "percona"):
-            start = branches[name]
-            end = next(n for n in ordered if n > start)
+        assert re.search(r"occurs three times", section, re.I), (
+            "§4.10 must state how many there are; the count is the thing "
+            "that went stale when Percona's branch added the third")
+        for engine in ("pgvector", "valkey", "percona"):
+            start, end = _branch_span(body, engine)
             inside = [n for n in at if start < n < end]
-            assert len(inside) == 1, (name, inside)
-            assert inside[0] in cited, (
-                f"§4.10 does not cite the {name} efConstruction line; it is "
-                f"at {inside[0]} and the section cites {sorted(cited)}")
+            assert len(inside) == 1, (engine, inside)
+
+    def test_the_branch_span_helper_can_fail(self):
+        """The helper every placement assertion above rests on, shown able to
+        come back empty rather than silently spanning the whole function."""
+        body = _render_config_body()
+        with pytest.raises(AssertionError):
+            _branch_span(body, "no_such_engine_zq")
+        start, end = _branch_span(body, "percona")
+        assert start < end
+        assert 'elif engine == "percona":' in body[start:end]
+        assert 'elif engine == "mongodb":' not in body[start:end]
+
+
+def _branch_span(body: str, engine: str):
+    """`(start, end)` offsets of one `elif engine == "<name>":` branch.
+
+    A branch runs to the next branch condition in file order, or to the
+    function's trailing `return`. Offsets rather than line numbers, because a
+    line number is the thing this whole section stopped using.
+    """
+    head = f'elif engine == "{engine}":'
+    assert head in body, f"render_config has no {engine} branch"
+    start = body.index(head)
+    later = [m.start() for m in re.finditer(r'elif engine == "\w+":', body)
+             if m.start() > start]
+    return start, (min(later) if later else len(body))
