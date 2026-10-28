@@ -108,7 +108,7 @@ command with no rebuild:
 | `harness/`, `report/`, `orchestrator/`, `config/` | nothing — just re-run |
 | `overlay/ann-benchmarks/` | nothing — `run` and `render` re-apply the overlay onto `work/` every time |
 | `docker/*/Dockerfile`, entrypoints, `docker/_shared/requirements-*.txt` | `./run-benchmark.sh build --engines <e>` |
-| engine `source.tag` | `./run-benchmark.sh build` (AliSQL is 1.5–3 h), then `--force` on the first ann run — see the ann results tree invariant below |
+| engine `source.tag` | `./run-benchmark.sh build` (AliSQL is 1.5–3 h), then move that engine's ann subtree aside — see the ann results tree invariant below |
 | `webui/` (server or static) | nothing in `--no-container` mode; the repo is mounted, so container mode also just needs a restart |
 | `docker/webui/Dockerfile` | `./scripts/build-images.sh --engine webui` (~1 min) |
 
@@ -184,11 +184,15 @@ These are the reasons the code looks over-defensive. Do not relax them.
   binary's recall cells are reused under the new pin's `engine_version`. `ann_pass.run_engine`
   does print `[ann] N existing result file(s) … will be skipped` before the run — "Warn before
   the fact, not after" — and `report/generate.py`'s `stale_ann` bucket adds the per-cell
-  attribution in the Validity section afterwards. **Pass `--force` on the first ann run after
-  a re-pin**, which `ann_pass.run_engine` hands through to ann-benchmarks and `--engines <e>`
-  scopes to the one engine, or move that engine's subtree aside. Bumping
-  `ANN_MEASUREMENT_VERSION` is not the remedy: it moves every pass's tree and re-measures every
-  recall point for all seven engines and both resource passes.
+  attribution in the Validity section afterwards. A fresh `--run-id` does **not** fix it: the
+  run directory holds `ops_results`, while `annb_results` is `results/annb` beside it, so a new
+  run directory leaves every recall cell where it was. **Move that engine's subtree of the ann
+  tree aside before the first run at a new pin** — `results/annb/<pass>/<fingerprint>/<dataset>/<k>/<engine>/`
+  — which makes `_count_results` return 0 and the curve get measured again. **Do not reach for
+  `--force` instead**, even though its help offers exactly that: the same flag is the escape
+  hatch on `_check_free_disk`, so it silently disables the free-disk refusal, which is the one
+  a core-dump campaign most needs. Bumping `ANN_MEASUREMENT_VERSION` is not the remedy either:
+  it moves every pass's tree and re-measures every recall point for all seven engines.
 - **Filtered ground truth is recomputed** (`harness/datasets.py`) — a `WHERE` predicate changes
   the correct answer set, and reusing unfiltered neighbours scores every engine against the
   wrong targets.
@@ -277,7 +281,9 @@ any long run) · `08-web-ui.md` (the browser front end, its access model and its
 decided each choice) · `10-rollout.md` (what to run after this series, in what order, and the
 two checks that cannot be done as specified) · `11-methodology-roadmap.md` (what the
 measurement methodology cannot yet observe, what it already handles, and in what order to
-address the rest — a design document, nothing in it is implemented) ·
+address the rest — a roadmap, not a description of the system. **One** of its items is now
+implemented, §4.1's per-phase capture of `Innodb_hnsw_memory_used`; nothing else in it is,
+so read a section as a proposal unless it says otherwise) ·
 `12-percona-feedback-plan.md` (the four things the server team asked for after reading the
 report, the re-pin that gates all of them, and what each costs — also a plan, also
 unimplemented).

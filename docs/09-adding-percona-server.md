@@ -1492,53 +1492,69 @@ likely to break:
    smoke run's churn phase is the test.
 4. Every phase writing records, the plan check passing on both filter columns,
    and the report rendering with seven series.
-5. **The run must be launched with `--force`, into a fresh run directory.**
-   Neither half is about the server, and both are things a green run would
-   hide.
+5. **The run needs a fresh `--run-id` and this engine's recall subtree moved
+   aside — and must *not* be given `--force`.** None of it is about the
+   server, and all of it is something a green run would hide.
 
-   *`--force`, for the recall path.* `ann_fingerprint` is deliberately
-   engine-invariant and holds no source tag, so the re-pin did not move
-   `results/annb/<pass>/<fingerprint>/`; ann-benchmarks skips any
-   configuration whose result file is already on disk and reports that as
-   success. Without `--force` the first run at a new pin reuses the old
-   binary's recall cells and publishes them under the new pin's
-   `engine_version`. `ann_pass.run_engine` does say so before the run —
-   `[ann] N existing result file(s) for <engine> / <dataset>;
-   already-computed configurations will be skipped`, printed under a comment
-   whose first five words are "Warn before the fact, not after" — and what
-   `report/generate.py`'s `stale_ann` bucket adds is per-cell attribution in
-   the Validity section afterwards. So:
-   `./run-benchmark.sh run --profile smoke --engines percona --force`, or move
-   the Percona subtree of that results directory aside first. Bumping
-   `ANN_MEASUREMENT_VERSION` instead would move every pass's tree and
+   *The recall path.* `ann_fingerprint` in
+   `orchestrator/ann_pass.py` is deliberately engine-invariant and holds no
+   source tag, so the re-pin did not move the ann results tree;
+   ann-benchmarks skips any configuration whose result file is already on
+   disk and reports that as success. Without `--force` the first run at a new
+   pin reuses the old binary's recall cells and publishes them under the new
+   pin's `engine_version`. `run_engine` in the same module does say so before
+   the run — it prints the count of existing result files and that
+   already-computed configurations will be skipped, under a comment whose
+   first five words are "Warn before the fact, not after" — and what the
+   `stale_ann` bucket built in `summarize` in `report/generate.py` adds is
+   per-cell attribution in the Validity section afterwards.
+
+   **A fresh run directory does not fix this**, which is the trap worth
+   stating plainly: `paths` in `orchestrator/cli.py` puts the ops results in
+   the run directory and the ann results in a sibling of it, shared across
+   runs by design, so a new run id leaves every recall cell where it was. The
+   remedy is to **move this engine's subtree of the ann results tree aside**
+   before the run — `_count_results` counts result files under directories
+   named for the engine, so moving them makes it return zero and the curve
+   gets measured again.
+
+   **Not `--force`**, even though its help text offers exactly that. The same
+   flag is the escape hatch on the free-disk refusal in
+   `orchestrator/cli.py`, so passing it silently disables the one refusal a
+   core-dump campaign most needs — a Percona core is about its peak RSS, and
+   that guard exists because a pgvector phase once died two seconds in with
+   nowhere to put the cluster and nothing in the run said so. And not a bump
+   of `ANN_MEASUREMENT_VERSION`, which would move every pass's tree and
    re-measure every recall point for all seven engines and both resource
-   passes, which is weeks of ingest to fix one engine's cache.
+   passes — weeks of ingest to fix one engine's cache.
 
    *A fresh run directory, for the ops path.* This is the same hazard one
    layer down and it has no `--force`. The report's provenance table is
-   `report/render.py:_engine_rows`, which prints `source.tag` and
-   `source.commit[:12]` from the manifest — **one value per engine per run
-   directory** — and `orchestrator/manifest.py:set_engine` overwrites that
-   entry from `sources/percona.source.json` at build time without comparing
-   it to what was there. `engine_version` is on every ops record but no
-   reader prints it. So a directory resumed across the rebuild pools
-   `9.7.1-1` and `9.7.2-2` numbers into one `build_signature` and attributes
-   all of them to the new commit, with nothing in the report to tell them
-   apart. Start a new run directory, and never `--resume` one that already
-   holds pre-rebuild Percona ops records.
+   `_engine_rows` in `report/render.py`, which prints the source tag and the
+   first twelve characters of the source commit from the manifest — **one
+   value per engine per run directory** — and `set_engine` in
+   `orchestrator/manifest.py` replaces that whole entry from the per-engine
+   source JSON the build writes, without comparing it to what was there.
+   `engine_version` is on every ops record but no reader prints it. So a
+   directory resumed across the rebuild pools `9.7.1-1` and `9.7.2-2` numbers
+   into one `build_signature` and attributes all of them to the new commit,
+   with nothing in the report to tell them apart. So the `smoke` command above
+   is run with **neither `--resume` nor `--run-id`**, which is what makes the
+   orchestrator start a fresh directory; the failure mode is reaching for
+   `--resume` after an interruption and landing the validating run in the
+   directory it was meant to replace. A `smoke` result from a stale directory
+   would stand in for the one that validates the re-pin.
 
-**What the re-pin to the `9.7` series left behind in this document, stated here
-because nothing else will say it.** The pin table above, §4.3's skeleton and
-every claim this document makes about *our* repository were re-derived at the
-new pin. The citations into the **Percona** tree were not. Those paths survive
-the move — the series was rebased, not rewritten — but every line number in
-them was read at the old `vector-mvp` pin and is unverified here, and so is
-every abbreviated vendor commit this document names, including the four in the
-list above: the fixes they point at are in the pinned series under different
-SHAs, because a rebase gives every commit a new one. `FOREIGN_MARKERS` in
-`tests/test_e1_percona_design.py` deny-lists those paths by name and with a
-correct reason, so no guard opens them and none of this is red. Converting
-them to symbol citations is its own change.
+**What the re-pin leaves unverified in this document, stated here because
+nothing else will say it.** The pin table, §4.3's skeleton and every claim this
+document makes about *our* repository were re-derived at the new pin. §0's
+citation policy already covers the vendor **paths and symbols**: it cites no
+line numbers, so nothing there rots to a rebase. What the policy does not
+cover is the vendor **commit abbreviations** — every `af72e2c0fa40`-shaped SHA
+in §0's pre-merge table, and the four reused in the list above. The fixes they
+name are in the pinned series, but under *different* SHAs, because a rebase
+gives every commit a new one, so `git show` on one of them against the pinned
+tree finds nothing. §0 says so beside the table; this says so beside the four.
 
 ## 6. Executable guards
 

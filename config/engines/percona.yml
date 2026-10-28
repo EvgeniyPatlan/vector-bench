@@ -82,22 +82,47 @@ source:
   # file(s) ... will be skipped` BEFORE the run -- its comment's first five
   # words are "Warn before the fact, not after" -- while
   # `report/generate.py`'s `stale_ann` bucket adds the per-cell attribution in
-  # the Validity section afterwards. So: PASS `--force` ON THE FIRST ann RUN AFTER
-  # A RE-PIN -- `./run-benchmark.sh run --profile smoke --engines percona
-  # --force` -- or move the Percona subtree of that results directory aside.
-  # Bumping `ANN_MEASUREMENT_VERSION` is NOT the remedy: it would move every
-  # pass's tree and re-measure every recall point for all seven engines and
-  # both resource passes.
+  # the Validity section afterwards.
+  #
+  # A FRESH RUN DIRECTORY DOES NOT FIX THIS, and that is the trap. `paths` in
+  # `orchestrator/cli.py` puts `ops_results` at the run directory but
+  # `annb_results` at `results/annb`, a SIBLING of it -- CLAUDE.md's invariant
+  # says the tree is shared across runs on purpose. So a new `--run-id` gives
+  # a clean ops tree and leaves every recall cell exactly where it was.
+  #
+  # THE REMEDY IS TO MOVE THIS ENGINE'S SUBTREE ASIDE before the first run at
+  # a new pin: `results/annb/<pass>/<fingerprint>/<dataset>/<k>/percona/`.
+  # `_count_results` counts `.hdf5` files under directories named for the
+  # engine, so moving them makes it return 0 and ann-benchmarks measures the
+  # curve again.
+  #
+  # DO NOT REACH FOR `--force` INSTEAD, even though its help text offers
+  # precisely this ("re-run ann-benchmarks points that already have results").
+  # The same flag is the escape hatch on the free-disk refusal --
+  # `_check_free_disk(...) and not args.force` in `orchestrator/cli.py` -- so
+  # passing it silently disables the one refusal a core-dump campaign most
+  # needs. A Percona core is about its peak RSS, tens of GiB, and the recorded
+  # reason for that guard is that a pgvector phase once died two seconds in
+  # because the volume had nowhere to put the cluster and nothing in the run
+  # said so. Moving the subtree aside buys the re-measurement without buying
+  # that.
+  #
+  # Bumping `ANN_MEASUREMENT_VERSION` is NOT the remedy either: it would move
+  # every pass's tree and re-measure every recall point for all seven engines
+  # and both resource passes.
   #
   # AND THE OPS PATH HAS THE SAME HAZARD WITH NO `--force` FOR IT: the
   # report's provenance table (`report/render.py:_engine_rows`) prints
   # `source.tag` and `source.commit[:12]` from the manifest, ONE value per
   # engine per run directory, and `manifest.py:set_engine` overwrites that
   # entry from `sources/percona.source.json` at build time without comparing
-  # it. So the first run after a rebuild goes to a FRESH run directory, and a
-  # directory already holding pre-rebuild Percona ops records is never
-  # resumed into -- otherwise two servers' numbers pool into one
-  # `build_signature` under the new commit.
+  # it. So the first run after a rebuild goes to a FRESH run directory: run it
+  # with NEITHER `--resume` NOR `--run-id`, which is what makes the
+  # orchestrator start one, and never resume a directory that already holds
+  # pre-rebuild Percona ops records -- otherwise two servers' numbers pool
+  # into one `build_signature` under the new commit and the report attributes
+  # all of them to the new one. A smoke result from a stale directory would
+  # stand in for the run that validates this re-pin.
   tag: 56124b03fdc5954e2401ab4d2c7bf7cb3a767158   # tip of PR #6278 on base 9.7
   upstream: https://github.com/percona/percona-server.git
   # No `submodules:` key, deliberately: all four of the pin's submodules are

@@ -2230,6 +2230,24 @@ CITED_SYMBOLS = {
     # labelling Percona's own branch as mongodb's. The branch CONDITION is
     # both the citation and the anchor now, so the label and the thing it
     # labels are the same string and cannot disagree.
+    # -- §5's two post-rebuild requirements, which name four symbols -----
+    # The ann half and the ops half of the same hazard: the recall tree does
+    # not move when the pin does, and the provenance table carries one source
+    # per engine per RUN DIRECTORY. Each anchor is the thing the sentence
+    # claims, not the symbol's name, so a rewrite that keeps the name and
+    # drops the behaviour fails here.
+    ("orchestrator/ann_pass.py", "ann_fingerprint"):
+        ("ANN_MEASUREMENT_VERSION",
+         "Deliberately engine-invariant"),
+    ("orchestrator/ann_pass.py", "run_engine"):
+        "already-computed configurations will be skipped",
+    ("report/generate.py", "summarize"):
+        '"stale_ann"',
+    ("report/render.py", "_engine_rows"):
+        'source.get("tag", "?")',
+    ("orchestrator/manifest.py", "set_engine"):
+        'self.data["engines"][engine] = {',
+
     ("orchestrator/ann_pass.py", "render_config"):
         ('raise ValueError(f"unknown engine',
          'if engine in MARIADB_ENGINES + ("alisql",)',

@@ -134,97 +134,121 @@ PROSE_CLAIMS = {
             "No measured ingest rate for percona.",
             "percona is excluded from the total.",
         ]),
-    "the first ann run after a re-pin needs --force": dict(
-        # THREE REQUIREMENTS, ORDER-INDEPENDENT, because this claim has three
-        # parts and a paragraph that drops any one of them stops being a
-        # warning: the TRIGGER (the source pin moved), the HAZARD (the recall
-        # cells already on disk are reused rather than re-measured, because
-        # `ann_fingerprint` is engine-invariant and holds no source tag) and
-        # the REMEDY (`--force`). Written as lookaheads rather than as a word
-        # order so that a rewrite saying them in any sequence still passes --
-        # the shape the comment above this dict exists to get right.
+    "a re-pin leaves the recall cells and the subtree must be moved aside": dict(
+        # FOUR REQUIREMENTS, ORDER-INDEPENDENT. A paragraph that drops any one
+        # of them stops being a warning: the TRIGGER (the source pin moved),
+        # the HAZARD (the cells already on disk are reused rather than
+        # re-measured, because `ann_fingerprint` is engine-invariant and holds
+        # no source tag), and the REMEDY in two halves -- the ACT (move,
+        # rename, delete, re-measure) and the OBJECT it acts on (the engine's
+        # subtree of the ann results tree). The act and the object are
+        # separate legs because "move the pin" and "the results tree is
+        # shared" are each true on their own and neither is the instruction.
         #
-        # THE REMEDY LEG CARRIES POLARITY, AND THE FIRST VERSION OF IT DID
-        # NOT. It was `(?=.*--force\b)`, a bare mention, and four inversions
-        # satisfied it -- "the run must NOT be launched with --force",
-        # "--force is deprecated and has no effect on the ann path", "bump
-        # ANN_MEASUREMENT_VERSION; --force is not the remedy" and "pass
-        # --force to the ops pass, not the ann pass". All four are now in
-        # `rejects`. `tests/test_e1_percona_design.py` states the house rule
-        # this broke -- "this asserts POLARITY and PLACEMENT, not presence" --
-        # and the mechanism is the same one `_prose`'s own comment describes:
-        # presence is what a hedge exploits.
+        # THE REMEDY IS NOT `--force`, AND IT USED TO SAY IT WAS. That flag
+        # does re-run points that already have results -- its help text says
+        # exactly that -- but it is also the escape hatch on the free-disk
+        # refusal (`_check_free_disk(...) and not args.force` in
+        # `orchestrator/cli.py`), so passing it silently disables the one
+        # refusal a core-dump campaign most needs. Moving the engine's subtree
+        # aside buys the re-measurement without buying that, and
+        # `_count_results` counts result files under directories named for the
+        # engine, so moving them is what makes it return zero.
         #
-        # ANCHORED AT \A, which is not decoration. Lookaheads only see
-        # forward from the match position, so unanchored `re.search` slides
-        # past a negation and matches from just after it: "must NOT be
-        # launched with --force" passed, because starting at "be launched"
-        # leaves "must not" behind the cursor. On a `_flat`-ened block there
-        # is exactly one legitimate start, so \A is it.
+        # A fresh `--run-id` is NOT a substitute and is not part of this
+        # claim: `paths` in `orchestrator/cli.py` puts `ops_results` at the
+        # run directory and `annb_results` at a sibling of it, so a new run
+        # directory leaves every recall cell where it was. That is a separate
+        # requirement, for the ops path, and it is stated beside this one.
         #
-        # The negative list is narrow on purpose. "does not" is NOT in it:
-        # the honest hazard sentence is "a re-pin does not invalidate the
-        # cached recall tree", and a guard that fired on that would teach the
-        # next author to delete it. What is listed is the modal refusal and
-        # the verb-directed refusal -- "do not pass", "need not pass" -- plus
-        # the deprecation and wrong-pass forms.
+        # ANCHORED AT \A for the reason the entry below documents.
         pattern=r"\A"
                 r"(?=.*\b(?:re-?pin(?:ned|ning)?|new pin|pin (?:move|change)[sd]?"
                 r"|moves? the pin|moved the pin|source\.tag)\b)"
                 r"(?=.*\b(?:reuse[sd]?|reusing|cached|cache|stale"
-                r"|skip(?:s|ped)?|already (?:on disk|measured))\b)"
-                r"(?=.*(?:\b(?:pass(?:es|ing)?|launch(?:ed|ing)?|re-?runs?"
-                r"|runs?|add|use|needs?|requires?|must|with)\b"
-                r"[^.]{0,60}--force\b"
-                r"|--force\b[^.]{0,80}\b(?:is what|is required|is mandatory"
-                r"|is not optional|recomputes?|re-?measures?|re-?computes?)\b))"
-                r"(?!.*\b(?:must not|should not|need not|cannot|can't|won't"
-                r"|will not|never|no longer|deprecated|obsolete"
-                r"|has no effect|no effect|is ignored)\b[^.]{0,60}--force\b)"
-                r"(?!.*\b(?:do|does|did)(?:\s+not|n't)\s+"
-                r"(?:need\s+to\s+|have\s+to\s+)?"
-                r"(?:pass|launch|use|add|run|re-?run|give|supply)\b"
-                r"[^.]{0,40}--force\b)"
-                r"(?!.*--force\b[^.]{0,80}\b(?:is deprecated|is obsolete"
-                r"|has no effect|does nothing|is ignored|is redundant"
-                r"|is no longer|is not (?:the remedy|needed|required"
-                r"|necessary))\b)"
-                r"(?!.*--force\b[^.]{0,60}\bto the ops\b)",
+                r"|skip(?:s|ped)?|already (?:on disk|measured)"
+                r"|where it was|left behind)\b)"
+                r"(?=.*\b(?:mov(?:e|es|ed|ing)|aside|renam\w+|delet\w+"
+                r"|re-?measur\w+|re-?comput\w+)\b)"
+                r"(?=.*\b(?:subtree|results tree|ann tree|result files"
+                r"|recall cells?|curve)\b)",
         accepts=[
-            "The pin moved, so every Percona recall cell already on disk is "
-            "reused rather than re-measured: pass --force on the first ann "
-            "run after this.",
-            "Because source.tag changed, ann-benchmarks skips the "
-            "configurations whose result files are already on disk, so the "
-            "first run needs --force.",
-            # The negative-sounding but affirmative sentence the narrow
-            # negative list exists to keep passing.
-            "A re-pin does not invalidate the cached recall tree, and "
-            "--force is what re-measures it.",
-            "The run must be launched with --force. Without it the first run "
-            "at a new pin reuses the old binary's recall cells.",
-            "After a re-pin the cells on disk are reused; re-run with "
-            "--force.",
+            "After a re-pin the recall cells on disk are reused, so move "
+            "that engine's subtree of the ann results tree aside before the "
+            "run; not --force, which also disables the free-disk refusal.",
+            "Because source.tag changed, the cached result files are "
+            "skipped; moving the engine's subtree aside makes the curve get "
+            "measured again.",
+            "A new pin leaves every recall cell where it was. Move the "
+            "subtree aside and the curve is re-measured.",
         ],
         rejects=[
-            # Three that drop exactly one of the three legs.
-            "The first ann run after the re-pin reuses every Percona recall "
-            "cell already on disk.",
-            "Pass --force to recompute the recall curve.",
-            "After the re-pin, pass --force.",
-            # Six that keep every leg's vocabulary and invert the CLAIM.
-            "The run must NOT be launched with --force after a re-pin; the "
-            "cached cells are correct.",
-            "--force is deprecated and has no effect on the ann path, so a "
-            "re-pin reuses the cached results.",
-            "Bump ANN_MEASUREMENT_VERSION after a re-pin; --force is not the "
-            "remedy for the reused cache.",
-            "After a re-pin, pass --force to the ops pass, not the ann pass, "
-            "or the cached cells are reused.",
-            "You do not need to pass --force after a re-pin; the cached "
-            "cells are still valid.",
-            "Never pass --force after a re-pin -- the cached recall cells "
-            "are fine.",
+            # Each drops exactly one leg.
+            "After a re-pin the recall cells are reused. Nothing to do.",
+            "Move the subtree aside before the run.",
+            "The cached result files are skipped; move the subtree aside.",
+            "A re-pin changes the engine_version on every record.",
+        ]),
+    "a sentence that tells the operator to pass --force": dict(
+        # NOT A CLAIM TO BE MADE -- a shape to be ABSENT. The test below
+        # asserts no paragraph at any of the three sites matches this, which
+        # is the assertion that would have caught the error this entry exists
+        # because of: for two rounds these documents told the operator to pass
+        # `--force`, and the guard over them only ever grepped for the string,
+        # so it could not tell an instruction from a warning. It passed on
+        # prose saying the opposite of what it was guarding.
+        #
+        # A DIRECTIVE IS AN INSTRUCTION WITH NO NEGATION IN FRONT OF THE FLAG.
+        # That is the whole definition and it is why both halves scan with a
+        # TEMPERED character class -- `(?:(?!\b(?:no|not|never|...)\b)[^.])*?`
+        # -- rather than `[^.]{0,60}`: a plain window matched "the same hazard
+        # WITH NO `--force` FOR IT" and "must *not* be given `--force`", both
+        # of which are prohibitions, and both of which are live in this
+        # repository's own prose. The tempered class cannot cross a negation,
+        # so a sentence that denies the flag can never read as a directive.
+        #
+        # THE SECOND BRANCH IS A COMMAND LINE, and it is the one that matters
+        # most: a copy-pasteable `./run-benchmark.sh ... --force` is the form
+        # an operator will actually act on, and the first branch cannot see it
+        # because `run-benchmark.sh` contains a period and the sentence scan
+        # stops at one. It found a real instance -- CLAUDE.md's rebuild table
+        # still said "then `--force` on the first ann run" after the prose
+        # above it had been corrected.
+        #
+        # `must` is in the verb list and `give[ns]?` is too, which is why the
+        # negation guard is not optional: "must *not* be given `--force`" has
+        # two matching verbs and is the opposite of a directive.
+        pattern=r"(?:\A|\.)(?:(?!\b(?:no|not|never|cannot|nor)\b)[^.])*?"
+                r"\b(?:pass(?:es|ing)?|launch(?:ed|ing)?|re-?runs?|add|use"
+                r"|needs?|requires?|must|give[ns]?|supply|with)\b"
+                r"(?:(?!\b(?:no|not|never|cannot|nor)\b)[^.])*?--force\b"
+                r"|run-benchmark\.sh"
+                r"(?:(?!\b(?:no|not|never|cannot|nor)\b)[^\n])*?--force\b",
+        accepts=[
+            # "accepts" here means "is correctly identified AS a directive".
+            "Pass --force on the first ann run after a re-pin.",
+            "Re-run with --force to recompute the cached points.",
+            "The first run at a new pin needs --force.",
+            "Launch the smoke run with --force.",
+            "The run must be launched with --force.",
+            "So: ./run-benchmark.sh run --profile smoke --engines percona "
+            "--force",
+        ],
+        rejects=[
+            # Prohibitions and bare mentions, every one of them live prose in
+            # this repository at the time this entry was written.
+            "Do not reach for --force instead, even though its help text "
+            "offers exactly that.",
+            "Not --force, even though its help text offers exactly that.",
+            "--force is the escape hatch on the free-disk refusal, so it "
+            "disables the warning.",
+            "Move the subtree aside before the run; not --force, which also "
+            "disables the refusal.",
+            "--force is deprecated and has no effect on the ann path.",
+            "the ops path has the same hazard WITH NO --force FOR IT",
+            "The run needs a fresh --run-id and must *not* be given --force.",
+            "Run ./run-benchmark.sh run --profile smoke --engines percona, "
+            "and never --force.",
         ]),
 }
 
@@ -2329,22 +2353,65 @@ def _paragraphs(text):
 
 class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
 
+    _CLAIM = "a re-pin leaves the recall cells and the subtree must be moved aside"
+    _DIRECTIVE = "a sentence that tells the operator to pass --force"
+
     @pytest.mark.parametrize("path", sorted(FORCE_SITES))
-    def test_the_force_requirement_is_made_at_this_site(self, path):
-        claim = "the first ann run after a re-pin needs --force"
-        blocks = [b for b in _paragraphs(open(os.path.join(VB_ROOT, path))
-                                        .read()) if "--force" in b]
-        assert blocks, f"{path} no longer mentions --force at all"
-        pattern = PROSE_CLAIMS[claim]["pattern"]
+    def test_the_subtree_requirement_is_made_at_this_site(self, path):
+        """Some ONE paragraph at this site makes the whole claim.
+
+        One paragraph and not the file, because a conjunction over a whole
+        file can be satisfied by sentences that have nothing to do with each
+        other -- which is what `_paragraphs` exists to prevent and what a
+        review demonstrated by deleting the warning and leaving the
+        vocabulary behind.
+        """
+        pattern = PROSE_CLAIMS[self._CLAIM]["pattern"]
+        blocks = _paragraphs(open(os.path.join(VB_ROOT, path)).read())
         hits = [b for b in blocks if re.search(pattern, _flat(b), re.I)]
         assert hits, (
-            f"{path} mentions --force but no single paragraph still makes the "
-            f"whole claim: {claim}\n"
+            f"no single paragraph in {path} still makes the whole claim: "
+            f"{self._CLAIM}\n"
             f"  reason this site was chosen: {FORCE_SITES[path]}\n"
             f"  pattern: {pattern}\n"
             f"  the pattern is a vocabulary, not a sentence -- if the claim "
             f"is still made and only the wording moved, widen PROSE_CLAIMS "
             f"rather than restoring the old phrasing")
+
+    @pytest.mark.parametrize("path", sorted(FORCE_SITES))
+    def test_this_site_does_not_tell_the_operator_to_pass_force(self, path):
+        """The assertion that would have caught two rounds of being wrong.
+
+        `--force` does re-run points that already have results, so for two
+        rounds these three sites said to pass it. It is also the escape hatch
+        on the free-disk refusal, so passing it disables the warning a
+        core-dump campaign most needs, and the remedy is to move the engine's
+        subtree aside instead. The old guard grepped for the string `--force`
+        and could not tell an instruction from a warning, so it was green
+        either way.
+
+        WHAT THIS CHECK DOES NOT COVER, stated because a guard over prose
+        always has an edge and naming it is the only honest terminus. It reads
+        one shape -- a directive verb, or a `run-benchmark.sh` command line,
+        reaching `--force` without a negation in between. A sentence that
+        recommends the flag without any of those verbs ("the flag to use here
+        is `--force`") is not caught, and neither is an instruction split
+        across two sentences. It is not a proof that these documents never
+        recommend `--force`; it is a proof that they do not recommend it in
+        the form an operator would copy. The rest is a reviewer's job, and
+        that is an acceptable terminus only because this docstring says so.
+        """
+        pattern = PROSE_CLAIMS[self._DIRECTIVE]["pattern"]
+        offenders = [
+            _flat(b)[:200]
+            for b in _paragraphs(open(os.path.join(VB_ROOT, path)).read())
+            if re.search(pattern, _flat(b), re.I)]
+        assert not offenders, (
+            f"{path} tells the operator to pass --force, and the remedy for "
+            f"a re-pin is to move the engine's ann subtree aside instead: "
+            f"--force is also the escape hatch on the free-disk refusal, so "
+            f"it disables the warning a core-dump campaign most needs.\n  "
+            + "\n  ".join(offenders))
 
     def test_every_site_exists_and_says_why_it_is_a_site(self):
         for path, reason in sorted(FORCE_SITES.items()):
