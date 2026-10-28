@@ -602,8 +602,17 @@ class TestTheMethodologyTableSaysTheSameThing:
         That one sentence is the WHOLE residue, and the reason it can be is
         the shape of the check: a necessary condition has exactly one failure
         mode, being satisfied while the claim is false, so naming that mode
-        names everything it misses. The guard below has no such luck, which
-        is why its disclosure is a list.
+        names everything it misses.
+
+        And it is not what does the real work here: that is the three
+        positive assertions beside it, none of which depends on how the cell
+        is worded -- `test_every_engine_whose_config_declares_the_knob_is_
+        named` reads the capability out of `config/engines/*.yml`,
+        `test_the_generated_row_names_the_same_engine_set` holds §3's
+        derived row to the same set, and
+        `test_the_cells_claim_about_that_engine_is_executable` pins the code
+        the cell is about. This check only stops the cell from dropping the
+        exception.
 
         Either of this repository's two names for the engine satisfies it --
         "Percona Search" or "mongot" -- because the requirement is that the
