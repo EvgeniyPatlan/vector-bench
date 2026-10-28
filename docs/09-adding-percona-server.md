@@ -213,7 +213,7 @@ pattern over code-font spans and a fenced block is not one, so it has a check
 of its own in `tests/test_e1_percona_design.py`, which walks every fence in
 this document and refuses a line that opens with a bare number. That check
 exists because leaving the class to the author failed on the first attempt —
-eight of this document's ten gutter-bearing blocks were cleared, a commit
+eight of this document's eleven gutter-bearing blocks were cleared, a commit
 message said all of them were, and four vendor line numbers survived in the
 excerpt below this paragraph, which asserts they are gone. The hand scan missed
 them because it anchored the fence at the start of a line and that block is
