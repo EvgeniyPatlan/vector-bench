@@ -1,10 +1,17 @@
 # What this instrument cannot see yet, and in what order to fix it
 
-This page is a design document, not a runbook and not a change. Nothing in it
-has been implemented; its purpose is to record, once and in one place, what
-this framework's measurement methodology **cannot currently observe**, what it
-already handles better than a reading of its gaps suggests, and in what order
-the rest is worth addressing.
+This page is a design document, not a runbook and not a change. Its purpose is
+to record, once and in one place, what this framework's measurement methodology
+**cannot currently observe**, what it already handles better than a reading of
+its gaps suggests, and in what order the rest is worth addressing.
+
+**One item has since been implemented, and it is marked where it sits:** §4.1's
+first option was taken, so `Innodb_hnsw_memory_used` is now collected at the
+build phase. Everything else on this page is still unbuilt. The blanket "nothing
+in it has been implemented" this paragraph used to carry was true when the page
+was written and is the kind of sentence that goes stale without anything
+failing, so `tests/test_e15_methodology_roadmap_doc.py` now keys a guard on the
+tree rather than on this claim.
 
 It exists because four independent read-only studies of this tree were run,
 against five hypotheses, and **four of the five did not survive contact with
@@ -326,7 +333,8 @@ anywhere gets a different count* is a statement about every call site and is
 not re-derived here.
 
 Two things survive, and they are the two §4 items of the "claim in prose" shape:
-a documented measurement that is collected nowhere (§4.1), and a measured,
+a documented measurement that was collected nowhere until §4.1 was built, and a
+measured,
 tested, deliberately unwired guard against the one quantified per-engine cold
 bias this harness has (§4.3). The churn workload's own warm-up count is the
 third, and the smallest (§4.7).
@@ -380,10 +388,13 @@ the report entirely.
 Ordered by severity. Every item is a thing this repo says and does not do, and
 every fix is additive.
 
-### 4.1 `Innodb_hnsw_memory_used` is documented as recorded and is collected nowhere
+### 4.1 `Innodb_hnsw_memory_used` was documented as recorded and collected nowhere — BUILT
 
-**Checked, and re-derived carefully because it is the most embarrassing item
-here.** The audit trail for a deliberate fairness decision does not exist.
+**BUILT — and the record of what was wrong is kept because it is the most
+embarrassing item on this page and the reason the collector exists.** For as
+long as this section described the present tense, the audit trail for a
+deliberate fairness decision did not exist. It does now: the first of the two
+options below was taken.
 
 `CLAUDE.md` says `Innodb_hnsw_memory_used` is recorded per phase. So does
 `README.md`. So does `config/engines/percona.yml`, which calls it "the audit
@@ -396,26 +407,40 @@ like every other engine's rather than comparing a wall against the graph caches
 `mhnsw_max_cache_size` and `vidx_hnsw_cache_size` are, ends in *and we record
 the gauge instead*.
 
-**There is no collection site, and the search is worth reporting precisely
-because the precise answer is the stronger one.** Grepping every `.py` in the
-tree for that status variable, in any casing, returns **no hit at all** — not
-one, none. Dropping to the bare suffix returns a single near-hit, and it is not
-a collection site either: a class docstring in
-`tests/test_e1_percona_design.py` naming a vendor MTR result file, inside a
-test about `docs/09-adding-percona-server.md`'s *arithmetic*. And a
-case-sensitive search for the capitalised status-variable prefix *Innodb_*
-anywhere under `harness/`, `report/` or `orchestrator/` returns nothing — in
-italics because it is a fragment of a name and not a name, which this page's §0
-rule and its guard both insist on — so it is not that the
-gauge is read under another name: nothing in the three directories that could
-record a status variable reads one from this engine at all. The lowercase
-`innodb_hnsw_ef_search` and `innodb_buffer_pool_size` that do appear are server
-variables this framework *sets*, which is the opposite direction.
+**There is a collection site now, and naming it is the whole of the fix.**
+`EngineDriver.status_gauges` declares which status variables a driver is worth
+asking for and is `()` for six of the seven engines; `EngineDriver.status_counters`
+is the hook, returning `{}` by default; `MySQLFamilyDriver.status_counters`
+implements it as one `SHOW GLOBAL STATUS LIKE` per name, with
+`_matching_status_row` rejecting a row the widened `LIKE` pattern dragged in;
+`PerconaDriver.status_gauges` is the only declaration in the set; and
+`harness/workloads/build.py`'s `_server_status` merges the reading into the
+`index_build` record as `extra.server_status`, a `{name: int}` dict written only
+when a gauge was actually read.
 
-**The fix is a choice of two, and either is honest.** Collect it — a per-phase
+**What the search used to return, kept because the search is how the gap was
+found.** Grepping every `.py` in the tree for that status variable, in any
+casing, returned **no hit at all** — not one, none — and a case-sensitive
+search for the capitalised status-variable prefix *Innodb_* anywhere under
+`harness/`, `report/` or `orchestrator/` returned nothing, which is what
+established that the gauge was not merely being read under another name. It is
+in italics because it is a fragment of a name and not a name, which this page's
+§0 rule and its guard both insist on. **Both searches now resolve**, to
+`harness/drivers/base.py`, `harness/drivers/mysql_family.py` and
+`harness/workloads/build.py`. The lowercase `innodb_hnsw_ef_search` and
+`innodb_buffer_pool_size` that also appear are server variables this framework
+*sets*, which is the opposite direction and always was.
+
+**The fix was a choice of two, and the first was taken.** Collect it — a
 `SHOW GLOBAL STATUS` read in `harness/drivers/mysql_family.py`, stamped into
 `extra`, which is additive and owes no bump — or strike the claim from all four
-places. Collecting it carries a mandatory rider that
+places. **Collecting it is what shipped, at the build phase only**: the
+concurrency and churn phases are still uncollected, and the filtered phase is
+the same hook at a different call site and is not built either, so this section
+is closed for `index_build` and open everywhere else. The verdict that it owes
+no measurement-version bump held on inspection — every identity component reads
+`extra` by literal key name and none enumerates a record's key set. Collecting
+it carries a mandatory rider that
 `docs/09-adding-percona-server.md` already supplies and that must travel with
 every figure quoted from it: the gauge **omits the node map**, at a supplied
 30–50 bytes per node, so it is a floor on graph memory and not a measurement of

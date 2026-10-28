@@ -294,8 +294,24 @@ class TestBuildArgConventions:
         assert args == {"PERCONA_TAG"}, args
 
     def test_the_arg_is_wired_to_the_env_var_the_manifest_reads(self):
-        """ops_pass.py:256 puts source.tag into VB_ENGINE_TAG; the image sets it
-        too, and an ARG declared but never used leaves it `unknown`."""
+        """`ops_pass.py`'s `VB_ENGINE_TAG` puts source.tag into the
+        environment the manifest reads; the image sets it too, and an ARG
+        declared but never used leaves it `unknown`.
+
+        A SYMBOL AND NOT A NUMBER. This used to cite a line number in
+        `ops_pass.py`, and the change that converted it is an edit above that
+        line -- which is #63's whole argument for the conversion, made again
+        against a citation #63 did not reach. It survived #63 because it is
+        bare docstring prose with a row in neither `CITED_SYMBOLS` nor the
+        `CITED_IN_REPO` table #63 deleted, so nothing failed and nothing would
+        have.
+
+        NO NUMBERS IN THIS PARAGRAPH, deliberately: the earlier version named
+        both the old line and the new one, and the new one went stale inside
+        the same round -- in a docstring whose subject is line numbers going
+        stale. A figure that needs maintaining to stay true does not belong in
+        the explanation of why figures should not be cited.
+        """
         dockerfile = open(os.path.join(DOCKER, "percona", "Dockerfile")).read()
         assert "VB_ENGINE_TAG=${PERCONA_TAG}" in dockerfile
 

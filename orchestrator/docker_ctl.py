@@ -154,6 +154,35 @@ class ContainerSpec:
     # measurement container must never depend on a terminal, or the same
     # command behaves differently under nohup than it does by hand.
     interactive: bool = False
+    #: `--ulimit name=value` per entry, or None for the daemon's defaults.
+    #:
+    #: Added for RLIMIT_CORE, and the two halves of a core dump are separate
+    #: switches that both have to be thrown: mysqld's `--core-file` asks the
+    #: process to dump, and this decides how much of it the kernel is willing
+    #: to write. A container inherits the daemon's own limit, which on a stock
+    #: install is whatever started dockerd, so asking for the core without
+    #: raising the limit produces a TRUNCATED core or none -- and a truncated
+    #: core is worse than no core, because gdb opens it and prints a backtrace
+    #: that stops where the file does.
+    #:
+    #: Per-engine rather than global (`runtime.ulimits` in the engine config),
+    #: so the six engines not under investigation keep the argv they had.
+    #:
+    #: NOT RECORDED ANYWHERE A RUN LEAVES BEHIND, and that gap is open rather
+    #: than closed here. `Manifest.set_engine` keeps an engine's `source`,
+    #: `build`, `images` and `presentation` and NOT its `runtime` block, and
+    #: the `exec mysqld ...` banner that `_save_server_log` archives carries
+    #: the SERVER flags only -- `--ulimit` is a docker flag and never reaches
+    #: mysqld's argv. So the value in force is visible in the engine config
+    #: and in nothing a run produces.
+    #:
+    #: LAST IN THE DATACLASS AND DEFAULTED, for the reason
+    #: `engines.EngineRuntime.error_log` records: Python forbids a field
+    #: without a default after one that has it, so a defaulted field goes at
+    #: the end rather than beside `memory_bytes` where it reads best. Every
+    #: caller constructs this class by keyword, so the position is invisible
+    #: to them.
+    ulimits: Optional[Dict[str, str]] = None
 
 
 def _spec_args(spec: ContainerSpec) -> List[str]:
@@ -176,6 +205,13 @@ def _spec_args(spec: ContainerSpec) -> List[str]:
                  "--memory-swap", str(spec.memory_bytes)]
     if spec.shm_size:
         args += ["--shm-size", spec.shm_size]
+    # One `--ulimit` per entry, not one flag carrying several: docker reads a
+    # second value as an argument to the image's command, so a loop that
+    # emitted the flag once would start the server with a stray argv entry.
+    # Empty or None adds nothing at all, which is what keeps every engine that
+    # declares no ulimits on byte-identical argv.
+    for name, value in (spec.ulimits or {}).items():
+        args += ["--ulimit", f"{name}={value}"]
     if spec.user:
         args += ["--user", spec.user]
     if spec.workdir:
@@ -337,6 +373,117 @@ def container_exists(name: str) -> bool:
     proc = _run(["docker", "inspect", "--type", "container", name],
                 check=False, timeout=30)
     return proc.returncode == 0
+
+
+#: The fields of `docker inspect`'s State that say how a container ended, in
+#: one template. Tab-separated with `State.Error` LAST deliberately: Go's
+#: text/template copies the separator through verbatim, and the only one whose
+#: value can itself contain a tab is the daemon's error string, so putting it
+#: last means an embedded tab lands inside the field it belongs to rather than
+#: shifting every field after it.
+#:
+#: `State.Running` is read and NOT reported. It is one of two independent
+#: discriminators that stop this reporting an exit the container has not had;
+#: see `exit_state`.
+_EXIT_STATE_FORMAT = ("{{.State.Running}}\t{{.State.ExitCode}}\t"
+                      "{{.State.OOMKilled}}\t{{.State.FinishedAt}}\t"
+                      "{{.State.Error}}")
+
+#: What `FinishedAt` reads as for a container that has never finished -- Go's
+#: zero time, which the daemon returns for one created and never started.
+_NEVER_FINISHED = "0001-01-01T00:00:00Z"
+
+
+def exit_state(name: str) -> Optional[Dict[str, Any]]:
+    """How a container ended: exit code, OOM verdict, finish time, error.
+
+    `is_running` and `container_exists` both run `docker inspect` and throw
+    the rest away, so until now nothing in the orchestrator recorded WHY a
+    server container stopped. In run full-20261015-215006 twelve ops units
+    died inside their first INSERT with `Lost connection to server during
+    query` and the run directory could not say whether the kernel had killed
+    the server or the server had killed itself.
+
+    `OOMKilled` IS THE FIELD THIS EXISTS FOR. It settles a cgroup OOM against
+    an in-process crash with no cooperation from the server at all -- a server
+    killed by its cgroup writes nothing to its own error log, which is exactly
+    the case where the error-log capture comes back empty and the absence of
+    evidence reads as evidence of absence. That run's peak server RSS ACROSS
+    ITS OPS PHASES was 48.5 GiB against a 112.5 GiB container cap, so the
+    hypothesis was live and unfalsifiable from the artefacts. (Scoped to the
+    ops phases deliberately, and the scope is the whole point of stating it:
+    the run's percona peak is 54.7 GiB, in `gist-960-euclidean-tuned-ann`,
+    and the ann path is not where the units under investigation died. Both
+    figures are from this run's `mem-percona-*.jsonl` timeseries.)
+
+    ONE INSPECT, NOT FOUR. The capture chain a failed phase runs already sits
+    on 510 s of worst-case timeouts (`copy_file_out` documents the
+    arithmetic), and three more inspects would be three more chances for a
+    wedged daemon to hold a teardown open.
+
+    RETURNS None FOR EVERY FAILURE AND RAISES FOR NONE, the contract
+    `read_file_tail` and `copy_file_out` already document and for the same
+    reason: the only caller runs in a `finally` on the path a crashed phase
+    takes, so a container that has already gone, a daemon that is not
+    answering and an output shape this does not understand must all come back
+    as "no exit state" rather than as an exception that converts a lost
+    measurement into a lost run.
+
+    `OOMKilled` is COMPARED, not coerced. Everything arrives as text, and
+    `bool("false")` is True: an engine that died on its own would be reported
+    as having been killed by the kernel, which is the one error this field
+    exists to prevent.
+
+    None FOR A CONTAINER THAT HAS NOT ENDED, which is not a failure case, and
+    TWO CHECKS RATHER THAN ONE because they catch different containers:
+
+    * `Running` true. The usual caller is `run_harness`'s `finally` AFTER THE
+      CLIENT FAILED, where the server is very often still up, and the daemon
+      answers `ExitCode` 0 for it. "exit_code: 0" there would say the server
+      exited cleanly when it had not exited at all, and a reader would close
+      the question on it. It also catches a container STARTED AGAIN after a
+      stop, which keeps the previous life's `FinishedAt` -- a real timestamp
+      belonging to an exit that is not the one being asked about.
+    * `FinishedAt` at Go's zero time. A container created and never started is
+      not running either, and reports `ExitCode` 0 with no exit behind it;
+      this is the only field that tells that apart from a clean exit 0.
+
+    A server that was alive at capture time and is then stopped by `teardown`
+    has no exit state worth recording, because teardown is what stopped it.
+    """
+    try:
+        proc = _run(["docker", "inspect", "--type", "container",
+                     "--format", _EXIT_STATE_FORMAT, name],
+                    check=False, timeout=30)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    # maxsplit, so a tab inside the daemon's error string stays in it.
+    #
+    # rstrip of the LINE ENDING ONLY, not of whitespace: `State.Error` is
+    # empty for every container that merely exited, so a `.strip()` here eats
+    # the trailing tab and leaves three fields, and the normal case -- a
+    # server that crashed without the daemon having anything to add -- parses
+    # as "no exit state". Found by the test, not by reading.
+    fields = (proc.stdout or "").rstrip("\r\n").split("\t", 4)
+    if len(fields) != 5:
+        return None
+    running, code, oom, finished, error = fields
+    if running.strip().lower() == "true":
+        return None
+    if finished.strip() == _NEVER_FINISHED:
+        return None
+    try:
+        exit_code = int(code.strip())
+    except ValueError:
+        return None
+    return {
+        "exit_code": exit_code,
+        "oom_killed": oom.strip().lower() == "true",
+        "finished_at": finished.strip(),
+        "error": error.strip(),
+    }
 
 
 def logs(name: str, tail: int = 100) -> str:
@@ -636,6 +783,112 @@ def remove_tree_as_root(path: str, image: str) -> bool:
     except Exception as exc:  # pragma: no cover - depends on the daemon
         print(f"[clean] could not remove {path}: {exc}", file=sys.stderr)
     return not os.path.exists(path)
+
+
+#: How deep under the bind directory a match is looked for.
+#:
+#: PUBLIC, because it is part of this function's contract rather than an
+#: implementation detail: `ops_pass.core_capture_verdict` has to know it to
+#: tell an operator whether a core written at a given `core_pattern` will
+#: actually be found. The volume is
+#: mounted at the engine's `data_mount` and mysqld chdirs into its datadir one
+#: level below it, so depth 2 covers both the volume root and the datadir while
+#: refusing to walk an InnoDB tree of several hundred thousand files.
+COPY_GLOB_MAX_DEPTH = 2
+
+#: Bounded in TIME, like `copy_file_out`, and the figure is the one an operator
+#: needs. A core here is bounded by the server's resident set minus whatever
+#: `innodb_buffer_pool_in_core_file=OFF` keeps out of it: the reference run's
+#: peak RSS across its OPS phases was 48.5 GiB against a ~39 GiB buffer pool,
+#: so ~9 GiB, and 900 s is a slow disk's worth of that. (54.7 GiB is that
+#: run's percona peak overall, in an ann phase, which this capture does not
+#: serve.)
+_COPY_GLOB_TIMEOUT_S = 900
+
+
+def copy_glob_as_root(bind_dir: str, pattern: str, dest_dir: str,
+                      image: str) -> List[str]:
+    """Copy files matching `pattern` out of a host directory a container
+    filled as root, and hand the copies back to the invoking user.
+
+    WHY A CONTAINER, which is the whole reason this is not four lines of
+    `glob` and `shutil`. The engine writes its data directory as root inside
+    its container, so the host side of a bind-backed volume is typically
+    root:root 0640 and a non-root orchestrator cannot even list it -- the same
+    fact `remove_tree_as_root` exists for and branches on `os.getuid() == 0`
+    for.
+
+    WHY NOT THE TWO MECHANISMS THAT ALREADY EXIST. `read_file_tail` needs a
+    RUNNING container, and the case this serves is a server that died.
+    `copy_file_out` works on a stopped one but needs an EXACT path -- and a
+    core's filename is decided by the host's `/proc/sys/kernel/core_pattern`,
+    which this framework must not change (see `ops_pass.host_core_pattern`).
+    So the ENUMERATION, not just the copy, has to happen through a container.
+
+    `pattern` is a FILENAME glob, matched at a depth of at most
+    `COPY_GLOB_MAX_DEPTH` below `bind_dir`, not a path glob: the caller knows
+    what a core is called, not which of the volume's two plausible directories
+    the kernel put it in.
+
+    The source is mounted READ-ONLY. The directory is about to be deleted by
+    teardown, so a `mv` -- which on one filesystem would cost no space at all
+    -- would be defensible; it is not done because a copy that mutates what it
+    is reading is the wrong default for an artefact somebody may want to
+    re-examine, and a half-failed `mv` leaves it in neither place. The cost is
+    one core's worth of transient disk, on the filesystem the checkout is on,
+    released seconds later when `remove_tree_as_root` takes the volume.
+
+    The copies are CHOWNED BACK inside the same container, the way
+    `ann_pass.fix_ownership` does it and for the reason it gives: without that
+    the artefact is unreadable to the operator and to `export`. In the same
+    container rather than a second one because a second `docker run` is a
+    second chance for a wedged daemon to hold a teardown open.
+
+    No `os.getuid() == 0` short cut, unlike `remove_tree_as_root`. The case
+    that branch exists for -- a setup that failed before the image existed --
+    is already ruled out by the caller, which does not come here unless the
+    bind directory is there, and it is only there with contents once a server
+    has run from that image.
+
+    Returns the local paths copied, and `[]` for every failure: no such
+    directory, no match, no daemon, a timeout, an unwritable destination. The
+    only caller runs before teardown on the path a crashed phase takes.
+    """
+    if not os.path.isdir(bind_dir):
+        return []
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError:
+        return []
+    uid, gid = os.getuid(), os.getgid()
+    # -exec rather than a `for` over $(find ...), which word-splits on a
+    # filename containing a space. `core_pattern` can be set to one.
+    script = (
+        f"find /src -maxdepth {COPY_GLOB_MAX_DEPTH} "
+        f"-name {shlex.quote(pattern)} -type f "
+        f"-exec cp -p {{}} /dst/ \\; ; "
+        f"chown -R {uid}:{gid} /dst"
+    )
+    spec = ContainerSpec(
+        name=f"vb-cp-{os.getpid()}",
+        image=image,
+        network="none",
+        entrypoint="sh",
+        command=["-c", script],
+        volumes=[f"{bind_dir}:/src:ro", f"{dest_dir}:/dst:rw"],
+        detach=False,
+    )
+    try:
+        run_foreground(spec, timeout=_COPY_GLOB_TIMEOUT_S, stream=False)
+    except Exception as exc:  # pragma: no cover - depends on the daemon
+        print(f"[docker] could not copy {pattern} out of {bind_dir}: {exc}",
+              file=sys.stderr)
+        return []
+    try:
+        names = sorted(os.listdir(dest_dir))
+    except OSError:
+        return []
+    return [os.path.join(dest_dir, n) for n in names]
 
 
 def cleanup_run(run_id: str = "") -> Dict[str, int]:
