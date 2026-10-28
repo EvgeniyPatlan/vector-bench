@@ -982,13 +982,22 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
             # `docs/07` for a figure's provenance -- and requiring a contents
             # row for each would force a row for every passing reference.
             #
-            # What the exemption does NOT do is leave those uncovered. The rows
-            # that matter are still here: this guard carries three `.md`
-            # rows and docs/09's carries one, each opening a named section of
-            # a sibling document and matching the sentence quoted from it.
-            # The exemption
-            # only removes the REQUIREMENT, and it removes it for the class of
-            # reference that is a pointer rather than a claim.
+            # What the exemption does NOT do is leave those uncovered. The
+            # rows that matter are still here: each `.md` row names a section
+            # of a sibling document, opens it, and matches the sentence quoted
+            # from it. The exemption only removes the REQUIREMENT, and it
+            # removes it for the class of reference that is a pointer rather
+            # than a claim.
+            #
+            # NO COUNT OF THOSE ROWS IS STATED HERE, and that is deliberate
+            # rather than vague. This note was pasted into both guards saying
+            # "this guard carries three `.md` rows and docs/09's carries one".
+            # Measured: the docs/09 guard carries ONE and the docs/10 guard
+            # carries SIX, across two files -- so "three" was false in both
+            # copies, and the second clause was true only when read from one
+            # of them. A figure in a comment is checked by nobody; the floor
+            # below is checked on every run, which is the whole argument this
+            # change exists to make.
             #
             # The honest cost: a contents claim about a `docs/` path with no row
             # is not detected, exactly as a contents claim about a file in
@@ -1068,9 +1077,36 @@ class TestEveryClaimAboutThisRepoIsOpenedAndMatched:
         assert anchors, f"{key} has no anchor at all"
         for anchor in anchors:
             assert isinstance(anchor, str), (key, anchor)
-            assert len(anchor.strip()) >= 6, (
+            # NON-SPACE characters, which is what the docstring says and
+            # what `len(anchor.strip())` did not do: `"a    b"` strips to six
+            # and is two characters of evidence.
+            assert len("".join(anchor.split())) >= 6, (
                 f"{key}'s anchor {anchor!r} is too short to be evidence; an "
                 f"anchor this small is satisfied by most bodies")
+
+    def test_the_markdown_rows_open_a_real_section(self):
+        """The premise of the carve-out above, checked instead of counted.
+
+        The forward check exempts every `docs/` path, and the note beside it
+        says the rows that matter are still here. That is a claim about this
+        table, so it is asserted: at least one `.md` row, every one of them
+        resolving to a section that exists, and its anchor inside that
+        section. The note used to carry a COUNT of these rows instead and the
+        count was wrong in both guards -- which is why there is a floor here
+        and no number there.
+        """
+        md = sorted(k for k in CITED_SYMBOLS if k[0].endswith(".md"))
+        assert md, (
+            "no `.md` rows at all, so the carve-out note's claim that sibling "
+            "documents are still covered by their own anchors is false")
+        for path, heading in md:
+            body = symbol_body(path, heading)
+            assert body is not None, (
+                f"{path} has no section matching {heading!r}; a sibling "
+                f"document's heading was renumbered or reworded")
+            anchors = CITED_SYMBOLS[(path, heading)]
+            for anchor in ((anchors,) if isinstance(anchors, str) else anchors):
+                assert anchor in body, (path, heading, anchor)
 
     def test_the_symbol_locator_can_fail(self):
         """Proved able to come back empty, from this file as well, because

@@ -802,10 +802,21 @@ class TestNoFileGainedALineCitation:
         for rel in RATCHETED_TO_ZERO:
             assert os.path.isfile(os.path.join(VB_ROOT, rel)), rel
             assert rel in CITATION_CEILINGS, rel
-            # Each must actually contain a zero-ratchet assertion, or it is
-            # not a file this rule is about.
+            # Each must actually contain a zero-ratchet assertion, or it
+            # is not a file this rule is about.
+            #
+            # MATCHED AS A PATTERN, because the literal substring could not
+            # grow. It was `"contains_no_line_citation" in source`, and
+            # `tests/test_e15_methodology_roadmap_doc.py`'s ratchet is named
+            # `test_docs_11_contains_no_path_line_citation` -- which does not
+            # contain that substring, so the rule could never have been
+            # extended to the third document guard without silently
+            # rejecting it. Moot while the tuple has two entries and exactly
+            # the kind of thing that is not moot later.
             source = open(os.path.join(VB_ROOT, rel)).read()
-            assert "contains_no_line_citation" in source, rel
+            assert re.search(
+                r"def test_docs_\d+_contains_no_(?:path_)?line_citation",
+                source), rel
 
     def test_this_file_makes_none_of_the_citations_it_counts(self):
         """The ban is unconditional, which is only possible because this file
