@@ -116,12 +116,13 @@ prepare_alisql() {
 # deliberate.
 #
 # 1. THE PIN IS A COMMIT, NOT A TAG. `source.tag` holds a SHA because the
-#    engine lives on branch `vector-mvp` and has no release to name. `git
-#    archive` takes a commit-ish wherever it takes a tag, so the mechanism is
-#    unchanged -- but `refs/tags/$tag` is not how this one is resolved, which
-#    is why the verify below is `rev-parse "$sha^{commit}"` against the bare
-#    object rather than against a tag ref. Compare SHAs and never dates: the
-#    branch was rebased, so its author and committer dates disagree.
+#    pin is commit 56124b03, the tip of Percona PR #6278 on base `9.7`, and
+#    has no release to name. `git archive` takes a commit-ish wherever it
+#    takes a tag, so the mechanism is unchanged -- but `refs/tags/$tag` is not
+#    how this one is resolved, which is why the verify below is
+#    `rev-parse "$sha^{commit}"` against the bare object rather than against a
+#    tag ref. Compare SHAs and never dates: the series was rebased onto `9.7`,
+#    so its author and committer dates disagree.
 #
 # 2. NO SUBMODULES, AND THAT IS NOT AN OMISSION. The pin has four of them --
 #    percona-xtradb-cluster-galera, storage/rocksdb/rocksdb, extra/coredumper
@@ -145,9 +146,10 @@ prepare_percona() {
     repo="$VB_SOURCES/percona-git"
     origin=upstream
     if [[ ! -d "$repo/.git" ]]; then
-      # No --depth: a shallow clone of a default branch would not contain a
-      # commit on `vector-mvp`, and the failure would arrive as "fatal: not a
-      # tree object" after the download rather than before it.
+      # No --depth: a shallow clone holds only the default branch's tip, and
+      # the pin is an older commit on `9.7` (that branch has moved past it),
+      # so the failure would arrive as "fatal: not a tree object" after the
+      # download rather than before it.
       git clone --quiet "$upstream" "$repo"
     fi
     git -C "$repo" cat-file -e "${sha}^{commit}" 2>/dev/null \

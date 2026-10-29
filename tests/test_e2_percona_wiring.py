@@ -10,7 +10,7 @@ WHAT THESE TESTS CAN AND CANNOT ESTABLISH
 -----------------------------------------
 Nothing here establishes anything about Percona Server. No image has been built
 and no server has been started; every claim about the engine's behaviour is
-sourced to a file:line on commit 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304 in
+sourced to a file:line on commit 56124b03fdc5954e2401ab4d2c7bf7cb3a767158 in
 docs/09 and is settled by reading that tree. What these establish is that the
 statements this repo would SEND are the ones the document says it sends, and
 that the seven-engine wiring agrees with itself across the files that have to.
@@ -47,7 +47,7 @@ from harness.drivers.mysql_family import (ALISQL_DIALECT,  # noqa: E402
 from harness.drivers.postgres import _driver_classes, _driver_table  # noqa: E402
 
 VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PINNED_SHA = "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304"
+PINNED_SHA = "56124b03fdc5954e2401ab4d2c7bf7cb3a767158"
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +133,159 @@ PROSE_CLAIMS = {
         rejects=[
             "No measured ingest rate for percona.",
             "percona is excluded from the total.",
+        ]),
+    "a re-pin leaves the recall cells and the subtree must be moved aside": dict(
+        # FOUR REQUIREMENTS, ORDER-INDEPENDENT. A paragraph that drops any one
+        # of them stops being a warning: the TRIGGER (the source pin moved),
+        # the HAZARD (the cells already on disk are reused rather than
+        # re-measured, because `ann_fingerprint` is engine-invariant and holds
+        # no source tag), and the REMEDY in two halves -- the ACT (move,
+        # rename, delete, re-measure) and the OBJECT it acts on (the engine's
+        # subtree of the ann results tree). The act and the object are
+        # separate legs because "move the pin" and "the results tree is
+        # shared" are each true on their own and neither is the instruction.
+        #
+        # THE REMEDY IS NOT `--force`, AND IT USED TO SAY IT WAS. That flag
+        # does re-run points that already have results -- its help text says
+        # exactly that -- but it is also the escape hatch on the free-disk
+        # refusal (`_check_free_disk(...) and not args.force` in
+        # `orchestrator/cli.py`), so passing it silently disables the one
+        # refusal a core-dump campaign most needs. Moving the engine's subtree
+        # aside buys the re-measurement without buying that, and
+        # `_count_results` counts result files under directories named for the
+        # engine, so moving them is what makes it return zero.
+        #
+        # A fresh `--run-id` is NOT a substitute and is not part of this
+        # claim: `paths` in `orchestrator/cli.py` puts `ops_results` at the
+        # run directory and `annb_results` at a sibling of it, so a new run
+        # directory leaves every recall cell where it was. That is a separate
+        # requirement, for the ops path, and it is stated beside this one.
+        #
+        # ANCHORED AT \A for the reason the entry below documents.
+        #
+        # BOTH HALVES ARE SENTENCE-LEVEL, AND THE FIRST VERSION WAS NOT. It
+        # asked for four tokens anywhere in the block, and two of this file's
+        # own mutants then SURVIVED: deleting the remedy sentence from
+        # CLAUDE.md left "Re-measure" and "recall" elsewhere in the same
+        # twenty-line bullet, and deleting the hazard sentence left
+        # "ann-benchmarks caches by algorithm" -- the bullet's original
+        # opening, which is a true statement about caching and not about this
+        # pin. A block larger than the claim can satisfy a conjunction out of
+        # sentences that have nothing to do with each other, which is the
+        # same defect `_paragraphs` exists to stop, one level further in.
+        #
+        # So the trigger must meet the hazard INSIDE ONE SENTENCE -- it is
+        # the pin moving that causes the reuse -- and the act must meet the
+        # object inside one sentence, because "move the pin" and "the results
+        # tree is shared" are each true alone and neither is the instruction.
+        # `(?:(?!\.)[^.])*?` is what keeps a match inside a sentence; either
+        # order is accepted, because English puts them both ways.
+        pattern=r"\A"
+                r"(?=.*\b(?:re-?pin(?:ned|ning)?|new pin"
+                r"|pin (?:move|change)[sd]?|moves? the pin|moved the pin"
+                r"|source\.tag)\b(?:(?!\.)[^.])*?"
+                r"\b(?:reuse[sd]?|reusing|cached?|caches|stale"
+                r"|skip(?:s|ped)?|already on disk|where it was"
+                r"|left behind)\b"
+                r"|.*\b(?:reuse[sd]?|reusing|cached?|caches|stale"
+                r"|skip(?:s|ped)?|already on disk|where it was"
+                r"|left behind)\b(?:(?!\.)[^.])*?"
+                r"\b(?:re-?pin(?:ned|ning)?|new pin"
+                r"|pin (?:move|change)[sd]?|moves? the pin|moved the pin"
+                r"|source\.tag)\b)"
+                r"(?=.*\b(?:mov(?:e|es|ed|ing)|aside|renam\w+|delet\w+"
+                r"|re-?measur\w+|re-?comput\w+)\b(?:(?!\.)[^.])*?"
+                r"\b(?:subtree|results tree|ann tree|result files"
+                r"|recall cells?|curve)\b"
+                r"|.*\b(?:subtree|results tree|ann tree|result files"
+                r"|recall cells?|curve)\b(?:(?!\.)[^.])*?"
+                r"\b(?:mov(?:e|es|ed|ing)|aside|renam\w+|delet\w+"
+                r"|re-?measur\w+|re-?comput\w+)\b)",
+        accepts=[
+            "After a re-pin the recall cells on disk are reused, so move "
+            "that engine's subtree of the ann results tree aside before the "
+            "run.",
+            "Because source.tag changed the cached result files are "
+            "skipped; moving the engine's subtree aside makes the curve get "
+            "measured again.",
+            "A new pin leaves every recall cell where it was, so move the "
+            "subtree aside and the curve is re-measured.",
+        ],
+        rejects=[
+            # Each drops one leg.
+            "After a re-pin the recall cells are reused. Nothing to do.",
+            "Move the subtree aside before the run.",
+            "The cached result files are skipped; move the subtree aside.",
+            "A re-pin changes the engine_version on every record.",
+            # The two shapes that survived the block-level version: the
+            # vocabulary present, scattered over sentences that do not make
+            # the claim between them.
+            "A re-pin does not move the tree. ann-benchmarks caches by "
+            "algorithm. Re-measure the engine if you want its real recall.",
+            "ann-benchmarks caches by algorithm and index parameters only. "
+            "Move that engine's subtree aside. The tree is keyed by the "
+            "resource pass.",
+        ]),
+    "a sentence that tells the operator to pass --force": dict(
+        # NOT A CLAIM TO BE MADE -- a shape to be ABSENT. The test below
+        # asserts no paragraph at any of the three sites matches this, which
+        # is the assertion that would have caught the error this entry exists
+        # because of: for two rounds these documents told the operator to pass
+        # `--force`, and the guard over them only ever grepped for the string,
+        # so it could not tell an instruction from a warning. It passed on
+        # prose saying the opposite of what it was guarding.
+        #
+        # A DIRECTIVE IS AN INSTRUCTION WITH NO NEGATION IN FRONT OF THE FLAG.
+        # That is the whole definition and it is why both halves scan with a
+        # TEMPERED character class -- `(?:(?!\b(?:no|not|never|...)\b)[^.])*?`
+        # -- rather than `[^.]{0,60}`: a plain window matched "the same hazard
+        # WITH NO `--force` FOR IT" and "must *not* be given `--force`", both
+        # of which are prohibitions, and both of which are live in this
+        # repository's own prose. The tempered class cannot cross a negation,
+        # so a sentence that denies the flag can never read as a directive.
+        #
+        # THE SECOND BRANCH IS A COMMAND LINE, and it is the one that matters
+        # most: a copy-pasteable `./run-benchmark.sh ... --force` is the form
+        # an operator will actually act on, and the first branch cannot see it
+        # because `run-benchmark.sh` contains a period and the sentence scan
+        # stops at one. It found a real instance -- CLAUDE.md's rebuild table
+        # still said "then `--force` on the first ann run" after the prose
+        # above it had been corrected.
+        #
+        # `must` is in the verb list and `give[ns]?` is too, which is why the
+        # negation guard is not optional: "must *not* be given `--force`" has
+        # two matching verbs and is the opposite of a directive.
+        pattern=r"(?:\A|\.)(?:(?!\b(?:no|not|never|cannot|nor)\b)[^.])*?"
+                r"\b(?:pass(?:es|ing)?|launch(?:ed|ing)?|re-?runs?|add|use"
+                r"|needs?|requires?|must|give[ns]?|supply|with)\b"
+                r"(?:(?!\b(?:no|not|never|cannot|nor)\b)[^.])*?--force\b"
+                r"|run-benchmark\.sh"
+                r"(?:(?!\b(?:no|not|never|cannot|nor)\b)[^\n])*?--force\b",
+        accepts=[
+            # "accepts" here means "is correctly identified AS a directive".
+            "Pass --force on the first ann run after a re-pin.",
+            "Re-run with --force to recompute the cached points.",
+            "The first run at a new pin needs --force.",
+            "Launch the smoke run with --force.",
+            "The run must be launched with --force.",
+            "So: ./run-benchmark.sh run --profile smoke --engines percona "
+            "--force",
+        ],
+        rejects=[
+            # Prohibitions and bare mentions, every one of them live prose in
+            # this repository at the time this entry was written.
+            "Do not reach for --force instead, even though its help text "
+            "offers exactly that.",
+            "Not --force, even though its help text offers exactly that.",
+            "--force is the escape hatch on the free-disk refusal, so it "
+            "disables the warning.",
+            "Move the subtree aside before the run; not --force, which also "
+            "disables the refusal.",
+            "--force is deprecated and has no effect on the ann path.",
+            "the ops path has the same hazard WITH NO --force FOR IT",
+            "The run needs a fresh --run-id and must *not* be given --force.",
+            "Run ./run-benchmark.sh run --profile smoke --engines percona, "
+            "and never --force.",
         ]),
 }
 
@@ -832,14 +985,31 @@ class TestTheEngineConfig:
 
     def test_the_source_pin_is_the_sha_under_the_tag_key(self, cfg):
         """`_source_tag` reads `tag` or `version` and there is no `sha` key, so
-        a `source: sha:` block would make it return "" and
-        prepare-sources.sh fall back to a hard-coded default."""
+        a `source: sha:` block would make it return "" and `prepare_percona`
+        die -- it passes `""` as the default and `die`s on an empty value.
+        There is no hard-coded fallback for THIS engine, unlike the three
+        other `prepare_*` functions that read the key; this docstring was the
+        third copy of that error in the tree.
+        """
         assert cfg["source"]["tag"] == PINNED_SHA
         assert "sha" not in cfg["source"]
 
     def test_the_registry_carries_that_pin_into_the_manifest(self):
         from orchestrator import engines as engines_mod
         assert engines_mod.registry(refresh=True)["percona"].tag == PINNED_SHA
+
+    def test_the_pin_is_a_commit_and_could_not_be_a_branch_name(self, cfg):
+        """The two tests above compare this value against this file's own
+        constant, so `9.7` in both places passes both of them -- and `git
+        archive` takes a branch name as happily as a SHA, resolving it afresh
+        on every build, so two runs carrying the same manifest would not be
+        the same server. The branch this pin sits in moved four commits in the
+        day after the pin was taken. So the SHAPE is asserted separately from
+        the value, on the config and on the constant.
+        """
+        assert re.fullmatch(r"[0-9a-f]{40}", str(cfg["source"]["tag"])), \
+            cfg["source"]["tag"]
+        assert re.fullmatch(r"[0-9a-f]{40}", PINNED_SHA), PINNED_SHA
 
     def test_no_submodules_key(self, cfg):
         """All four of the pin's submodules are switched off in the build
@@ -1779,3 +1949,576 @@ class TestTheInvariantsKeyedOnHardCodedEngineTuples:
                                                                 1)[0]
         offenders = re.findall(r'"(\w+)":\s*(None\b|\[|\{)', block)
         assert not offenders, offenders
+
+
+# ---------------------------------------------------------------------------
+# The pin is one value in every file that spells one
+# ---------------------------------------------------------------------------
+#
+# `tests/test_e1_percona_design.py`'s
+# `test_the_pinned_sha_is_the_same_in_every_file_that_names_one` collects every
+# 40-hex string in docs/09 and the overlay module and asserts the set is that
+# file's own `PINNED_SHA`. Those are two of the eight files in this repository
+# that spell a full commit SHA, and the two constants named `PINNED_SHA` --
+# that file's and this one's -- are independent literals that nothing
+# compares. So the chain that is supposed to make a re-pin all-or-nothing had
+# a break in the middle: the engine config was tied to THIS file's constant,
+# the document to that file's, and `docker/percona/Dockerfile`'s SHA note and
+# `tests/test_e4_percona_build_flags.py`'s provenance paragraph were tied to
+# nothing at all. Both of those spell the pin inside a comment that reasons
+# from it, so a half-finished re-pin leaves the config naming one source while
+# the cmake reasoning cites another -- which is worse than no re-pin, because
+# it reads as deliberate.
+#
+# This is the whole-tree form of that guard. It is what turns the re-pin's own
+# acceptance criterion -- `grep -rn <the old sha>` over the tree returns
+# nothing -- into an assertion rather than a step somebody remembers to run.
+
+#: Directories never walked. The same list and the same reasons as
+#: `tests/test_e16_citation_ratchet.py`'s `SKIP_DIRS`: `.git` and
+#: `__pycache__` hold no source; `.claude` is gitignored and holds other
+#: agents' git worktrees, so walking it would scan whole second copies of this
+#: repository; and the rest are generated and gitignored per CLAUDE.md, so a
+#: scan that read them would differ between a fresh checkout and a machine
+#: that had run a benchmark. That last one is not a tidiness point here: the
+#: vendor trees exported under `sources/` spell a 40-hex SHA on nearly every
+#: page, so including them would make this guard fail on exactly the machine
+#: that had done the build it exists to protect.
+SHA_SCAN_SKIP_DIRS = ("__pycache__", ".git", ".pytest_cache", ".claude",
+                      ".cache", ".venv", "venv", "sources", "work", "results",
+                      "datasets", "state")
+
+#: Suffixes read. The last entry is a whole filename rather than an extension,
+#: because the Dockerfile is where two of the pin's three unguarded copies
+#: lived and `str.endswith` takes both forms from one tuple.
+SHA_SCAN_SUFFIXES = (".py", ".yml", ".yaml", ".md", ".sh", ".sql", ".js",
+                     ".txt", ".json", "Dockerfile")
+
+#: This file, and the plan document, by relative path. Both are named
+#: because both legitimately spell commits that are not the pin, and a guard
+#: whose own data sits inside its own scan has to say so rather than quietly
+#: skip itself -- `tests/test_e16_citation_ratchet.py` makes the same
+#: declaration for the same reason, in
+#: `test_this_file_makes_none_of_the_citations_it_counts`.
+SELF_REL = "tests/test_e2_percona_wiring.py"
+PLAN_DOC = "docs/12-percona-feedback-plan.md"
+
+#: `orchestrator/estimate.py`, which dates its measured ingest rates to the
+#: binary that produced them. Named here rather than edited: the sentence is
+#: a fact about seventeen archived records and not a copy of the pin, and the
+#: file belongs to another unit.
+ESTIMATOR = "orchestrator/estimate.py"
+
+#: Commits other than the pin that this tree may name, as
+#: `{sha: (the files that may name it, why)}`.
+#:
+#: KEYED BY SHA AND NOT BY FILE, which is the correction a review made and
+#: the principle this comment already stated two paragraphs up. The first
+#: version exempted `docs/12-percona-feedback-plan.md` wholesale, so a SECOND
+#: stale commit landing in that file would have passed -- an exemption
+#: inferred from a filename rather than named.
+#:
+#: THIS FILE IS IN EVERY ENTRY'S FILE LIST, AND THAT IS NOT A SELF-EXEMPTION.
+#: A guard that forbids a commit has to spell it, so the forbidding and the
+#: forbidden look identical to a grep. The narrow check below --
+#: `test_this_file_holds_nothing_but_the_commits_it_declares` -- is what
+#: stops that from being a hiding place: every commit in this file must be
+#: the pin or a declared entry, so a stale copy smuggled in here fails even
+#: though the file is listed. The first version of this guard had no such
+#: declaration at all and simply failed against its own data, which is how
+#: the omission was found.
+COMMITS_ALLOWED_BESIDE_THE_PIN = {
+    "1fc5dadc7265e0080e70320edcf238c3743d2b7a": (
+        (PLAN_DOC, SELF_REL),
+        "the pre-rebase head of PR #6278's branch, and so the twin of the "
+        "pin: it is the plan's evidence that the old branch tip is not an "
+        "ancestor of the merged series. docs/12's figures describe the tree "
+        "as it was when the plan was written and are deliberately not "
+        "maintained -- the plan's own phase 0 says so."),
+    "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304": (
+        (PLAN_DOC, SELF_REL, ESTIMATOR),
+        "the superseded pin: the `vector-mvp` tip of 2026-10-13, left behind "
+        "when the vector MVP was merged into the `9.7` series. docs/12 is "
+        "the document that argues for that re-pin, so naming the pin it "
+        "moved away from is its subject rather than a stale copy.\n"
+        "\n"
+        "`orchestrator/estimate.py` is the third entry and it was found by "
+        "this guard rather than by reading: the estimator's rates landed on "
+        "master while the old pin was still live, and its comment says `All "
+        "seventeen records carry engine_version 9.7.1-1-vector-bench at "
+        "engine_tag 02a8b80c. These are therefore rates for the OLD pin`. "
+        "That is a fact about which binary measured seventeen archived "
+        "records, not a copy of the pin, and the sentence is the reason the "
+        "first run at the new pin has something explicit to supersede. The "
+        "file belongs to another unit, so it is declared here and not "
+        "edited -- and the check below means that if that sentence is ever "
+        "removed, this allowance fails rather than lingering."),
+}
+
+#: Of those, the ones that were once this engine's `source.tag`.
+#:
+#: THE RE-PIN'S ACCEPTANCE CRITERION IS A GREP FOR THE SUPERSEDED PIN, AND
+#: `_FORTY_HEX` CANNOT SEE ONE. CLAUDE.md's engine table and this engine's own
+#: config comment write a pin as EIGHT characters, so reverting either of them
+#: to the old abbreviation left the 40-hex scan green while the acceptance
+#: grep failed -- a half-finished re-pin in a file the re-pin itself edited.
+#: So the criterion gets its own assertion below, over abbreviations of seven
+#: characters and up and case-insensitively: `git log --format=%H` is lower
+#: case, but nothing stops a document shouting one.
+#:
+#: The files allowed to name each one come from the table above, so the two
+#: assertions cannot disagree about where a commit may live.
+SUPERSEDED_PINS = ("02a8b80c70b0ccf6c9035d8a2307e7fa988cc304",)
+
+#: A commit as this repository writes one: seven to forty hex characters,
+#: token-bounded, holding BOTH a digit and a letter.
+#:
+#: The digit-and-letter requirement is what makes a 7-character scan usable at
+#: all. Without it the pattern matches ordinary English -- `effaced`, `decade`,
+#: `deadbeef` are all hex -- and a guard that fires on prose is a guard the
+#: next author deletes. With it, the tree yields 40 commit-shaped tokens, most
+#: of them this repository's OWN commits cited in test docstrings, which is
+#: why the assertions below are scoped to the superseded pin and to near
+#: misses of the current one rather than demanding an allow-list of all 40.
+_HEXISH = re.compile(r"(?<![0-9A-Za-z])([0-9a-fA-F]{7,40})(?![0-9A-Za-z])")
+
+#: Sites the scan must actually reach, so that a walk which quietly stopped
+#: finding files cannot pass every assertion it makes. One per shape the
+#: suffix list has to handle: a YAML config, an extensionless Dockerfile, a
+#: Markdown document, a Python module. The two test files that spell the pin
+#: are deliberately absent -- a non-vacuity check naming only the guards
+#: proves nothing about the tree they guard.
+SHA_SCAN_WITNESSES = (
+    "config/engines/percona.yml",
+    "docker/percona/Dockerfile",
+    "docs/09-adding-percona-server.md",
+    "overlay/ann-benchmarks/ann_benchmarks/algorithms/percona/module.py",
+)
+
+_FORTY_HEX = re.compile(r"\b[0-9a-f]{40}\b")
+
+
+def _forty_hex_shas(root):
+    """`{relative path: {every 40-hex string in it}}`, under `root`.
+
+    Taken as a parameter rather than off `VB_ROOT` so the planted tree below
+    exercises this walk and this regex, and not a copy of them.
+    """
+    found = {}
+    for where, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SHA_SCAN_SKIP_DIRS]
+        for name in files:
+            if not name.endswith(SHA_SCAN_SUFFIXES):
+                continue
+            try:
+                text = open(os.path.join(where, name), encoding="utf-8",
+                            errors="replace").read()
+            except OSError:
+                continue
+            shas = set(_FORTY_HEX.findall(text))
+            if shas:
+                rel = os.path.relpath(os.path.join(where, name), root)
+                found[rel.replace(os.sep, "/")] = shas
+    return found
+
+
+def _hexish_tokens(root):
+    """`{relative path: {every commit-shaped token in it, lower-cased}}`.
+
+    Same walk and same suffix list as `_forty_hex_shas`; a different pattern,
+    and lower-cased on the way out so an abbreviation shouted in prose is
+    still recognised.
+    """
+    found = {}
+    for where, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SHA_SCAN_SKIP_DIRS]
+        for name in files:
+            if not name.endswith(SHA_SCAN_SUFFIXES):
+                continue
+            try:
+                text = open(os.path.join(where, name), encoding="utf-8",
+                            errors="replace").read()
+            except OSError:
+                continue
+            tokens = {
+                tok.lower() for tok in _HEXISH.findall(text)
+                if re.search(r"[0-9]", tok) and re.search(r"[a-fA-F]", tok)}
+            if tokens:
+                rel = os.path.relpath(os.path.join(where, name), root)
+                found[rel.replace(os.sep, "/")] = tokens
+    return found
+
+
+class TestThePinIsOneValueInEveryFileThatSpellsOne:
+
+    def test_every_forty_hex_sha_in_the_tree_is_the_pin(self):
+        found = _forty_hex_shas(VB_ROOT)
+        wrong = {}
+        for rel, shas in sorted(found.items()):
+            bad = sorted(
+                s for s in shas
+                if s != PINNED_SHA
+                and rel not in COMMITS_ALLOWED_BESIDE_THE_PIN.get(
+                    s, ((), ""))[0])
+            if bad:
+                wrong[rel] = bad
+        assert not wrong, (
+            "these files name a 40-hex commit that is not the pin, so the "
+            "re-pin is half-finished; a pin that differs between two files "
+            "is not a pin\n  "
+            + "\n  ".join(f"{rel}: {', '.join(shas)}"
+                          for rel, shas in wrong.items()))
+
+    def test_the_scan_reaches_the_sites_nothing_else_pins(self):
+        """Non-vacuity, and the reason it is four paths and not a count: a
+        count goes stale the next time a file stops naming the pin, and then
+        the repair is to lower the count, which is how a floor becomes a
+        comment."""
+        found = _forty_hex_shas(VB_ROOT)
+        missing = [rel for rel in SHA_SCAN_WITNESSES if rel not in found]
+        assert not missing, (
+            "the scan no longer sees a SHA in these files, so it is not "
+            "checking what it claims to check -- either the suffix list "
+            "stopped matching them or the walk stopped reaching them: "
+            + ", ".join(missing))
+
+    def test_the_scan_sees_a_planted_sha_and_skips_a_generated_tree(self,
+                                                                   tmp_path):
+        """The walk, the suffix list and the regex proved end to end on a tree
+        built for the purpose, because one guard in this series shipped green
+        while scanning zero files.
+
+        The last two plants assert the LIMITS rather than the behaviour: a
+        generated tree is skipped even though it holds the needle, and a
+        suffix outside the list is not read. Both are deliberate, and a
+        reader of this file is entitled to know which omissions were chosen.
+        """
+        stale = "0" * 39 + "1"
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "engines.yml").write_text(f"tag: {stale}\n")
+        (tmp_path / "Dockerfile").write_text(f"# built from {stale}\n")
+        (tmp_path / "sources").mkdir()
+        (tmp_path / "sources" / "vendor.md").write_text(stale + "\n")
+        (tmp_path / "notes.rst").write_text(stale + "\n")
+        found = _forty_hex_shas(str(tmp_path))
+        assert found == {"config/engines.yml": {stale},
+                         "Dockerfile": {stale}}, found
+
+    def test_every_allowed_commit_is_still_where_it_says_it_is(self):
+        """An allowance for a commit that is no longer in the file it names is
+        pure allowance: it would wave through the next stale copy under the
+        same SHA. Same shape as `tests/test_e16_citation_ratchet.py`'s check
+        that no ceiling is slack by more than its file holds.
+        """
+        found = _hexish_tokens(VB_ROOT)
+        assert COMMITS_ALLOWED_BESIDE_THE_PIN, "the allow-set is empty"
+        for sha, (rels, reason) in sorted(
+                COMMITS_ALLOWED_BESIDE_THE_PIN.items()):
+            assert reason.strip(), sha
+            assert sha != PINNED_SHA, sha
+            assert rels, sha
+            for rel in rels:
+                assert os.path.isfile(os.path.join(VB_ROOT, rel)), rel
+                # At ANY abbreviation, which is the whole point: docs/12
+                # writes the superseded pin as eight characters and the full
+                # forty never appears there, so a 40-hex check here declared
+                # that allowance dead when it is live.
+                assert any(sha.startswith(tok)
+                           for tok in found.get(rel, set())), (
+                    f"{sha} is no longer named in {rel}, at any "
+                    f"abbreviation, so that half of its allowance is doing "
+                    f"nothing but waiting to be abused -- remove it")
+
+    def test_this_file_holds_nothing_but_the_commits_it_declares(self):
+        """The narrow check that keeps this file's own listing from being a
+        hiding place.
+
+        This guard has to SPELL the commits it forbids, so to a grep the
+        forbidding and the forbidden are the same string, and the file must
+        therefore appear in its own allow-list. What stops that being an
+        exemption is this: the only commits allowed in here are the pin and
+        the declared entries, so a stale copy smuggled into this file fails
+        even though the file is listed. `tests/test_e16_citation_ratchet.py`
+        makes exactly this move for exactly this reason.
+        """
+        declared = {PINNED_SHA} | set(COMMITS_ALLOWED_BESIDE_THE_PIN)
+        found = _forty_hex_shas(VB_ROOT).get(SELF_REL, set())
+        assert found, f"{SELF_REL} names no commit at all; the scan is blind"
+        assert found <= declared, sorted(found - declared)
+        tokens = _hexish_tokens(VB_ROOT).get(SELF_REL, set())
+        undeclared = sorted(
+            tok for tok in tokens
+            if not any(sha.startswith(tok) for sha in declared))
+        assert not undeclared, (
+            f"{SELF_REL} names commit-shaped tokens it does not declare, so "
+            f"its place in its own allow-list is hiding them: {undeclared}")
+
+    def test_no_abbreviation_of_a_superseded_pin_survives(self):
+        """The re-pin's acceptance criterion, as an assertion.
+
+        This is the one the 40-hex scan cannot make: the pin appears as eight
+        characters in CLAUDE.md's engine table and in the engine config's own
+        comment, and reverting either to the old abbreviation leaves
+        `test_every_forty_hex_sha_in_the_tree_is_the_pin` green because
+        neither file names a 40-hex string at all.
+        """
+        assert SUPERSEDED_PINS, "nothing is recorded as superseded"
+        found = _hexish_tokens(VB_ROOT)
+        stale = []
+        for sha in sorted(SUPERSEDED_PINS):
+            assert len(sha) == 40 and re.fullmatch(r"[0-9a-f]{40}", sha), sha
+            allowed = COMMITS_ALLOWED_BESIDE_THE_PIN[sha][0]
+            for rel, tokens in sorted(found.items()):
+                if rel in allowed:
+                    continue
+                for token in sorted(tokens):
+                    if sha.startswith(token):
+                        stale.append(f"{rel}: {token} (abbreviates {sha})")
+        assert not stale, (
+            "a superseded pin is still named outside the one file allowed to "
+            "name it, so the re-pin is half-finished:\n  "
+            + "\n  ".join(stale))
+
+    def test_a_near_miss_of_the_pin_is_not_mistaken_for_it(self):
+        """A mistyped abbreviation is the failure the two assertions above
+        both miss: it is not 40 hex and it is not the superseded pin.
+
+        Scoped to tokens sharing the pin's first three characters, which is
+        narrow enough to cost nothing -- no other commit-shaped token in the
+        tree begins with them -- and wide enough to catch a transposed or
+        truncated digit in a hand-copied pin.
+        """
+        found = _hexish_tokens(VB_ROOT)
+        wrong = []
+        for rel, tokens in sorted(found.items()):
+            for token in sorted(tokens):
+                if token[:3] == PINNED_SHA[:3] and not PINNED_SHA.startswith(token):
+                    wrong.append(f"{rel}: {token}")
+        assert not wrong, (
+            "these look like the pin and are not it, so they are a typo in a "
+            f"hand-copied abbreviation of {PINNED_SHA}:\n  "
+            + "\n  ".join(wrong))
+
+
+# ---------------------------------------------------------------------------
+# The ann results tree is reused across a re-pin, and three files say so
+# ---------------------------------------------------------------------------
+#
+# `orchestrator/ann_pass.py:ann_fingerprint` is DELIBERATELY engine-invariant:
+# it hashes `ANN_MEASUREMENT_VERSION`, the server memory, the pass signature,
+# the build threads and the CPU count, and no engine name and no source tag.
+# That is the right design -- making it engine-specific fragments the tree and
+# produces a seven-engine recall chart with one engine in it -- and it means a
+# re-pin does not move `results/annb/<pass>/<fingerprint>/`. ann-benchmarks
+# skips a configuration that already has a result file and reports that as
+# success, so after a re-pin every Percona recall cell on disk is reused, the
+# new binary's recall is never measured, and the report publishes the old
+# binary's numbers under the new pin's `engine_version`.
+#
+# Two things notice, and neither prevents it. `ann_pass.run_engine` prints
+# "already-computed configurations will be skipped" before the run, and
+# `report/generate.py`'s `stale_ann` bucket compares each record's
+# `extra.source_mtime` against the run's start and lists the cell in the
+# Validity section afterwards. The remedy is to MOVE THE ENGINE'S SUBTREE of
+# the ann results tree aside before the first run at a new pin:
+# `_count_results` counts result files under directories named for the
+# engine, so it returns 0 and ann-benchmarks measures the curve again. NOT
+# `--force`: its help text offers exactly this re-run, but the same flag is
+# the escape hatch on the free-disk refusal in `orchestrator/cli.py`, so
+# passing it disables the one refusal a core-dump campaign most needs -- and
+# for two rounds this file asserted `--force` as the remedy. NOT a fresh run
+# directory: `annb_results` is `results/annb`, a sibling of the run
+# directory, so a new `--run-id` leaves every recall cell where it was. And
+# NOT a bump of `ANN_MEASUREMENT_VERSION`, which would move every pass's tree
+# and re-measure every recall point for all seven engines and both resource
+# passes.
+#
+# So the requirement is written in the three places an operator or an author
+# actually passes through on the way to that run, and asserted here, because
+# a requirement that lives only in a merged pull request body is a
+# requirement nobody will read at the moment it matters.
+
+#: Where the move-the-subtree-aside requirement is written, and why each site.
+ANN_SUBTREE_SITES = {
+    "config/engines/percona.yml":
+        "beside the pin itself: moving `source.tag` is the act that creates "
+        "the hazard, so the warning belongs in the diff that creates it",
+    "CLAUDE.md":
+        "in the invariant that already explains why the fingerprint is "
+        "engine-invariant, which is the bullet a reader lands on when they "
+        "ask why the tree is shared",
+    "docs/09-adding-percona-server.md":
+        "in the list of what the smoke run has to survive, which is the "
+        "document the first post-re-pin run is planned from",
+}
+
+
+#: A line that separates two paragraphs: empty, or carrying nothing but a
+#: comment marker. The second half is what a YAML or shell comment block uses
+#: for a paragraph break, and leaving it out is what let the whole 77-line
+#: `source:` comment in `config/engines/percona.yml` count as ONE block.
+_PARAGRAPH_BREAK = re.compile(r"^[ \t]*(?:#|--|//)?[ \t]*$")
+
+#: The start of a list item, bulleted or numbered. `5. ` is not a `-` bullet,
+#: and leaving numbers out is what let all five items of docs/09 §5 count as
+#: one 34-line block.
+_LIST_ITEM = re.compile(r"\n(?=[ \t]{0,4}(?:[-*][ \t]|\d{1,2}[.)][ \t]))")
+
+
+def _paragraphs(text):
+    """One block per paragraph: blank-line separated, comment markers and
+    list items understood.
+
+    A block that is bigger than the claim is a smuggling hole, because the
+    three-part conjunction below can then be satisfied by three unrelated
+    sentences while the warning itself is gone. THIS IS NOT HYPOTHETICAL AND
+    THE FIRST VERSION HAD IT: that version split on blank lines and on `-`
+    bullets only, so a `  #` line was not a break and `5. ` was not an item,
+    and the measured block sizes were 77 lines for the engine config's
+    `source:` comment and 34 for docs/09 §5 against 8 and 10 for CLAUDE.md.
+    A review then deleted the whole hazard paragraph from the config, left
+    the bare line `# Rebuild, then run with --force.`, added the word
+    "cached" to an unrelated comment line in the same block, and the guard
+    stayed GREEN. With both breaks understood, no site's `--force` block
+    exceeds seventeen lines and that deletion is red.
+    """
+    blocks, current = [], []
+    for line in text.splitlines():
+        if _PARAGRAPH_BREAK.match(line):
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    out = []
+    for chunk in blocks:
+        out.extend(p for p in _LIST_ITEM.split(chunk) if p.strip())
+    return out
+
+
+class TestTheAnnCacheHazardIsWrittenWhereItWillBeRead:
+
+    _CLAIM = "a re-pin leaves the recall cells and the subtree must be moved aside"
+    _DIRECTIVE = "a sentence that tells the operator to pass --force"
+
+    @pytest.mark.parametrize("path", sorted(ANN_SUBTREE_SITES))
+    def test_the_subtree_requirement_is_made_at_this_site(self, path):
+        """Some ONE paragraph at this site makes the whole claim.
+
+        One paragraph and not the file, because a conjunction over a whole
+        file can be satisfied by sentences that have nothing to do with each
+        other -- which is what `_paragraphs` exists to prevent and what a
+        review demonstrated by deleting the warning and leaving the
+        vocabulary behind.
+        """
+        pattern = PROSE_CLAIMS[self._CLAIM]["pattern"]
+        blocks = _paragraphs(open(os.path.join(VB_ROOT, path)).read())
+        hits = [b for b in blocks if re.search(pattern, _flat(b), re.I)]
+        assert hits, (
+            f"no single paragraph in {path} still makes the whole claim: "
+            f"{self._CLAIM}\n"
+            f"  reason this site was chosen: {ANN_SUBTREE_SITES[path]}\n"
+            f"  pattern: {pattern}\n"
+            f"  the pattern is a vocabulary, not a sentence -- if the claim "
+            f"is still made and only the wording moved, widen PROSE_CLAIMS "
+            f"rather than restoring the old phrasing")
+
+    @pytest.mark.parametrize("path", sorted(ANN_SUBTREE_SITES))
+    def test_this_site_does_not_tell_the_operator_to_pass_force(self, path):
+        """The assertion that would have caught two rounds of being wrong.
+
+        `--force` does re-run points that already have results, so for two
+        rounds these three sites said to pass it. It is also the escape hatch
+        on the free-disk refusal, so passing it disables the warning a
+        core-dump campaign most needs, and the remedy is to move the engine's
+        subtree aside instead. The old guard grepped for the string `--force`
+        and could not tell an instruction from a warning, so it was green
+        either way.
+
+        WHAT THIS CHECK DOES NOT COVER, stated because a guard over prose
+        always has an edge and naming it is the only honest terminus. It reads
+        one shape -- a directive verb, or a `run-benchmark.sh` command line,
+        reaching `--force` without a negation in between. A sentence that
+        recommends the flag without any of those verbs ("the flag to use here
+        is `--force`") is not caught, and neither is an instruction split
+        across two sentences. It is not a proof that these documents never
+        recommend `--force`; it is a proof that they do not recommend it in
+        the form an operator would copy. The rest is a reviewer's job, and
+        that is an acceptable terminus only because this docstring says so.
+        """
+        pattern = PROSE_CLAIMS[self._DIRECTIVE]["pattern"]
+        offenders = [
+            _flat(b)[:200]
+            for b in _paragraphs(open(os.path.join(VB_ROOT, path)).read())
+            if re.search(pattern, _flat(b), re.I)]
+        assert not offenders, (
+            f"{path} tells the operator to pass --force, and the remedy for "
+            f"a re-pin is to move the engine's ann subtree aside instead: "
+            f"--force is also the escape hatch on the free-disk refusal, so "
+            f"it disables the warning a core-dump campaign most needs.\n  "
+            + "\n  ".join(offenders))
+
+    def test_every_site_exists_and_says_why_it_is_a_site(self):
+        for path, reason in sorted(ANN_SUBTREE_SITES.items()):
+            assert reason.strip(), path
+            assert os.path.isfile(os.path.join(VB_ROOT, path)), path
+
+    @pytest.mark.parametrize("shape,text,expected", [
+        # A markdown bullet list: the shape CLAUDE.md's invariants use.
+        ("markdown bullets",
+         "- the first bullet says the pin moved\n"
+         "- the second says pass --force\n", 2),
+        # A NUMBERED list: the shape docs/09 §5 uses, and the one the first
+        # version of this splitter could not see at all.
+        ("numbered items",
+         "4. the fourth item says the pin moved\n"
+         "5. the fifth says pass --force\n", 2),
+        # A YAML comment block broken by comment-marker-only lines: the shape
+        # `config/engines/percona.yml` uses, and the site where the deletion
+        # attack was actually open.
+        ("yaml comment paragraphs",
+         "  # the first paragraph says the pin moved\n"
+         "  # and continues\n"
+         "  #\n"
+         "  # the second says pass --force\n", 2),
+        # A shell comment block, same rule, because the entrypoint uses it.
+        ("shell comment paragraphs",
+         "# first paragraph\n#\n# second paragraph\n", 2),
+        # Continuation lines stay with their item rather than becoming
+        # blocks of their own, or every multi-line warning would be split
+        # into fragments that each fail the conjunction.
+        ("an item keeps its continuations",
+         "5. the fifth item says the pin moved\n"
+         "   and that the cells are reused\n"
+         "   so pass --force\n", 1),
+    ])
+    def test_the_paragraph_split_isolates_each_shape(self, shape, text,
+                                                     expected):
+        """The smuggling hole `_paragraphs` exists to close, asserted on every
+        shape the three sites actually use rather than on the one that already
+        worked. The first version of this test pinned only the markdown
+        bullet, which is why the YAML and numbered cases shipped broken."""
+        got = _paragraphs(text)
+        assert len(got) == expected, (shape, got)
+
+    def test_no_force_block_is_large_enough_to_smuggle(self):
+        """The property, stated as a number rather than trusted to the
+        splitter's implementation.
+
+        A block much larger than the claim can satisfy a three-part
+        conjunction out of three unrelated sentences. Seventeen lines is the
+        largest any site needs today; the bound is what fails if a future
+        edit merges the warning back into a wall of comment.
+        """
+        for path in sorted(ANN_SUBTREE_SITES):
+            text = open(os.path.join(VB_ROOT, path)).read()
+            blocks = [b for b in _paragraphs(text) if "--force" in b]
+            assert blocks, path
+            worst = max(len(b.splitlines()) for b in blocks)
+            assert worst <= 25, (
+                f"{path}'s largest --force block is {worst} lines; a block "
+                f"that big can satisfy the three-part claim out of three "
+                f"unrelated sentences, which is what `_paragraphs` exists to "
+                f"prevent")

@@ -1,6 +1,6 @@
 # Adding Percona Server as a seventh engine
 
-Percona Server's `vector-mvp` branch carries a native InnoDB HNSW vector index.
+Percona Server's `9.7` series carries a native InnoDB HNSW vector index.
 This document is the investigation that has to happen before any of it is wired
 in: what the dialect actually is, what changes in which file, and — kept
 separate, in [§7](#7-what-only-a-live-server-can-settle) — what no amount of
@@ -86,34 +86,34 @@ document permitted to make the citation it forbids.
 | | |
 |---|---|
 | Repository | `https://github.com/percona/percona-server` |
-| Branch | `vector-mvp` |
-| **Pinned SHA** | **`02a8b80c70b0ccf6c9035d8a2307e7fa988cc304`** |
-| Tip **author** date | 2026-10-08T12:52:19Z |
-| Tip **committer** date | 2026-10-13T13:05:40Z |
-| Tip subject | `PS-11626: IGNORE INDEX ... FOR ORDER BY (vk)` is ignored for vector (ANN) queries |
-| Server version | MySQL 9.7.1 LTS base (`MYSQL_VERSION`: `MAJOR=9 MINOR=7 PATCH=1 MATURITY="LTS"`) |
-| MTR suite | `mysql-test/suite/percona_vector/` — **91** `.test` files and 91 `.result` files, plus two in `mysql-test/suite/sys_vars/` |
+| Base branch | `9.7` — the vector MVP was merged out of `vector-mvp` into this series by PR #6278 |
+| **Pinned SHA** | **`56124b03fdc5954e2401ab4d2c7bf7cb3a767158`** |
+| Pin **author** date | 2026-10-14T22:27:46Z |
+| Pin **committer** date | 2026-10-26T12:41:43Z |
+| Pin subject | `PS-11751 : [9.7] VIRTUAL generated column returns a stale, identical value for every row when read through an HNSW vector index (ANN query)` |
+| Server version | MySQL 9.7.2 LTS base (`MYSQL_VERSION`: `MAJOR=9 MINOR=7 PATCH=2 EXTRA=-2 MATURITY="LTS"`, i.e. `9.7.2-2`) |
+| MTR suite | `mysql-test/suite/percona_vector/` — **97** `.test` files and 97 `.result` files, plus two in `mysql-test/suite/sys_vars/` |
 
-That SHA was the branch tip when this was written (`gh api
-'repos/percona/percona-server/commits?sha=vector-mvp&per_page=1'`).
+That SHA is PR #6278's `merge_commit_sha` (`gh api 'repos/percona/percona-server/pulls/6278'`).
+The merge was a REBASE, so that field names the last of the 30 rebased commits and not a squash.
 
-**Dates on this branch need their basis stated, and the table above gives both.**
-Under **author** dates the tip is *not* the newest commit in its own history —
-ancestors are dated 2026-10-12 and 2026-10-13, which is the fingerprint of a
-rebase. Under **committer** dates the tip is the newest, as it must be. An
+**Dates on this pin need their basis stated, and the table above gives both.**
+The series was rebased onto `9.7` at merge, so the pin's **author** date sits
+eleven days under its **committer** date and its parent carries the same
+committer second — which is the fingerprint of a rebase, not of a backdate. An
 earlier revision of this table printed one date without saying which, and then
 built the warning on it; the warning's conclusion survives either way, for a
 simpler reason than the one it gave: **a date never tells you whether you have
 the tip, so compare SHAs.** Every date in the table below is an author date,
 because that is what `git log` shows by default.
 
-### What the commit log says about stability
+### What the pre-merge `vector-mvp` commit log said about stability
 
-Of the twelve newest commits, **four** are crash or assertion fixes and two
-more are the features that brought the vector work to its current state. All
-six carry author dates between 2026-10-02 and 2026-10-13 — note that two are
-*later* than the tip's own author date, which is the rebase above, not an
-error:
+A snapshot of the **branch as it stood before the merge**, kept because its
+reading still holds. Of the twelve newest commits *on that branch*, **four**
+were crash or assertion fixes and two more were the features that brought the
+vector work to the state it was merged in. All six carry author dates between
+2026-10-02 and 2026-10-13, every one of them earlier than the pin's own:
 
 | SHA | Date | What it fixed |
 |---|---|---|
@@ -124,18 +124,18 @@ error:
 | `eebc427aab7b` | 2026-10-02 | PS-11623: assertion in *ddl0loader.cc* when an index build aborts on `innodb_hnsw_max_memory` exhaustion |
 | `d436bb1c77d7` | 2026-10-09 | PS-11618: COSINE distance support for vector indexes |
 
-Read as a group that is a branch under daily development whose *recent* failures
-cluster in three places: restart recovery, concurrent DDL against a live search,
-and the memory ceiling. Two of those three are things a four-day benchmark run
-does — it restarts servers between phases and it loads until something stops it
-— which is the argument for the smoke run in [§7](#7-what-only-a-live-server-can-settle)
-rather than an argument against the engine.
+Read as a group, those were the failures of a branch then under daily
+development, and they clustered in three places: restart recovery, concurrent
+DDL against a live search, and the memory ceiling. Two of those three are
+things a four-day benchmark run does — it restarts servers between phases and
+it loads until something stops it — which is the argument for the smoke run in
+[§7](#7-what-only-a-live-server-can-settle), not against the engine.
 
 Three qualifications on reading that table as a risk assessment, all of which
 cut against over-reading it:
 
-- Each row is a **fix**, so the pin contains it. The list says where the bugs
-  were, not where they are.
+- Each row is a **fix** the pin contains, under a *different* SHA because the
+  series was rebased. It says where the bugs were, not where they are.
 - Two are explicitly debug-build assertions (`a86503214416`, `5c30ac32877a` say
   "debug"). `config/engines/percona.yml` will build `RelWithDebInfo` with
   *NDEBUG* defined, as every other engine here does, so those two cannot fire in a
@@ -898,7 +898,7 @@ Read three ways:
 **This is decided, not proposed.** The choice was the user's to make, because it
 is a fairness judgement rather than a fact, and it has been made:
 `config/engines/percona.yml` sets `--innodb-hnsw-max-memory=0` (unlimited),
-with `Innodb_hnsw_memory_used` recorded per phase. The two policies below are
+with `Innodb_hnsw_memory_used` collected onto the `index_build` record. The two policies below are
 kept as the justification for it, not as an open question — a reader asking
 "why is this engine's graph budget unlimited when the other two have a cache
 size" needs the whole argument, and a decision whose reasoning has been deleted
@@ -908,8 +908,12 @@ What the policy does **not** change: `--innodb-hnsw-max-memory` must not be fed
 from `graph_cache_bytes`, and the report must state the asymmetry rather than
 paper over it.
 
-1. **`0` (unlimited), with `Innodb_hnsw_memory_used` recorded per phase —
-   CHOSEN.** The graph is then bounded only by the container's memory limit,
+1. **`0` (unlimited), with `Innodb_hnsw_memory_used` collected onto the
+   `index_build` record — CHOSEN.** It is collected there and nowhere else:
+   `ingest`, `concurrency`, `filtered`, `churn` and `ef_calibration` carry no
+   reading, so this audit trail covers one of the six ops phases and the
+   earlier wording "per phase" over-claimed it. Widening it is unlanded work.
+   The graph is then bounded only by the container's memory limit,
    which the orchestrator already sets and already records — so Percona is held
    to the same *total* memory budget as every other engine, measured where the
    other engines' budgets are measured. This is the honest like-for-like, and
@@ -1095,12 +1099,14 @@ source:
   # cosmetic choice. `_source_tag` in `orchestrator/engines.py` is
   # `return str(source.get("tag") or source.get("version") or "")` — there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag` return
-  # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for that engine. `OpsRun.run_harness` in
+  # the empty string and `prepare_percona` die — it passes `""` as the
+  # default, so there is no hard-coded fallback for THIS engine; the three
+  # other `prepare_*` functions that read the key do pass one.
+  # `OpsRun.run_harness` in
   # `orchestrator/ops_pass.py` reads the same key
   # into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive`
   # takes a SHA wherever it takes a tag, so the mechanism is unchanged.
-  tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
+  tag: 56124b03fdc5954e2401ab4d2c7bf7cb3a767158   # tip of PR #6278 on base 9.7
   upstream: https://github.com/percona/percona-server.git
   # No `submodules:` key, deliberately: all four of the pin's submodules are
   # switched off in the build instead, which takes four cmake flags, one of
@@ -1141,8 +1147,12 @@ runtime:
 comment.** `_source_tag` in `orchestrator/engines.py` is
 `return str(source.get("tag") or source.get("version") or "")`. There is no
 `sha` key, so a `source: sha:` block would make it return the empty string and
-`scripts/prepare-sources.sh` fall back to its hard-coded default for that
-engine. `OpsRun.run_harness` in `orchestrator/ops_pass.py` reads the same key
+`prepare_percona` in `scripts/prepare-sources.sh` die: it reads the key with
+`""` as the default and `die`s on an empty value. There is no hard-coded
+fallback for this engine. `prepare_alisql`, `prepare_mariadb` and
+`prepare_pgvector` do pass one (`AliSQL-8.0.44-2`, `mariadb-11.8.8`, `v0.8.6`),
+which is why "it falls back to a default tag" reads as true and is not.
+`OpsRun.run_harness` in `orchestrator/ops_pass.py` reads the same key
 into `VB_ENGINE_TAG`, which is what reaches the manifest. `git archive` takes a
 SHA wherever it takes a tag, so the mechanism is unchanged.
 
@@ -1492,6 +1502,69 @@ likely to break:
    smoke run's churn phase is the test.
 4. Every phase writing records, the plan check passing on both filter columns,
    and the report rendering with seven series.
+5. **The run needs a fresh `--run-id` and this engine's recall subtree moved
+   aside — and must *not* be given `--force`.** None of it is about the
+   server, and all of it is something a green run would hide.
+
+   *The recall path.* `ann_fingerprint` in
+   `orchestrator/ann_pass.py` is deliberately engine-invariant and holds no
+   source tag, so the re-pin did not move the ann results tree;
+   ann-benchmarks skips any configuration whose result file is already on
+   disk and reports that as success. Without `--force` the first run at a new
+   pin reuses the old binary's recall cells and publishes them under the new
+   pin's `engine_version`. `run_engine` in the same module does say so before
+   the run — it prints the count of existing result files and that
+   already-computed configurations will be skipped, under a comment whose
+   first five words are "Warn before the fact, not after" — and what the
+   `stale_ann` bucket built in `summarize` in `report/generate.py` adds is
+   per-cell attribution in the Validity section afterwards.
+
+   **A fresh run directory does not fix this**, which is the trap worth
+   stating plainly: `paths` in `orchestrator/cli.py` puts the ops results in
+   the run directory and the ann results in a sibling of it, shared across
+   runs by design, so a new run id leaves every recall cell where it was. The
+   remedy is to **move this engine's subtree of the ann results tree aside**
+   before the run — `_count_results` counts result files under directories
+   named for the engine, so moving them makes it return zero and the curve
+   gets measured again.
+
+   **Not `--force`**, even though its help text offers exactly that. The same
+   flag is the escape hatch on the free-disk refusal in
+   `orchestrator/cli.py`, so passing it silently disables the one refusal a
+   core-dump campaign most needs — a Percona core is about its peak RSS, and
+   that guard exists because a pgvector phase once died two seconds in with
+   nowhere to put the cluster and nothing in the run said so. And not a bump
+   of `ANN_MEASUREMENT_VERSION`, which would move every pass's tree and
+   re-measure every recall point for all seven engines and both resource
+   passes — weeks of ingest to fix one engine's cache.
+
+   *A fresh run directory, for the ops path.* This is the same hazard one
+   layer down and it has no `--force`. The report's provenance table is
+   `_engine_rows` in `report/render.py`, which prints the source tag and the
+   first twelve characters of the source commit from the manifest — **one
+   value per engine per run directory** — and `set_engine` in
+   `orchestrator/manifest.py` replaces that whole entry from the per-engine
+   source JSON the build writes, without comparing it to what was there.
+   `engine_version` is on every ops record but no reader prints it. So a
+   directory resumed across the rebuild pools `9.7.1-1` and `9.7.2-2` numbers
+   into one `build_signature` and attributes all of them to the new commit,
+   with nothing in the report to tell them apart. So the `smoke` command above
+   is run with **neither `--resume` nor `--run-id`**, which is what makes the
+   orchestrator start a fresh directory; the failure mode is reaching for
+   `--resume` after an interruption and landing the validating run in the
+   directory it was meant to replace. A `smoke` result from a stale directory
+   would stand in for the one that validates the re-pin.
+
+**What the re-pin leaves unverified in this document, stated here because
+nothing else will say it.** The pin table, §4.3's skeleton and every claim this
+document makes about *our* repository were re-derived at the new pin. §0's
+citation policy already covers the vendor **paths and symbols**: it cites no
+line numbers, so nothing there rots to a rebase. What the policy does not
+cover is the vendor **commit abbreviations** — every `af72e2c0fa40`-shaped SHA
+in §0's pre-merge table, and the four reused in the list above. The fixes they
+name are in the pinned series, but under *different* SHAs, because a rebase
+gives every commit a new one, so `git show` on one of them against the pinned
+tree finds nothing. §0 says so beside the table; this says so beside the four.
 
 ## 6. Executable guards
 
@@ -1737,9 +1810,10 @@ unknowns look less urgent.
    is set for all three MySQL-family engines and is dead repo-wide today —
    `VBMySQLBase.hint` only uses it when `force_index=True` and no call site
    passes that — so this costs nothing right now. It is listed because Percona
-   is the engine where it might not *parse*: the pin's own tip commit
-   (`02a8b80c`, PS-11626) is about index hints and vector ANN queries, having
-   just fixed `IGNORE INDEX … FOR ORDER BY (vk)` being ignored for them. If a
+   is the engine where it might not *parse*: the pinned series carries
+   PS-11626, folded into PS-11212's optimizer commit, which fixed
+   `IGNORE INDEX … FOR ORDER BY (vk)` being ignored for vector (ANN)
+   queries — so this is settled code inside the pin rather than its tip. If a
    future caller switches the hint on, a `FORCE INDEX` the parser rejects turns
    every plan check into an exception instead of a plan.
 8. **The ops path's `march` field.** §4.8: `_detect_march` in

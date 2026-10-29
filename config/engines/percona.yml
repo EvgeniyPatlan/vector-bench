@@ -1,9 +1,12 @@
 # Percona Server engine definition.
 #
 # Vector support: InnoDB HNSW (storage/innobase, `VECTOR KEY … TYPE hnsw`),
-# on branch `vector-mvp` over MySQL 9.7.1 LTS. Everything here is pinned to one
-# commit and the whole design is written up in docs/09-adding-percona-server.md,
-# which cites the server's own sources and recorded MTR output for every claim.
+# in Percona Server's `9.7` series over MySQL 9.7.2 LTS. The vector work used
+# to live on branch `vector-mvp`; it was merged into `9.7` on 2026-10-26 and
+# the pin below is a commit in that series, not on that branch. Everything
+# here is pinned to one commit and the whole design is written up in
+# docs/09-adding-percona-server.md, which cites the server's own sources and
+# recorded MTR output for every claim.
 #
 # NOTHING IN THIS FILE HAS EVER BEEN RUN. The image has never been built and no
 # server has been started from it. The first thing that will exercise it is the
@@ -14,20 +17,113 @@ family: mysql
 
 source:
   # The key is `tag` even though the value is a SHA, and that is not a cosmetic
-  # choice. `orchestrator/engines.py:63-65` is
+  # choice. `orchestrator/engines.py:_source_tag` is
   # `return str(source.get("tag") or source.get("version") or "")` -- there is
   # no `sha` key, so a `source: sha:` block would make `_source_tag()` return
-  # the empty string and `scripts/prepare-sources.sh` fall back to its
-  # hard-coded default for this engine. `orchestrator/ops_pass.py` reads the
-  # same key into `VB_ENGINE_TAG`, which is what reaches the manifest, so a
-  # misnamed key would also publish a run whose engine version is blank.
-  # `git archive` takes a SHA wherever it takes a tag, so the mechanism is
-  # unchanged.
+  # the empty string. `scripts/prepare-sources.sh:prepare_percona` then DIES:
+  # it reads this key with `""` as the default and `die`s on an empty value.
+  # It does NOT fall back to a hard-coded default: the three other
+  # `prepare_*` functions that read this key pass a hard-coded tag as the
+  # default (`AliSQL-8.0.44-2`, `mariadb-11.8.8`, `v0.8.6`) and this one
+  # passes `""`. An earlier revision of this comment said the opposite. `orchestrator/ops_pass.py`
+  # reads the same key into `VB_ENGINE_TAG`, which is what reaches the
+  # manifest, so a misnamed key would also publish a run whose engine version
+  # is blank. `git archive` takes a SHA wherever it takes a tag, so the
+  # mechanism is unchanged. (That first citation was a line range for most of
+  # this file's life and had rotted by 21 lines by the time anyone read it; it
+  # is a symbol now, which is what CLAUDE.md asks of a new citation.)
   #
-  # Compare SHAs and never dates: the branch was rebased, so the author date
-  # (2026-10-08) sits under the committer date (2026-10-13) and a date is not
-  # an identifier here.
-  tag: 02a8b80c70b0ccf6c9035d8a2307e7fa988cc304   # branch vector-mvp
+  # THE VALUE IS A COMMIT AND MUST NEVER BE A BRANCH NAME, which matters more
+  # in this series than it did on `vector-mvp`. `git archive` would accept
+  # `9.7` and resolve it afresh on every build, so two runs carrying the same
+  # manifest would not be the same server. `9.7` moved while this re-pin was
+  # being written: it was at 56124b03 on 2026-10-26T12:41:43Z and at f52fe4b0
+  # by 2026-10-27T10:54:59Z, four commits later.
+  # `tests/test_e2_percona_wiring.py` asserts the SHAPE of this value
+  # separately from its content, because asserting only that it equals the
+  # test's own constant would pass with a branch name in both places.
+  #
+  # Compare SHAs and never dates. The series was rebased onto `9.7` at merge,
+  # so this commit's author date (2026-10-14T22:27:46Z) sits eleven days under
+  # its committer date (2026-10-26T12:41:43Z) and its parent carries the same
+  # committer second -- which is the fingerprint of a rebase and the reason a
+  # date is not an identifier here.
+  #
+  # WHAT THIS PIN IS, read from the vendor's API rather than inferred from a
+  # commit subject. The vector search MVP was merged out of `vector-mvp` into
+  # the `9.7` series as PR #6278 (`vector-mvp-97-squashed` -> base `9.7`, 30
+  # commits, 331 files, +37,587/-322, merged 2026-10-26T12:41:44Z). The merge
+  # was a REBASE and not a squash: GitHub reports this SHA as that PR's
+  # `merge_commit_sha`, and for a rebase merge that field is the LAST of the
+  # rebased commits -- here PS-11751, a VIRTUAL-generated-column fix read
+  # through an HNSW vector index, 8 files and +586/-21 on its own. Pinning it
+  # therefore takes the whole series, and the PR's aggregate figures above
+  # describe the PR and not this commit's diff. Calling it "the squash commit"
+  # would invite the next reader to look for a 331-file diff here, not find
+  # one, and conclude the pin was wrong.
+  #
+  # The previous pin -- the `vector-mvp` tip of 2026-10-13, which
+  # docs/12-percona-feedback-plan.md names and this file deliberately no
+  # longer does -- is NOT an ancestor of this one: GitHub's compare of the two
+  # reports `diverged`: measured FROM the old pin, this one is 721 commits
+  # ahead of it and the old pin holds 43 that this one does not. Nothing
+  # from that branch tip is reachable from here, which is why this is a re-pin
+  # and not a fast-forward, and why the cmake flags below are unverified at
+  # this base until a configure has run.
+  #
+  # MOVING THIS KEY DOES NOT INVALIDATE THE RECALL RESULTS, AND IT SHOULD.
+  # `orchestrator/ann_pass.py:ann_fingerprint` is deliberately
+  # engine-invariant and holds no source tag, so a new pin leaves
+  # `results/annb/<pass>/<fingerprint>/` exactly where it was.
+  # ann-benchmarks then skips every configuration whose result file is already
+  # on disk and reports that as success, so the old binary's recall cells are
+  # reused under the new pin's `engine_version`, and the only thing that says
+  # so first is `ann_pass.run_engine`, which prints `[ann] N existing result
+  # file(s) ... will be skipped` BEFORE the run -- its comment's first five
+  # words are "Warn before the fact, not after" -- while
+  # `report/generate.py`'s `stale_ann` bucket adds the per-cell attribution in
+  # the Validity section afterwards. So, before the first run at a new pin,
+  # MOVE THIS ENGINE'S SUBTREE OF THE ANN RESULTS TREE ASIDE:
+  # `results/annb/<pass>/<fingerprint>/<dataset>/<k>/percona/`.
+  # `_count_results` counts `.hdf5` files under directories named for the
+  # engine, so moving them makes it return 0 and ann-benchmarks measures the
+  # curve again.
+  #
+  # A FRESH RUN DIRECTORY DOES NOT DO IT, and that is the trap. `paths` in
+  # `orchestrator/cli.py` puts `ops_results` at the run directory but
+  # `annb_results` at `results/annb`, a SIBLING of it -- CLAUDE.md's invariant
+  # says the tree is shared across runs on purpose. So a new `--run-id` gives
+  # a clean ops tree and leaves every recall cell exactly where it was. It is
+  # a separate requirement, for the ops path, and it is below.
+  #
+  # DO NOT REACH FOR `--force` INSTEAD, even though its help text offers
+  # precisely this ("re-run ann-benchmarks points that already have results").
+  # The same flag is the escape hatch on the free-disk refusal --
+  # `_check_free_disk(...) and not args.force` in `orchestrator/cli.py` -- so
+  # passing it silently disables the one refusal a core-dump campaign most
+  # needs. A Percona core is about its peak RSS, tens of GiB, and the recorded
+  # reason for that guard is that a pgvector phase once died two seconds in
+  # because the volume had nowhere to put the cluster and nothing in the run
+  # said so. Moving the subtree aside buys the re-measurement without buying
+  # that.
+  #
+  # Bumping `ANN_MEASUREMENT_VERSION` is NOT the remedy either: it would move
+  # every pass's tree and re-measure every recall point for all seven engines
+  # and both resource passes.
+  #
+  # AND THE OPS PATH HAS THE SAME HAZARD WITH NO `--force` FOR IT: the
+  # report's provenance table (`report/render.py:_engine_rows`) prints
+  # `source.tag` and `source.commit[:12]` from the manifest, ONE value per
+  # engine per run directory, and `manifest.py:set_engine` overwrites that
+  # entry from `sources/percona.source.json` at build time without comparing
+  # it. So the first run after a rebuild goes to a FRESH run directory: run it
+  # with NEITHER `--resume` NOR `--run-id`, which is what makes the
+  # orchestrator start one, and never resume a directory that already holds
+  # pre-rebuild Percona ops records -- otherwise two servers' numbers pool
+  # into one `build_signature` under the new commit and the report attributes
+  # all of them to the new one. A smoke result from a stale directory would
+  # stand in for the run that validates this re-pin.
+  tag: 56124b03fdc5954e2401ab4d2c7bf7cb3a767158   # tip of PR #6278 on base 9.7
   upstream: https://github.com/percona/percona-server.git
   # No `submodules:` key, deliberately: all four of the pin's submodules are
   # switched off in the build instead, which takes four cmake flags, one of
@@ -65,6 +161,13 @@ build:
   # `IF(NOT DEFINED WITH_… AND NOT DEFINED WITHOUT_… OR WITH_…)`, so defining
   # the WITHOUT_ symbol is what closes it. Measured, not reasoned -- the
   # Dockerfile note records which spellings were tried.
+  #
+  # EVERY MEASUREMENT BELOW WAS MADE AGAINST THE 9.7.1 BASE AT THE PREVIOUS
+  # PIN. This engine is pinned about four months further on and no configure
+  # has been run against the new base, so the list is carried forward
+  # unchanged and unverified. Re-verifying it needs a configure, a configure
+  # is a build, and that build is the gate this re-pin must not be merged
+  # ahead of.
   #
   # WITH_CURL=bundled was not chosen, it was measured -- by five failed
   # configures of this tree on 2026-10-14, the first time anyone built it.
@@ -224,8 +327,16 @@ server:
     # to the same TOTAL budget as every other engine, measured where the
     # others' budgets are measured.
     #
-    # The audit trail for that is `Innodb_hnsw_memory_used`, recorded per
-    # phase, and EVERY FIGURE TAKEN FROM IT MUST CARRY THE CAVEAT that it
+    # The audit trail for that is `Innodb_hnsw_memory_used` -- and it is
+    # THINNER THAN THIS COMMENT USED TO CLAIM. It is collected onto the
+    # `index_build` record and no other: `ingest`, `concurrency`, `filtered`,
+    # `churn` and `ef_calibration` carry no reading, so the trail covers one
+    # of the six ops phases. An audit trail for a fairness decision that
+    # covers a sixth of the run, described as per-phase, is the shape of
+    # defect CLAUDE.md opens by warning about, which is why it is spelled out
+    # here rather than rounded up. Widening it is unlanded work.
+    #
+    # EVERY FIGURE TAKEN FROM IT MUST ALSO CARRY THE CAVEAT that it
     # omits the node map (HNSW::m_nodes, roughly 30-50 bytes per node on the
     # normal heap) and search scratch space. At glove-100's 1,183,514 rows
     # that is 35.5-59.2 MB unreported per vector index. It is a FLOOR on graph

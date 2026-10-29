@@ -11,7 +11,7 @@ all using an HNSW index:
 | `mariadb123` | MariaDB | 12.3.2 | MHNSW, a second version |
 | `mongodb` | Percona Search for MongoDB | mongot 1.70.3 | Lucene HNSW in a sidecar process |
 | `valkey` | Valkey + valkey-search | 9.1 | HNSW, entirely in memory |
-| `percona` | Percona Server | MySQL 9.7.1 + `vector-mvp` | InnoDB HNSW (`storage/innobase`) |
+| `percona` | Percona Server | 9.7.2-2 (MySQL 9.7.2 LTS base) | InnoDB HNSW (`storage/innobase`) |
 
 The first three are the original comparison and what `build` produces by
 default; the rest are opt-in, because each is another image to compile or
@@ -373,9 +373,11 @@ a hard allocation ceiling rather than a cache: exceeding it fails the statement
 instead of evicting anything, and the check is re-applied as a cold search
 faults the graph back in after a restart. It is therefore set to `0`
 (unlimited), so the container's memory limit bounds it as it does every other
-engine, and `Innodb_hnsw_memory_used` is recorded per phase — a figure that
-excludes the node map and so is a floor on graph memory, not a measurement of
-it. See [docs/09](docs/09-adding-percona-server.md) §3.
+engine, and `Innodb_hnsw_memory_used` is recorded on the `index_build` record
+only — one of the six ops phases, with `ingest`, `concurrency`, `filtered`,
+`churn` and `ef_calibration` uncollected — and even there it excludes the node
+map, so it is a floor on graph memory rather than a measurement of it. See
+[docs/09](docs/09-adding-percona-server.md) §3.
 
 ---
 

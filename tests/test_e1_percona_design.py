@@ -65,7 +65,7 @@ def _doc_09() -> str:
 # module docstring and this file all name the same commit -- the value is the
 # whole point of pinning, and three copies that can drift is how a pin stops
 # meaning anything.
-PINNED_SHA = "02a8b80c70b0ccf6c9035d8a2307e7fa988cc304"
+PINNED_SHA = "56124b03fdc5954e2401ab4d2c7bf7cb3a767158"
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +272,13 @@ class TestBuildArgConventions:
     """The Dockerfile has to receive the pin through the ARG the build script
     will pass, and the pin has to be under the key the orchestrator reads.
 
-    Both of these were wrong in the first draft of docs/09, and neither would
-    have failed visibly: a mismatched ARG leaves `VB_ENGINE_TAG=unknown` in the
-    image, and the wrong config key makes `_source_tag()` return the empty
-    string and `prepare-sources.sh` silently fall back to a default tag. The
-    engine would then be built from whatever that default names, and the
-    manifest would not record which commit was measured.
+    Both of these were wrong in the first draft of docs/09. A mismatched ARG
+    fails quietly: the image builds and carries `VB_ENGINE_TAG=unknown`. The
+    wrong config key fails loudly, before any build: `_source_tag()` returns
+    the empty string and `prepare_percona` dies, because it passes `""` as
+    the default and `die`s on an empty value -- unlike the other `prepare_*`
+    functions, which fall back to a hard-coded tag. An earlier revision of
+    this docstring said this engine silently falls back too; it does not.
     """
 
     def test_the_dockerfile_arg_follows_the_build_script_convention(self):
@@ -2246,6 +2247,24 @@ CITED_SYMBOLS = {
     # labelling Percona's own branch as mongodb's. The branch CONDITION is
     # both the citation and the anchor now, so the label and the thing it
     # labels are the same string and cannot disagree.
+    # -- §5's two post-rebuild requirements, which name four symbols -----
+    # The ann half and the ops half of the same hazard: the recall tree does
+    # not move when the pin does, and the provenance table carries one source
+    # per engine per RUN DIRECTORY. Each anchor is the thing the sentence
+    # claims, not the symbol's name, so a rewrite that keeps the name and
+    # drops the behaviour fails here.
+    ("orchestrator/ann_pass.py", "ann_fingerprint"):
+        ("ANN_MEASUREMENT_VERSION",
+         "Deliberately engine-invariant"),
+    ("orchestrator/ann_pass.py", "run_engine"):
+        "already-computed configurations will be skipped",
+    ("report/generate.py", "summarize"):
+        '"stale_ann"',
+    ("report/render.py", "_engine_rows"):
+        'source.get("tag", "?")',
+    ("orchestrator/manifest.py", "set_engine"):
+        'self.data["engines"][engine] = {',
+
     ("orchestrator/ann_pass.py", "render_config"):
         ('raise ValueError(f"unknown engine',
          'if engine in MARIADB_ENGINES + ("alisql",)',
