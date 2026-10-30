@@ -1,0 +1,153 @@
+# MyVector engine definition.
+#
+# Vector support: the MyVector PLUGIN (askdba/myvector, GPL-2.0) on MySQL 9.7
+# LTS. It is the only engine in this study whose index is not part of the
+# server's storage engine: the HNSW graph is an hnswlib graph held in memory
+# by the plugin and written to files in `myvector_index_dir`, the column is a
+# native `VECTOR(n)` carrying a `MYVECTOR Column |...` comment, and the plugin
+# rewrites `WHERE MYVECTOR_IS_ANN(...)` into `id IN (<k nearest ids>)` before
+# the parser sees it (an audit-plugin pre-parse rewrite). Every behaviour this
+# file and `harness/drivers/myvector.py` rely on is cited against the pinned
+# tree by symbol; docs/04-engine-notes.md carries the list of traps.
+name: myvector
+display_name: MyVector (MySQL plugin)
+family: mysql
+
+source:
+  # The MyVector commit, under the key every other engine uses, because
+  # `orchestrator/engines.py:_source_tag` and `ops_pass` read `source.tag`
+  # into `VB_ENGINE_TAG` and the manifest. It is release v1.26.9.
+  tag: 384d9df7ab8a2afee9c8f99704e5a7ea90d32730
+  release: v1.26.9
+  upstream: https://github.com/askdba/myvector.git
+  # The server the plugin is compiled into, from source, with the plugin
+  # in-tree -- the vendor's own plugin recipe (`.github/workflows/
+  # docker-publish.yml`: clone mysql-server at a tag, copy src/ include/
+  # CMakeLists.txt into plugin/myvector, `make myvector`). A plugin built
+  # against one MySQL tree and loaded into a different server binary is an ABI
+  # gamble, so both come out of the same build here.
+  #
+  # mysql-9.7.2, not the newer 9.7.4, because Percona Server's `9.7` series is
+  # MySQL 9.7.2 based: the same upstream server line, at the same point, is
+  # what makes a percona-vs-myvector comparison a comparison of the two vector
+  # implementations and not of two server releases. Both tags are recorded in
+  # `sources/myvector.source.json` and so in the run manifest.
+  server_tag: mysql-9.7.2
+  # The commit that tag names, asserted by `prepare_myvector`: a tag can be
+  # moved upstream, and a server tree that changed under an unchanged tag is
+  # a different server under the same label.
+  server_commit: 008e09c2834b98143a8c067d4d225c90953050cf
+  server_upstream: https://github.com/mysql/mysql-server.git
+
+image:
+  runtime: vector-bench/myvector-runtime
+  bench: vector-bench/myvector-bench
+  base: ubuntu:24.04
+
+build:
+  type: RelWithDebInfo
+  # The hnswlib distance kernels live in the PLUGIN, which is compiled with
+  # these flags (MYSQL_ADD_PLUGIN inherits CMAKE_CXX_FLAGS). x86-64-v3 like
+  # every other engine built from source. hnswlib selects its SIMD path from
+  # the compiler's predefined macros (`__AVX__`, `__AVX512F__` in
+  # include/space_l2.h), so on an AVX-512 machine this image still runs the
+  # AVX path, exactly as the other engines' kernels do.
+  march: x86-64-v3
+  cmake_flags:
+    - -DWITH_PACKAGE_FLAGS=OFF
+    - -DWITH_ROUTER=OFF
+    - -DWITH_MYSQLX=OFF
+    - -DWITH_NDB=OFF
+    - -DWITH_NDBCLUSTER=OFF
+    - -DWITH_RAPID=OFF
+    - -DWITH_UNIT_TESTS=OFF
+    - -DWITH_SSL=system
+    - -DWITH_ZLIB=bundled
+    - -DWITH_ZSTD=bundled
+  extra_cxxflags: ""
+
+# There is deliberately no `sql:` block -- see config/engines/mariadb.yml and
+# tests/test_c1_engine_sql.py. Every statement is built in
+# harness/drivers/myvector.py.
+
+server:
+  common:
+    - --skip-name-resolve
+    # NO BINLOG FLAGS, although MyVector documents binlog-driven online index
+    # maintenance (`online=Y`). On this build that listener exits after its
+    # first idle second and never restarts (`INCREMENTAL_DECLINED` in
+    # harness/drivers/myvector.py has the mechanism and the observation), so
+    # the driver does not use it and this server gets exactly the logging the
+    # other MySQL-family engines get: MySQL's default binlog in the normalized
+    # pass, --skip-log-bin in the tuned one, as Percona Server's config does.
+  normalized:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=2
+    - --innodb-doublewrite=0
+    # One build thread in the normalized pass, the way pgvector's
+    # max_parallel_maintenance_workers=0 pins its bulk build to one process.
+    # The plugin default is 2 (`index_bg_threads` in src/myvector_plugin.cc),
+    # and `HNSWMemoryIndex::startParallelBuild` only engages at >= 2.
+    #
+    - --myvector-index-bg-threads=1
+  tuned:
+    - --innodb-buffer-pool-size={buffer_bytes}
+    - --innodb-flush-log-at-trx-commit=0
+    - --innodb-doublewrite=0
+    - --innodb-flush-method=O_DIRECT
+    - --skip-log-bin
+    # The plugin's ceiling is 100 (`index_bg_threads` max).
+    - --myvector-index-bg-threads={build_threads}
+
+storage_engines:
+  normalized: [InnoDB]
+  tuned: [InnoDB]
+
+capabilities:
+  # The build-fits-in-memory check (`harness/memory_fit.py`). The graph is
+  # resident hnswlib memory outside the buffer pool and the build holds a
+  # second copy of the vectors, so a corpus whose estimated build peak is over
+  # the server limit would be OOM-killed mid-build; the orchestrator refuses
+  # that unit up front (`cli._memory_refusal`) and the report says why.
+  memory_fit: myvector
+  # `ef=` in the column options is hnswlib's ef_construction
+  # (`HNSWMemoryIndex::HNSWMemoryIndex`, default 100).
+  ef_construction_tunable: true
+  m_per_index: true
+  requires_read_committed: false
+  # FALSE, and the driver declines the workload. v1.26.9 has no filtered
+  # search: `myvector_ann_set_init` accepts 3 or 4 arguments (column, id
+  # column, query vector, options) and nothing else, and the options parser
+  # in `myvector_ann_set` reads only `nn` and `ef_search`. A `WHERE tag < t`
+  # beside MYVECTOR_IS_ANN is applied to the k candidates AFTER the search
+  # (`rewriteMyVectorIsANN` turns the annotation into `id IN (...)`), which
+  # docs/LIMITATIONS.md states as "No filtered search ... a filtered query can
+  # return fewer than k rows". Measuring that as filtered search would publish
+  # post-filtering recall under a pre-filtering label. The key-list argument
+  # some later upstream versions take (`MYVECTOR_ANN_FILTERED`) is not in
+  # this release.
+  filtered_search: false
+
+runtime:
+  order: 80
+  driver: MyVectorDriver
+  ann_constructor: MyVector
+  port: 3306
+  data_mount: /var/lib/vbench
+  server_data_mount: /server-data/data
+  # Must equal LOG_FILE's default in docker/myvector/entrypoint-myvector.sh.
+  error_log: /var/lib/vbench/myvector.err
+  credentials:
+    user: "bench"
+    password: "bench"
+  group: extra
+  probe:
+    - "sh"
+    - "-c"
+    - "/opt/myvector/bin/mysql -ubench -pbench --socket=/var/run/vbench/myvector.sock -e 'SELECT 1' >/dev/null 2>&1"
+  chart:
+    color: "#17becf"
+    marker: "X"
+    linestyle: ":"
+    label: "MyVector (MySQL 9.7 plugin, hnswlib)"
+  label: "MyVector (MySQL 9.7 plugin, hnswlib)"

@@ -696,6 +696,7 @@ def _driver_classes() -> Dict[str, Any]:
     """
     from .mongo import MongoDriver
     from .mysql_family import AliSQLDriver, MariaDBDriver, PerconaDriver
+    from .myvector import MyVectorDriver
     from .valkey import ValkeyDriver
 
     return {
@@ -710,6 +711,12 @@ def _driver_classes() -> Dict[str, Any]:
         # repair path, and the index leaves the table definition in bulk-build
         # mode. Everything else about it is a `MySQLDialect`.
         "PerconaDriver": PerconaDriver,
+        # An architecture of its own: the index is a plugin's hnswlib graph,
+        # declared by a column comment, built by a stored procedure that
+        # reports failure as a result row, searched through a query rewrite
+        # and brought up to date by an explicit refresh procedure. See
+        # harness/drivers/myvector.py.
+        "MyVectorDriver": MyVectorDriver,
     }
 
 
@@ -734,6 +741,7 @@ def _driver_table() -> Dict[str, Any]:
         "mongodb": classes["MongoDriver"],
         "valkey": classes["ValkeyDriver"],
         "percona": classes["PerconaDriver"],
+        "myvector": classes["MyVectorDriver"],
     }
 
 

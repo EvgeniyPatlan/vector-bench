@@ -23,7 +23,7 @@ import numpy
 # it, so there is exactly one place to patch when a test needs to stand the
 # guard down -- binding the functions here as well would give every reader its
 # own copy of the reference and a patch would reach only some of them.
-from report import measurement_versions as _versions
+from report import disclosures as _disclosures, measurement_versions as _versions
 
 # Re-exported, not re-implemented: `from report.loaders import ...` is how the
 # existing callers and tests reach these. New code should import
@@ -176,6 +176,7 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                             # so an unchanged tree silently reappears in a new
                             # report.
                             "source_mtime": os.path.getmtime(path),
+                            **_disclosures.query_path_extra(attrs),
                         },
                     }
                     if attrs.get("index_size") is not None:

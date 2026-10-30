@@ -296,6 +296,219 @@ selectivities, carries over. Both reproduce the run: 5.2x slower at 1% than at
 
 ---
 
+## MyVector — hnswlib as a MySQL plugin
+
+Source: `askdba/myvector` release v1.26.9, commit `384d9df7`, built in-tree
+into MySQL `mysql-9.7.2` (the server line Percona Server's `9.7` series is
+based on). Symbols below are in that tree's `src/myvector.cc`,
+`src/myvector_binlog.cc`, `src/myvector_plugin.cc`, `include/hnswdisk.h` and
+`sql/myvectorplugin.sql`. Driver: `harness/drivers/myvector.py`.
+
+The only engine here whose index is not part of the server's storage layer.
+The graph is an hnswlib graph held in the plugin's memory and saved to files
+in `myvector_index_dir`; the table is an ordinary InnoDB table with a native
+`VECTOR(n)` column. How each piece works, and the traps in it:
+
+| | MyVector v1.26.9 |
+| --- | --- |
+| Declared by | column `COMMENT 'MYVECTOR Column \|type=HNSW,dim=…,size=…,M=…,ef=…,dist=…,track=updatets'` |
+| Built by | `CALL mysql.myvector_index_build('db.t.col','pk')`, after the load |
+| Searched by | `WHERE MYVECTOR_IS_ANN('db.t.col','pk', vec, 'nn=k,ef_search=e')`, rewritten before parsing |
+| **M** / **ef_construction** | `M=` / `ef=` column options (exact case) |
+| Search width | `ef_search=` inside each call; hnswlib searches at `max(ef, k)` |
+| Cosine | `dist=Cosine` → `AngularDistanceSpace`, a **scalar** loop (`computeCosineDistance`); L2 uses hnswlib's SIMD `L2Space` |
+| Capacity | `size=` is hnswlib's fixed `max_elements`; `addPoint` throws past it, inside mysqld |
+| Writes after the build | `myvector_index_refresh` over a `track=` timestamp — **adds only** (below) |
+| Online (binlog) maintenance | documented; **exits after its first idle second** on this server (below) |
+| Filtered search | **none** |
+
+### Trap 1 — options are case-sensitive and unknown spellings are silent
+
+`HNSWMemoryIndex::HNSWMemoryIndex` reads `getIntOption("M", 16)` and compares
+`getOption("dist") == "Cosine"`. `m=32` builds M=16; `dist=cosine` builds L2.
+Nothing warns. `MYVECTOR_INDEX_STATUS` prints `M` as the effective value but
+`Distance` **as written**, and does not print `ef` at all. The driver writes
+the exact spellings, then reads status back and refuses a build whose `Type`,
+`M`, `Dimension`, `Distance`, capacity or row count is not what it declared.
+
+### Trap 2 — a failed build is a result row, not an error
+
+`myvector_index_build` opens its own connection back to the server using
+`myvector.cnf` (`BuildMyVectorIndexSQL`); the file must be mode 0600/0400 or it
+is refused. Every failure — no file, refused connection, failed save — comes
+back as text in the procedure's result set and the `CALL` succeeds. The driver
+requires the text to start `SUCCESS` and to report the loaded row count.
+
+### Trap 3 — the binlog listener does not survive idleness, and never deletes
+
+`docs/ONLINE_INDEX_UPDATES.md` describes `online=Y` as real-time maintenance
+from the binary log, applying inserts, updates and deletes. Two things are
+true instead, the first observed in this image and the second read from the
+source:
+
+- **It dies.** `myvector_binlog_loop` opens the stream with a 1-second
+  `MYSQL_OPT_READ_TIMEOUT` and treats any fetch error whose text lacks
+  `timed out` as fatal. Against MySQL 9.7.2 the idle-timeout error text is
+  empty, so the server log shows `Binlog fetch failed: ` and `Exiting binlog
+  func` about a second after startup, no `Binlog Dump` thread remains, and a
+  row inserted after that never reaches the graph. Nothing restarts it.
+- **It only inserts.** The loop dispatches `TABLE_MAP_EVENT` and
+  `WRITE_ROWS_EVENT` and nothing else, and `myvector_table_op` only ever calls
+  `insertVector`. (Its row parser also reads the key from a `MYSQL_TYPE_LONG`
+  column only, so a BIGINT key would be indexed as 0.)
+
+So the framework does not use `online=Y` and the engine gets no binlog
+requirement: its server flags log exactly as Percona Server's do. Writes after
+the build reach the index through the release's other documented incremental
+path, a `track=` timestamp column and `myvector_index_refresh`, which the
+churn workload's `wait_index_synced` hook runs after each re-insert and times
+(`index_sync_s`). The refresh selects rows changed since the last build or
+refresh at one-second resolution, so the driver waits out the watermark
+second after each build and refresh — at most one second, inside the timed
+maintenance — or a row written in that second would never be selected.
+
+**`index_sync_s` is therefore not an incremental sync, and is not comparable
+to another engine's.** A refresh is `myvector_open_index_impl` (action
+`refresh`) → `BuildMyVectorIndexSQL`, which inserts the changed rows and then
+calls `saveIndex(myvector_index_dir, "build")` — a full rewrite of the graph
+file — after which `myvector_open_index_impl` calls `saveIndex(…, "refresh")`,
+an incremental checkpoint, on top. So the figure is the re-inserted rows plus
+one whole-graph write plus a checkpoint, and it grows with the corpus rather
+than with the churn. It is one procedure call, so the parts cannot be timed
+apart from SQL. The driver stamps this on every record
+(`extra.index_sync_semantics`) and the report prints it under §9 Churn and in
+Validity.
+
+**Neither path removes a deleted row.** It stays in the graph; the search
+still returns its id; the rewritten `id IN (…)` drops it, and the query
+returns fewer than k rows. That is the degradation churn measures. Every
+re-insert also consumes a graph slot for good, so the driver sizes the graph
+at 1.5× the loaded rows and refuses a re-insert that would overflow it rather
+than let hnswlib throw inside mysqld. The repair is a full
+`myvector_index_build`, which takes `LOCK TABLES … READ` for its duration.
+
+### Trap 4 — the rewrite is textual
+
+The audit-plugin rewrite (`myvector_query_rewrite`) fires only on a statement
+whose first character is `S`/`E`/`C`/`A` and that matches `^SELECT\s+` or
+`^EXPLAIN\s+` — a leading comment or space disables it. It finds the end of
+`MYVECTOR_IS_ANN(…)` by counting parentheses over the raw text, quotes
+included, so an escaped binary vector can derail it with the bytes 0x28/0x29.
+Worse, **a long statement kills the server**: with the query vector inline as a
+hex literal, a 100-dim search (a 0.9 KB statement) works and a 784-dim one
+(6.4 KB) makes mysqld exit with nothing in its error log — reproduced on this
+image, and the cause of the first smoke run's failure. The same search with
+the vector in a user variable works. So every query is two statements, `SET
+@vb_q = X'…'` (no `MYVECTOR` in it, so the rewrite returns at its first
+`strstr`) and the search over `@vb_q` — a second round trip per query that no
+other engine here pays, charged by the plugin's design. `ef_search` mutates the shared index
+(`setSearchEffort`), so it is sent on every query; omitting it searches at
+whatever another session last asked for.
+
+Both query-path asymmetries — the second round trip, and Cosine's scalar
+distance loop (`AngularDistanceSpace` → `computeCosineDistance`; L2 runs
+hnswlib's SIMD `L2Space`) — are recorded on every record
+(`extra.round_trips_per_query`, `extra.distance_impl`, set by
+`MyVectorDriver.query_path_facts` on the ops path and by the overlay module's
+`get_additional` on the ann path) and footnoted by the report under §4, §7 and
+in Validity.
+
+### Trap 5 — dropping the table does not drop the index
+
+`DROP DATABASE` leaves the plugin's in-memory index object alive under the
+same `db.table.col` name, and the next build reuses that object — with the
+dimension, M and ef it was constructed with. The driver calls
+`myvector_index_drop` first, and the status check above would catch a stale
+object anyway.
+
+### No filtered search
+
+`myvector_ann_set_init` accepts three or four arguments and the options string
+carries `nn` and `ef_search` only. A predicate beside `MYVECTOR_IS_ANN`
+filters the k results after the search (the release's own
+`docs/LIMITATIONS.md` says so). The driver declares the `filtered` workload
+declined (`EngineDriver.declined_workloads`); the harness skips it, prints the
+reason and stamps `extra.declined_workloads` on every record of the run.
+
+### Build mode
+
+`post` only: load, then one `myvector_index_build`. There is no incremental
+mode to compare it with, because the only write-path maintenance is the dead
+binlog listener; the driver refuses `build_mode: incremental` with that
+reason. `myvector_index_bg_threads` is the build's parallelism — 1 in the
+normalized pass, `{build_threads}` in the tuned one; the plugin only builds in
+parallel at 2 or more (`HNSWMemoryIndex::startParallelBuild`).
+
+### Memory: the graph is outside the buffer pool, and the build holds the table twice
+
+The graph is hnswlib's, in mysqld's own heap: it is not InnoDB pages, it is not
+bounded by `innodb_buffer_pool_size` or by any MyVector variable, and it cannot
+be paged out — the whole graph is resident or the search does not run. It IS
+charged the same way as every other engine's memory: it is mysqld's address
+space, inside the server container, so the container memory limit bounds it
+and the run's `mem-*.jsonl` sampler and peak-RSS figures include it. What
+differs is how the same budget is split. The normalized pass gives every
+MySQL-family server a buffer pool of 30% of 16 GiB (4.8 GiB) and MariaDB/AliSQL
+a graph cache of another 30%; MyVector's buffer pool serves only the table and
+the k primary-key lookups per query, and its graph takes whatever is left.
+
+Size, per element, is `MYVECTOR_INDEX_STATUS`'s `Element Data Size` — the
+vector, the level-0 links (`2·M` 4-byte ids plus a count) and the 8-byte label;
+3,276 B at 784 dims and M=16, measured — plus an allowance of 100 B for the
+per-element lock, level and pointer arrays and the label map (an allowance,
+not a measurement). The build additionally keeps the WHOLE `(id, vector)`
+result set client-side inside mysqld while it inserts (`BuildMyVectorIndexSQL`:
+`mysql_store_result`), counted as `4·dim·rows`. So the build peak is buffer pool
++ graph + that copy, with no further margin. `harness/memory_fit.py` computes
+it; these rows are its output at M=16 and the normalized pass's 16 GiB limit
+(30% buffer pool), and `tests/test_e25_myvector_memory_fit.py` fails if they
+drift from it:
+
+| Corpus | Graph | Build transient | Buffer pool | Build peak | Against 16 GiB |
+| --- | --- | --- | --- | --- | --- |
+| gist-960 | 3.8 GiB | 3.6 GiB | 4.8 GiB | **12.2 GiB** | fits |
+| dbpedia-openai-1000k | 5.9 GiB | 5.7 GiB | 4.8 GiB | **16.4 GiB** | does **not** fit |
+
+(dbpedia-openai-1000k is 1536-d and 990,000 training rows; gist-960 is 960-d
+and 1,000,000.) Nothing beyond those parts is added — mysqld's own baseline,
+the ann-benchmarks client sharing the container on the ann path, and
+page cache are not in the figure — so a peak near the limit is a peak that
+will not survive; a refusal at 16.4 GiB against 16.0 is not a close call.
+
+**The orchestrator refuses a unit whose estimated peak is over the run's
+resolved server limit** (`cli._memory_refusal`, gated on
+`capabilities.memory_fit: myvector`), before the load, for both the ann and the
+ops phase, with the rows that phase loads (`ops.subset_rows` for ops) and the
+largest M it builds. The manifest records the phase as `refused` with the
+reason — `does not fit: estimated peak X GiB > limit Y GiB at M=32 (largest of
+[8, 16, 32])` — and the report lists it in Validity under "Units refused before
+they ran", separately from failures, and the run's finish banner counts them.
+The ann grid is `ann_pass.ann_m_values`, the function the ann render itself
+uses, so a tuned `m_values_by_engine` override is honoured; the ops grid is
+`ops.m_values`. **A unit is refused as a whole when its largest M does not
+fit**, even if its smaller M values would: one unit is one phase over the
+whole grid, and splitting it would change what a checkpoint means. That is
+conservative, and the reason text names the M and the grid so the reader can
+see it. A phase the profile disables (`ann.enabled: false`, `ops.enabled:
+false`) is never checked and never shows a refusal. **The check compares
+against the server container's limit only**, not the client's and not the
+host's: the graph and the build's copy of the vectors live in mysqld, so the
+server's memory cgroup is the one that OOM-kills it, and the ann-benchmarks
+client that shares the container on the ann path is sized separately by
+`ann_pass.client_memory_bytes`. No default budget changed: the normalized pass stays at 16 GiB.
+dbpedia under `mariadb-blog`'s own 64 GiB, or under the tuned pass's host
+fraction, fits and runs. Other engines are never refused: their graphs are
+caches or InnoDB pages that degrade instead of killing the server.
+
+The build record carries `extra.myvector_graph_bytes_floor` (level-0 bytes,
+measured from the server's status) and every record carries
+`extra.memory_note`; the report states both under §5 and in Validity. One
+budget question remains the user's to decide: whether MyVector's normalized
+buffer pool should give up the graph-cache share MariaDB and AliSQL get, so
+its graph has the same headroom.
+
+---
+
 ## Things that are true of all of them
 
 - **The optimizer can always decline the index.** Every one of them will fall

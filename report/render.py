@@ -19,6 +19,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from report import disclosures as _disclosures
 from report import scope as _scope
 
 # Defaults; the manifest's per-engine `presentation.label` overrides them, so an
@@ -616,9 +617,20 @@ def _widening_note(manifest: Dict[str, Any]) -> str:
             f"engines a profile names. Widening means editing the profile.")
 
 
-def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
+def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
+                      records: Optional[List[Dict[str, Any]]] = None) -> str:
     parts: List[str] = []
     warnings = manifest.get("warnings", []) or []
+
+    # Driver-declared facts the records carry: workloads an engine refused to
+    # measure, and costs its own query path puts inside every timed query.
+    # First, because both change how everything below reads.
+    for note in (_disclosures.all_declined_lines(records or [], _label),
+                 _disclosures.structural_lines(records or [], _label),
+                 _disclosures.index_sync_lines(records or [], _label),
+                 _disclosures.memory_lines(records or [], _label)):
+        if note:
+            parts.append(note)
 
     if summary.get("failed_phases"):
         parts.append(
@@ -634,6 +646,20 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any]) -> str:
                 for f in summary["failed_phases"]]
         parts.append(_md_table(
             ["Engine", "Phase", "Pass", "Dataset", "Exit code", "Ran for"], rows))
+
+    if summary.get("refused_phases"):
+        parts.append(
+            "\n### Units refused before they ran\n\n"
+            "Not failures: the orchestrator declined to start these because "
+            "the engine's index build cannot fit the server memory limit of "
+            "this run, and would have been killed mid-build after the load. "
+            "The estimate is `harness/memory_fit.py`'s.\n\n")
+        rows = [[_label(p.get("engine", "?")), p.get("phase", "?"),
+                 p.get("resource_pass", "?"), p.get("dataset", "?"),
+                 str(p.get("reason", "?"))]
+                for p in summary["refused_phases"]]
+        parts.append(_md_table(
+            ["Engine", "Phase", "Pass", "Dataset", "Reason"], rows))
 
     if summary.get("silent_ann_failures"):
         parts.append(
@@ -1574,13 +1600,33 @@ def _build_table_notes(summary: Dict[str, Any]) -> str:
     return ("\n" + "\n\n".join(notes) + "\n") if notes else ""
 
 
-def _not_measured(workload: str, profile: Dict[str, Any]) -> str:
+def _not_measured(workload: str, profile: Dict[str, Any],
+                  records: Optional[List[Dict[str, Any]]] = None) -> str:
     """Say a workload was not enabled, rather than printing an empty table.
 
     A section with an empty table and a blank chart reads as a broken report.
-    It usually just means `ops.workloads` did not include this one.
+    It usually just means `ops.workloads` did not include this one -- but NOT
+    when a driver declined it (`extra.declined_workloads`): then the profile
+    did ask, and saying it did not is the wrong reason in the one place a
+    reader looks for the reason.
     """
     enabled = ((profile.get("ops") or {}).get("workloads")) or []
+    declined = _disclosures.declined_lines(records or [], workload, _label)
+    if declined:
+        # Named from the engines that DECLINED, and nothing said about the
+        # rest: another engine may be absent because its phase failed, which
+        # Validity's failed-phase table reports, and a sentence here claiming
+        # "every engine declined" would be a second, wrong reason for it.
+        decliners = sorted(
+            engine for engine, reasons in
+            _disclosures.declined_by_engine(records or []).items()
+            if workload in reasons)
+        return (
+            f"_Not measured in this run._ The "
+            f"`{profile.get('name', 'profile')}` profile requested "
+            f"`{workload}`; {_prose_list(decliners)} declined it, as "
+            f"below, and no engine produced `{workload}` records.\n"
+            + declined)
     return (
         f"_Not measured in this run._ The `{profile.get('name', 'profile')}` "
         f"profile ran `workloads: {list(enabled)}`, which does not include "
@@ -3268,7 +3314,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         _md_table(["Engine", "Tag", "Commit", "-march", "Build type"],
                   _engine_rows(manifest)),
         "\n---\n\n## 2. Validity\n\n",
-        _validity_section(manifest, summary),
+        _validity_section(manifest, summary, records),
         "\n---\n\n## 3. Known asymmetries\n\n",
         _known_asymmetries(summary),
         "\n---\n\n## 4. Recall vs throughput\n\n",
@@ -3281,6 +3327,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
     for stem, paths in sorted(chart_paths.items()):
         if stem.split("-")[0] in ("pareto", "paretozoom", "qpsatrecall", "latency"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
+    # Under the QPS and latency charts, where the asymmetry bites.
+    parts.append(_disclosures.structural_lines(records, _label))
 
     parts += [
         "\n---\n\n## 5. Index build cost\n\n",
@@ -3299,6 +3347,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
     for stem, paths in sorted(chart_paths.items()):
         if stem.split("-")[0] in ("build", "storage"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
+    parts.append(_disclosures.memory_lines(records, _label))
 
     parts += [
         # Before the concurrency section and not after it, per PR 2 §2.3.2,
@@ -3350,11 +3399,12 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "across repeated measurement windows at that point; a dash means the "
         "point was measured once and carries no error bar.\n\n",
         (_concurrency_table(summary) if summary.get("concurrency")
-         else _not_measured("concurrency", profile)),
+         else _not_measured("concurrency", profile, records)),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.startswith("concurrency-"):
             parts.append(f"\n![{stem}](charts/{os.path.basename(paths['svg'])})\n")
+    parts.append(_disclosures.structural_lines(records, _label))
 
     parts += [
         "\n---\n\n## 8. Filtered (hybrid) search\n\n",
@@ -3363,7 +3413,11 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "queries that returned fewer than k rows — a real consequence of "
         "post-filtering, not a harness fault.\n\n",
         (_filtered_table(summary) if summary.get("filtered")
-         else _not_measured("filtered", profile)),
+         else _not_measured("filtered", profile, records)),
+        # In a mixed run the other engines fill the table and the decliner
+        # would simply be absent from it; name it and say why.
+        (_disclosures.declined_lines(records, "filtered", _label)
+         if summary.get("filtered") else ""),
         _filter_strategy_table(summary),
     ]
     for stem, paths in sorted(chart_paths.items()):
@@ -3375,7 +3429,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "Recall and throughput after deleting and re-inserting a fraction of rows. "
         "HNSW graphs degrade under deletion; how much differs by implementation.\n\n",
         (_churn_table(summary) if summary.get("churn")
-         else _not_measured("churn", profile)),
+         else _not_measured("churn", profile, records)),
+        _disclosures.index_sync_lines(records, _label),
     ]
     for stem, paths in sorted(chart_paths.items()):
         if stem.split("-")[0] in ("churn", "churnimpact", "passcompare") or stem.startswith("memory-timeline"):
@@ -3510,6 +3565,7 @@ _PROSE_NAME = {
     "mongodb": "Percona Search",
     "valkey": "Valkey",
     "percona": "Percona Server",
+    "myvector": "MyVector",
 }
 
 #: Which engines expose `ef_construction` when no record says either way.
@@ -3540,7 +3596,7 @@ _PROSE_NAME = {
 #: this set's equality with the engine configs, because a set that may be
 #: widened by a one-word edit is a literal again.
 EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED = frozenset(
-    {"pgvector", "valkey", "percona"})
+    {"pgvector", "valkey", "percona", "myvector"})
 
 
 def _prose_name(engine: str) -> str:
@@ -4063,14 +4119,16 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
              ["Engine", "Tag", "Commit", "-march", "Build type"], _engine_rows(manifest))),
          ""),
         ("2. Validity",
-         _md_tables_to_html(_validity_section(manifest, summary)), ""),
+         _md_tables_to_html(_validity_section(manifest, summary, records)), ""),
         ("3. Known asymmetries",
          _md_tables_to_html(_known_asymmetries(summary)), ""),
         ("4. Recall vs throughput",
          _md_tables_to_html(_headline_tables(summary)),
-         figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")),
+         figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")
+         + _md_tables_to_html(_disclosures.structural_lines(records, _label))),
         ("5. Index build cost",
-         _md_tables_to_html(_build_table(summary)), figures("build-") + figures("storage-")),
+         _md_tables_to_html(_build_table(summary)), figures("build-") + figures("storage-")
+         + _md_tables_to_html(_disclosures.memory_lines(records, _label))),
         # Before concurrency, and carrying no figure: the calibration chart is
         # Appendix A below. Numbered and worded to match the markdown, for the
         # reason the comment under this list gives -- this page is the one a
@@ -4085,15 +4143,20 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
         # "No data." for a workload the profile never ran.
         ("7. Concurrency scaling",
          _md_tables_to_html(_concurrency_table(summary) if summary.get("concurrency")
-                            else _not_measured("concurrency", profile)),
-         figures("concurrency-")),
+                            else _not_measured("concurrency", profile, records)),
+         figures("concurrency-")
+         + _md_tables_to_html(_disclosures.structural_lines(records, _label))),
         ("8. Filtered (hybrid) search",
-         _md_tables_to_html(_filtered_table(summary) if summary.get("filtered")
-                            else _not_measured("filtered", profile)),
+         _md_tables_to_html(
+             (_filtered_table(summary)
+              + _disclosures.declined_lines(records, "filtered", _label))
+             if summary.get("filtered")
+             else _not_measured("filtered", profile, records)),
          figures("filtered-")),
         ("9. Churn",
-         _md_tables_to_html(_churn_table(summary) if summary.get("churn")
-                            else _not_measured("churn", profile))
+         _md_tables_to_html((_churn_table(summary) if summary.get("churn")
+                             else _not_measured("churn", profile, records))
+                            + _disclosures.index_sync_lines(records, _label))
          + _pass_note(summary),
          figures("churn-") + figures("churnimpact-") + figures("passcompare-") + figures("memory-timeline")),
         # PR 5 §5.2 item 3, in the renderer a reader actually opens. The

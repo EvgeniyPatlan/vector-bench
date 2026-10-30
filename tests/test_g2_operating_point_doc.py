@@ -429,9 +429,9 @@ class TestTheParsersFoundSomething:
                      "report/loaders.py"):
             assert any(p == path for p, _ in found), path
 
-    def test_the_knob_table_parser_finds_five_rows(self):
+    def test_the_knob_table_parser_finds_six_rows(self):
         rows = _knob_rows()
-        assert len(rows) == 5, rows
+        assert len(rows) == 6, rows
 
     def test_the_grid_parser_finds_twelve_values(self):
         assert len(_grid_in_doc()) == 12, _grid_in_doc()
@@ -924,7 +924,7 @@ class TestTheMarksComeFromTheRenderer:
 class TestTheKnobTableResolves:
     """Each row's knob literal and symbol, read out of the driver it names."""
 
-    @pytest.mark.parametrize("index", range(5))
+    @pytest.mark.parametrize("index", range(6))
     def test_the_row_points_at_what_it_says(self, index):
         rows = _knob_rows()
         engine, knob, path, symbol = rows[index]
@@ -948,11 +948,11 @@ class TestTheKnobTableResolves:
             f"docs/05 §2.0 says {engine} is driven by {knob!r} and "
             f"{needle!r} does not appear in {path} as a whole name")
 
-    def test_the_five_rows_name_five_distinct_knobs(self):
+    def test_the_six_rows_name_six_distinct_knobs(self):
         """The claim the table makes by existing. Two rows with one knob
         would be a table that proves the opposite of what it is for."""
         knobs = [knob for _, knob, _, _ in _knob_rows()]
-        assert len(set(knobs)) == 5, knobs
+        assert len(set(knobs)) == 6, knobs
 
     def test_every_driver_with_a_concrete_knob_is_in_the_table(self):
         """The other direction. A seventh engine with a sixth knob must land

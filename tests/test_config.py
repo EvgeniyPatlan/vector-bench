@@ -1560,13 +1560,16 @@ class TestReportShowsEverySweptAxis:
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         html_block = source[source.index('sections = ['):]
         for workload in ("concurrency", "filtered", "churn"):
-            assert f'_not_measured("{workload}", profile)' in html_block, workload
+            # `records` since a driver can decline a workload: the note has
+            # to say "declined", not "the profile did not include it".
+            assert f'_not_measured("{workload}", profile, records)' in html_block, workload
 
     def test_both_renderers_reference_not_measured_equally(self):
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         for workload in ("concurrency", "filtered", "churn"):
             # once for the markdown body, once for the html section list
-            assert source.count(f'_not_measured("{workload}", profile)') == 2, workload
+            assert source.count(
+                f'_not_measured("{workload}", profile, records)') == 2, workload
 
 
 class TestPassComparisonNeedsTwoPasses:
@@ -4913,7 +4916,7 @@ class TestARunMeasuresEveryEngineByDefault:
         from orchestrator.cli import KNOWN_ENGINES
         assert set(KNOWN_ENGINES) == {"mariadb", "mariadb123", "alisql",
                                       "pgvector", "valkey", "mongodb",
-                                      "percona"}
+                                      "percona", "myvector"}
 
     def test_run_defaults_to_all_of_them(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
@@ -5075,7 +5078,7 @@ class TestAProfileThatNamesItsEnginesGetsThem:
         true and would stay green while proving nothing."""
         from orchestrator.cli import KNOWN_ENGINES
         assert load_profile("percona")["engines"] == ["percona"]
-        assert len(KNOWN_ENGINES) == 7
+        assert len(KNOWN_ENGINES) == 8
         assert "engines" not in load_profile("smoke")
 
     def test_a_bare_run_of_a_one_engine_profile_runs_one_engine(

@@ -122,6 +122,22 @@ def annb_results_dir(paths: Dict[str, str], resource_pass: str,
     return path
 
 
+def ann_m_values(engine: str, profile: Dict[str, Any],
+                 resources: Dict[str, Any], resource_pass: str) -> List[int]:
+    """The M values the ann phase builds for `engine`, in this pass.
+
+    The tuned pass's `resources.extras.m_values_by_engine` first, then the
+    profile's `ann.m_values_by_engine`, then `ann.m_values`. One function so
+    the ann render and `cli._memory_refusal` -- which must estimate the same
+    graphs the ann phase will build -- cannot read the grid two ways.
+    """
+    ann = profile.get("ann", {}) or {}
+    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
+                 if resource_pass == "tuned" else None) or \
+                ann.get("m_values_by_engine") or {}
+    return list(by_engine.get(engine) or ann.get("m_values", [16]))
+
+
 def render_config(engine: str, profile: Dict[str, Any],
                   resources: Dict[str, Any], resource_pass: str) -> Dict[str, Any]:
     """Build the ann-benchmarks config.yml body for one engine and profile.
@@ -138,10 +154,7 @@ def render_config(engine: str, profile: Dict[str, Any],
     # down to 0.76. Sweeping M only where it is the sole knob costs a reload
     # per value on the engines that need it and nothing on the engines that do
     # not, and it turns three daggered cells into real measurements.
-    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
-                 if resource_pass == "tuned" else None) or \
-                ann.get("m_values_by_engine") or {}
-    m_values = list(by_engine.get(engine) or ann.get("m_values", [16]))
+    m_values = ann_m_values(engine, profile, resources, resource_pass)
     query_args = [list(ann.get("ef_search", [10, 40, 160]))]
     extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
 
@@ -270,6 +283,31 @@ def render_config(engine: str, profile: Dict[str, Any],
                 "M": m_values,
                 "efConstruction": ef_constructions,
                 "engine": "InnoDB",
+            }],
+            "args": {},
+            "query_args": query_args,
+        }
+
+    elif engine == "myvector":
+        # Percona's shape for the same reason: MyVector exposes a build-time
+        # effort knob (`ef=` in the column options, hnswlib's ef_construction)
+        # and a query-time one (`ef_search` per MYVECTOR_IS_ANN call), so it is
+        # pinned in the normalized pass and swept only where the tuned pass
+        # asks. 200 rather than the plugin's own default of 100, so that the
+        # normalized pass builds MyVector at the same ef_construction as
+        # pgvector, Valkey and Percona -- every engine that has the knob.
+        if resource_pass == "tuned" and extras.get("myvector_ef_construction"):
+            ef_constructions = list(extras["myvector_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("myvector_ef_construction", 200))]
+        # No build-mode axis anywhere: the overlay module and the ops driver
+        # both build after the load, which is the only build the engine has
+        # on this server (see `INCREMENTAL_DECLINED` in
+        # harness/drivers/myvector.py).
+        run_groups["innodb"] = {
+            "arg_groups": [{
+                "M": m_values,
+                "efConstruction": ef_constructions,
             }],
             "args": {},
             "query_args": query_args,

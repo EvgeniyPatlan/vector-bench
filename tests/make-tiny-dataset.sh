@@ -27,7 +27,8 @@ mkdir -p "$VB_DATASETS"
 
 # Any bench image will do — they all carry numpy and h5py.
 IMAGE=""
-for candidate in vector-bench/pgvector-bench vector-bench/mariadb-bench vector-bench/alisql-bench; do
+for candidate in vector-bench/pgvector-bench vector-bench/mariadb-bench vector-bench/alisql-bench \
+                 vector-bench/percona-bench vector-bench/myvector-bench; do
   if image_exists "$candidate"; then IMAGE="$candidate"; break; fi
 done
 [[ -n "$IMAGE" ]] || die "no bench image found; build one first: ./run-benchmark.sh build"

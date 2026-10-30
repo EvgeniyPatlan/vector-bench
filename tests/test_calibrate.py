@@ -773,7 +773,9 @@ class TestEffectiveEf:
         overriding = sorted(
             {cls.__name__ for cls in _driver_table().values()
              if cls.effective_ef is not EngineDriver.effective_ef})
-        assert overriding == ["MongoDriver", "PerconaDriver"]
+        # MyVectorDriver is the third: hnswlib's `searchKnn` searches at
+        # `std::max(ef_, k)`, and the driver reports it.
+        assert overriding == ["MongoDriver", "MyVectorDriver", "PerconaDriver"]
         # What each clamp actually does is exercised where it belongs:
         # MongoDB's below, Percona's in tests/test_e2_percona_wiring.py.
 

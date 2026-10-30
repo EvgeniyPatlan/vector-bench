@@ -526,6 +526,9 @@ class TestOnlyTheDriverDecidesTheStorageEngine:
         "mariadb": "InnoDB", "mariadb123": "InnoDB", "alisql": "InnoDB",
         "percona": "InnoDB", "pgvector": None, "mongodb": None,
         "valkey": None,
+        # MyVector's table is an ordinary InnoDB table; the plugin's graph is
+        # beside it in files, but the rows the record describes are InnoDB's.
+        "myvector": "InnoDB",
     }
 
     @staticmethod
@@ -556,7 +559,7 @@ class TestOnlyTheDriverDecidesTheStorageEngine:
         assert set(self.EXPECTED) == set(table)
         # Both branches are populated, so neither test below runs over an
         # empty collection and passes by doing nothing.
-        assert sum(1 for v in self.EXPECTED.values() if v is not None) == 4
+        assert sum(1 for v in self.EXPECTED.values() if v is not None) == 5
         assert sum(1 for v in self.EXPECTED.values() if v is None) == 3
         spec = ConnectionSpec(host="h", port=1)
         return {engine: cls(spec) for engine, cls in table.items()}

@@ -373,16 +373,96 @@ prepare_valkey() {
 }
 
 
+# ---------------------------------------------------------------------------
+# MyVector — TWO pinned sources in one context: the plugin at a commit, and
+# the MySQL server tree it is compiled into, at a tag.
+# ---------------------------------------------------------------------------
+#
+# The plugin is built in-tree (`plugin/myvector/`), which is the vendor's own
+# plugin recipe, so the context tarball carries the MySQL tree as `source/`
+# and the plugin tree beside it as `myvector/`; the Dockerfile copies the
+# plugin files into place the way upstream's CI does. Both are shallow
+# fetches into sources/ -- nothing here touches a vendor checkout.
+#
+# The manifest's `engines.myvector.source` is this function's JSON, so it is
+# where the plugin commit AND the server tag/commit are recorded.
+prepare_myvector() {
+  local cfg="$VB_CONFIG/engines/myvector.yml"
+  local sha; sha="$(yq_get "$cfg" source.tag "")"
+  [[ -n "$sha" ]] || die "myvector: $cfg has no source.tag"
+  local release; release="$(yq_get "$cfg" source.release "")"
+  local upstream; upstream="$(yq_get "$cfg" source.upstream https://github.com/askdba/myvector.git)"
+  local server_tag; server_tag="$(yq_get "$cfg" source.server_tag "")"
+  [[ -n "$server_tag" ]] || die "myvector: $cfg has no source.server_tag"
+  local server_up; server_up="$(yq_get "$cfg" source.server_upstream https://github.com/mysql/mysql-server.git)"
+
+  local plugin_repo="$VB_SOURCES/myvector-git"
+  if [[ ! -d "$plugin_repo/.git" ]]; then
+    info "myvector: fetching plugin commit ${sha:0:12} from $upstream"
+    git init --quiet "$plugin_repo"
+    git -C "$plugin_repo" remote add origin "$upstream"
+  fi
+  git -C "$plugin_repo" cat-file -e "${sha}^{commit}" 2>/dev/null \
+    || git -C "$plugin_repo" fetch --quiet --depth 1 origin "$sha" \
+    || die "myvector: cannot fetch commit $sha from $upstream"
+  local resolved; resolved="$(git -C "$plugin_repo" rev-parse "${sha}^{commit}")"
+  [[ "$resolved" == "$sha" ]] \
+    || die "myvector: source.tag $sha resolved to $resolved -- not the pinned commit"
+
+  local server_repo="$VB_SOURCES/mysql-server-${server_tag}"
+  if [[ ! -d "$server_repo/.git" ]]; then
+    info "myvector: cloning server $server_tag from $server_up (shallow)"
+    git clone --quiet --depth 1 --branch "$server_tag" "$server_up" "$server_repo" \
+      || die "myvector: cannot clone $server_tag from $server_up"
+  fi
+  local server_pin; server_pin="$(yq_get "$cfg" source.server_commit "")"
+  [[ -n "$server_pin" ]] || die "myvector: $cfg has no source.server_commit"
+  local server_sha; server_sha="$(git -C "$server_repo" rev-parse "refs/tags/${server_tag}^{commit}" 2>/dev/null \
+                                  || git -C "$server_repo" rev-parse HEAD)"
+  # The same refusal the plugin commit gets: a tag that now names another
+  # commit is a different server tree under the pinned label.
+  [[ "$server_sha" == "$server_pin" ]] \
+    || die "myvector: server tag $server_tag resolved to $server_sha -- not the pinned $server_pin"
+
+  local tar="$VB_SOURCES/myvector-${sha}-${server_tag}.tar"
+  if [[ $FORCE -eq 0 && -f "$tar" ]]; then
+    ok "myvector: source tarball up to date ($(human_bytes "$(stat -c%s "$tar")"))"
+  else
+    info "myvector: exporting server $server_tag and plugin ${sha:0:12}"
+    git -C "$server_repo" archive --format=tar --prefix=source/ HEAD > "$tar.tmp"
+    git -C "$plugin_repo" archive --format=tar --prefix=myvector/ "$resolved" > "$tar.plugin"
+    tar --concatenate --file="$tar.tmp" "$tar.plugin"
+    rm -f "$tar.plugin"
+    mv "$tar.tmp" "$tar"
+  fi
+
+  python3 - "$VB_SOURCES/myvector.source.json" "$sha" "$resolved" "$release" \
+           "$upstream" "$server_tag" "$server_sha" "$server_up" <<'PY'
+import json, sys
+out, tag, commit, release, origin, server_tag, server_commit, server_origin = sys.argv[1:9]
+with open(out, "w") as fh:
+    json.dump({"engine": "myvector", "tag": tag, "commit": commit,
+               "release": release, "origin": origin,
+               "server_tag": server_tag, "server_commit": server_commit,
+               "server_origin": server_origin},
+              fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+  ok "myvector: plugin ${release} commit=${resolved:0:12}, server ${server_tag} commit=${server_sha:0:12}"
+  stage_context myvector "$tar"
+}
+
 case "$ENGINE" in
   all)        prepare_mariadb mariadb; prepare_alisql; prepare_pgvector ;;
   percona)    prepare_percona ;;
+  myvector)   prepare_myvector ;;
   mariadb)    prepare_mariadb mariadb ;;
   mariadb123) prepare_mariadb mariadb123 ;;
   alisql)     prepare_alisql ;;
   pgvector)   prepare_pgvector ;;
   mongodb)    prepare_mongodb ;;
   valkey)     prepare_valkey ;;
-  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|all)" ;;
+  *) die "unknown engine: $ENGINE (expected mariadb|mariadb123|alisql|pgvector|mongodb|valkey|percona|myvector|all)" ;;
 esac
 
 ok "sources prepared"

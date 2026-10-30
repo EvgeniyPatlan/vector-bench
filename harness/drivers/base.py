@@ -275,10 +275,43 @@ class EngineDriver(abc.ABC):
     #: memory figure in the study -- see that override for the caveat that
     #: travels with every figure quoted from it.
     status_gauges: Tuple[str, ...] = ()
+    #: Workloads this engine cannot run honestly, as `((workload, reason),
+    #: ...)`, or `()` for an engine that runs all of them.
+    #:
+    #: A declaration and not an exception raised mid-workload, for the reason
+    #: `repair_path` is one: `harness/main.py` has to know BEFORE the first
+    #: record is written, so it can stamp `extra.declined_workloads` onto every
+    #: record of the run and skip the workload with the reason printed, rather
+    #: than fail the whole ops unit after build and concurrency have already
+    #: been paid for. The alternative a driver has without this -- answering
+    #: the filtered queries some other way -- publishes a number under a label
+    #: it does not deserve, which is the failure this repository is built
+    #: against.
+    #:
+    #: A tuple of pairs rather than a dict because it is a class attribute: a
+    #: mutable default here would be one object shared by every driver class.
+    #: Only `MyVectorDriver` declares anything (filtered search, which its
+    #: pinned release does not have).
+    declined_workloads: Tuple[Tuple[str, str], ...] = ()
 
     def __init__(self, spec: ConnectionSpec):
         self.spec = spec
         self._conn: Any = None
+
+    def query_path_facts(self, index: IndexSpec) -> Dict[str, Any]:
+        """Structural facts about this engine's query path, for every record.
+
+        `{}` for every engine whose query is one statement on a vectorised
+        distance kernel, which is all of them but one. `harness/main.py`
+        stamps whatever this returns onto every record of the run, and
+        `report/disclosures.py` renders a footnote from it -- CLAUDE.md
+        requires a structural asymmetry to be stated in the report, and a fact
+        that lived only in a driver's docstring would not be.
+
+        Keys: `round_trips_per_query` (int) and `distance_impl` (a string
+        starting `scalar` or `simd`).
+        """
+        return {}
 
     # -- lifecycle ------------------------------------------------------
 
@@ -539,8 +572,9 @@ class EngineDriver(abc.ABC):
         """How many candidates this engine will really search for `ef`.
 
         For most engines here the answer is `ef`, which is why this is a
-        concrete method rather than another abstract one. TWO clamp, and both
-        clamp to k:
+        concrete method rather than another abstract one. THREE clamp, and all
+        clamp to k (the third, MyVector, is hnswlib's own `searchKnn`, which
+        searches at `std::max(ef_, k)`):
 
         * MongoDB -- `numCandidates` below `limit` cannot return `limit` rows,
           so it raises the low end of the grid to k.

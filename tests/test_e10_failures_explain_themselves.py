@@ -82,6 +82,7 @@ FILE_LOGGING = {
     "mariadb123": ("mariadb", "/var/lib/vbench/mariadb.err"),
     "alisql": ("alisql", "/var/lib/vbench/alisql.err"),
     "mongodb": ("mongodb", "/var/lib/vbench/mongot/mongot.log"),
+    "myvector": ("myvector", "/var/lib/vbench/myvector.err"),
 }
 
 #: Engines whose every log reaches the container's stdout, so `docker logs`
@@ -2012,11 +2013,12 @@ class TestSection410StillDescribesRenderConfig:
         body = _render_config_body()
         at = [m.start() for m in
               re.finditer(r'"efConstruction": ef_constructions', body)]
-        assert len(at) == 3, at
-        assert re.search(r"occurs three times", section, re.I), (
+        # Four since MyVector's branch, which has the same two knobs.
+        assert len(at) == 4, at
+        assert re.search(r"occurs four times", section, re.I), (
             "§4.10 must state how many there are; the count is the thing "
             "that went stale when Percona's branch added the third")
-        for engine in ("pgvector", "valkey", "percona"):
+        for engine in ("pgvector", "valkey", "percona", "myvector"):
             start, end = _branch_span(body, engine)
             inside = [n for n in at if start < n < end]
             assert len(inside) == 1, (engine, inside)

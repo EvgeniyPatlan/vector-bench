@@ -138,6 +138,25 @@ def filter_column(record: Dict[str, Any]) -> str:
             or FILTER_COLUMN_WHEN_ABSENT)
 
 
+def _why_absent(records: List[Dict[str, Any]], dataset: str,
+                workload: str) -> str:
+    """Why a workload's chart has no records: not asked for, or declined.
+
+    The harness stamps `extra.declined_workloads` on every record of a run
+    whose driver declined a workload (MyVector's filtered search). Without
+    this the skip line said "not in this profile's workloads" about a profile
+    that DID ask, and the one place a reader would look for the reason gave
+    the wrong one.
+    """
+    decliners = sorted({
+        str(r.get("engine")) for r in records
+        if r.get("dataset") == dataset
+        and workload in ((r.get("extra") or {}).get("declined_workloads") or {})})
+    if decliners:
+        return f"declined by the driver for {', '.join(decliners)}"
+    return "not in this profile's workloads"
+
+
 def filtered_chart_entries(records: List[Dict[str, Any]], dataset: str,
                            draw=None) -> List[Any]:
     """The `(name, fn, payload)` chart entries for the filtered section.
@@ -926,8 +945,14 @@ def summarize(records: List[Dict[str, Any]],
     # A phase that failed leaves a hole in the results. Without this the report
     # simply omits that engine/pass and a reader cannot distinguish "not
     # measured" from "measured and unremarkable".
+    # A unit the orchestrator refused up front (`cli._memory_refusal`: the
+    # build would not fit the server limit) is neither: it carries its reason
+    # and is reported as a refusal, not as a crash.
+    summary.setdefault("refused_phases", [])
     for phase in (manifest or {}).get("phases", []):
-        if phase.get("status") != "completed":
+        if phase.get("status") == "refused":
+            summary["refused_phases"].append(phase)
+        elif phase.get("status") != "completed":
             summary["failed_phases"].append(phase)
 
     return summary
@@ -1453,7 +1478,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             required = needs.get(name) or needs.get(name.split("-")[0])
             if required and required not in phases_present:
                 print(f"[report] skipping {name}: no {required} records "
-                      f"(not in this profile's workloads)")
+                      f"({_why_absent(records, dataset, name.split('-')[0])})")
                 continue
             stem = f"{name}-{safe}"
             try:
