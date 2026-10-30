@@ -945,8 +945,14 @@ def summarize(records: List[Dict[str, Any]],
     # A phase that failed leaves a hole in the results. Without this the report
     # simply omits that engine/pass and a reader cannot distinguish "not
     # measured" from "measured and unremarkable".
+    # A unit the orchestrator refused up front (`cli._memory_refusal`: the
+    # build would not fit the server limit) is neither: it carries its reason
+    # and is reported as a refusal, not as a crash.
+    summary.setdefault("refused_phases", [])
     for phase in (manifest or {}).get("phases", []):
-        if phase.get("status") != "completed":
+        if phase.get("status") == "refused":
+            summary["refused_phases"].append(phase)
+        elif phase.get("status") != "completed":
             summary["failed_phases"].append(phase)
 
     return summary

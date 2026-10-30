@@ -647,6 +647,20 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
         parts.append(_md_table(
             ["Engine", "Phase", "Pass", "Dataset", "Exit code", "Ran for"], rows))
 
+    if summary.get("refused_phases"):
+        parts.append(
+            "\n### Units refused before they ran\n\n"
+            "Not failures: the orchestrator declined to start these because "
+            "the engine's index build cannot fit the server memory limit of "
+            "this run, and would have been killed mid-build after the load. "
+            "The estimate is `harness/memory_fit.py`'s.\n\n")
+        rows = [[_label(p.get("engine", "?")), p.get("phase", "?"),
+                 p.get("resource_pass", "?"), p.get("dataset", "?"),
+                 str(p.get("reason", "?"))]
+                for p in summary["refused_phases"]]
+        parts.append(_md_table(
+            ["Engine", "Phase", "Pass", "Dataset", "Reason"], rows))
+
     if summary.get("silent_ann_failures"):
         parts.append(
             "\n### Recall phases that ran and measured nothing\n\n"
@@ -1599,11 +1613,20 @@ def _not_measured(workload: str, profile: Dict[str, Any],
     enabled = ((profile.get("ops") or {}).get("workloads")) or []
     declined = _disclosures.declined_lines(records or [], workload, _label)
     if declined:
+        # Named from the engines that DECLINED, and nothing said about the
+        # rest: another engine may be absent because its phase failed, which
+        # Validity's failed-phase table reports, and a sentence here claiming
+        # "every engine declined" would be a second, wrong reason for it.
+        decliners = sorted(
+            engine for engine, reasons in
+            _disclosures.declined_by_engine(records or []).items()
+            if workload in reasons)
         return (
             f"_Not measured in this run._ The "
             f"`{profile.get('name', 'profile')}` profile requested "
-            f"`{workload}`, and every engine that would have populated this "
-            f"section declined it.\n" + declined)
+            f"`{workload}`; {_prose_list(decliners)} declined it, as "
+            f"below, and no engine produced `{workload}` records.\n"
+            + declined)
     return (
         f"_Not measured in this run._ The `{profile.get('name', 'profile')}` "
         f"profile ran `workloads: {list(enabled)}`, which does not include "

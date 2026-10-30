@@ -454,30 +454,45 @@ the k primary-key lookups per query, and its graph takes whatever is left.
 
 Size, per element, is `MYVECTOR_INDEX_STATUS`'s `Element Data Size` — the
 vector, the level-0 links (`2·M` 4-byte ids plus a count) and the 8-byte label;
-3,276 B at 784 dims and M=16, measured — plus about 100 B of per-element arrays
-and the label map. The build additionally keeps the WHOLE `(id, vector)` result
-set client-side inside mysqld while it inserts (`BuildMyVectorIndexSQL`:
-`mysql_store_result`), so its peak is roughly buffer pool + graph + one more
-copy of the vectors. At M=16, 1M rows, estimated from that formula:
+3,276 B at 784 dims and M=16, measured — plus an allowance of 100 B for the
+per-element lock, level and pointer arrays and the label map (an allowance,
+not a measurement). The build additionally keeps the WHOLE `(id, vector)`
+result set client-side inside mysqld while it inserts (`BuildMyVectorIndexSQL`:
+`mysql_store_result`), counted as `4·dim·rows`. So the build peak is buffer pool
++ graph + that copy, with no further margin. `harness/memory_fit.py` computes
+it; these rows are its output at M=16 and the normalized pass's 16 GiB limit
+(30% buffer pool), and `tests/test_e25_myvector_memory_fit.py` fails if they
+drift from it:
 
-| Corpus | Graph | Build transient | Buffer pool (normalized) | Build peak | Normalized limit |
+| Corpus | Graph | Build transient | Buffer pool | Build peak | Against 16 GiB |
 | --- | --- | --- | --- | --- | --- |
-| gist-960 | ~3.8 GiB | ~3.6 GiB | 4.8 GiB | **~12.5 GiB** | 16 GiB — fits, ~3 GiB spare |
-| dbpedia-openai-1000k (1536-d) | ~6.0 GiB | ~5.7 GiB | 4.8 GiB | **~17 GiB** | 16 GiB — does **not** fit |
+| gist-960 | 3.8 GiB | 3.6 GiB | 4.8 GiB | **12.2 GiB** | fits |
+| dbpedia-openai-1000k | 5.9 GiB | 5.7 GiB | 4.8 GiB | **16.4 GiB** | does **not** fit |
 
-No shipped profile runs dbpedia under the 16 GiB normalized limit:
-`mariadb-blog` sets 64 GiB and `tuned-complete` uses the tuned pass's host
-fraction. A profile that did would see MyVector killed by the container's OOM
-killer during the build, while the cache-based engines merely slowed down — the
-same cache-versus-wall distinction CLAUDE.md draws for Percona's
-`innodb_hnsw_max_memory`. The build record carries
-`extra.myvector_graph_bytes_floor` (level-0 bytes) and every record carries
-`extra.memory_note`; the report states both under §5 and in Validity. Not done,
-because it changes a budget and that is the user's call: (a) give MyVector's
-normalized buffer pool the graph-cache share instead of its own 30%, so its
-graph has the headroom the MHNSW/VIDX caches are given; or (b) refuse a
-MyVector unit up front when the estimated build peak exceeds the server limit,
-the way the free-disk check refuses a run, instead of letting it OOM.
+(dbpedia-openai-1000k is 1536-d and 990,000 training rows; gist-960 is 960-d
+and 1,000,000.) Nothing beyond those parts is added — mysqld's own baseline,
+the ann-benchmarks client sharing the container on the ann path, and
+page cache are not in the figure — so a peak near the limit is a peak that
+will not survive; a refusal at 16.4 GiB against 16.0 is not a close call.
+
+**The orchestrator refuses a unit whose estimated peak is over the run's
+resolved server limit** (`cli._memory_refusal`, gated on
+`capabilities.memory_fit: myvector`), before the load, for both the ann and the
+ops phase, with the rows that phase loads (`ops.subset_rows` for ops) and the
+largest M it builds. The manifest records the phase as `refused` with the
+reason — `does not fit: estimated peak X GiB > limit Y GiB` — and the report
+lists it in Validity under "Units refused before they ran", separately from
+failures. No default budget changed: the normalized pass stays at 16 GiB.
+dbpedia under `mariadb-blog`'s own 64 GiB, or under the tuned pass's host
+fraction, fits and runs. Other engines are never refused: their graphs are
+caches or InnoDB pages that degrade instead of killing the server.
+
+The build record carries `extra.myvector_graph_bytes_floor` (level-0 bytes,
+measured from the server's status) and every record carries
+`extra.memory_note`; the report states both under §5 and in Validity. One
+budget question remains the user's to decide: whether MyVector's normalized
+buffer pool should give up the graph-cache share MariaDB and AliSQL get, so
+its graph has the same headroom.
 
 ---
 

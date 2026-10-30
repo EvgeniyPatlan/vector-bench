@@ -104,6 +104,12 @@ storage_engines:
   tuned: [InnoDB]
 
 capabilities:
+  # The build-fits-in-memory check (`harness/memory_fit.py`). The graph is
+  # resident hnswlib memory outside the buffer pool and the build holds a
+  # second copy of the vectors, so a corpus whose estimated build peak is over
+  # the server limit would be OOM-killed mid-build; the orchestrator refuses
+  # that unit up front (`cli._memory_refusal`) and the report says why.
+  memory_fit: myvector
   # `ef=` in the column options is hnswlib's ef_construction
   # (`HNSWMemoryIndex::HNSWMemoryIndex`, default 100).
   ef_construction_tunable: true

@@ -558,6 +558,22 @@ def cmd_run(args: argparse.Namespace) -> int:
 
                     started = utcnow()
                     print(f"\n--- {key} ---")
+                    refusal = _memory_refusal(engine, engine_cfg, dataset,
+                                              phase, profile, resolved)
+                    if refusal is not None:
+                        # Not a failure and not a skip: the unit is recorded
+                        # as refused with its reason, which the report states
+                        # in Validity, and the run goes on with the rest.
+                        print(f"[refused] {key}: {refusal['reason']}",
+                              file=sys.stderr)
+                        manifest.add_phase(
+                            phase, engine, dataset, "refused", started,
+                            utcnow(), {"resource_pass": resource_pass,
+                                       "reason": refusal["reason"],
+                                       "estimated_peak_bytes":
+                                           refusal["estimated_peak_bytes"],
+                                       "limit_bytes": refusal["limit_bytes"]})
+                        continue
                     t0 = time.time()
                     try:
                         rc = _run_unit(phase, engine, dataset, profile, engine_cfg,
@@ -1057,6 +1073,43 @@ def _ops_build_modes(engine: str, profile: Dict[str, Any],
               f"post-maintenance record. Flipping the capability is what "
               f"restores both.", file=sys.stderr)
     return modes
+
+
+def _memory_refusal(engine: str, engine_cfg: Dict[str, Any], dataset: str,
+                    phase: str, profile: Dict[str, Any],
+                    resolved: Any) -> Optional[Dict[str, Any]]:
+    """A refusal for a unit whose index build cannot fit, or None.
+
+    For the one engine that declares a model (`capabilities.memory_fit`,
+    MyVector): its HNSW graph is resident hnswlib memory outside the buffer
+    pool and its build holds a second copy of the vectors, so a corpus too
+    large for the server limit is an OOM kill mid-build -- after the load has
+    been paid for, and looking like a crash. Refused here instead, like the
+    free-disk check refuses a run, against the run's RESOLVED limits (the
+    profile's `resources:` override, the tuned pass's host fraction).
+
+    Rows are what the unit loads: the whole training set for the ann phase,
+    `ops.subset_rows` of it for the ops phase. M is the largest the phase
+    builds. An unknown corpus is never refused.
+    """
+    from harness import memory_fit
+    model = ((engine_cfg.get("capabilities") or {}).get("memory_fit"))
+    facts = datasets_mod.KNOWN_DATASETS.get(dataset) or {}
+    rows = int(facts.get("train") or 0)
+    if phase == "ops":
+        ops = profile.get("ops", {}) or {}
+        subset = ops.get("subset_rows")
+        if subset:
+            rows = min(rows, int(subset))
+        m_values = list(ops.get("m_values") or [16])
+    else:
+        ann = profile.get("ann", {}) or {}
+        m_values = list(((ann.get("m_values_by_engine") or {}).get(engine))
+                        or ann.get("m_values") or [16])
+    return memory_fit.check(
+        model, int(facts.get("dim") or 0), rows, max(int(m) for m in m_values),
+        int(getattr(resolved, "buffer_bytes", 0) or 0),
+        int(getattr(resolved, "server_memory_bytes", 0) or 0))
 
 
 def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],

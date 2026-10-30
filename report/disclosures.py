@@ -110,17 +110,69 @@ def all_declined_lines(records: Iterable[Dict[str, Any]],
             "not a failure of the run.\n\n" + "\n".join(lines) + "\n")
 
 
+#: The query-path facts an engine's design fixes, for a record that predates
+#: their being written. Keyed by engine and, for the distance, by the record's
+#: metric. Must equal `MyVectorDriver.DISTANCE_IMPL` and the overlay module's
+#: table; `tests/test_e25_myvector_memory_fit.py` pins all three together.
+ENGINE_QUERY_PATH_FACTS: Dict[str, Dict[str, Any]] = {
+    "myvector": {
+        "round_trips_per_query": 2,
+        "distance_impl": {"angular": "scalar (computeCosineDistance)",
+                          "euclidean": "simd (hnswlib L2Space)"},
+    },
+}
+
+#: The ann-benchmarks record phase (`harness.metrics.records.PHASE_RECALL`),
+#: spelled here so this module stays import-free.
+_ANN_PHASE = "recall_qps"
+
+
+def _derived(record: Dict[str, Any]) -> Dict[str, Any]:
+    """The facts for an ann record of a known engine that carries none.
+
+    An ann result cached before the overlay module wrote these attributes
+    (MyVector before commit 970a55a) has neither key. ann-benchmarks reuses
+    cached results whose parameters match (CLAUDE.md, "The ann results tree
+    ... is shared across runs"), so such a record can sit in a new run's
+    report. The facts are properties of the engine's design, not of the
+    measurement, so they are derived from the engine and the record's metric
+    rather than left out -- and the record is counted as stale so the report
+    says so.
+    """
+    known = ENGINE_QUERY_PATH_FACTS.get(str(record.get("engine") or ""))
+    if not known or record.get("phase") != _ANN_PHASE:
+        return {}
+    extra = _extra(record)
+    if "round_trips_per_query" in extra and "distance_impl" in extra:
+        return {}
+    out: Dict[str, Any] = {}
+    if "round_trips_per_query" not in extra:
+        out["round_trips_per_query"] = known["round_trips_per_query"]
+    if "distance_impl" not in extra:
+        impl = known["distance_impl"].get(str(record.get("metric_space") or ""))
+        if impl:
+            out["distance_impl"] = impl
+    return out
+
+
 def structural_facts(records: Iterable[Dict[str, Any]]
                      ) -> Dict[str, Dict[str, Any]]:
-    """`{engine: {"round_trips_per_query": n, "distance_impl": {..}}}`.
+    """`{engine: {"round_trips_per_query": n, "distance_impl": {..},
+    "stale_ann": count}}`.
 
     Only engines that declare something different from the default: more than
-    one round trip per query, or a scalar distance path.
+    one round trip per query, or a scalar distance path. An ann record of a
+    known engine that lacks the attributes contributes the engine's facts
+    (`_derived`) and is counted in `stale_ann`.
     """
     out: Dict[str, Dict[str, Any]] = {}
     for record in records:
-        extra = _extra(record)
+        derived = _derived(record)
+        extra = {**_extra(record), **derived}
         engine = str(record.get("engine") or "?")
+        if derived:
+            entry = out.setdefault(engine, {})
+            entry["stale_ann"] = entry.get("stale_ann", 0) + 1
         trips = extra.get("round_trips_per_query")
         if isinstance(trips, (int, float)) and not isinstance(trips, bool) \
                 and trips > 1:
@@ -209,6 +261,14 @@ def structural_lines(records: Iterable[Dict[str, Any]],
                 f"{impl} implementation (`extra.distance_impl`); its other "
                 f"metric uses SIMD kernels, so its throughput on this metric "
                 f"is not a statement about its SIMD path.")
+        stale = fact.get("stale_ann")
+        if stale:
+            lines.append(
+                f"- **{name}**: {stale} recall/QPS result(s) predate these "
+                f"attributes (an ann result cached before they were written "
+                f"and reused by ann-benchmarks); the facts above are derived "
+                f"from the engine for them. Move that engine's ann subtree "
+                f"aside to re-measure.")
     if not lines:
         return ""
     return ("\n**Structural asymmetries in the query path.** Read these "

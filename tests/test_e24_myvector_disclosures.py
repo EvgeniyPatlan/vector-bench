@@ -110,6 +110,26 @@ class TestDeclinedWorkloadIsRendered:
         assert "which does not include" not in section
         assert "declined: `filtered`" in section
 
+    def test_declined_plus_failed_names_only_the_decliner(self):
+        """pgvector's ops phase FAILED and MyVector DECLINED. The sentence is
+        about MyVector alone: it must not claim every engine declined, and it
+        must not say anything about why pgvector is absent -- Validity's
+        failed-phase table does that."""
+        from report import generate, render
+        records = [r for r in _mixed_records() if r["engine"] == "myvector"]
+        manifest = _manifest()
+        manifest["phases"] = [{"phase": "ops", "engine": "pgvector",
+                               "dataset": "glove-100-angular",
+                               "status": "failed", "exit_code": 1,
+                               "resource_pass": "normalized"}]
+        summary = generate.summarize(records, manifest)
+        page = render.render_markdown(manifest, summary, records, {}, "E24")
+        section = _section(page, "## 8. Filtered (hybrid) search")
+        assert "every engine" not in section
+        assert "MyVector declined it" in section
+        assert "pgvector" not in section.lower()
+        assert "PostgreSQL" not in section
+
     def test_the_html_page_says_it_too(self):
         page = _render(_mixed_records(), html=True)
         assert "declined: <code>filtered</code>" in page \
