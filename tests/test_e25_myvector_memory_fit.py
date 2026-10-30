@@ -41,10 +41,21 @@ def _resolved(info, resource_pass, profile, engine="myvector"):
     return resolve_resources(resources, engine, info)
 
 
-def _profile(dataset, **ops):
+def _refusal(info, engine, dataset, phase, profile, resource_pass="normalized",
+             resources=None):
+    """`cli._memory_refusal` against the resolution `cmd_run` would make."""
+    if resources is None:
+        resources = merge_resource_overrides(load_resources(resource_pass),
+                                             profile)
+    resolved = resolve_resources(resources, engine, info)
+    return cli._memory_refusal(engine, load_engine(engine), dataset, phase,
+                               profile, resources, resolved, resource_pass)
+
+
+def _profile(dataset, ann_m=(16,), ops_m=(16,), **ops):
     return {"name": "e25", "datasets": [dataset],
-            "ann": {"m_values": [16]},
-            "ops": {"m_values": [16], **ops}}
+            "ann": {"m_values": list(ann_m)},
+            "ops": {"m_values": list(ops_m), **ops}}
 
 
 class TestTheEstimator:
@@ -65,59 +76,50 @@ class TestTheEstimator:
 
 
 class TestTheRefusal:
-    """The three cases the change was specified by."""
+    """The three cases the change was specified by, and the edges around them."""
 
     def test_dbpedia_under_normalized_16_gib_is_refused(self, info):
         profile = _profile("dbpedia-openai-1000k-angular")
-        resolved = _resolved(info, "normalized", profile)
-        assert resolved.server_memory_bytes == 16 * GIB
+        assert _resolved(info, "normalized", profile).server_memory_bytes \
+            == 16 * GIB
         for phase in ("ann", "ops"):
-            refusal = cli._memory_refusal(
-                "myvector", load_engine("myvector"),
-                "dbpedia-openai-1000k-angular", phase, profile, resolved)
+            refusal = _refusal(info, "myvector",
+                               "dbpedia-openai-1000k-angular", phase, profile)
             assert refusal is not None, phase
             assert refusal["reason"].startswith(
                 "does not fit: estimated peak 16.4 GiB > limit 16.0 GiB")
+            assert "at M=16 (largest of [16])" in refusal["reason"]
 
     def test_gist_under_normalized_16_gib_is_allowed(self, info):
         profile = _profile("gist-960-euclidean")
-        resolved = _resolved(info, "normalized", profile)
         for phase in ("ann", "ops"):
-            assert cli._memory_refusal(
-                "myvector", load_engine("myvector"), "gist-960-euclidean",
-                phase, profile, resolved) is None, phase
+            assert _refusal(info, "myvector", "gist-960-euclidean", phase,
+                            profile) is None, phase
 
     def test_dbpedia_under_mariadb_blogs_64_gib_is_allowed(self, info):
         profile = load_profile("mariadb-blog")
-        resolved = _resolved(info, profile.get("default_resource_pass",
-                                               "normalized"), profile)
-        assert resolved.server_memory_bytes >= 32 * GIB, \
+        pass_ = profile.get("default_resource_pass", "normalized")
+        assert _resolved(info, pass_, profile).server_memory_bytes >= 32 * GIB, \
             "mariadb-blog's own 64 GiB override did not reach the resolution"
-        assert cli._memory_refusal(
-            "myvector", load_engine("myvector"),
-            "dbpedia-openai-1000k-angular", "ops", profile, resolved) is None
+        for phase in ("ann", "ops"):
+            assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                            phase, profile, pass_) is None, phase
 
     def test_other_engines_are_never_refused(self, info):
         profile = _profile("dbpedia-openai-1000k-angular")
         for engine in ("mariadb", "percona", "pgvector", "valkey"):
-            resolved = _resolved(info, "normalized", profile, engine)
-            assert cli._memory_refusal(
-                engine, load_engine(engine), "dbpedia-openai-1000k-angular",
-                "ops", profile, resolved) is None, engine
+            assert _refusal(info, engine, "dbpedia-openai-1000k-angular",
+                            "ops", profile) is None, engine
 
     def test_a_subset_is_estimated_at_its_own_size(self, info):
         profile = _profile("dbpedia-openai-1000k-angular", subset_rows=20_000)
-        resolved = _resolved(info, "normalized", profile)
-        assert cli._memory_refusal(
-            "myvector", load_engine("myvector"),
-            "dbpedia-openai-1000k-angular", "ops", profile, resolved) is None
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ops", profile) is None
 
     def test_an_unknown_corpus_is_not_refused(self, info):
         profile = _profile("tiny-16-euclidean")
-        resolved = _resolved(info, "normalized", profile)
-        assert cli._memory_refusal(
-            "myvector", load_engine("myvector"), "tiny-16-euclidean", "ops",
-            profile, resolved) is None
+        assert _refusal(info, "myvector", "tiny-16-euclidean", "ops",
+                        profile) is None
 
     def test_the_default_budget_is_untouched(self):
         assert load_resources("normalized")["memory"]["server_limit_gb"] == 16
@@ -126,12 +128,180 @@ class TestTheRefusal:
         assert load_engine("myvector")["capabilities"]["memory_fit"] == "myvector"
 
 
-class TestTheRunLoopRecordsIt:
-    def test_the_phase_loop_consults_the_check_and_records_refused(self):
-        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
-        loop = source.split("def cmd_run", 1)[1].split("\ndef ", 1)[0]
-        assert "_memory_refusal(" in loop
-        assert '"refused"' in loop
+class TestTheMValuesAndRowsArePerPhase:
+    """gist-960 under a 10.62 GiB limit: M=8 and M=16 fit and M=32 does not
+    (`test_the_limit_sits_between_m16_and_m32` proves the premise), so a
+    `max` replaced by `min` or a constant fails here."""
+
+    LIMIT_GB = 10.62    # between the limits gist-960 needs at M=16 and at M=32
+
+    def _tight(self, profile):
+        profile = dict(profile)
+        profile["resources"] = {"memory": {"server_limit_gb": self.LIMIT_GB}}
+        return profile
+
+    def test_the_limit_sits_between_m16_and_m32(self):
+        buffer = int(self.LIMIT_GB * GIB * 0.30)
+        at = {m: memory_fit.myvector_build_peak(960, 1_000_000, m, buffer)["peak"]
+              for m in (8, 16, 32)}
+        limit = self.LIMIT_GB * GIB
+        assert at[8] <= limit and at[16] <= limit < at[32], \
+            {m: v / GIB for m, v in at.items()}
+
+    def test_the_largest_ann_m_decides(self, info):
+        profile = self._tight(_profile("gist-960-euclidean", ann_m=(8, 16, 32)))
+        refusal = _refusal(info, "myvector", "gist-960-euclidean", "ann",
+                           profile)
+        assert refusal is not None, "max(M) not used: [8, 16, 32] fitted"
+        assert "at M=32 (largest of [8, 16, 32])" in refusal["reason"]
+        fits = self._tight(_profile("gist-960-euclidean", ann_m=(8, 16)))
+        assert _refusal(info, "myvector", "gist-960-euclidean", "ann",
+                        fits) is None
+
+    def test_ann_does_not_read_ops_m_and_ops_does_not_read_ann_m(self, info):
+        ann_big = self._tight(_profile("gist-960-euclidean", ann_m=(32,),
+                                       ops_m=(16,)))
+        assert _refusal(info, "myvector", "gist-960-euclidean", "ann",
+                        ann_big) is not None
+        assert _refusal(info, "myvector", "gist-960-euclidean", "ops",
+                        ann_big) is None
+        ops_big = self._tight(_profile("gist-960-euclidean", ann_m=(16,),
+                                       ops_m=(32,)))
+        assert _refusal(info, "myvector", "gist-960-euclidean", "ann",
+                        ops_big) is None
+        assert _refusal(info, "myvector", "gist-960-euclidean", "ops",
+                        ops_big) is not None
+
+    def test_subset_rows_bind_ops_only(self, info):
+        profile = _profile("dbpedia-openai-1000k-angular", subset_rows=20_000)
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ops", profile) is None
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ann", profile) is not None
+
+    def test_a_tuned_m_values_by_engine_override_is_honoured(self, info):
+        from orchestrator import ann_pass
+        profile = self._tight(_profile("gist-960-euclidean", ann_m=(16,)))
+        resources = merge_resource_overrides(load_resources("tuned"), profile)
+        resources["memory"]["server_limit_gb"] = self.LIMIT_GB
+        resources.setdefault("extras", {})["m_values_by_engine"] = {
+            "myvector": [32]}
+        assert ann_pass.ann_m_values("myvector", profile, resources,
+                                     "tuned") == [32]
+        refusal = _refusal(info, "myvector", "gist-960-euclidean", "ann",
+                           profile, "tuned", resources)
+        assert refusal is not None
+        assert "at M=32 (largest of [32])" in refusal["reason"]
+
+    def test_render_config_and_the_check_share_one_m_function(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        body = source.split("def render_config(", 1)[1].split("\ndef ", 1)[0]
+        assert "ann_m_values(engine, profile, resources, resource_pass)" in body
+
+
+class TestTheDocsStateTheTwoLimitsOfTheCheck:
+    def test_whole_unit_and_server_limit_only_are_stated(self):
+        doc = open(os.path.join(VB_ROOT, "docs", "04-engine-notes.md")).read()
+        flat = " ".join(doc.split())
+        assert "A unit is refused as a whole when its largest M does not fit" \
+            in flat
+        assert "The check compares against the server container's limit only" \
+            in flat
+
+
+class TestADisabledPhaseIsNotRefused:
+    def test_ann_disabled(self, info):
+        profile = _profile("dbpedia-openai-1000k-angular")
+        profile["ann"]["enabled"] = False
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ann", profile) is None
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ops", profile) is not None
+
+    def test_ops_disabled(self, info):
+        profile = _profile("dbpedia-openai-1000k-angular")
+        profile["ops"]["enabled"] = False
+        assert _refusal(info, "myvector", "dbpedia-openai-1000k-angular",
+                        "ops", profile) is None
+
+
+class TestTheRunLoopRefusesForReal:
+    """`cmd_run` driven end to end with `_run_unit` stubbed: the refused unit
+    is never started, carries no checkpoint, and the rest of the run goes on.
+    The previous source grep passed with the `continue` deleted."""
+
+    DATASET = "dbpedia-openai-1000k-angular"
+
+    def _run(self, monkeypatch, tmp_path, capsys):
+        import argparse
+        from orchestrator import cli as cli_mod
+        root = str(tmp_path / "vb")
+        real_paths = cli_mod.paths_for
+        monkeypatch.setattr(cli_mod, "paths_for", lambda run_id: {
+            k: v.replace(VB_ROOT, root) if isinstance(v, str) else v
+            for k, v in real_paths(run_id).items()})
+        profile = {"name": "e25run", "description": "", "k": 10,
+                   "datasets": [self.DATASET],
+                   "ann": {"m_values": [16]},
+                   "ops": {"m_values": [16], "workloads": ["build"]}}
+        monkeypatch.setattr(cli_mod, "load_profile", lambda name: profile)
+        monkeypatch.setattr(cli_mod.docker_ctl, "docker_available",
+                            lambda: True)
+        monkeypatch.setattr(cli_mod.docker_ctl, "image_id", lambda ref: "x")
+        monkeypatch.setattr(cli_mod.docker_ctl, "image_exists",
+                            lambda ref: False)
+        monkeypatch.setattr(cli_mod, "print_load_estimate",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "_check_free_disk", lambda *a: False)
+        ran = []
+
+        def _unit(phase, engine, dataset, *a, **k):
+            ran.append((engine, dataset, phase))
+            return 0
+        monkeypatch.setattr(cli_mod, "_run_unit", _unit)
+        args = argparse.Namespace(
+            profile="e25run", engines="myvector,pgvector", datasets=None,
+            resource_pass="normalized", phases="both",
+            run_id="e25run-20260101-000000", resume=False, force=False,
+            fail_fast=False, no_report=True)
+        paths = cli_mod.paths_for(args.run_id)
+        os.makedirs(paths["datasets"], exist_ok=True)
+        open(os.path.join(paths["datasets"], f"{self.DATASET}.hdf5"),
+             "wb").close()
+        rc = cli_mod.cmd_run(args)
+        return rc, ran, paths, capsys.readouterr()
+
+    def test_refused_units_never_run_and_others_do(self, monkeypatch,
+                                                    tmp_path, capsys):
+        import json
+        rc, ran, paths, out = self._run(monkeypatch, tmp_path, capsys)
+        assert rc == 0
+        assert not [u for u in ran if u[0] == "myvector"], ran
+        assert sorted(ran) == [("pgvector", self.DATASET, "ann"),
+                               ("pgvector", self.DATASET, "ops")]
+        manifest = json.load(open(os.path.join(paths["run_dir"],
+                                               "run-manifest.json")))
+        mine = [p for p in manifest["phases"] if p["engine"] == "myvector"]
+        assert {p["phase"] for p in mine} == {"ann", "ops"}
+        assert all(p["status"] == "refused" for p in mine), mine
+        assert all(p["reason"].startswith("does not fit") for p in mine)
+        assert manifest["status"] == "completed"
+        checkpoints = ""
+        if os.path.exists(paths["checkpoints"]):
+            checkpoints = open(paths["checkpoints"]).read()
+        assert "myvector" not in checkpoints
+        assert "pgvector" in checkpoints
+
+    def test_the_finish_banner_summarises_the_refusals(self, monkeypatch,
+                                                       tmp_path, capsys):
+        rc, ran, paths, out = self._run(monkeypatch, tmp_path, capsys)
+        text = out.out + out.err
+        finished = text.index("finished ===")
+        summary = text[finished:]
+        assert ("2 unit(s) refused before they ran: "
+                f"normalized/myvector/{self.DATASET}/ann, "
+                f"normalized/myvector/{self.DATASET}/ops") in summary
+        assert "see the report's Validity" in summary
 
 
 class TestTheReportStatesIt:

@@ -130,6 +130,28 @@ class TestDeclinedWorkloadIsRendered:
         assert "pgvector" not in section.lower()
         assert "PostgreSQL" not in section
 
+    def test_each_section_names_only_the_engine_that_declined_it(self):
+        """Two engines declined DIFFERENT workloads. `if True` in place of the
+        workload filter would name both in both sections."""
+        records = [
+            _base("myvector", "index_build", build_wall_s=1.0, rows=1000,
+                  extra={"declined_workloads": {"filtered": REASON}}),
+            _base("zengine", "index_build", build_wall_s=1.0, rows=1000,
+                  extra={"declined_workloads": {"churn": "no churn here"}}),
+        ]
+        manifest = _manifest()
+        manifest["config"]["profile"]["ops"]["workloads"] = [
+            "build", "filtered", "churn"]
+        from report import generate, render
+        summary = generate.summarize(records, manifest)
+        page = render.render_markdown(manifest, summary, records, {}, "E24")
+        filtered = _section(page, "## 8. Filtered (hybrid) search")
+        churn = _section(page, "## 9. Churn")
+        assert "MyVector declined it" in filtered
+        assert "zengine" not in filtered
+        assert "zengine declined it" in churn
+        assert "MyVector" not in churn and "myvector" not in churn
+
     def test_the_html_page_says_it_too(self):
         page = _render(_mixed_records(), html=True)
         assert "declined: <code>filtered</code>" in page \

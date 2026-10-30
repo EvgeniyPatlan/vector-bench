@@ -122,6 +122,22 @@ def annb_results_dir(paths: Dict[str, str], resource_pass: str,
     return path
 
 
+def ann_m_values(engine: str, profile: Dict[str, Any],
+                 resources: Dict[str, Any], resource_pass: str) -> List[int]:
+    """The M values the ann phase builds for `engine`, in this pass.
+
+    The tuned pass's `resources.extras.m_values_by_engine` first, then the
+    profile's `ann.m_values_by_engine`, then `ann.m_values`. One function so
+    the ann render and `cli._memory_refusal` -- which must estimate the same
+    graphs the ann phase will build -- cannot read the grid two ways.
+    """
+    ann = profile.get("ann", {}) or {}
+    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
+                 if resource_pass == "tuned" else None) or \
+                ann.get("m_values_by_engine") or {}
+    return list(by_engine.get(engine) or ann.get("m_values", [16]))
+
+
 def render_config(engine: str, profile: Dict[str, Any],
                   resources: Dict[str, Any], resource_pass: str) -> Dict[str, Any]:
     """Build the ann-benchmarks config.yml body for one engine and profile.
@@ -138,10 +154,7 @@ def render_config(engine: str, profile: Dict[str, Any],
     # down to 0.76. Sweeping M only where it is the sole knob costs a reload
     # per value on the engines that need it and nothing on the engines that do
     # not, and it turns three daggered cells into real measurements.
-    by_engine = ((resources.get("extras", {}) or {}).get("m_values_by_engine")
-                 if resource_pass == "tuned" else None) or \
-                ann.get("m_values_by_engine") or {}
-    m_values = list(by_engine.get(engine) or ann.get("m_values", [16]))
+    m_values = ann_m_values(engine, profile, resources, resource_pass)
     query_args = [list(ann.get("ef_search", [10, 40, 160]))]
     extras = (resources.get("extras", {}) or {}) if resource_pass == "tuned" else {}
 

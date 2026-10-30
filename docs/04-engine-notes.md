@@ -480,9 +480,22 @@ resolved server limit** (`cli._memory_refusal`, gated on
 `capabilities.memory_fit: myvector`), before the load, for both the ann and the
 ops phase, with the rows that phase loads (`ops.subset_rows` for ops) and the
 largest M it builds. The manifest records the phase as `refused` with the
-reason — `does not fit: estimated peak X GiB > limit Y GiB` — and the report
-lists it in Validity under "Units refused before they ran", separately from
-failures. No default budget changed: the normalized pass stays at 16 GiB.
+reason — `does not fit: estimated peak X GiB > limit Y GiB at M=32 (largest of
+[8, 16, 32])` — and the report lists it in Validity under "Units refused before
+they ran", separately from failures, and the run's finish banner counts them.
+The ann grid is `ann_pass.ann_m_values`, the function the ann render itself
+uses, so a tuned `m_values_by_engine` override is honoured; the ops grid is
+`ops.m_values`. **A unit is refused as a whole when its largest M does not
+fit**, even if its smaller M values would: one unit is one phase over the
+whole grid, and splitting it would change what a checkpoint means. That is
+conservative, and the reason text names the M and the grid so the reader can
+see it. A phase the profile disables (`ann.enabled: false`, `ops.enabled:
+false`) is never checked and never shows a refusal. **The check compares
+against the server container's limit only**, not the client's and not the
+host's: the graph and the build's copy of the vectors live in mysqld, so the
+server's memory cgroup is the one that OOM-kills it, and the ann-benchmarks
+client that shares the container on the ann path is sized separately by
+`ann_pass.client_memory_bytes`. No default budget changed: the normalized pass stays at 16 GiB.
 dbpedia under `mariadb-blog`'s own 64 GiB, or under the tuned pass's host
 fraction, fits and runs. Other engines are never refused: their graphs are
 caches or InnoDB pages that degrade instead of killing the server.

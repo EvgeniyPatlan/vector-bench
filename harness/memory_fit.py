@@ -20,7 +20,7 @@ container's OOM killer ends it mid-build.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 GIB = 1024 ** 3
 
@@ -60,15 +60,27 @@ def gib(nbytes: float) -> str:
     return f"{nbytes / GIB:.1f} GiB"
 
 
-def refusal_reason(peak: int, limit: int) -> str:
-    """The sentence a refused unit carries, in the manifest and the report."""
-    return (f"does not fit: estimated peak {gib(peak)} > limit {gib(limit)} "
-            f"(buffer pool + HNSW graph + the build's transient copy of the "
-            f"vectors; harness/memory_fit.py)")
+def refusal_reason(peak: int, limit: int, m: Optional[int] = None,
+                   m_values: Optional[List[int]] = None) -> str:
+    """The sentence a refused unit carries, in the manifest and the report.
+
+    Names the M it was estimated at and the grid it is the largest of: the
+    unit is refused whole when its largest M does not fit, and a reader has
+    to be able to see that smaller ones might have.
+    """
+    at = ""
+    if m is not None:
+        grid = sorted(int(v) for v in (m_values or [m]))
+        at = f" at M={int(m)} (largest of {grid})"
+    return (f"does not fit: estimated peak {gib(peak)} > limit {gib(limit)}"
+            f"{at} (buffer pool + HNSW graph + the build's transient copy of "
+            f"the vectors; harness/memory_fit.py)")
 
 
 def check(model: Optional[str], dim: int, rows: int, m: int,
-          buffer_bytes: int, limit_bytes: int) -> Optional[Dict[str, object]]:
+          buffer_bytes: int, limit_bytes: int,
+          m_values: Optional[List[int]] = None
+          ) -> Optional[Dict[str, object]]:
     """A refusal record for a unit that cannot fit, or None.
 
     None when the engine declares no model, when the corpus size or the limit
@@ -80,7 +92,7 @@ def check(model: Optional[str], dim: int, rows: int, m: int,
     parts = myvector_build_peak(dim, rows, m, buffer_bytes)
     if parts["peak"] <= limit_bytes:
         return None
-    return {"reason": refusal_reason(parts["peak"], limit_bytes),
+    return {"reason": refusal_reason(parts["peak"], limit_bytes, m, m_values),
             "estimated_peak_bytes": parts["peak"],
             "limit_bytes": int(limit_bytes),
             "estimate": parts, "rows": int(rows), "dim": int(dim), "m": int(m)}
