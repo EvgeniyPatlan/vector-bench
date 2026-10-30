@@ -190,7 +190,8 @@ class TestTheIngestEstimateDidNotMove:
         # MyVector, the eighth engine, has no measured rate: named, and
         # contributing nothing to the ingest total, exactly as Percona was
         # before its rate was measured. That is why no figure above moved.
-        assert e["engines_without_ingest_rate"] == ["myvector"]
+        # VillageSQL, the ninth, is the same: no measured rate yet.
+        assert e["engines_without_ingest_rate"] == ["myvector", "villagesql"]
         # Three ann M values now, one ops M. The pair is the whole point of
         # the change: `ops_m_values` is still 1 and `ann.m_values` contains
         # it, which is what makes §5.2's match key able to meet.
@@ -303,7 +304,9 @@ class TestPerconasMeasuredIngestRateReachesTheEstimator:
         assert "percona ~" in out
         # The disclosure is back, for MyVector alone -- the eighth engine,
         # whose rate nothing has measured -- and Percona is not in it.
-        assert "No measured ingest rate for myvector, so" in " ".join(out.split())
+        # VillageSQL, the ninth, joins it on the same line.
+        assert ("No measured ingest rate for myvector, villagesql, so"
+                in " ".join(out.split()))
         assert "No measured ingest rate for percona" not in out
 
     def test_the_three_entries_are_the_records_they_came_from(self):
@@ -396,9 +399,9 @@ class TestTotalHoursStillMeansIngest:
         after = est("main")
         assert after["total_hours"] == before["total_hours"]
         assert after["per_engine_hours"] == before["per_engine_hours"]
-        # 16.0: one hour per (engine, dataset, pass), eight engines.
+        # 18.0: one hour per (engine, dataset, pass), nine engines.
         assert after["worst_case_total_hours"] == round(
-            before["worst_case_total_hours"] + 16.0, 2)
+            before["worst_case_total_hours"] + 18.0, 2)
 
     def test_long_run_is_still_the_ingest_warning(self):
         """The warning text is about M values reloading the corpus, so the flag
@@ -459,9 +462,10 @@ class TestTheConcurrencyTermIsTimeNotQueries:
     def test_main(self):
         # 2.25 and not 2.00: MyVector, the eighth engine, adds one ops unit per
         # dataset -- 9 units x 2 datasets = 18 unit-instances x 450 s.
+        # 2.50 with VillageSQL, the ninth: 10 units x 2 datasets.
         t = term(est("main"), "concurrency windows")
-        assert t["typical_hours"] == 2.25
-        assert t["worst_hours"] == 2.25
+        assert t["typical_hours"] == 2.5
+        assert t["worst_hours"] == 2.5
         assert t["bounded"] is True
 
     def test_the_client_count_list_is_counted_not_summed(self):
@@ -1330,8 +1334,10 @@ class TestTheWholeQueryEstimateForMain:
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 7.78
-        assert e["query_hours_worst"] == 30.55
+        # 8.03 / 30.80 with VillageSQL's concurrency windows (it declines
+        # filtered search and churn, so those terms charge it nothing).
+        assert e["query_hours"] == 8.03
+        assert e["query_hours_worst"] == 30.8
         # The totals move with the ENGINE LIST as well as with the ann M
         # grid. Over six engines these were 100.16 and 116.39, before the
         # iterative-scan modes added 2.0 h to pgvector alone. The INGEST half
@@ -1339,8 +1345,9 @@ class TestTheWholeQueryEstimateForMain:
         # in `engines_without_ingest_rate` and contributed nothing to it; it
         # is 100.44 over seven now that its rate is measured, and the 7.38 h
         # of the difference is ingest and not query time.
-        assert e["typical_total_hours"] == 108.22
-        assert e["worst_case_total_hours"] == 130.99
+        # 108.47 / 131.24 with VillageSQL's 0.25 h of concurrency windows.
+        assert e["typical_total_hours"] == 108.47
+        assert e["worst_case_total_hours"] == 131.24
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1360,21 +1367,22 @@ class TestTheWholeQueryEstimateForMain:
         assert e["query_per_engine_hours"] == {
             "mariadb": 1.38, "alisql": 2.28, "pgvector": 0.68,
             "mariadb123": 1.84, "mongodb": 0.29, "valkey": 0.29,
-            "percona": 0.74, "myvector": 0.28,
+            "percona": 0.74, "myvector": 0.28, "villagesql": 0.25,
         }
         # The asymmetry is back, for the eighth engine: MyVector has query
         # figures (spans the profile clocks) and no ingest one (no rate).
+        # And for the ninth, VillageSQL, for the same reason.
         assert (set(e["query_per_engine_hours"]) - set(e["per_engine_hours"])
-                == {"myvector"})
-        assert e["engines_without_ingest_rate"] == ["myvector"]
+                == {"myvector", "villagesql"})
+        assert e["engines_without_ingest_rate"] == ["myvector", "villagesql"]
         # The mechanism that made the asymmetry possible is still there, and
         # an engine nothing has measured still falls out of the ingest split
         # alone. This is the non-vacuous half: `tests/test_config.py` injects
         # the same probe engine for the same reason -- a guard that needs some
         # real engine to be unmeasured fires on the day one stops being.
         probe = est("main", engines=ALL + ["e2-no-such-engine"])
-        assert probe["engines_without_ingest_rate"] == ["myvector",
-                                                        "e2-no-such-engine"]
+        assert probe["engines_without_ingest_rate"] == [
+            "myvector", "villagesql", "e2-no-such-engine"]
         assert "e2-no-such-engine" not in probe["per_engine_hours"]
         assert "e2-no-such-engine" in probe["query_per_engine_hours"]
 
@@ -1514,12 +1522,12 @@ class TestTheExtensionPoint:
         # 14.0 and not 12.0: `_one_hour_per_pass_term` is one hour per
         # (engine, dataset, pass) and `main` is seven engines x two datasets
         # x one pass. Six engines gave 12.0.
-        # 16.0 with MyVector, the eighth engine.
-        assert after["query_hours"] == round(before["query_hours"] + 16.0, 2)
+        # 16.0 with MyVector, the eighth engine; 18.0 with VillageSQL.
+        assert after["query_hours"] == round(before["query_hours"] + 18.0, 2)
         assert after["query_hours_worst"] == round(
-            before["query_hours_worst"] + 16.0, 2)
+            before["query_hours_worst"] + 18.0, 2)
         assert after["worst_case_total_hours"] == round(
-            before["worst_case_total_hours"] + 16.0, 2)
+            before["worst_case_total_hours"] + 18.0, 2)
         out = printed("main")
         assert "test term" in out
         assert "one hour, flat" in out
@@ -1533,7 +1541,9 @@ class TestTheExtensionPoint:
         # 0.74 h now that `churn re-insert` can model a duration for it.
         # 7.78 with MyVector, whose 0.28 h is its concurrency windows and
         # reader baseline -- no churn duration, since it has no rate.
-        assert est("main")["query_hours"] == 7.78
+        # 8.03 with VillageSQL, whose 0.25 h is its concurrency windows alone:
+        # it declines churn (`capabilities.churn: false`).
+        assert est("main")["query_hours"] == 8.03
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 8 ops units per dataset x 2 datasets = 16 per pass.
@@ -1549,9 +1559,9 @@ class TestTheExtensionPoint:
         monkeypatch.setattr(est_mod, "_QUERY_TERMS", (one_second_per_unit,))
         one = est("main")
         two = est("main", passes=("normalized", "tuned"))
-        # 18 with MyVector: one more unit per dataset.
-        assert term(one, "unit term")["typical_seconds"] == 18.0
-        assert term(two, "unit term")["typical_seconds"] == 36.0
+        # 18 with MyVector: one more unit per dataset; 20 with VillageSQL.
+        assert term(one, "unit term")["typical_seconds"] == 20.0
+        assert term(two, "unit term")["typical_seconds"] == 40.0
 
     def test_scope_pass_skips_the_ops_unit_multiplier(self, monkeypatch):
         """14, not 16: SEVEN engines x two datasets, where unit scope would
@@ -1568,9 +1578,10 @@ class TestTheExtensionPoint:
         monkeypatch.setattr(est_mod, "_QUERY_TERMS", (one_second_per_pass,))
         # 16 with MyVector, the eighth engine; the gap to unit scope is
         # still pgvector's one extra unit per dataset.
-        assert term(est("main"), "pass term")["typical_seconds"] == 16.0
+        # 18 with VillageSQL, the ninth.
+        assert term(est("main"), "pass term")["typical_seconds"] == 18.0
         assert term(est("main", passes=("normalized", "tuned")),
-                    "pass term")["typical_seconds"] == 32.0
+                    "pass term")["typical_seconds"] == 36.0
 
     def test_an_unknown_scope_is_refused_loudly(self, monkeypatch):
         """Silently charging it once per (engine, dataset) is how a term meant
@@ -1671,8 +1682,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~131.0 h worst case" in out
-        assert "~108.2 h typical" in out
+        assert "~131.2 h worst case" in out
+        assert "~108.5 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
@@ -1760,10 +1771,14 @@ class TestThePrintedOutput:
         out = printed("smoke")
         assert "estimated ingest time" in out
         assert "churn re-insert" in out
-        assert "~6.0 h worst case" in out
-        # MyVector, the eighth engine, is named as unmeasured; nothing else is.
-        assert "No measured ingest rate for myvector, so" in " ".join(out.split())
-        assert est("smoke")["engines_without_ingest_rate"] == ["myvector"]
+        # ~6.5 with VillageSQL's concurrency windows.
+        assert "~6.5 h worst case" in out
+        # MyVector and VillageSQL, the eighth and ninth engines, are named as
+        # unmeasured; nothing else is.
+        assert ("No measured ingest rate for myvector, villagesql, so"
+                in " ".join(out.split()))
+        assert est("smoke")["engines_without_ingest_rate"] == [
+            "myvector", "villagesql"]
 
 
 # ---------------------------------------------------------------------------
@@ -1864,12 +1879,12 @@ class TestTheDocumentedFiguresAreTheOnesTheCodeProduces:
         # thing. The vocabularies live in `tests/test_e2_percona_wiring.py`
         # with their own accepts and rejects asserted beside them.
         from tests.test_e2_percona_wiring import _prose
-        _prose("the engine count is eight", claude)
+        _prose("the engine count is nine", claude)
         # The scope split is BACK, for MyVector: the worst case covers all
         # eight engines and the ingest figure the seven with a measured rate,
         # and the sentence says so.
-        _prose("the ingest figure covers seven of the eight", claude)
-        assert e["engines_without_ingest_rate"] == ["myvector"]
+        _prose("the ingest figure covers seven of the nine", claude)
+        assert e["engines_without_ingest_rate"] == ["myvector", "villagesql"]
         assert "percona" in e["per_engine_hours"]
         # Non-vacuity, and the guard that replaces the deleted claim: the
         # document's figure must be the SEVEN-engine one. `abs=0.5` above is

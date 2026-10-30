@@ -1368,4 +1368,10 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         # knob is built at.
         args += ["--ef-construction",
                  str(int(ann.get("myvector_ef_construction", 200)))]
+    if engine == "villagesql":
+        # The same key and default `ann_pass.render_config`'s villagesql
+        # branch reads, so both paths build the graph at one ef_construction
+        # (the driver clamps it to 32 x M exactly as the module does).
+        args += ["--ef-construction",
+                 str(int(ann.get("villagesql_ef_construction", 200)))]
     return args
