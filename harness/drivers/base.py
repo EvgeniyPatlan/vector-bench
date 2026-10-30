@@ -298,6 +298,21 @@ class EngineDriver(abc.ABC):
         self.spec = spec
         self._conn: Any = None
 
+    def query_path_facts(self, index: IndexSpec) -> Dict[str, Any]:
+        """Structural facts about this engine's query path, for every record.
+
+        `{}` for every engine whose query is one statement on a vectorised
+        distance kernel, which is all of them but one. `harness/main.py`
+        stamps whatever this returns onto every record of the run, and
+        `report/disclosures.py` renders a footnote from it -- CLAUDE.md
+        requires a structural asymmetry to be stated in the report, and a fact
+        that lived only in a driver's docstring would not be.
+
+        Keys: `round_trips_per_query` (int) and `distance_impl` (a string
+        starting `scalar` or `simd`).
+        """
+        return {}
+
     # -- lifecycle ------------------------------------------------------
 
     @abc.abstractmethod

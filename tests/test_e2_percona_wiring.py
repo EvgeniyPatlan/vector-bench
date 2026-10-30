@@ -2088,6 +2088,12 @@ COMMITS_ALLOWED_BESIDE_THE_PIN = {
         "scans the whole tree for 40-hex commits, so a second engine pinned "
         "by SHA has to be declared here or it reads as a half-finished "
         "Percona re-pin."),
+    "008e09c2834b98143a8c067d4d225c90953050cf": (
+        ("config/engines/myvector.yml", "tests/test_e24_myvector_disclosures.py",
+         SELF_REL),
+        "MySQL's mysql-9.7.2 tag, the server tree MyVector is compiled into. "
+        "Pinned by commit as well as by tag so prepare_myvector can refuse a "
+        "moved tag, the way it refuses a moved plugin commit."),
 }
 
 #: Of those, the ones that were once this engine's `source.tag`.

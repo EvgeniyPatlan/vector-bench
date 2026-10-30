@@ -415,8 +415,14 @@ prepare_myvector() {
     git clone --quiet --depth 1 --branch "$server_tag" "$server_up" "$server_repo" \
       || die "myvector: cannot clone $server_tag from $server_up"
   fi
+  local server_pin; server_pin="$(yq_get "$cfg" source.server_commit "")"
+  [[ -n "$server_pin" ]] || die "myvector: $cfg has no source.server_commit"
   local server_sha; server_sha="$(git -C "$server_repo" rev-parse "refs/tags/${server_tag}^{commit}" 2>/dev/null \
                                   || git -C "$server_repo" rev-parse HEAD)"
+  # The same refusal the plugin commit gets: a tag that now names another
+  # commit is a different server tree under the pinned label.
+  [[ "$server_sha" == "$server_pin" ]] \
+    || die "myvector: server tag $server_tag resolved to $server_sha -- not the pinned $server_pin"
 
   local tar="$VB_SOURCES/myvector-${sha}-${server_tag}.tar"
   if [[ $FORCE -eq 0 && -f "$tar" ]]; then

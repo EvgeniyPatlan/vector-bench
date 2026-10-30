@@ -107,6 +107,34 @@ INCREMENTAL_DECLINED = (
     "restarts (observed in this image: 'Binlog fetch failed: ' then 'Exiting "
     "binlog func'). The only build is the post-load myvector_index_build.")
 
+#: What `index_sync_s` means for this engine, stamped on every record.
+#:
+#: A refresh is not an incremental sync. `myvector_open_index_impl` (action
+#: `refresh`) runs `BuildMyVectorIndexSQL`, which ends in
+#: `vi->saveIndex(myvector_index_dir, "build")` -- a FULL rewrite of the graph
+#: file -- and then calls `saveIndex(dir, "refresh")` itself, an incremental
+#: checkpoint on top. So the figure is (select + insert the changed rows) +
+#: (write the whole graph) + (checkpoint), and grows with the corpus. The
+#: procedure is one call and its parts cannot be timed separately from SQL.
+INDEX_SYNC_NOTE = (
+    "is one myvector_index_refresh: the changed rows are inserted and then "
+    "the WHOLE graph file is rewritten (BuildMyVectorIndexSQL's "
+    "saveIndex(..., \"build\")) plus a checkpoint, so it grows with the "
+    "corpus, not with the re-inserted rows; the parts cannot be timed apart "
+    "from SQL. Not comparable to another engine's wait for an asynchronous "
+    "index to catch up.")
+
+#: Where this engine's graph lives, stamped on every record so the report can
+#: say it beside the memory figures. See docs/04-engine-notes.md, "Memory".
+MEMORY_NOTE = (
+    "keeps its whole HNSW graph in mysqld's own heap (hnswlib, no paging), "
+    "OUTSIDE innodb_buffer_pool_size and not bounded by any knob; it counts "
+    "against the same server-container memory limit as every engine's "
+    "memory. Its build also holds the entire (id, vector) table client-side "
+    "inside mysqld while inserting (BuildMyVectorIndexSQL: mysql_store_result), "
+    "so build peak is roughly buffer pool + graph + one more copy of the "
+    "vectors.")
+
 #: `Key : value` and `Key = value` lines of `HNSWMemoryIndex::getStatus`.
 _STATUS_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z .]*?)\s*[:=]\s*(.*?)\s*$")
 #: `SUCCESS: Index created & saved at (binlog.000002 157), rows : 1000.`
@@ -141,6 +169,20 @@ def parse_status(text: str) -> Dict[str, str]:
         if match:
             out[match.group(1).strip()] = match.group(2).strip()
     return out
+
+
+def graph_bytes_floor(status: Dict[str, str]) -> Optional[int]:
+    """Level-0 graph bytes the plugin holds: `Element Data Size` x rows.
+
+    hnswlib's `size_data_per_element_` is the vector plus the level-0 link
+    list plus the label (3,276 B at 784 dims and M=16, measured), so this
+    product is the bulk of the graph. It is a FLOOR: upper-level link lists,
+    the per-element lock and level arrays and the label map are not in it.
+    """
+    try:
+        return int(status["Element Data Size"]) * int(status["Current Rows"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _as_text(value: Any) -> str:
@@ -286,6 +328,9 @@ class MyVectorDriver(MySQLFamilyDriver):
                                 "ef_construction_tunable": True}
         if self._status:
             caps["myvector_status"] = dict(self._status)
+            floor = graph_bytes_floor(self._status)
+            if floor is not None:
+                caps["myvector_graph_bytes_floor"] = floor
         if self._build_result:
             caps["myvector_build_result"] = self._build_result
         return caps
@@ -479,10 +524,22 @@ class MyVectorDriver(MySQLFamilyDriver):
         result = " | ".join(_as_text(c) for row in self._call(sql) for c in row)
         print(f"[{self.name}] refresh returned: {result}")
         self.check_build_result(result, self._pending)
+        refreshed = self._pending
         self._expected_elements += self._pending
         self._pending = 0
         self.verify_status(expected_rows=self._expected_elements)
         self._next_second()
+        # Per churn record, through the hook `churn._sync_shape` already reads
+        # (`index_sync_note` / `index_sync_detail`): what the figure covers.
+        # The rows the refresh indexed and the graph it then wrote out are the
+        # closest this can get to the refresh/save split -- the procedure is
+        # one call and its two halves cannot be timed apart from SQL.
+        self.index_sync_note = INDEX_SYNC_NOTE
+        self.index_sync_detail = {
+            "refreshed_rows": int(refreshed),
+            "graph_elements_saved": int(self._expected_elements),
+            "graph_bytes_saved_floor": graph_bytes_floor(self._status),
+        }
         return time.perf_counter() - started
 
     def maintain(self) -> Optional[str]:
@@ -511,6 +568,27 @@ class MyVectorDriver(MySQLFamilyDriver):
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
+
+    #: What each metric's distance runs on in the plugin: `Cosine` is
+    #: `AngularDistanceSpace` -> `computeCosineDistance`, a plain loop; `L2`
+    #: is hnswlib's `L2Space`, whose kernels are SIMD.
+    DISTANCE_IMPL = {"Cosine": "scalar (computeCosineDistance)",
+                     "L2": "simd (hnswlib L2Space)"}
+
+    def query_path_facts(self, index: IndexSpec) -> Dict[str, Any]:
+        """Two statements per query, and the distance path for this metric.
+
+        Both are inside every timed query on both measurement paths: the
+        `SET @vb_q` round trip (`_bind_query_vector` says why it exists) and
+        the distance kernel. Recorded so the report states them.
+        """
+        dist = self.dialect.metric_names.get(index.metric, "")
+        facts: Dict[str, Any] = {"round_trips_per_query": 2,
+                                 "index_sync_semantics": INDEX_SYNC_NOTE,
+                                 "memory_note": MEMORY_NOTE}
+        if dist in self.DISTANCE_IMPL:
+            facts["distance_impl"] = self.DISTANCE_IMPL[dist]
+        return facts
 
     def set_ef_search(self, ef_search: int) -> None:
         """Remembered, and sent with every query. No statement is issued."""

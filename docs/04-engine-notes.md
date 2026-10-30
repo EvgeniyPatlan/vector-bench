@@ -367,6 +367,18 @@ refresh at one-second resolution, so the driver waits out the watermark
 second after each build and refresh — at most one second, inside the timed
 maintenance — or a row written in that second would never be selected.
 
+**`index_sync_s` is therefore not an incremental sync, and is not comparable
+to another engine's.** A refresh is `myvector_open_index_impl` (action
+`refresh`) → `BuildMyVectorIndexSQL`, which inserts the changed rows and then
+calls `saveIndex(myvector_index_dir, "build")` — a full rewrite of the graph
+file — after which `myvector_open_index_impl` calls `saveIndex(…, "refresh")`,
+an incremental checkpoint, on top. So the figure is the re-inserted rows plus
+one whole-graph write plus a checkpoint, and it grows with the corpus rather
+than with the churn. It is one procedure call, so the parts cannot be timed
+apart from SQL. The driver stamps this on every record
+(`extra.index_sync_semantics`) and the report prints it under §9 Churn and in
+Validity.
+
 **Neither path removes a deleted row.** It stays in the graph; the search
 still returns its id; the rewritten `id IN (…)` drops it, and the query
 returns fewer than k rows. That is the degradation churn measures. Every
@@ -393,6 +405,14 @@ other engine here pays, charged by the plugin's design. `ef_search` mutates the 
 (`setSearchEffort`), so it is sent on every query; omitting it searches at
 whatever another session last asked for.
 
+Both query-path asymmetries — the second round trip, and Cosine's scalar
+distance loop (`AngularDistanceSpace` → `computeCosineDistance`; L2 runs
+hnswlib's SIMD `L2Space`) — are recorded on every record
+(`extra.round_trips_per_query`, `extra.distance_impl`, set by
+`MyVectorDriver.query_path_facts` on the ops path and by the overlay module's
+`get_additional` on the ann path) and footnoted by the report under §4, §7 and
+in Validity.
+
 ### Trap 5 — dropping the table does not drop the index
 
 `DROP DATABASE` leaves the plugin's in-memory index object alive under the
@@ -418,6 +438,46 @@ binlog listener; the driver refuses `build_mode: incremental` with that
 reason. `myvector_index_bg_threads` is the build's parallelism — 1 in the
 normalized pass, `{build_threads}` in the tuned one; the plugin only builds in
 parallel at 2 or more (`HNSWMemoryIndex::startParallelBuild`).
+
+### Memory: the graph is outside the buffer pool, and the build holds the table twice
+
+The graph is hnswlib's, in mysqld's own heap: it is not InnoDB pages, it is not
+bounded by `innodb_buffer_pool_size` or by any MyVector variable, and it cannot
+be paged out — the whole graph is resident or the search does not run. It IS
+charged the same way as every other engine's memory: it is mysqld's address
+space, inside the server container, so the container memory limit bounds it
+and the run's `mem-*.jsonl` sampler and peak-RSS figures include it. What
+differs is how the same budget is split. The normalized pass gives every
+MySQL-family server a buffer pool of 30% of 16 GiB (4.8 GiB) and MariaDB/AliSQL
+a graph cache of another 30%; MyVector's buffer pool serves only the table and
+the k primary-key lookups per query, and its graph takes whatever is left.
+
+Size, per element, is `MYVECTOR_INDEX_STATUS`'s `Element Data Size` — the
+vector, the level-0 links (`2·M` 4-byte ids plus a count) and the 8-byte label;
+3,276 B at 784 dims and M=16, measured — plus about 100 B of per-element arrays
+and the label map. The build additionally keeps the WHOLE `(id, vector)` result
+set client-side inside mysqld while it inserts (`BuildMyVectorIndexSQL`:
+`mysql_store_result`), so its peak is roughly buffer pool + graph + one more
+copy of the vectors. At M=16, 1M rows, estimated from that formula:
+
+| Corpus | Graph | Build transient | Buffer pool (normalized) | Build peak | Normalized limit |
+| --- | --- | --- | --- | --- | --- |
+| gist-960 | ~3.8 GiB | ~3.6 GiB | 4.8 GiB | **~12.5 GiB** | 16 GiB — fits, ~3 GiB spare |
+| dbpedia-openai-1000k (1536-d) | ~6.0 GiB | ~5.7 GiB | 4.8 GiB | **~17 GiB** | 16 GiB — does **not** fit |
+
+No shipped profile runs dbpedia under the 16 GiB normalized limit:
+`mariadb-blog` sets 64 GiB and `tuned-complete` uses the tuned pass's host
+fraction. A profile that did would see MyVector killed by the container's OOM
+killer during the build, while the cache-based engines merely slowed down — the
+same cache-versus-wall distinction CLAUDE.md draws for Percona's
+`innodb_hnsw_max_memory`. The build record carries
+`extra.myvector_graph_bytes_floor` (level-0 bytes) and every record carries
+`extra.memory_note`; the report states both under §5 and in Validity. Not done,
+because it changes a budget and that is the user's call: (a) give MyVector's
+normalized buffer pool the graph-cache share instead of its own 30%, so its
+graph has the headroom the MHNSW/VIDX caches are given; or (b) refuse a
+MyVector unit up front when the estimated build peak exceeds the server limit,
+the way the free-disk check refuses a run, instead of letting it OOM.
 
 ---
 

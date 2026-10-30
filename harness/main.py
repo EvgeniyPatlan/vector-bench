@@ -76,6 +76,17 @@ def _apply_declined(driver: Any, workloads: Sequence[str]
     return [w for w in workloads if w not in declined], declined
 
 
+def _query_path_facts(driver: Any, index: IndexSpec) -> Dict[str, Any]:
+    """`EngineDriver.query_path_facts`, or `{}` for a driver without it.
+
+    Through `getattr` because test fakes and lab scripts build drivers that
+    are not `EngineDriver` subclasses; an engine that declares nothing writes
+    no key, so every other engine's records are unchanged.
+    """
+    hook = getattr(driver, "query_path_facts", None)
+    return dict(hook(index) or {}) if hook is not None else {}
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="vb-harness",
@@ -369,6 +380,9 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"driver, not run. {reason}", file=sys.stderr)
     if declined:
         recorder.declare_run_extra(declined_workloads=declined)
+    facts = _query_path_facts(driver, index)
+    if facts:
+        recorder.declare_run_extra(**facts)
     failures: List[str] = []
     try:
         driver.connect()

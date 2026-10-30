@@ -1560,13 +1560,16 @@ class TestReportShowsEverySweptAxis:
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         html_block = source[source.index('sections = ['):]
         for workload in ("concurrency", "filtered", "churn"):
-            assert f'_not_measured("{workload}", profile)' in html_block, workload
+            # `records` since a driver can decline a workload: the note has
+            # to say "declined", not "the profile did not include it".
+            assert f'_not_measured("{workload}", profile, records)' in html_block, workload
 
     def test_both_renderers_reference_not_measured_equally(self):
         source = open(os.path.join(VB_ROOT, "report", "render.py")).read()
         for workload in ("concurrency", "filtered", "churn"):
             # once for the markdown body, once for the html section list
-            assert source.count(f'_not_measured("{workload}", profile)') == 2, workload
+            assert source.count(
+                f'_not_measured("{workload}", profile, records)') == 2, workload
 
 
 class TestPassComparisonNeedsTwoPasses:

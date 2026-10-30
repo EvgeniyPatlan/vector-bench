@@ -46,6 +46,9 @@ VECTOR_COLUMN = f"{DATABASE}.{TABLE}.v"
 DEFAULT_EF_CONSTRUCTION = 200
 #: The exact spellings `HNSWMemoryIndex::HNSWMemoryIndex` matches.
 METRIC_NAMES = {"angular": "Cosine", "euclidean": "L2"}
+#: Must equal `MyVectorDriver.DISTANCE_IMPL`; tests/test_e23 pins the two.
+DISTANCE_IMPL = {"Cosine": "scalar (computeCosineDistance)",
+                 "L2": "simd (hnswlib L2Space)"}
 #: hnswlib's capacity. ann-benchmarks never deletes or re-inserts, so a small
 #: margin over the corpus is enough here (the ops driver needs more for churn).
 CAPACITY_MARGIN = 1000
@@ -259,6 +262,11 @@ class MyVector(VBMySQLBase):
         # as an HDF5 attribute, and a dict has no HDF5 type -- the first smoke
         # run lost a finished query sweep to exactly that TypeError.
         extra["myvector_status"] = json.dumps(self._status, sort_keys=True)
+        # The structural asymmetries the report must state, with the same keys
+        # and values the ops driver stamps (`MyVectorDriver.query_path_facts`):
+        # both statements of every query are inside ann-benchmarks' timer.
+        extra["round_trips_per_query"] = 2
+        extra["distance_impl"] = DISTANCE_IMPL.get(self._metric, "")
         return extra
 
     def done(self) -> None:

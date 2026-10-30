@@ -626,7 +626,11 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     stated rather than left to be discovered. Counted across `report/`: at the
     base all four keys had 0 occurrences; they are now `maintenance` 25,
     `maintenance_state` 14, `repair_path` 1 -- and that one is inside a
-    docstring, not a read -- and `index_sync` 0. (They were 20 and 13 before
+    docstring, not a read -- and `index_sync` 10, every one of them
+    `report/disclosures.py`'s `index_sync_lines` (its name, its calls in
+    `render.py`, and the `extra.index_sync_semantics` stamp it reads, which
+    MyVector declares because its figure is a refresh plus a whole-graph
+    save) and none of them a read of `index_sync_s` itself. (They were 20 and 13 before
     PR 5 §5.1 item 6 grouped the churn table's tie column by maintenance
     state and §5.2 cited the two-maintenance-state pairing defect in
     `report/crosscheck.py`. Neither added a `repair_path` read.)

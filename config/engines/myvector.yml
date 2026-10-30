@@ -33,6 +33,10 @@ source:
   # implementations and not of two server releases. Both tags are recorded in
   # `sources/myvector.source.json` and so in the run manifest.
   server_tag: mysql-9.7.2
+  # The commit that tag names, asserted by `prepare_myvector`: a tag can be
+  # moved upstream, and a server tree that changed under an unchanged tag is
+  # a different server under the same label.
+  server_commit: 008e09c2834b98143a8c067d4d225c90953050cf
   server_upstream: https://github.com/mysql/mysql-server.git
 
 image:

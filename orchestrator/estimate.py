@@ -28,8 +28,11 @@ path on every form change.
 
 from __future__ import annotations
 
+import sys
 from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Sequence,
                     Tuple)
+
+import yaml
 
 # Imported for `MARIADB_ENGINES`, a two-element tuple, and nothing else. It is
 # declared in ann_pass.py and belongs in engines.py with the rest of the
@@ -641,14 +644,24 @@ def _runs_filtered_search(engine: str) -> bool:
     Read from the engine config and not from the driver, which lives in
     `harness/` where the orchestrator must not reach. The two are held in
     agreement by `tests/test_e23_myvector_engine.py`, for the one engine that
-    declines (MyVector v1.26.9 has no filtered search). Absence, and any
-    config that cannot be read, keep the charge: over-charging leaves a
-    ceiling a ceiling.
+    declines (MyVector v1.26.9 has no filtered search). Absence keeps the
+    charge -- over-charging leaves a ceiling a ceiling.
+
+    Narrow on purpose. An engine with no config at all (the estimator's own
+    probe engines in the suite) is charged quietly. A config that exists and
+    cannot be read or parsed is charged and SAID, on stderr, because the
+    printed estimate is then built on an assumption about that engine.
+    Anything else is a bug here and propagates.
     """
+    from . import config as config_mod
     try:
-        from .config import load_engine
-        caps = (load_engine(engine) or {}).get("capabilities") or {}
-    except Exception:
+        caps = (config_mod.load_engine(engine) or {}).get("capabilities") or {}
+    except FileNotFoundError:
+        return True
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"[estimate] WARNING: could not read config/engines/{engine}.yml "
+              f"({exc}); charging its filtered-search term as if the engine "
+              f"ran it", file=sys.stderr)
         return True
     return caps.get("filtered_search", True) is not False
 
