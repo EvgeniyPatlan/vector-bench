@@ -635,6 +635,24 @@ def _charged_scan_modes(plan: _QueryPlan) -> List[str]:
     return _declared_scan_modes(plan.ops.get("pgvector_iterative_scan"))
 
 
+def _runs_filtered_search(engine: str) -> bool:
+    """False only for an engine whose config declares `filtered_search: false`.
+
+    Read from the engine config and not from the driver, which lives in
+    `harness/` where the orchestrator must not reach. The two are held in
+    agreement by `tests/test_e23_myvector_engine.py`, for the one engine that
+    declines (MyVector v1.26.9 has no filtered search). Absence, and any
+    config that cannot be read, keep the charge: over-charging leaves a
+    ceiling a ceiling.
+    """
+    try:
+        from .config import load_engine
+        caps = (load_engine(engine) or {}).get("capabilities") or {}
+    except Exception:
+        return True
+    return caps.get("filtered_search", True) is not False
+
+
 def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
     """Filtered search: a fixed number of queries per point, capped per point.
 
@@ -724,6 +742,11 @@ def _filtered_search(plan: _QueryPlan) -> Optional[_QueryTerm]:
     re-derived here, so the two cannot disagree about what `[off, off]` means.
     """
     if "filtered" not in plan.workloads:
+        return None
+    if not _runs_filtered_search(plan.engine):
+        # The harness skips the workload for an engine whose driver declines
+        # it (`EngineDriver.declined_workloads`), so charging it here would
+        # put hours into the ceiling for points nobody will run.
         return None
     # Defaulted exactly as ops_pass.harness_args defaults them. A profile that
     # omits either key still runs the workload, so charging nothing here would

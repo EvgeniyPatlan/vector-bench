@@ -84,6 +84,29 @@ PROSE_CLAIMS = {
             "all six of the engines",
             "every one of the six engines",
         ]),
+    "the engine count is eight": dict(
+        pattern=r"\b(all|every one of|each of)\b[^.]{0,24}?"
+                r"\b(eight|8)\b[^.]{0,24}?\bengines?\b",
+        accepts=[
+            "all eight engines, which is what that command measures",
+            "all eight of the engines",
+            "all 8 engines",
+        ],
+        rejects=[
+            "all seven engines, which is what that command measures",
+            "every one of the seven engines",
+        ]),
+    "the ingest figure covers seven of the eight": dict(
+        pattern=r"\bingest\b[^.]{0,80}?\bseven\b[^.]{0,40}?"
+                r"\b(measured rate|rate)\b",
+        accepts=[
+            "the ingest figure covers the seven with a measured rate",
+            "the ingest total is over the seven engines that have a rate",
+        ],
+        rejects=[
+            "the ingest figure covers all eight",
+            "Both figures cover all eight engines.",
+        ]),
     # "the ingest figure covers six of the seven" WAS HERE, and was deleted
     # rather than reworded: the claim it guarded has stopped being true.
     # Percona's M=16 incremental rate is in `_MEASURED_ROWS_PER_S` and
@@ -1595,7 +1618,10 @@ class TestAnUnmeasuredIngestRateIsNamedAndNotModelled:
                                 list(profile["datasets"]), ["normalized"],
                                 ["ann", "ops"])
         out = buf.getvalue()
-        assert f"No measured ingest rate for {self.UNMEASURED}" in _flat(out)
+        # MyVector is the registry's own unmeasured engine now, so the probe is
+        # named beside it, in registry order, on the one disclosure line.
+        assert (f"No measured ingest rate for myvector, {self.UNMEASURED}"
+                in _flat(out))
         # The engine that gained a rate is on the per-engine line instead of
         # in the disclosure, which is the whole difference this change makes
         # to what an operator reads.
@@ -1752,7 +1778,7 @@ class TestTheProfiles:
     def test_smoke_no_longer_claims_six(self):
         text = open(os.path.join(VB_ROOT, "config", "profiles",
                                  "smoke.yml")).read()
-        _prose("the engine count is seven", text)
+        _prose("the engine count is eight", text)
 
     def test_smoke_names_no_engines_so_percona_joins_automatically(self):
         from orchestrator.config import load_profile
@@ -2053,6 +2079,15 @@ COMMITS_ALLOWED_BESIDE_THE_PIN = {
         "file belongs to another unit, so it is declared here and not "
         "edited -- and the check below means that if that sentence is ever "
         "removed, this allowance fails rather than lingering."),
+    "384d9df7ab8a2afee9c8f99704e5a7ea90d32730": (
+        ("config/engines/myvector.yml", "tests/test_e23_myvector_engine.py",
+         SELF_REL),
+        "a different engine's pin, not a copy of Percona's: MyVector "
+        "release v1.26.9 (askdba/myvector), which config/engines/myvector.yml "
+        "carries as its own `source.tag` and its own test pins. This guard "
+        "scans the whole tree for 40-hex commits, so a second engine pinned "
+        "by SHA has to be declared here or it reads as a half-finished "
+        "Percona re-pin."),
 }
 
 #: Of those, the ones that were once this engine's `source.tag`.

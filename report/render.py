@@ -3510,6 +3510,7 @@ _PROSE_NAME = {
     "mongodb": "Percona Search",
     "valkey": "Valkey",
     "percona": "Percona Server",
+    "myvector": "MyVector",
 }
 
 #: Which engines expose `ef_construction` when no record says either way.
@@ -3540,7 +3541,7 @@ _PROSE_NAME = {
 #: this set's equality with the engine configs, because a set that may be
 #: widened by a one-word edit is a literal again.
 EF_CONSTRUCTION_TUNABLE_WHEN_UNRECORDED = frozenset(
-    {"pgvector", "valkey", "percona"})
+    {"pgvector", "valkey", "percona", "myvector"})
 
 
 def _prose_name(engine: str) -> str:

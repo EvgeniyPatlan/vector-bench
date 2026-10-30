@@ -555,7 +555,7 @@ class VBMySQLBase(BaseANN):
         that was missing, and the one whose absence nothing noticed.
         """
         for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
-                     "/opt/percona/.march"):
+                     "/opt/percona/.march", "/opt/myvector/.march"):
             try:
                 with open(path) as fh:
                     return fh.read().strip()

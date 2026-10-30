@@ -46,10 +46,12 @@ It is a different knob in each of them, and this repository names every one:
 | pgvector | `SET hnsw.ef_search` | `harness/drivers/postgres.py:set_ef_search` |
 | Valkey | `EF_RUNTIME`, a modifier inside the query string | `harness/drivers/valkey.py:set_ef_search` |
 | Percona Search | `numCandidates`, a per-query argument | `harness/drivers/mongo.py:set_ef_search` |
+| MyVector | `ef_search`, an option inside each `MYVECTOR_IS_ANN` call | `harness/drivers/myvector.py:set_ef_search` |
 
-Two of those five do not search the number they are handed. Valkey sends
+Three of those six do not search the number they are handed. Valkey sends
 `EF_RUNTIME max(ef, k)` and Percona Search sends `max(numCandidates, k)`,
-because neither can return `k` rows out of fewer than `k` candidates. At any
+because neither can return `k` rows out of fewer than `k` candidates, and
+MyVector's hnswlib searches at `std::max(ef_, k)` inside `searchKnn`. At any
 `k` above the grid's floor the low end of a shared grid therefore collapses: at
 `k = 100` the six points 10, 16, 24, 32, 48 and 64 are one search measured six
 times (`harness/drivers/mongo.py:effective_ef`). That much is read out of the
@@ -57,7 +59,7 @@ drivers and needs no server to check, and on its own it settles the weaker half
 of the claim — a shared literal is demonstrably not a shared amount of work.
 The harness asks each driver what it will really search and records the answer
 as `extra.effective_ef`, so a reader comparing two engines at "ef 10" can see
-which of them looked at ten candidates. Only Percona Search overrides the
+which of them looked at ten candidates. Only Percona Search and MyVector override the
 default (`harness/drivers/base.py:effective_ef`), so **Valkey's clamp is
 applied to its queries and is not reflected in its `effective_ef`** — that is a
 known gap in the record rather than a claim about Valkey.
@@ -1019,7 +1021,7 @@ removes. They must accompany any published number.
 
 | Asymmetry | Consequence |
 | --- | --- |
-| **`ef_construction` is exposed** by pgvector, Valkey and Percona Server, and by no other MySQL-family engine here — not by MariaDB MHNSW and not by AliSQL VIDX. Percona Server is the only engine in this study with both a build-time (`ef_construction`) and a query-time (`innodb_hnsw_ef_search`) effort knob. | The build-quality sweep varies `ef_construction` only for the three that have it, and `M` for every engine but Percona Search, whose index exposes no graph degree (`orchestrator/ann_pass.py` gives it one `M` value and carries it as a label) — so neither claim is about the MySQL family, which has an engine on each side of this line. It is pinned to each engine's default in the normalized pass (pgvector's is `ef_construction=200`) so no engine is given a tuning axis the others lack, and swept only in the tuned pass. §3 of a generated report states this row from the records of the engines that actually ran, so a single-engine report names one engine where this table names three. |
+| **`ef_construction` is exposed** by pgvector, Valkey, Percona Server and MyVector, and by no other MySQL-family engine here — not by MariaDB MHNSW and not by AliSQL VIDX. Percona Server and MyVector are the two MySQL-family engines with both a build-time and a query-time effort knob (Percona's `ef_construction` and `innodb_hnsw_ef_search`; MyVector's `ef=` column option and the `ef_search` option of each `MYVECTOR_IS_ANN` call). | The build-quality sweep varies `ef_construction` only for the four that have it, and `M` for every engine but Percona Search, whose index exposes no graph degree (`orchestrator/ann_pass.py` gives it one `M` value and carries it as a label) — so neither claim is about the MySQL family, which has engines on each side of this line. It is pinned to each engine's default in the normalized pass (pgvector's is `ef_construction=200`) so no engine is given a tuning axis the others lack, and swept only in the tuned pass. §3 of a generated report states this row from the records of the engines that actually ran, so a single-engine report names one engine where this table names four. |
 | **AliSQL requires `READ-COMMITTED`** and `vidx_disabled=OFF`; vector indexes are InnoDB-only. | AliSQL runs at RC. MariaDB and PostgreSQL are run at their defaults in the tuned pass and at RC in the normalized pass where the engine allows it. |
 | **MariaDB supports MyISAM** for vector tables (and its own published benchmark uses MyISAM); AliSQL cannot. | Headline comparison is **InnoDB for both**. MariaDB MyISAM is reported as an additional MariaDB-only curve in the tuned pass, clearly labelled. |
 | **`M` is set differently** — MariaDB via the `mhnsw_default_m` server variable at startup, AliSQL via a per-index DDL option, pgvector via `WITH (m=…)`. | Handled per-driver; the effective `M` is recorded in the manifest, not assumed. |

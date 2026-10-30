@@ -379,7 +379,7 @@ class MySQLFamilyDriver(EngineDriver):
             f"  id {self.dialect.pk_type} PRIMARY KEY",
             "  tag INT NOT NULL",
             "  ctag INT NOT NULL",
-            f"  v VECTOR({index.dim}) NOT NULL",
+            f"  {self._vector_column(index)}",
             "  KEY tag_idx (tag)",
             "  KEY ctag_idx (ctag)",
         ]
@@ -389,6 +389,16 @@ class MySQLFamilyDriver(EngineDriver):
         body = ",\n".join(columns)
         return (f"CREATE TABLE {TABLE} (\n{body}\n"
                 f") ENGINE={index.storage_engine}")
+
+    def _vector_column(self, index: IndexSpec) -> str:
+        """The `v` column definition. The same for every engine but one.
+
+        A method so that `MyVectorDriver` can attach the index declaration its
+        plugin reads -- a column COMMENT, because MyVector's index is not a
+        server index -- without a second copy of the column list above, which
+        is the arrangement `_create_table_ddl`'s docstring exists to prevent.
+        """
+        return f"v VECTOR({index.dim}) NOT NULL"
 
     def _index_clause(self, index: IndexSpec, metric: str) -> str:
         """The vector-index clause, in this dialect's spelling.

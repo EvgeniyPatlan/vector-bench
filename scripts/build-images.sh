@@ -135,6 +135,11 @@ build_engine() {
     # nor care which it is. docker/percona/Dockerfile declares `ARG PERCONA_TAG` to receive it.
     percona)  bargs+=(--build-arg "PERCONA_TAG=${tag}") ;;
     pgvector) bargs+=(--build-arg "PGVECTOR_TAG=${tag}") ;;
+    # The MyVector plugin commit (the value of `source.tag`) plus the MySQL
+    # server tag it is compiled into; both land in the image's environment and
+    # the manifest's source record. docker/myvector/Dockerfile declares both.
+    myvector) bargs+=(--build-arg "MYVECTOR_TAG=${tag}"
+                      --build-arg "MYSQL_SERVER_TAG=$(yq_get "$cfg" source.server_tag unknown)") ;;
     # Nothing compiled: the module is copied out of its own published image.
     mongodb)  bargs+=(--build-arg "MONGOT_IMAGE=$(yq_get "$cfg" source.mongot_image "")") ;;
     # Nothing compiled: installed from a Percona repository. The package list
@@ -211,6 +216,9 @@ case "$ENGINE" in
   # same reason mariadb123 is: it is another full MySQL build that nobody
   # asked for by typing "all".
   percona)    build_engine percona ;;
+  # MySQL 9.7 compiled from source with the MyVector plugin in-tree. Opt-in
+  # for the same reason percona is: another full MySQL build.
+  myvector)   build_engine myvector ;;
   mariadb|alisql|pgvector) build_engine "$ENGINE" ;;
   *) die "unknown engine: $ENGINE" ;;
 esac

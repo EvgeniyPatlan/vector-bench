@@ -296,6 +296,131 @@ selectivities, carries over. Both reproduce the run: 5.2x slower at 1% than at
 
 ---
 
+## MyVector — hnswlib as a MySQL plugin
+
+Source: `askdba/myvector` release v1.26.9, commit `384d9df7`, built in-tree
+into MySQL `mysql-9.7.2` (the server line Percona Server's `9.7` series is
+based on). Symbols below are in that tree's `src/myvector.cc`,
+`src/myvector_binlog.cc`, `src/myvector_plugin.cc`, `include/hnswdisk.h` and
+`sql/myvectorplugin.sql`. Driver: `harness/drivers/myvector.py`.
+
+The only engine here whose index is not part of the server's storage layer.
+The graph is an hnswlib graph held in the plugin's memory and saved to files
+in `myvector_index_dir`; the table is an ordinary InnoDB table with a native
+`VECTOR(n)` column. How each piece works, and the traps in it:
+
+| | MyVector v1.26.9 |
+| --- | --- |
+| Declared by | column `COMMENT 'MYVECTOR Column \|type=HNSW,dim=…,size=…,M=…,ef=…,dist=…,track=updatets'` |
+| Built by | `CALL mysql.myvector_index_build('db.t.col','pk')`, after the load |
+| Searched by | `WHERE MYVECTOR_IS_ANN('db.t.col','pk', vec, 'nn=k,ef_search=e')`, rewritten before parsing |
+| **M** / **ef_construction** | `M=` / `ef=` column options (exact case) |
+| Search width | `ef_search=` inside each call; hnswlib searches at `max(ef, k)` |
+| Cosine | `dist=Cosine` → `AngularDistanceSpace`, a **scalar** loop (`computeCosineDistance`); L2 uses hnswlib's SIMD `L2Space` |
+| Capacity | `size=` is hnswlib's fixed `max_elements`; `addPoint` throws past it, inside mysqld |
+| Writes after the build | `myvector_index_refresh` over a `track=` timestamp — **adds only** (below) |
+| Online (binlog) maintenance | documented; **exits after its first idle second** on this server (below) |
+| Filtered search | **none** |
+
+### Trap 1 — options are case-sensitive and unknown spellings are silent
+
+`HNSWMemoryIndex::HNSWMemoryIndex` reads `getIntOption("M", 16)` and compares
+`getOption("dist") == "Cosine"`. `m=32` builds M=16; `dist=cosine` builds L2.
+Nothing warns. `MYVECTOR_INDEX_STATUS` prints `M` as the effective value but
+`Distance` **as written**, and does not print `ef` at all. The driver writes
+the exact spellings, then reads status back and refuses a build whose `Type`,
+`M`, `Dimension`, `Distance`, capacity or row count is not what it declared.
+
+### Trap 2 — a failed build is a result row, not an error
+
+`myvector_index_build` opens its own connection back to the server using
+`myvector.cnf` (`BuildMyVectorIndexSQL`); the file must be mode 0600/0400 or it
+is refused. Every failure — no file, refused connection, failed save — comes
+back as text in the procedure's result set and the `CALL` succeeds. The driver
+requires the text to start `SUCCESS` and to report the loaded row count.
+
+### Trap 3 — the binlog listener does not survive idleness, and never deletes
+
+`docs/ONLINE_INDEX_UPDATES.md` describes `online=Y` as real-time maintenance
+from the binary log, applying inserts, updates and deletes. Two things are
+true instead, the first observed in this image and the second read from the
+source:
+
+- **It dies.** `myvector_binlog_loop` opens the stream with a 1-second
+  `MYSQL_OPT_READ_TIMEOUT` and treats any fetch error whose text lacks
+  `timed out` as fatal. Against MySQL 9.7.2 the idle-timeout error text is
+  empty, so the server log shows `Binlog fetch failed: ` and `Exiting binlog
+  func` about a second after startup, no `Binlog Dump` thread remains, and a
+  row inserted after that never reaches the graph. Nothing restarts it.
+- **It only inserts.** The loop dispatches `TABLE_MAP_EVENT` and
+  `WRITE_ROWS_EVENT` and nothing else, and `myvector_table_op` only ever calls
+  `insertVector`. (Its row parser also reads the key from a `MYSQL_TYPE_LONG`
+  column only, so a BIGINT key would be indexed as 0.)
+
+So the framework does not use `online=Y` and the engine gets no binlog
+requirement: its server flags log exactly as Percona Server's do. Writes after
+the build reach the index through the release's other documented incremental
+path, a `track=` timestamp column and `myvector_index_refresh`, which the
+churn workload's `wait_index_synced` hook runs after each re-insert and times
+(`index_sync_s`). The refresh selects rows changed since the last build or
+refresh at one-second resolution, so the driver waits out the watermark
+second after each build and refresh — at most one second, inside the timed
+maintenance — or a row written in that second would never be selected.
+
+**Neither path removes a deleted row.** It stays in the graph; the search
+still returns its id; the rewritten `id IN (…)` drops it, and the query
+returns fewer than k rows. That is the degradation churn measures. Every
+re-insert also consumes a graph slot for good, so the driver sizes the graph
+at 1.5× the loaded rows and refuses a re-insert that would overflow it rather
+than let hnswlib throw inside mysqld. The repair is a full
+`myvector_index_build`, which takes `LOCK TABLES … READ` for its duration.
+
+### Trap 4 — the rewrite is textual
+
+The audit-plugin rewrite (`myvector_query_rewrite`) fires only on a statement
+whose first character is `S`/`E`/`C`/`A` and that matches `^SELECT\s+` or
+`^EXPLAIN\s+` — a leading comment or space disables it. It finds the end of
+`MYVECTOR_IS_ANN(…)` by counting parentheses over the raw text, quotes
+included, so an escaped binary vector can derail it with the bytes 0x28/0x29.
+Worse, **a long statement kills the server**: with the query vector inline as a
+hex literal, a 100-dim search (a 0.9 KB statement) works and a 784-dim one
+(6.4 KB) makes mysqld exit with nothing in its error log — reproduced on this
+image, and the cause of the first smoke run's failure. The same search with
+the vector in a user variable works. So every query is two statements, `SET
+@vb_q = X'…'` (no `MYVECTOR` in it, so the rewrite returns at its first
+`strstr`) and the search over `@vb_q` — a second round trip per query that no
+other engine here pays, charged by the plugin's design. `ef_search` mutates the shared index
+(`setSearchEffort`), so it is sent on every query; omitting it searches at
+whatever another session last asked for.
+
+### Trap 5 — dropping the table does not drop the index
+
+`DROP DATABASE` leaves the plugin's in-memory index object alive under the
+same `db.table.col` name, and the next build reuses that object — with the
+dimension, M and ef it was constructed with. The driver calls
+`myvector_index_drop` first, and the status check above would catch a stale
+object anyway.
+
+### No filtered search
+
+`myvector_ann_set_init` accepts three or four arguments and the options string
+carries `nn` and `ef_search` only. A predicate beside `MYVECTOR_IS_ANN`
+filters the k results after the search (the release's own
+`docs/LIMITATIONS.md` says so). The driver declares the `filtered` workload
+declined (`EngineDriver.declined_workloads`); the harness skips it, prints the
+reason and stamps `extra.declined_workloads` on every record of the run.
+
+### Build mode
+
+`post` only: load, then one `myvector_index_build`. There is no incremental
+mode to compare it with, because the only write-path maintenance is the dead
+binlog listener; the driver refuses `build_mode: incremental` with that
+reason. `myvector_index_bg_threads` is the build's parallelism — 1 in the
+normalized pass, `{build_threads}` in the tuned one; the plugin only builds in
+parallel at 2 or more (`HNSWMemoryIndex::startParallelBuild`).
+
+---
+
 ## Things that are true of all of them
 
 - **The optimizer can always decline the index.** Every one of them will fall

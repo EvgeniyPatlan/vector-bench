@@ -275,6 +275,31 @@ def render_config(engine: str, profile: Dict[str, Any],
             "query_args": query_args,
         }
 
+    elif engine == "myvector":
+        # Percona's shape for the same reason: MyVector exposes a build-time
+        # effort knob (`ef=` in the column options, hnswlib's ef_construction)
+        # and a query-time one (`ef_search` per MYVECTOR_IS_ANN call), so it is
+        # pinned in the normalized pass and swept only where the tuned pass
+        # asks. 200 rather than the plugin's own default of 100, so that the
+        # normalized pass builds MyVector at the same ef_construction as
+        # pgvector, Valkey and Percona -- every engine that has the knob.
+        if resource_pass == "tuned" and extras.get("myvector_ef_construction"):
+            ef_constructions = list(extras["myvector_ef_construction"])
+        else:
+            ef_constructions = [int(ann.get("myvector_ef_construction", 200))]
+        # No build-mode axis anywhere: the overlay module and the ops driver
+        # both build after the load, which is the only build the engine has
+        # on this server (see `INCREMENTAL_DECLINED` in
+        # harness/drivers/myvector.py).
+        run_groups["innodb"] = {
+            "arg_groups": [{
+                "M": m_values,
+                "efConstruction": ef_constructions,
+            }],
+            "args": {},
+            "query_args": query_args,
+        }
+
     elif engine == "mongodb":
         # Quantization is the one axis no other engine has, so it follows the
         # ef_construction precedent exactly: pinned in the normalized pass, set

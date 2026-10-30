@@ -16,7 +16,7 @@ import json
 import os
 import sys
 import traceback
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Allow running as `python3 /opt/vb-harness/main.py` as well as `-m harness.main`.
 if __package__ in (None, ""):  # pragma: no cover
@@ -56,6 +56,24 @@ def _should_calibrate(ef_mode: str, workloads: Sequence[str]) -> bool:
     return (ef_mode == calibrate_workload.EF_MODE_CALIBRATED
             and any(w in workloads
                     for w in calibrate_workload.CALIBRATED_WORKLOADS))
+
+
+def _apply_declined(driver: Any, workloads: Sequence[str]
+                    ) -> Tuple[List[str], Dict[str, str]]:
+    """The workloads to run, and the ones this driver declines with why.
+
+    `EngineDriver.declined_workloads` is a declaration on the driver class --
+    MyVector's pinned release has no filtered search, and answering filtered
+    queries by post-filtering the k nearest would publish a number under a
+    label it does not deserve. Applied here, before the first record, so the
+    decline is stamped onto every record of the run
+    (`extra.declined_workloads`) and the measurement workloads that CAN run
+    still do. A driver that declares nothing gets its workload list back
+    unchanged and an empty mapping, which writes no key at all.
+    """
+    declared = dict(getattr(driver, "declined_workloads", ()) or ())
+    declined = {w: declared[w] for w in workloads if w in declared}
+    return [w for w in workloads if w not in declined], declined
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -266,7 +284,7 @@ def _detect_march() -> str:
     """
     for path in ("/opt/mariadb/.march", "/opt/alisql/.march",
                  "/opt/pgvector-artifacts/.march",
-                 "/opt/percona/.march"):
+                 "/opt/percona/.march", "/opt/myvector/.march"):
         try:
             with open(path) as fh:
                 return fh.read().strip()
@@ -345,6 +363,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     driver = driver_factory()
+    workloads, declined = _apply_declined(driver, workloads)
+    for workload, reason in declined.items():
+        print(f"[vb-harness] {workload}: DECLINED by the {args.engine} "
+              f"driver, not run. {reason}", file=sys.stderr)
+    if declined:
+        recorder.declare_run_extra(declined_workloads=declined)
     failures: List[str] = []
     try:
         driver.connect()

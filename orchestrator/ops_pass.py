@@ -1360,4 +1360,12 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         modes = _iterative_scan_modes(iterative_scan)
         if modes:
             args += ["--iterative-scan", modes]
+    if engine == "myvector":
+        # Explicit, and the same key and default the ann render reads
+        # (`ann_pass.render_config`'s myvector branch), so the two paths build
+        # the graph at one ef_construction. Left to the driver it would be the
+        # plugin's own default of 100, half what every other engine with the
+        # knob is built at.
+        args += ["--ef-construction",
+                 str(int(ann.get("myvector_ef_construction", 200)))]
     return args

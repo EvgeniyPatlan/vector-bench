@@ -1420,8 +1420,9 @@ which is what caught it.
   `for build_mode in ann.get("valkey_build_modes", ["post"]):`. The
   MySQL-family branch has no equivalent, so a Percona `arg_groups` carrying
   `efConstruction` had nowhere to come from. `"efConstruction": ef_constructions`
-  occurs three times in the function now; the third, in the percona branch, is
-  the one this section asked for.
+  occurs four times in the function now; the third, in the percona branch, is
+  the one this section asked for, and the fourth is the myvector branch, added
+  with the eighth engine on the same reasoning.
 - **`build_modes`.** Those same two loops read `pgvector_build_modes` and
   `valkey_build_modes` out of the profile's `ann` block. A
   `percona_build_modes` key needs the same treatment, and it is the key that

@@ -409,8 +409,12 @@ class TestTheDeclaredRepairPathMatchesTheHook:
         longer string. The expected map is exhaustive for the same reason --
         a third repairing driver must fail here rather than pass.
         """
+        # MyVector is the third: neither of its incremental paths can remove
+        # a deleted row from the graph, so its repair is a full
+        # `myvector_index_build` (`MyVectorDriver.maintain`).
         expected = {"PostgresDriver": "vacuum_analyze",
-                    "PerconaDriver": "index-replace"}
+                    "PerconaDriver": "index-replace",
+                    "MyVectorDriver": "index-rebuild"}
         assert len(DRIVER_CLASSES) >= 6, DRIVER_CLASSES
         for cls in DRIVER_CLASSES:
             want = expected.get(cls.__name__, "none")

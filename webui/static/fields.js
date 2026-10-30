@@ -9,7 +9,7 @@
 const ENGINE_COLOR = {
   mariadb: "#1f77b4", mariadb123: "#5fa8d3", alisql: "#d62728",
   pgvector: "#2ca02c", mongodb: "#9467bd", valkey: "#e377c2",
-  percona: "#ff7f0e",
+  percona: "#ff7f0e", myvector: "#17becf",
 };
 const ENGINE_LABEL = {
   mariadb: "MariaDB 11.8 (MHNSW)", mariadb123: "MariaDB 12.3 (MHNSW)",
@@ -19,6 +19,7 @@ const ENGINE_LABEL = {
   // are different engines from the same vendor and swapping them would make
   // one report the other's recall.
   percona: "Percona Server (InnoDB HNSW)",
+  myvector: "MyVector (MySQL 9.7 plugin, hnswlib)",
 };
 // Fallback colours for series that are NOT engines -- `app.js` reads
 // `ENGINE_COLOR[name] || PALETTE[index % PALETTE.length]`, so this is only

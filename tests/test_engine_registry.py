@@ -50,12 +50,20 @@ GOLDEN = {
                 "/server-data/data", ("bench", "bench"), "extra",
                 "#ff7f0e", "P", "-", "Percona Server (InnoDB HNSW)",
                 "Percona Server (InnoDB HNSW)"),
+    # MyVector, the hnswlib plugin, on MySQL 9.7.2. `MyVector` is a new
+    # ann-benchmarks constructor, so no other engine's result files can be
+    # read as its own. Same port, mounts and account as the other
+    # MySQL-family engines: it IS a MySQL server, the index is what differs.
+    "myvector": ("MyVectorDriver", "MyVector", 3306, "/var/lib/vbench",
+                 "/server-data/data", ("bench", "bench"), "extra",
+                 "#17becf", "X", ":", "MyVector (MySQL 9.7 plugin, hnswlib)",
+                 "MyVector (MySQL 9.7 plugin, hnswlib)"),
 }
 
 # The order a run iterates and a report presents: the original three, then the
 # engines added later. Directory discovery is alphabetical and would not.
 GOLDEN_ORDER = ("mariadb", "alisql", "pgvector", "mariadb123", "mongodb",
-                "valkey", "percona")
+                "valkey", "percona", "myvector")
 
 
 @pytest.fixture(scope="module")
@@ -110,7 +118,7 @@ class TestRegistry:
         # added to config/engines/ and not to this tuple fails here rather
         # than passing silently, which is what a `>=` or an `in` would do.
         assert engines_mod.engines_in_group("extra") == \
-            ("mariadb123", "mongodb", "valkey", "percona")
+            ("mariadb123", "mongodb", "valkey", "percona", "myvector")
 
     def test_get_unknown_names_the_alternatives(self):
         with pytest.raises(ValueError) as excinfo:
