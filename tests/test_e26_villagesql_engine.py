@@ -1,0 +1,471 @@
+"""VillageSQL 0.0.7 + vsql_vector: the engine's wiring and the behaviours that
+keep it honest.
+
+No server is started here. What is pinned are the things that fail SILENTLY
+against the real build, each measured on it (2026-10-30):
+
+* the server answers every KNN query by sorting a full scan (the HNSW index
+  is never chosen), so a driver that merely warned would publish exact
+  brute force as ANN recall/QPS -- the driver and the ann module must REFUSE;
+* SVECTOR has only a text input, so the encoding must round-trip float32
+  exactly or every stored vector is silently perturbed;
+* the extension refuses ef_construction > 32 x M, so a profile's 200 at M=6
+  would fail the build unless clamped and recorded;
+* DELETE is rejected, and the bulk CREATE INDEX intermittently aborts the
+  server, which the configuration and the orchestrator must route around.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+import types
+from typing import Any, List, Optional
+
+import numpy
+import pytest
+import yaml
+
+VB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, VB_ROOT)
+
+from harness.drivers.base import ConnectionSpec, IndexSpec  # noqa: E402
+from harness.drivers import villagesql as vs  # noqa: E402
+
+EXTENSION_PIN = "bac885dd2bf43347c80dc9d9c4fa86ca0a596957"
+SERVER_PIN = "533ab4b58d2744b79bb45e41f44fa928f190a655"
+
+#: EXPLAIN FORMAT=TREE as the pinned build printed it for
+#: `SELECT id FROM t1 ORDER BY L2_DISTANCE(v, '[..]') LIMIT 10` (vector
+#: shortened): a sort over a table scan, the brute force this file is about.
+MEASURED_BRUTE_FORCE_PLAN = (
+    "-> Limit: 10 row(s)\n    -> Sort: vsql_vector.l2_distance(t1.v,'[-0.93,"
+    "0.87]'), limit input to 10 row(s) per chunk  (cost=505 rows=5000)\n"
+    "        -> Table scan on t1  (cost=505 rows=5000)\n")
+#: What the server prints when it does drive the index
+#: (`explain_access_path.cc`: "Custom index distance scan on " + key name).
+INDEX_PLAN = ("-> Limit: 10 row(s)\n    -> Custom index distance scan on vi "
+              "using vsql_vector.l2_distance  (rows=10)\n")
+
+
+def _read(rel: str) -> str:
+    with open(os.path.join(VB_ROOT, rel)) as fh:
+        return fh.read()
+
+
+def _config() -> dict:
+    return yaml.safe_load(_read("config/engines/villagesql.yml"))
+
+
+class ScriptedCursor:
+    def __init__(self, plan: str = MEASURED_BRUTE_FORCE_PLAN,
+                 file_sizes: Optional[List[int]] = None):
+        self.statements: List[str] = []
+        self.params: List[Any] = []
+        self.many: List[List[tuple]] = []
+        self.plan = plan
+        self.file_sizes = list(file_sizes or [])
+        self._rows: List[tuple] = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        self.params.append(params)
+        s = sql.upper()
+        if s.startswith("EXPLAIN"):
+            self._rows = [(self.plan,)]
+        elif "INNODB_TABLESPACES" in s:
+            self._rows = [(self.file_sizes.pop(0),)] if self.file_sizes else []
+        elif s.startswith("SELECT ID FROM T1"):
+            self._rows = [(i,) for i in range(10)]
+        else:
+            self._rows = []
+
+    def executemany(self, sql, rows):
+        self.statements.append(sql)
+        self.many.append(list(rows))
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def fetchone(self):
+        rows = self.fetchall()
+        return rows[0] if rows else None
+
+    def close(self):
+        pass
+
+
+def driver(build_mode="incremental", metric="euclidean", m=16, dim=4,
+           ef_construction=200, **cursor):
+    d = vs.VillageSQLDriver(ConnectionSpec(host="h", port=1))
+    d._cur = ScriptedCursor(**cursor)
+    d._index = IndexSpec(dim=dim, m=m, metric=metric,
+                         ef_construction=ef_construction,
+                         build_mode=build_mode)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# §1 wiring
+# ---------------------------------------------------------------------------
+
+class TestWiring:
+    def test_the_config_pins_both_trees_by_commit(self):
+        source = _config()["source"]
+        assert source["tag"] == EXTENSION_PIN
+        assert source["server_commit"] == SERVER_PIN
+        assert source["server_tag"] == "publish/mysql-9.7_0.0.7"
+
+    def test_the_driver_is_registered_by_class_name(self):
+        from harness.drivers.postgres import _driver_classes, _driver_table
+        assert _driver_classes()["VillageSQLDriver"] is vs.VillageSQLDriver
+        assert _driver_table()["villagesql"] is vs.VillageSQLDriver
+        assert _config()["runtime"]["driver"] == "VillageSQLDriver"
+
+    def test_the_declined_workloads_agree_with_the_config(self):
+        """The estimator reads the config, the harness reads the driver."""
+        caps = _config()["capabilities"]
+        declined = dict(vs.VillageSQLDriver.declined_workloads)
+        assert set(declined) == {"filtered", "churn"}
+        assert caps["filtered_search"] is False and caps["churn"] is False
+        assert vs.DELETE_REJECTED in declined["churn"]
+
+    def test_main_skips_both_and_stamps_them(self):
+        from harness import main as hmain
+        run, declined = hmain._apply_declined(
+            vs.VillageSQLDriver(ConnectionSpec(host="h", port=1)),
+            ["build", "concurrency", "filtered", "churn"])
+        assert run == ["build", "concurrency"]
+        assert set(declined) == {"filtered", "churn"}
+
+    def test_the_bulk_build_is_declared_broken_so_incremental_is_the_default(self):
+        from orchestrator import cli
+        cfg = _config()
+        assert cfg["capabilities"]["bulk_vector_index_build"] is False
+        assert cli._ops_build_modes("villagesql", {}, cfg) == ["incremental"]
+
+    def test_ann_and_ops_build_at_one_ef_construction(self):
+        from orchestrator import ann_pass, ops_pass
+        profile = {"ann": {"m_values": [6, 16], "ef_search": [10, 40]},
+                   "ops": {}}
+        body = ann_pass.render_config("villagesql", profile, {}, "normalized")
+        group = body["float"]["any"][0]["run_groups"]["innodb"]
+        assert group["arg_groups"] == [{"M": [6, 16], "efConstruction": [200]}]
+        assert body["float"]["any"][0]["constructor"] == "VillageSQL"
+        args = ops_pass.harness_args({**profile, "name": "t", "k": 10}, 16,
+                                     "villagesql", None, "normalized", {})
+        assert args[args.index("--ef-construction") + 1] == "200"
+
+    def test_the_estimator_charges_neither_declined_workload(self):
+        from orchestrator import estimate
+        assert estimate._runs_churn("villagesql") is False
+        assert estimate._runs_filtered_search("villagesql") is False
+        assert estimate._runs_churn("pgvector") is True
+        assert estimate._runs_churn("e26-no-such-engine") is True
+
+
+# ---------------------------------------------------------------------------
+# §2 DDL
+# ---------------------------------------------------------------------------
+
+class TestSchema:
+    def test_incremental_declares_the_index_in_create_table(self):
+        d = driver(build_mode="incremental", metric="angular")
+        d.create_schema(d._index)
+        ddl = d._cur.statements[-1]
+        assert "v SVECTOR(4) NOT NULL" in ddl
+        assert ("INDEX vi (v hnsw_cosine) USING EXTENDED(hnsw) "
+                "WITH (M = 16, ef_construction = 200)") in ddl
+        assert ddl.rstrip().endswith("ENGINE=InnoDB")
+        assert d.capabilities()["incremental_index"] is True
+
+    def test_post_leaves_it_out_and_create_index_adds_it(self):
+        d = driver(build_mode="post", metric="euclidean",
+                   file_sizes=[1_000_000, 9_000_000])
+        d.create_schema(d._index)
+        assert "USING EXTENDED" not in d._cur.statements[-1]
+        assert d.capabilities()["incremental_index"] is False
+        d.create_index(d._index)
+        assert ("CREATE INDEX vi ON t1 (v hnsw_l2) USING EXTENDED(hnsw) "
+                "WITH (M = 16, ef_construction = 200)") in d._cur.statements
+        assert d.index_bytes() == 8_000_000
+
+    def test_incremental_create_index_is_a_noop_and_reports_no_size(self):
+        d = driver(build_mode="incremental")
+        before = list(d._cur.statements)
+        d.create_index(d._index)
+        assert d._cur.statements == before
+        assert d.index_bytes() == 0
+
+    @pytest.mark.parametrize("m,want", [(6, 192), (8, 200), (4, 128)])
+    def test_ef_construction_is_clamped_to_what_the_extension_accepts(
+            self, m, want):
+        d = driver(m=m)
+        d.create_schema(d._index)
+        assert f"ef_construction = {want})" in d._cur.statements[-1]
+        assert d.capabilities()["ef_construction"] == want
+
+    def test_effective_ef_is_floored_at_k(self):
+        d = driver()
+        assert d.effective_ef(5, 10) == 10
+        assert d.effective_ef(40, 10) == 40
+
+
+# ---------------------------------------------------------------------------
+# §3 text binding
+# ---------------------------------------------------------------------------
+
+class TestTextBinding:
+    def test_the_literal_round_trips_every_float32_exactly(self):
+        rng = numpy.random.RandomState(7)
+        v = numpy.concatenate([
+            rng.normal(size=500).astype("<f4"),
+            numpy.array([0.0, -0.0, 1e-30, 3.4e38, 255.0, 1 / 3],
+                        dtype="<f4")])
+        text = vs.text_literal(v)
+        assert text.startswith("[") and text.endswith("]")
+        back = numpy.array([numpy.float32(t) for t in text[1:-1].split(",")],
+                           dtype="<f4")
+        assert back.tobytes() == v.tobytes()
+
+    def test_only_number_characters_reach_the_statement(self):
+        text = vs.text_literal(numpy.random.RandomState(1).normal(size=64))
+        assert set(text) <= set("0123456789.-+e[],")
+
+    @pytest.mark.parametrize("bad", [numpy.nan, numpy.inf, -numpy.inf])
+    def test_a_non_finite_element_is_refused(self, bad):
+        with pytest.raises(ValueError):
+            vs.text_literal([1.0, bad])
+
+    def test_load_and_reinsert_bind_text_not_bytes(self):
+        d = driver()
+        x = numpy.arange(12, dtype="<f4").reshape(3, 4)
+        d.load(x, numpy.array([1, 2, 3]))
+        d.insert_rows([10], x[:1], numpy.array([4]))
+        rows = [r for batch in d._cur.many for r in batch]
+        assert len(rows) == 4
+        assert all(isinstance(r[-1], str) and r[-1].startswith("[")
+                   for r in rows)
+        assert rows[0] == (0, 1, 1, "[0.0,1.0,2.0,3.0]")
+
+
+# ---------------------------------------------------------------------------
+# §4 the plan guard
+# ---------------------------------------------------------------------------
+
+class TestBruteForceIsRefused:
+    def test_the_measured_plan_is_refused_before_any_query_runs(self):
+        d = driver()
+        with pytest.raises(vs.BruteForceRefused):
+            d.query(numpy.ones(4), 10)
+        assert not any(s.startswith("SELECT id FROM t1")
+                       for s in d._cur.statements)
+        assert d._cur.statements[-1].startswith("EXPLAIN FORMAT=TREE ")
+
+    def test_a_plan_on_the_index_is_measured_with_the_vector_inlined(self):
+        d = driver(plan=INDEX_PLAN)
+        assert d.query(numpy.ones(4), 10) == list(range(10))
+        sql = d._cur.statements[-1]
+        assert sql == ("SELECT id FROM t1 ORDER BY "
+                       "L2_DISTANCE(v, '[1.0,1.0,1.0,1.0]') LIMIT 10")
+        assert d._cur.params[-1] is None
+
+    def test_the_marker_must_name_this_index(self):
+        d = driver(plan=INDEX_PLAN.replace("on vi", "on other_index"))
+        assert d.explain_uses_vector_index(numpy.ones(4), 10) is False
+
+    def test_the_check_is_once_per_driver(self):
+        d = driver(plan=INDEX_PLAN)
+        d.query(numpy.ones(4), 10)
+        d.query(numpy.ones(4), 10)
+        assert sum(s.startswith("EXPLAIN") for s in d._cur.statements) == 1
+
+    def test_cosine_orders_by_the_function_its_profile_binds(self):
+        d = driver(metric="angular", plan=INDEX_PLAN)
+        d.query(numpy.ones(4), 5)
+        assert "ORDER BY COSINE_DISTANCE(v, '[" in d._cur.statements[-1]
+
+    def test_filtered_binds_the_threshold_and_whitelists_the_column(self):
+        d = driver(plan=INDEX_PLAN)
+        d.query_filtered(numpy.ones(4), 10, 7, column="ctag")
+        assert d._cur.statements[-1].startswith(
+            "SELECT id FROM t1 WHERE ctag < %s ORDER BY")
+        assert d._cur.params[-1] == (7,)
+        with pytest.raises(ValueError):
+            d.query_filtered(numpy.ones(4), 10, 7, column="tag; DROP")
+
+    def test_delete_is_refused_with_the_servers_reason(self):
+        d = driver()
+        with pytest.raises(NotImplementedError, match="not supported yet"):
+            d.delete_ids([1, 2])
+        assert not d._cur.statements
+        d.delete_ids([])      # nothing to do is not an error
+
+
+# ---------------------------------------------------------------------------
+# §5 disclosures
+# ---------------------------------------------------------------------------
+
+def _label(engine: str) -> str:
+    return {"villagesql": "VillageSQL", "pgvector": "pgvector"}.get(engine,
+                                                                    engine)
+
+
+class TestDisclosures:
+    def test_the_driver_declares_both_facts(self):
+        facts = vs.VillageSQLDriver(ConnectionSpec(host="h", port=1)) \
+            .query_path_facts(IndexSpec(dim=4, m=16, metric="euclidean"))
+        assert facts["vector_binding"].startswith("text")
+        assert facts["extension_status"].startswith("preview")
+
+    def test_the_report_states_them_for_villagesql_alone(self):
+        from report import disclosures
+        facts = vs.VillageSQLDriver(ConnectionSpec(host="h", port=1)) \
+            .query_path_facts(IndexSpec(dim=4, m=16, metric="euclidean"))
+        records = [
+            {"engine": "villagesql", "phase": "index_build", "extra": facts},
+            {"engine": "pgvector", "phase": "index_build", "extra": {}},
+        ]
+        text = disclosures.structural_lines(records, _label)
+        assert "**VillageSQL** receives every vector as a text literal" in text
+        assert "preview feature" in text
+        assert "pgvector" not in text
+
+    def test_an_engine_that_declares_nothing_renders_nothing(self):
+        from report import disclosures
+        records = [{"engine": "pgvector", "phase": "index_build",
+                    "extra": {"vector_binding": "binary float32"}}]
+        assert disclosures.structural_lines(records, _label) == ""
+
+    def test_the_ann_attributes_reach_the_record(self):
+        from report import disclosures
+        got = disclosures.query_path_extra(
+            {"vector_binding": b"text literal (SVECTOR has no binary input)",
+             "extension_status": "preview (x)"})
+        assert got == {"vector_binding":
+                       "text literal (SVECTOR has no binary input)",
+                       "extension_status": "preview (x)"}
+        assert disclosures.query_path_extra({}) == {}
+
+
+# ---------------------------------------------------------------------------
+# §6 the ann overlay module, run against a scripted cursor
+# ---------------------------------------------------------------------------
+
+def _load_module():
+    from tests.test_e1_percona_design import ALGORITHMS, _load_overlay
+    _load_overlay()
+    pkg = types.ModuleType("ann_benchmarks.algorithms.villagesql")
+    pkg.__path__ = [os.path.join(ALGORITHMS, "villagesql")]
+    sys.modules[pkg.__name__] = pkg
+    was = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "ann_benchmarks.algorithms.villagesql.module",
+            os.path.join(ALGORITHMS, "villagesql", "module.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = was
+    return mod
+
+
+@pytest.fixture
+def annmod():
+    return _load_module()
+
+
+def _algo(annmod, m=16, ef_construction=200, **cursor):
+    """A VillageSQL instance without __init__, which would start a server."""
+    algo = object.__new__(annmod.VillageSQL)
+    algo._m, algo._metric, algo._metric_fn = m, "l2", "l2"
+    algo._ef_construction_requested = ef_construction
+    algo._ef_construction = annmod.clamp_ef_construction(m, ef_construction)
+    algo.dialect = annmod.dataclasses.replace(
+        annmod.VILLAGESQL, ef_construction=algo._ef_construction)
+    algo._storage_engine = "InnoDB"
+    algo._insert_threads = 1
+    algo._data_dir = "/nonexistent"
+    algo._dim = 0
+    algo._ef_search = None
+    algo._plan_verified = None
+    algo._build_seconds = algo._ingest_seconds = 0.0
+    algo._cur = ScriptedCursor(**cursor)
+    return algo
+
+
+class TestAnnModule:
+    def test_fit_declares_the_index_inline_and_loads_text(self, annmod):
+        algo = _algo(annmod, m=6)
+        algo.fit(numpy.ones((3, 4), dtype="<f4"))
+        create = next(s for s in algo._cur.statements
+                      if s.startswith("CREATE TABLE t1"))
+        assert "v SVECTOR(4) NOT NULL" in create
+        assert ("INDEX vi (v hnsw_l2) USING EXTENDED(hnsw) "
+                "WITH (M = 6, ef_construction = 192)") in create
+        assert not any(s.startswith("CREATE INDEX")
+                       for s in algo._cur.statements)
+        rows = [r for batch in algo._cur.many for r in batch]
+        assert rows[0] == (0, 0, "[1.0,1.0,1.0,1.0]")
+
+    def test_a_brute_force_plan_is_refused_not_measured(self, annmod):
+        algo = _algo(annmod)
+        algo._dim = 4
+        with pytest.raises(RuntimeError, match="Refusing to measure"):
+            algo.set_query_arguments(40)
+        assert algo._cur.statements[0] == \
+            "SET SESSION vsql_vector.ef_search = 40"
+        assert algo._cur.statements[1].startswith("EXPLAIN FORMAT=TREE ")
+
+    def test_an_index_plan_is_measured(self, annmod):
+        algo = _algo(annmod, plan=INDEX_PLAN)
+        algo._dim = 4
+        algo.set_query_arguments(80)
+        assert algo._plan_verified is True
+        assert algo.query(numpy.ones(4), 10) == list(range(10))
+        assert algo._cur.statements[-1] == (
+            "SELECT id FROM t1 ORDER BY L2_DISTANCE(v, '[1.0,1.0,1.0,1.0]') "
+            "LIMIT 10")
+
+    def test_the_records_carry_requested_and_built_ef_construction(
+            self, annmod, monkeypatch):
+        monkeypatch.setattr(annmod.VBMySQLBase, "get_additional",
+                            lambda self: {})
+        algo = _algo(annmod, m=6)
+        extra = algo.get_additional()
+        assert extra["ef_construction"] == 192
+        assert extra["ef_construction_requested"] == 200
+        assert extra["vector_binding"].startswith("text")
+        assert extra["extension_status"].startswith("preview")
+
+    def test_the_module_and_driver_encode_identically(self, annmod):
+        v = numpy.random.RandomState(3).normal(size=32)
+        assert annmod.text_literal(v) == vs.text_literal(v)
+        for m in (4, 6, 8, 16):
+            assert annmod.clamp_ef_construction(m, 200) == \
+                vs.clamp_ef_construction(m, 200)
+
+
+class TestTheBulkBuildDeclaration:
+    def test_the_host_flag_reaches_the_driver_and_the_build_still_runs(
+            self, capsys):
+        d = driver(build_mode="post", file_sizes=[0, 0])
+        assert d.bulk_vector_index_build is True
+        d.declare_bulk_vector_index_build(False)
+        assert d.bulk_vector_index_build is False
+        d.create_index(d._index)
+        assert any(s.startswith("CREATE INDEX vi ON t1")
+                   for s in d._cur.statements)
+        assert "declares this bulk build broken" in capsys.readouterr().out
+
+    def test_the_orchestrator_sends_the_flag_for_villagesql(self):
+        from orchestrator import cli, ops_pass
+        assert cli._bulk_vector_index_build(_config()) is False
+        argv = ops_pass.harness_args(
+            {"name": "t", "k": 10, "ops": {}}, 16, "villagesql", None,
+            "normalized", {}, bulk_vector_index_build=False)
+        assert "--no-bulk-vector-index-build" in argv
