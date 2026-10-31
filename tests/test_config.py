@@ -604,6 +604,17 @@ class TestAnnResultFingerprint:
         finally:
             ann_pass.ANN_MEASUREMENT_VERSION = original
 
+    def test_the_index_warm_up_is_version_3(self):
+        """Pinned so the next bump is a decision, not a side effect: 3 is the
+        one-time index warm-up, and every tree keyed by 2 holds a cold first
+        point (full-20260825: ef_search 10 below 20 on every MySQL-family
+        curve). Raising it re-measures every recall point of every engine."""
+        from orchestrator import ann_pass
+        assert ann_pass.ANN_MEASUREMENT_VERSION == 3
+        source = open(os.path.join(VB_ROOT, "orchestrator",
+                                   "ann_pass.py")).read()
+        assert "3 -- the one-time index warm-up" in source
+
     def test_results_dir_is_namespaced_by_config(self, tmp_path):
         from orchestrator.ann_pass import annb_results_dir, ann_fingerprint
         paths = {"annb_results": str(tmp_path)}
@@ -4551,6 +4562,59 @@ class TestThroughputThatRisesWithEffortIsFlagged:
         assert len(s["qps_inversions"]) == 1
         assert s["qps_inversions"][0]["first_in_sweep"] is True
         assert s["qps_inversions"][0]["ratio"] < 2
+
+    def _warmed_summary(self, points, warmed=True):
+        from report.generate import summarize
+        extra = ({"index_warmup_queries": 1400, "index_warmup_seconds": 9.2,
+                  "index_warmup_converged": True} if warmed else {})
+        records = [dict(phase="recall_qps", engine="mariadb", dataset="d",
+                        m=16, storage_engine="InnoDB", build_mode="post",
+                        ef_search=ef, qps=qps, recall_at_k=0.99,
+                        extra=dict(extra))
+                   for ef, qps in points]
+        return summarize(records)
+
+    # full-20260825, MariaDB 11.8 on dbpedia: 454.2 QPS at ef_search 10 and
+    # 843.4 at 20 -- the cold first point the index warm-up now removes.
+    FULL_20260825 = [(10, 454.2), (20, 843.4), (40, 600.0), (80, 400.0)]
+
+    def test_a_first_step_inversion_on_a_warmed_index_is_unexplained(self):
+        """Once the overlay warmed the index before its first configuration
+        there is no cold cache left to blame, so the same shape that used to
+        read "warm-up" is a measurement of something else."""
+        from report.render import _validity_section
+        s = self._warmed_summary(self.FULL_20260825)
+        assert len(s["qps_inversions"]) == 1
+        found = s["qps_inversions"][0]
+        assert found["first_in_sweep"] is True
+        assert found["index_warmed"] is True
+        assert found["likely"] == "unexplained"
+        text = _validity_section({}, s)
+        row = next(line for line in text.splitlines() if "10 → 20" in line)
+        assert "**unexplained**" in row and "warm-up" not in row
+        assert "1 of these are not the cold-first-step artifact" in text
+
+    def test_without_the_warm_up_attributes_it_is_still_warm_up(self):
+        """Result files measured before ANN_MEASUREMENT_VERSION 3 carry no
+        warm-up attributes and keep the old, correct label."""
+        from report.render import _validity_section
+        s = self._warmed_summary(self.FULL_20260825, warmed=False)
+        found = s["qps_inversions"][0]
+        assert found["index_warmed"] is False
+        assert found["likely"] == "warm-up"
+        row = next(line for line in _validity_section({}, s).splitlines()
+                   if "10 → 20" in line)
+        assert "warm-up" in row and "unexplained" not in row
+
+    def test_the_loader_carries_the_warm_up_attributes(self):
+        from report.disclosures import warmup_extra
+        import numpy
+        assert warmup_extra({}) == {}
+        assert warmup_extra({"index_warmup_queries": numpy.int64(1400),
+                             "index_warmup_seconds": numpy.float64(9.25),
+                             "index_warmup_converged": numpy.bool_(False)}) == {
+            "index_warmup_queries": 1400, "index_warmup_seconds": 9.25,
+            "index_warmup_converged": False}
 
     def test_the_worst_is_reported_first(self):
         s = self._summary([(10, 100), (20, 150), (40, 10), (80, 300)])
@@ -8605,3 +8669,52 @@ class TestEveryPgvectorParallelismKnobIsPinnedOnPurpose:
             assert name in prose, (
                 f"{name} is pinned in config/engines/pgvector.yml and "
                 "explained nowhere in it")
+
+
+class TestPublishableProfiles:
+    """A profile a report is published from measures every ann point at least
+    twice. full-20260825 was a tuned-complete run at `runs: 1` (all 112 ann
+    records carry `run_count` 1), so the first point of every sweep was a
+    single draw on a cold index -- and it published ef_search 10 SLOWER than
+    20 on every MySQL-family curve. Two runs do not replace the index warm-up; they
+    stop one unlucky draw from becoming the published number."""
+
+    PUBLISHED = ("tuned-complete", "main", "full")
+    NOT_PUBLISHED = ("dev", "smoke")
+
+    @staticmethod
+    def _profile(name):
+        from orchestrator.config import load_profile
+        return load_profile(name)
+
+    @pytest.mark.parametrize("name", PUBLISHED)
+    def test_the_published_profiles_are_marked(self, name):
+        assert self._profile(name).get("publishable") is True
+
+    @pytest.mark.parametrize("name", NOT_PUBLISHED)
+    def test_development_profiles_are_left_alone(self, name):
+        profile = self._profile(name)
+        assert not profile.get("publishable")
+        assert profile.get("runs") == 1
+
+    def test_no_publishable_profile_runs_fewer_than_two(self):
+        from orchestrator.config import available_profiles
+        short = {}
+        for name in available_profiles():
+            profile = self._profile(name)
+            if profile.get("publishable"):
+                runs = profile.get("runs", 1)
+                if not isinstance(runs, int) or runs < 2:
+                    short[name] = runs
+        assert not short, (
+            f"publishable profile(s) with runs < 2: {short}. ann-benchmarks "
+            "keeps the best of `runs`; one run publishes a single draw.")
+
+    def test_the_key_is_one_the_profile_editor_knows(self):
+        """Otherwise the web UI warns about it on every published profile."""
+        from webui.profiles import KNOWN_TOP_LEVEL
+        assert "publishable" in KNOWN_TOP_LEVEL
+
+    def test_runs_reaches_ann_benchmarks(self):
+        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
+        assert '"--runs", str(profile.get("runs", 1))' in source

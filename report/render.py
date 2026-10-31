@@ -617,6 +617,13 @@ def _widening_note(manifest: Dict[str, Any]) -> str:
             f"engines a profile names. Widening means editing the profile.")
 
 
+def _inversion_likely(inversion: Dict[str, Any]) -> str:
+    """`summarize`'s verdict; a summary written before it carried one falls
+    back to the old rule, which was first step = warm-up."""
+    return inversion.get("likely") or (
+        "warm-up" if inversion.get("first_in_sweep") else "unexplained")
+
+
 def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
                       records: Optional[List[Dict[str, Any]]] = None) -> str:
     parts: List[str] = []
@@ -767,7 +774,7 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
 
     if summary.get("qps_inversions"):
         inversions = summary["qps_inversions"]
-        severe = [i for i in inversions if not i.get("first_in_sweep")]
+        severe = [i for i in inversions if _inversion_likely(i) != "warm-up"]
         parts.append(
             "\n### Throughput that rose as query effort rose\n\n"
             "Examining more candidates cannot be faster on the same index, so "
@@ -779,7 +786,9 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
             "configuration pays for a cold cache and the second looks faster. "
             "Anything larger, or anywhere other than the first step, is not "
             "explicable that way and the affected points should be "
-            "re-measured rather than published.\n"
+            "re-measured rather than published. A sweep whose index was "
+            "warmed before its first configuration has no cold first point, "
+            "so a first-step inversion there is unexplained too.\n"
         )
         rows = [[_label(i.get("engine", "?")),
                  str(i.get("storage_engine") or "—"),
@@ -787,7 +796,8 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
                  f"{i.get('from_ef')} → {i.get('to_ef')}",
                  f"{i.get('from_qps'):,} → {i.get('to_qps'):,}",
                  f"{i.get('ratio')}x",
-                 "warm-up" if i.get("first_in_sweep") else "**unexplained**"]
+                 ("warm-up" if _inversion_likely(i) == "warm-up"
+                  else "**unexplained**")]
                 for i in inversions[:30]]
         parts.append(_md_table(
             ["Engine", "Storage", "ef_construction", "ef_search",
@@ -797,7 +807,7 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
         if severe:
             worst = severe[0]
             parts.append(
-                f"\n**{len(severe)} of these are not at the first step.** The "
+                f"\n**{len(severe)} of these are not the cold-first-step artifact.** The "
                 f"largest is {_label(worst['engine'])}, where ef_search "
                 f"{worst['from_ef']} measured {worst['from_qps']:,} QPS and "
                 f"ef_search {worst['to_ef']} measured {worst['to_qps']:,} — "

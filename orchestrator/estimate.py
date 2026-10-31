@@ -428,8 +428,13 @@ _PER_QUERY_OPS_COSTS: Dict[str, Tuple[str, ...]] = {
         "~6.7 min for main's two datasets x two columns",
     ),
 }
+# Named, not quantified: there is no measured single-client ann QPS to
+# multiply by, so `runs: 2` on the publishable profiles doubles a term this
+# estimator never put a number on. The index warm-up is in the same position
+# -- bounded (5,000 queries per built index) but with no rate to price it.
 _ANN_QUERY_COST = ("recall/QPS sweep: every ann.ef_search point, `runs` times, "
-                   "over each dataset's query set")
+                   "over each dataset's query set, plus a one-time index "
+                   "warm-up of up to 5,000 training-set queries per built index")
 
 
 def _query_qps(engine: str, dataset: str) -> Optional[float]:

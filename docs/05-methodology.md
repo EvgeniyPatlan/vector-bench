@@ -271,6 +271,23 @@ The standard approximate-nearest-neighbour quality/speed tradeoff.
   the true top-`k` neighbours that appear in the engine's returned top-`k`.
   Ground truth ships with the HDF5 dataset; it is exact, computed by brute force.
 - **QPS** — queries per second, single client, best of `--runs` repetitions.
+  Every profile a report is published from (`publishable: true` —
+  `tuned-complete`, `main`, `full`) sets `runs` to 2 or more, and
+  `tests/test_config.py` refuses one that does not.
+- **Warm-up** — before the first configuration on each built index, the
+  overlay module queries that index with a fixed, seeded sample of
+  **training** vectors (never the test set, which would pre-cache the paths
+  about to be timed) in batches of 200, until two consecutive batches agree on
+  mean latency within 5%, capped at 5,000 queries
+  (`overlay/ann-benchmarks/ann_benchmarks/vb_warmup.py`, identical for every
+  engine). The count, duration and whether it converged are written into each
+  result file as `index_warmup_queries`, `index_warmup_seconds` and
+  `index_warmup_converged`. Thirty further random-vector queries still run
+  before every configuration. Without the one-time warm-up the first
+  `ef_search` point measured a cold graph: full-20260825 published ef_search
+  10 slower than 20 on every MySQL-family curve. On a warmed index the report
+  labels a first-step throughput inversion **unexplained**, not "warm-up".
+  Introduced as `ANN_MEASUREMENT_VERSION` 3, which moved every results tree.
 - Sweep: for each `M` (graph degree), query at several `ef_search` values. Each
   `(M, ef_search)` pair is one point. The upper-left envelope of those points is
   the **Pareto frontier** — that is what gets plotted and compared.

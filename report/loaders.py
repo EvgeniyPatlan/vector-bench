@@ -177,6 +177,7 @@ def load_annb_results(annb_dir: str, datasets_dir: str,
                             # report.
                             "source_mtime": os.path.getmtime(path),
                             **_disclosures.query_path_extra(attrs),
+                            **_disclosures.warmup_extra(attrs),
                         },
                     }
                     if attrs.get("index_size") is not None:

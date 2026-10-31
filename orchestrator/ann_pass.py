@@ -48,10 +48,24 @@ MARIADB_ENGINES = ("mariadb", "mariadb123")
 
 
 # Bump when the measurement path itself changes in a way that makes older
-# numbers non-comparable, even at an identical resource configuration. Adding
-# the per-configuration warmup was such a change: without it the first
-# ef_search point paid for a cold cache and landed below the second.
-ANN_MEASUREMENT_VERSION = 2
+# numbers non-comparable, even at an identical resource configuration. It is
+# part of `ann_fingerprint`, so a bump moves EVERY pass's results tree and
+# forces every recall point of every engine to be measured again -- which is
+# the intent when it is bumped, and the reason it is not the remedy for a
+# single engine's re-pin (CLAUDE.md, the ann results tree invariant).
+#
+# History:
+#   2 -- the per-configuration `_warm_cache` (30 random-vector queries): without
+#        it the first ef_search point paid for a cold cache and landed below
+#        the second.
+#   3 -- the one-time index warm-up (overlay/.../vb_warmup.py): training-set
+#        queries before the first configuration on each built index until two
+#        consecutive 200-query batches agree within 5%, capped at 5,000. Thirty
+#        queries had not been enough: full-20260825 (tuned-complete, dbpedia
+#        1M x 1536) still measured ef_search 10 slower than 20 on all six
+#        MariaDB/AliSQL curves (1.69x-2.13x) and on both Percona Search curves
+#        (1.13x). A curve measured at 2 has that cold first point in it.
+ANN_MEASUREMENT_VERSION = 3
 
 
 def ann_fingerprint(resolved: Any) -> str:
