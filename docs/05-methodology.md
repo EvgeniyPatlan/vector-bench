@@ -297,6 +297,22 @@ its frontier is above the other's at the same recall.
 
 `k = 10` by default (`--count`). Recall at k=100 is also recorded.
 
+**The headline QPS-at-recall table uses one build per engine: its reference
+build.** Each engine declares it in `config/engines/<e>.yml`
+(`runtime.reference_build`) as the index the ops pass builds — M=16 for the
+MySQL family, `ef_construction` as the ops pass sets it for pgvector, Valkey,
+Percona Server and MyVector, and the pass's quantization for Percona Search.
+`orchestrator/reference_build.py` resolves it per profile and pass, `run`
+refuses one the ann grid does not contain, and the manifest carries it to the
+report in `engines.<name>.presentation.reference_builds`. A floor the
+reference build never reaches reads "—", with that build's highest recall in a
+footnote; it is never filled from another build. A second table beside it,
+"best of the sweep", keeps the fastest figure over every build and names the
+build under each number. The run of 2026-08-25 is why: its published table
+gave Percona Search 138 / 124 / 88 QPS at 0.90 / 0.95 / 0.99 from the
+unquantized sweep, while every other Percona Search figure came from the
+scalar index, which peaks at recall 0.892.
+
 ### 2.2 Index build cost (ops harness)
 
 Measured per `(engine, dataset, M)`:
@@ -433,7 +449,18 @@ be wrong while the quotient stays plausibly between 0 and 1.
 `clients.CLIENT_BOUND_UTIL`, which is **0.80**, and the report draws those
 points hollow and names them in a footnote. That threshold is not a measured
 constant and is not offered as one: it is the level at which this harness stops
-being able to say whose ceiling a figure shows.
+being able to say whose ceiling a figure shows. A client-bound point never sets
+an engine's peak in the report's peak-throughput table, and neither does a unit
+whose ef calibration ended `target_unreached` or `floor_above_target`: those
+are listed with their status and not ranked.
+
+**Sizing the client set.** `resources.cpu.client_cpus: auto` gives the clients
+one CPU per two clients of the profile's largest `ops.client_counts`, never
+fewer than four (16 for a 1–32 sweep), taken from the topology pool after the
+server cpuset. When the pool cannot supply it, `run` refuses before anything
+loads and names both numbers; a numeric pin keeps its old behaviour of warning
+and sharing cores. The run's estimate prints the resolved size beside the
+largest client count.
 
 **The flag is blind to a ceiling that costs no CPU, and that is measured rather
 than suspected. The case below is the one it was measured on, and §7 has since

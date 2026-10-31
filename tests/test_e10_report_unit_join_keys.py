@@ -1106,7 +1106,11 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     #: printing neither made two configurations' duplicates read as one
     #: configuration listed twice. The reasoning this guard records for
     #: section 10's `Storage` applies unchanged.
-    OPS_UNIT_TABLE_COUNT = 9
+    #:
+    #: 9 -> 10: §7's peak-throughput headline (`_peak_throughput_table`). It
+    #: ranks concurrency UNITS -- one row per (engine, pass, M, build mode,
+    #: storage) -- so it names all four axes like every other unit table.
+    OPS_UNIT_TABLE_COUNT = 10
 
     def test_every_ops_unit_header_names_every_axis(self):
         """The header side of `ops_unit`, over the FILE rather than a list.

@@ -1285,7 +1285,6 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     here.
     """
     ops = profile.get("ops", {}) or {}
-    ann = profile.get("ann", {}) or {}
 
     args = [
         "--m", str(m),
@@ -1351,18 +1350,37 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     ]
     if ops.get("subset_rows"):
         args += ["--subset-rows", str(ops["subset_rows"])]
-    if engine == "pgvector":
-        ef_construction = ann.get("pgvector_ef_construction", 200)
+    ef_construction = ops_ef_construction(engine, profile)
+    if ef_construction is not None:
         args += ["--ef-construction", str(ef_construction)]
+    if engine == "pgvector":
         modes = _iterative_scan_modes(iterative_scan)
         if modes:
             args += ["--iterative-scan", modes]
+    return args
+
+
+def ops_ef_construction(engine: str, profile: Dict[str, Any]) -> Optional[int]:
+    """The `--ef-construction` the ops pass hands the harness, or None.
+
+    One function because two readers need the same answer: `harness_args`,
+    which builds the index, and `config.resolve_reference_build`, which names
+    that index as the build every summary figure is taken from. Two copies of
+    the rule are how the 25 Aug report came to print pgvector's floor figures
+    from an efC=400 build beside ops numbers measured at 200.
+
+    None for every engine the ops pass leaves to its driver -- Valkey (the
+    server default) and Percona (`PERCONA_DIALECT.ef_construction`) -- whose
+    config declares the literal those defaults resolve to instead.
+    """
+    ann = profile.get("ann", {}) or {}
+    if engine == "pgvector":
+        return int(ann.get("pgvector_ef_construction", 200))
     if engine == "myvector":
         # Explicit, and the same key and default the ann render reads
         # (`ann_pass.render_config`'s myvector branch), so the two paths build
         # the graph at one ef_construction. Left to the driver it would be the
         # plugin's own default of 100, half what every other engine with the
         # knob is built at.
-        args += ["--ef-construction",
-                 str(int(ann.get("myvector_ef_construction", 200)))]
-    return args
+        return int(ann.get("myvector_ef_construction", 200))
+    return None

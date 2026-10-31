@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from .config import (ResolvedResources, engine_resolution, load_engine,
                      load_resources, merge_resource_overrides,
-                     resolve_resources)
+                     profile_max_clients, resolve_resources)
 from .manifest import Manifest, ResolutionChanged
 
 
@@ -85,7 +85,13 @@ def resolve_engines(manifest: Manifest, passes: Sequence[str],
         for engine in engines:
             engine_cfg = plan.engine_cfg.get(engine) or load_engine(engine)
             plan.engine_cfg[engine] = engine_cfg
-            resolved = resolve_resources(resources, engine, info)
+            # The profile's largest client count, which `client_cpus: auto`
+            # is sized from. Derived here rather than passed in so every
+            # caller of this plan gets it; `cmd_run` has already refused a
+            # topology that cannot supply it, before anything was recorded.
+            resolved = resolve_resources(
+                resources, engine, info,
+                max_clients=profile_max_clients(profile))
             plan.resolved[(resource_pass, engine)] = resolved
             entry = engine_resolution(engine_cfg, resource_pass, resolved)
             try:
