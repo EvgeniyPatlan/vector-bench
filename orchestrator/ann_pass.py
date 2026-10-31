@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from . import docker_ctl
 from . import engines as engines_mod
-from .config import ResolvedResources, server_args
+from .config import ResolvedResources, server_args, server_env
 
 # Re-exported, not just imported: `cli.py` and a dozen tests reach these
 # through `ann_pass`, and the split that moved them into their own module is
@@ -31,6 +31,7 @@ from .ann_config import (  # noqa: F401
     config_path,
     expected_result_count,
     expected_results,
+    read_config,
     result_stem,
     result_stems,
     write_config,
@@ -474,11 +475,9 @@ def run_engine(engine: str, dataset: str, profile: Dict[str, Any],
             "VB_INSERT_THREADS": str(profile.get("ann", {}).get("insert_threads", 0)),
             "VB_RUN_ID": run_id,
             "VB_RESOURCE_PASS": resource_pass,
-            # See ops_pass: sized centrally so both measurement paths give
-            # mongot the same heap, and the single-process engines ignore it.
-            "VB_MONGOT_HEAP_GB": str(
-                max(1, resolved.mongot_heap_bytes // (1024 ** 3))),
-            "VB_MAXMEMORY_BYTES": str(resolved.maxmemory_bytes),
+            # Sized centrally so both measurement paths give mongot the same
+            # heap, and so `engines_resolved` records exactly this env.
+            **server_env(resolved),
             "PYTHONUNBUFFERED": "1",
         },
         volumes=[

@@ -2220,11 +2220,20 @@ class TestTwoProcessMemorySplit:
 
     def test_the_heap_reaches_the_container(self):
         """Sized here and never passed through is how a tuned run would
-        silently use the image default instead."""
-        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
-        assert "VB_MONGOT_HEAP_GB" in source
-        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
-        assert "VB_MONGOT_HEAP_GB" in source
+        silently use the image default instead.
+
+        Both launchers now build the size env through `config.server_env`,
+        the function the manifest's `engines_resolved` record is built from
+        too, so the test pins the builder's output and that both launchers
+        splat it, rather than a literal each file used to repeat."""
+        from orchestrator.config import server_env
+        r = self._resolve("mongodb")
+        env = server_env(r)
+        assert env["VB_MONGOT_HEAP_GB"] == str(
+            max(1, r.mongot_heap_bytes // 1024 ** 3))
+        for name in ("ops_pass.py", "ann_pass.py"):
+            source = open(os.path.join(VB_ROOT, "orchestrator", name)).read()
+            assert "**server_env(" in source, name
 
     def test_the_split_is_recorded_in_the_manifest(self):
         assert "mongot_heap_bytes" in self._resolve("mongodb").as_dict()
@@ -2396,10 +2405,15 @@ class TestInMemoryResourceModel:
 
 
     def test_the_limit_reaches_the_server(self):
-        source = open(os.path.join(VB_ROOT, "orchestrator", "ops_pass.py")).read()
-        assert "maxmemory_bytes" in source
-        source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
-        assert "maxmemory_bytes" in source
+        """Both launchers take the size env from `config.server_env`, the
+        same builder `engines_resolved` records, so the test pins its output
+        and that each launcher splats it."""
+        from orchestrator.config import server_env
+        r = self._resolve("valkey", ram_gb=8)
+        assert server_env(r)["VB_MAXMEMORY_BYTES"] == str(r.maxmemory_bytes)
+        for name in ("ops_pass.py", "ann_pass.py"):
+            source = open(os.path.join(VB_ROOT, "orchestrator", name)).read()
+            assert "**server_env(" in source, name
 
     def test_the_split_is_recorded_in_the_manifest(self):
         assert "maxmemory_bytes" in self._resolve("valkey").as_dict()
@@ -3571,17 +3585,26 @@ class TestReRunContinuesAManifest:
             b = Manifest(d, "run-b")
             assert b.data["phases"] == []
 
-    def test_a_repeated_unit_replaces_its_earlier_attempt(self, tmp_path):
+    def test_a_repeated_unit_keeps_both_attempts_and_the_last_decides(
+            self, tmp_path):
         """A re-run that fixes a failure must not leave the failure behind for
-        the report to keep reporting."""
+        the report to keep reporting -- but the earlier attempt is no longer
+        erased to achieve that. `full-20260825` lost the attempts that wrote
+        the M=16 files its recall table used, because this method replaced
+        them. Both attempts are kept and numbered; the readers that ask how a
+        unit ended read `latest_attempts`."""
+        from report.provenance import latest_attempts
         m = self._manifest(tmp_path)
         m.add_phase("ops", "valkey", "d", "failed", "t0", "t1",
                     {"resource_pass": "tuned", "exit_code": 1})
         m.add_phase("ops", "valkey", "d", "completed", "t2", "t3",
                     {"resource_pass": "tuned"})
         valkey = [p for p in m.data["phases"] if p["engine"] == "valkey"]
-        assert len(valkey) == 1
-        assert valkey[0]["status"] == "completed"
+        assert [(p["attempt"], p["status"]) for p in valkey] == [
+            (1, "failed"), (2, "completed")]
+        last = [p for p in latest_attempts(m.data["phases"])
+                if p["engine"] == "valkey"]
+        assert [p["status"] for p in last] == ["completed"]
 
     def test_the_same_unit_in_another_pass_is_kept(self):
         import tempfile

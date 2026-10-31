@@ -624,7 +624,7 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
 
     **`repair_path` and `index_sync_s` are still read nowhere**, and that is
     stated rather than left to be discovered. Counted across `report/`: at the
-    base all four keys had 0 occurrences; they are now `maintenance` 25,
+    base all four keys had 0 occurrences; they are now `maintenance` 26,
     `maintenance_state` 14, `repair_path` 1 -- and that one is inside a
     docstring, not a read -- and `index_sync` 10, every one of them
     `report/disclosures.py`'s `index_sync_lines` (its name, its calls in
@@ -633,7 +633,10 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     save) and none of them a read of `index_sync_s` itself. (They were 20 and 13 before
     PR 5 §5.1 item 6 grouped the churn table's tie column by maintenance
     state and §5.2 cited the two-maintenance-state pairing defect in
-    `report/crosscheck.py`. Neither added a `repair_path` read.)
+    `report/crosscheck.py`. Neither added a `repair_path` read. The 26th
+    is not a churn key at all: `report/provenance.py` reads the resource
+    figure `maintenance_bytes` for §1's per-engine build-memory column, and
+    the count is a substring count.)
     `tests/test_t4b_readers.py` asserts those four counts, so this paragraph
     cannot drift from the directory it describes.
 

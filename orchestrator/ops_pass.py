@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import docker_ctl
 from . import engines as engines_mod
-from .config import ResolvedResources, server_args
+from .config import ResolvedResources, server_args, server_env
 from .manifest import utcnow
 
 
@@ -333,12 +333,9 @@ class OpsRun:
             env={
                 "VB_SERVER_ARGS": " ".join(flags),
                 "VB_RUN_ID": self.run_id,
-                # Sized by resolve_resources and passed through, so a tuned run
-                # cannot silently fall back to the image default. Harmless for
-                # the single-process engines, which never read it.
-                "VB_MONGOT_HEAP_GB": str(
-                    max(1, self.resolved.mongot_heap_bytes // (1024 ** 3))),
-                "VB_MAXMEMORY_BYTES": str(self.resolved.maxmemory_bytes),
+                # See `config.server_env`: one builder for both paths and
+                # for the manifest's `engines_resolved` record.
+                **server_env(self.resolved),
             },
             volumes=[f"{self.volume}:{data_mount}:rw"],
             command=["server"],

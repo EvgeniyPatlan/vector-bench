@@ -615,3 +615,72 @@ def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
             continue
         rendered.append(text)
     return rendered
+
+
+def server_env(resolved: ResolvedResources) -> Dict[str, str]:
+    """The size-carrying env vars every server container is started with.
+
+    One function for both measurement paths and for the manifest, so what
+    `engines_resolved` records is the env the container got rather than a
+    second spelling of it. `ann_pass.run_engine` and `ops_pass._start_server`
+    used to build these two entries inline, each with its own copy of the
+    `max(1, ...)` floor; a third copy here, for the manifest, would be the
+    one nobody noticed drifting.
+    """
+    return {
+        # Sized by resolve_resources and passed through, so a tuned run
+        # cannot silently fall back to the image default. Harmless for the
+        # single-process engines, which never read it.
+        "VB_MONGOT_HEAP_GB": str(max(1, resolved.mongot_heap_bytes // GB)),
+        "VB_MAXMEMORY_BYTES": str(resolved.maxmemory_bytes),
+    }
+
+
+def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
+                      resolved: ResolvedResources) -> Dict[str, Any]:
+    """What one engine was given under one pass, for `engines_resolved`.
+
+    WHY THIS IS PER ENGINE. `full-20260825` published "all six got the same
+    budget", and the budgets were not the same: InnoDB got a 42.3 GB buffer
+    pool, pgvector 72.5 GB of shared_buffers, Valkey 108.7 GB of maxmemory,
+    and MongoDB ran on its default WiredTiger cache (57-64 GB). That is
+    `resolve_resources` working as designed -- pgvector's buffer absorbs the
+    graph cache's share, an in-memory engine gets maxmemory instead of a
+    buffer -- but the manifest held one `config.resolved_resources`, written by
+    whichever engine `set_config` saw LAST. Snapshot 1 of that run, written
+    after mongodb, shows graph_cache 0 and shm 8g; snapshot 9, written after an
+    AliSQL rerun, shows 30.2 GB and 13g. The per-engine figures could only be
+    recovered from server logs.
+
+    Built from the same `engine_cfg` and `resolved` objects `cmd_run` hands to
+    `_run_unit`, through the same `server_args` and `server_env` the two
+    container launchers call, so the record and the container cannot disagree
+    without one of those functions changing for both.
+
+    `mem_limit_bytes` is the SERVER's limit. The ann container adds the
+    client's in-RAM corpus on top (`ann_pass.client_memory_bytes`), because
+    that is the benchmark's memory and not the engine's; it is per dataset,
+    and this record is per (engine, pass).
+    """
+    # Which resolved figures a server flag actually carries, read off the
+    # templates rather than inferred from the rendered values: MyVector's
+    # graph cache and buffer resolve to the same byte count, so "is the
+    # number in the args" said MyVector had a graph cache it has no flag for.
+    server = engine_cfg.get("server", {}) or {}
+    templates = " ".join(str(a) for a in list(server.get("common", []) or [])
+                         + list(server.get(resource_pass, []) or []))
+    applied = [key for key in SERVER_ARG_KEYS if "{" + key + "}" in templates]
+    if resolved.graph_cache_bytes == 0 and "graph_cache_bytes" in applied:
+        # `server_args` drops a zero cache-size flag; so does this record.
+        applied.remove("graph_cache_bytes")
+    return {
+        "resolved": resolved.as_dict(),
+        "server_args": server_args(engine_cfg, resource_pass, resolved),
+        "applied": applied,
+        "container": {
+            "cpuset": resolved.server_cpuset,
+            "mem_limit_bytes": resolved.server_memory_bytes,
+            "shm_size": resolved.shm_size,
+            "env": server_env(resolved),
+        },
+    }

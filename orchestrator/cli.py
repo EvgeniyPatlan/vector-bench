@@ -38,7 +38,8 @@ sys.path.insert(0, VB_ROOT)
 
 from harness import datasets as datasets_mod  # noqa: E402
 from harness.metrics import sysinfo as sysinfo_mod  # noqa: E402
-from orchestrator import ann_pass, docker_ctl, ops_pass  # noqa: E402
+from orchestrator import ann_pass, ann_provenance, docker_ctl, ops_pass  # noqa: E402
+from orchestrator.engine_plan import resolve_engines as _resolve_engines  # noqa: E402
 from orchestrator import engines as engines_mod  # noqa: E402
 from orchestrator.config import (available_profiles, dedupe,  # noqa: E402
                                  engines_outside_profile, load_engine,
@@ -510,15 +511,28 @@ def cmd_run(args: argparse.Namespace) -> int:
             d, (profile.get("ops", {}) or {}).get("subset_rows"))
          for d in profile.get("datasets", [])), default=0)
 
+    # Every (pass, engine) resolved and recorded before the first unit runs,
+    # and the run refused here if a resume would measure under a budget other
+    # than the one this directory recorded -- see `engine_plan`. The objects
+    # below are the ones `engines_resolved` was written from.
+    plan = _resolve_engines(manifest, passes, engines, profile, info,
+                            expected_corpus, checkpoints, datasets, phases)
+    if plan.refusals:
+        print("\nrefusing to resume: the per-engine resolution changed",
+              file=sys.stderr)
+        for message in plan.refusals:
+            print(f"  {message}", file=sys.stderr)
+        print("  Start a fresh --run-id to measure under the new resolution, "
+              "or restore the configuration this run was measured under.",
+              file=sys.stderr)
+        manifest.finish("refused")
+        return 5
+
     for resource_pass in passes:
-        resources = merge_resource_overrides(
-            load_resources(resource_pass), profile)
-        if expected_corpus:
-            resources.setdefault("memory", {})["expected_corpus_bytes"] = \
-                expected_corpus
+        resources = plan.resources[resource_pass]
         for engine in engines:
-            engine_cfg = load_engine(engine)
-            resolved = resolve_resources(resources, engine, info)
+            engine_cfg = plan.engine_cfg[engine]
+            resolved = plan.resolved[(resource_pass, engine)]
             # Recorded here, where orchestrator code is importable. The report
             # generator runs inside a bench image that mounts only report/ and
             # harness/, so it cannot compute this itself — an earlier version
@@ -582,6 +596,18 @@ def cmd_run(args: argparse.Namespace) -> int:
                                        "limit_bytes": refusal["limit_bytes"]})
                         continue
                     t0 = time.time()
+                    # Which result files this attempt wrote or stood on, so
+                    # the report can tie every recall number to the attempt
+                    # that produced it -- see `ann_provenance`.
+                    # Not for a disabled ann phase: it writes nothing, and
+                    # `annb_results_dir` would create an empty tree for it.
+                    ann_tree = (ann_pass.annb_results_dir(
+                        paths, resource_pass, resolved)
+                        if phase == "ann"
+                        and (profile.get("ann") or {}).get("enabled", True)
+                        else None)
+                    ann_before = (ann_provenance.snapshot(
+                        ann_tree, engine, dataset) if ann_tree else None)
                     try:
                         rc = _run_unit(phase, engine, dataset, profile, engine_cfg,
                                        resources, resolved, resource_pass, paths,
@@ -596,10 +622,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
                     elapsed = time.time() - t0
                     status = "completed" if rc == 0 else "failed"
+                    detail: Dict[str, Any] = {
+                        "exit_code": rc, "duration_s": round(elapsed, 1),
+                        "resource_pass": resource_pass}
+                    if ann_tree:
+                        detail["files"] = ann_provenance.phase_files(
+                            ann_before,
+                            ann_provenance.snapshot(ann_tree, engine, dataset),
+                            ann_pass.read_config(paths["work_annb"], engine))
                     manifest.add_phase(phase, engine, dataset, status, started,
-                                       utcnow(), {"exit_code": rc,
-                                                  "duration_s": round(elapsed, 1),
-                                                  "resource_pass": resource_pass})
+                                       utcnow(), detail)
                     if rc == 0:
                         _save_checkpoint(paths["checkpoints"], key)
                         print(f"[ok] {key} in {elapsed / 60:.1f} min")

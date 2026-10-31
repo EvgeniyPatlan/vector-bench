@@ -2093,11 +2093,14 @@ class TestTheProseSaysWhatTheCodeDoes:
             counts[key] = total
         # `maintenance` counts `maintenance_state` too, which is why it is the
         # larger figure rather than a separate set of sites.
-        assert counts == {"maintenance": 25, "maintenance_state": 14,
+        # 26 rather than 25 since §1's per-engine table reads the resource
+        # key `maintenance_bytes` in `report/provenance.py`: a substring hit,
+        # not a churn read, and `churn.py`'s paragraph says so.
+        assert counts == {"maintenance": 26, "maintenance_state": 14,
                           "repair_path": 1, "index_sync": 10}, counts
         source = open(os.path.join(root, "harness", "workloads",
                                    "churn.py")).read()
         block = source.split("**`repair_path` and `index_sync_s` are still")[1]
-        for key, n in (("maintenance", 25), ("maintenance_state", 14),
+        for key, n in (("maintenance", 26), ("maintenance_state", 14),
                        ("repair_path", 1), ("index_sync", 10)):
             assert f"`{key}` {n}" in block, (key, n, block[:400])
