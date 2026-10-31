@@ -1103,7 +1103,9 @@ def _fixed_ef_section(records: List[Dict[str, Any]]) -> str:
     named = ", ".join(str(ef) for ef in efs) or "unrecorded"
     return (
         "\n### Throughput at a fixed ef_search, not at a fixed recall\n\n"
-        f"This run used `ef_mode: fixed`: every engine's concurrency, "
+        f"This run measured at a fixed ef -- `ef_mode: fixed`, or a harness "
+        f"from before ops measurement version 4, which had no other mode and "
+        f"records no `ef_mode`: every engine's concurrency, "
         f"filtered and churn figures were measured at ef_search = {named}, "
         f"whatever recall that bought each engine. Throughput is therefore "
         f"**not compared at equal recall** in §7-§9 -- an engine with a "

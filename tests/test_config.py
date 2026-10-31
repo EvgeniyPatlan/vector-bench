@@ -8972,6 +8972,18 @@ class TestClientCpusAuto:
             cpu = (load_profile(name).get("resources") or {}).get("cpu") or {}
             assert cpu.get("client_cpus") != "auto", name
 
+    def test_the_engine_plan_resolves_auto_from_the_profile(self, tmp_path):
+        """`engine_plan.resolve_engines` is what every unit is resolved by
+        since #76; without the client count `auto` would raise there."""
+        from orchestrator.engine_plan import resolve_engines
+        from orchestrator.manifest import Manifest
+        profile = load_profile("tuned-complete")
+        plan = resolve_engines(Manifest(str(tmp_path), "auto-1"), ["tuned"],
+                               ["pgvector"], profile, self._host(80), 0,
+                               set(), [], [])
+        resolved = plan.resolved[("tuned", "pgvector")]
+        assert len(_expand_cpuset(resolved.client_cpuset)) == 16
+
     def test_the_run_resolves_with_the_largest_client_count(self):
         from orchestrator.config import profile_max_clients
         assert profile_max_clients(load_profile("tuned-complete")) == 32
