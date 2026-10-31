@@ -20,6 +20,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from report import disclosures as _disclosures
+from report import provenance_render as _provenance
 from report import scope as _scope
 
 # Defaults; the manifest's per-engine `presentation.label` overrides them, so an
@@ -945,6 +946,12 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
         more = len(summary["out_of_scope_ann"]) - 30
         if more > 0:
             parts.append(f"\n_…and {more} more._\n")
+
+    # Only when there is something to say: `if not parts` below picks the
+    # "no validity problems" ending, and an appended empty string retires it.
+    provenance_notices = _provenance.validity_notices(manifest, summary)
+    if provenance_notices:
+        parts.append(provenance_notices)
 
     if summary.get("passes_without_a_tree"):
         # The notice that has to be IN the document. `full-20261015-215006`
@@ -3323,6 +3330,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "\n### Engines under test\n\n",
         _md_table(["Engine", "Tag", "Commit", "-march", "Build type"],
                   _engine_rows(manifest)),
+        _provenance.engine_budget_section(manifest),
         "\n---\n\n## 2. Validity\n\n",
         _validity_section(manifest, summary, records),
         "\n---\n\n## 3. Known asymmetries\n\n",
@@ -3331,6 +3339,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "The headline comparison. Each engine's Pareto frontier is the best "
         "throughput it achieved at each recall level across the whole parameter "
         "sweep; the faint scatter behind it is every measured point.\n",
+        _provenance.section4_note(summary),
         _headline_tables(summary),
     ]
 
@@ -4126,14 +4135,16 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
          _md_tables_to_html(_md_table(["Property", "Value"], _environment_rows(manifest)))
          + "<h3>Engines under test</h3>"
          + _md_tables_to_html(_md_table(
-             ["Engine", "Tag", "Commit", "-march", "Build type"], _engine_rows(manifest))),
+             ["Engine", "Tag", "Commit", "-march", "Build type"], _engine_rows(manifest)))
+         + _md_tables_to_html(_provenance.engine_budget_section(manifest)),
          ""),
         ("2. Validity",
          _md_tables_to_html(_validity_section(manifest, summary, records)), ""),
         ("3. Known asymmetries",
          _md_tables_to_html(_known_asymmetries(summary)), ""),
         ("4. Recall vs throughput",
-         _md_tables_to_html(_headline_tables(summary)),
+         _md_tables_to_html(_provenance.section4_note(summary)
+                            + _headline_tables(summary)),
          figures("pareto-") + figures("paretozoom-") + figures("qpsatrecall-") + figures("latency-")
          + _md_tables_to_html(_disclosures.structural_lines(records, _label))),
         ("5. Index build cost",

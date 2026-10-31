@@ -27,6 +27,7 @@ for candidate in (VB_ROOT, "/opt", os.path.dirname(os.path.abspath(__file__))):
         sys.path.insert(0, candidate)
 
 from report import charts, loaders, scope  # noqa: E402
+from report import provenance as _provenance  # noqa: E402
 from report import measurement_versions as versions  # noqa: E402
 from report.render import (adopt_presentation as render_adopt_presentation,  # noqa: E402
                            render_html, render_markdown)
@@ -632,13 +633,19 @@ def summarize(records: List[Dict[str, Any]],
     # An engine that spent the phase against its cgroup limit was reclaiming
     # continuously, so its numbers describe the memory budget and not the
     # implementation. Nothing in the records shows this.
-    limit = (((manifest or {}).get("config") or {})
-             .get("resolved_resources") or {}).get("server_memory_bytes")
+    #
+    # The limit is the series' own engine's, from `engines_resolved`, and not
+    # `config.resolved_resources` -- that key is whichever engine
+    # `set_config` saw last (mongodb's in one `full-20260825` snapshot,
+    # AliSQL's in another). Older manifests fall back to it, and the row says
+    # so for §2 to state.
     for name, rows in sorted((memory or {}).items()):
         from report.loaders import ceiling_pressure
+        limit, limit_source = _provenance.series_memory_limit(manifest, name)
         pressure = ceiling_pressure(rows, limit)
         if not pressure:
             continue
+        pressure["limit_source"] = limit_source
         engine = name.split("-", 1)[0]
         pressure["engine"] = engine
         pressure["series"] = name
@@ -941,7 +948,7 @@ def summarize(records: List[Dict[str, Any]],
     # slow, because nothing distinguished "did not run" from "ran and produced
     # no measurement".
     measured = {r.get("engine") for r in recall_records}
-    for phase in (manifest or {}).get("phases", []):
+    for phase in _provenance.latest_attempts((manifest or {}).get("phases")):
         engine = phase.get("engine")
         if (phase.get("phase") == "ann" and phase.get("status") == "completed"
                 and engine and engine not in measured):
@@ -959,7 +966,9 @@ def summarize(records: List[Dict[str, Any]],
     # build would not fit the server limit) is neither: it carries its reason
     # and is reported as a refusal, not as a crash.
     summary.setdefault("refused_phases", [])
-    for phase in (manifest or {}).get("phases", []):
+    # The last attempt per unit: a failure a later attempt fixed is history,
+    # not a hole in the results.
+    for phase in _provenance.latest_attempts((manifest or {}).get("phases")):
         if phase.get("status") == "refused":
             summary["refused_phases"].append(phase)
         elif phase.get("status") != "completed":
@@ -1259,6 +1268,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     # persisted there is inherited by every later reader.
     measured = scope.scope_of(manifest)
     records, out_of_scope = scope.narrow_to_measured_scope(records, manifest)
+    # Then per file: a pair the phase log names is not enough, because the
+    # attempt it names may not be the one that wrote the file -- see
+    # `report/provenance.py` for `full-20260825`, whose M=16 recall table
+    # stood under a manifest naming M=6 attempts.
+    records, unprovenanced, ann_provenance = \
+        _provenance.split_by_provenance(records, manifest)
+    if unprovenanced:
+        print(f"[report] excluded "
+              f"{sum(r['records'] for r in unprovenanced)} recall record(s) "
+              f"from {sum(r['files'] for r in unprovenanced)} result file(s) "
+              f"that no ann attempt of this run wrote or reused; §2 Validity "
+              f"names them.")
+    if ann_provenance["counts"][_provenance.UNVERIFIED]:
+        print(f"[report] {ann_provenance['counts'][_provenance.UNVERIFIED]} "
+              f"recall record(s) come from ann attempts that recorded no file "
+              f"list; they are labelled unverified.")
     # The PAIRS first, because that is the unit the narrowing works in. The
     # two axis lists are printed under it as the sets the pairs are drawn
     # from and as what each unrecorded-axis warning is about -- printing only
@@ -1381,6 +1406,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # it with `.get`, like every other optional notice, so a summary built by
     # hand -- several tests build one -- simply has nothing to say.
     summary["out_of_scope_ann"] = out_of_scope
+    # Same reasoning: the census is of records `summarize` never sees.
+    summary["unprovenanced_ann"] = unprovenanced
+    summary["ann_provenance"] = ann_provenance
     chart_paths: Dict[str, Dict[str, str]] = {}
 
     for dataset in summary["datasets"]:
