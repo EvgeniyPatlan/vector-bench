@@ -734,43 +734,9 @@ def summarize(records: List[Dict[str, Any]],
                 frontier = pareto_frontier(points)
                 if not frontier:
                     continue
-                # QPS at a recall floor is the comparison an operator actually
-                # makes: "how fast is it, at accuracy I can accept?"
-                entry: Dict[str, Any] = {"points": len(points)}
-                # Which storage engine reached each floor, not only how fast. The
-                # frontier spans every configuration swept, so on the tuned pass
-                # "MariaDB 12.3: 1,176 QPS" is a MyISAM result -- printing it
-                # unattributed credits it to the default build.
-                entry["storage_engines"] = sorted(
-                    {p.get("storage_engine") for p in points if p.get("storage_engine")})
-                for floor in (0.90, 0.95, 0.99):
-                    qualifying = [p for p in frontier if (p.get("recall_at_k") or 0) >= floor]
-                    best = max(qualifying, key=lambda p: p["qps"]) if qualifying else None
-                    entry[f"qps_at_recall_{int(floor * 100)}"] = best["qps"] if best else None
-                    entry[f"qps_at_recall_{int(floor * 100)}_storage"] = (
-                        best.get("storage_engine") if best else None)
-                    entry[f"qps_at_recall_{int(floor * 100)}_recall"] = (
-                        best.get("recall_at_k") if best else None)
-                entry["max_recall"] = max((p.get("recall_at_k") or 0) for p in frontier)
-                # The floor columns compare engines at an accuracy the operator
-                # accepts, which is only a comparison if both engines have
-                # measurements near it. ef_search cannot go below k and MHNSW
-                # exposes no ef_construction, so with M pinned there is no MariaDB
-                # configuration returning recall below about 0.975: its 0.90 and
-                # 0.95 figures are one measurement printed twice. Recording the
-                # lowest recall reached is what lets the report say so.
-                entry["min_recall"] = min((p.get("recall_at_k") or 0) for p in points)
-                for floor in (0.90, 0.95, 0.99):
-                    if entry[f"qps_at_recall_{int(floor * 100)}"] is None:
-                        continue
-                    if entry["min_recall"] > floor:
-                        summary["recall_floor_gaps"].append({
-                            "engine": engine, "dataset": dataset, "floor": floor,
-                            "lowest_recall": entry["min_recall"],
-                            "measured_at": entry[f"qps_at_recall_{int(floor * 100)}_recall"],
-                            "qps": entry[f"qps_at_recall_{int(floor * 100)}"],
-                        })
-                per_engine[engine] = entry
+                per_engine[engine] = _floor_entry(
+                    points, frontier, records, manifest or {}, engine,
+                    dataset, resource_pass, summary["recall_floor_gaps"])
             if per_engine:
                 # Keyed by the pair, and `render._headline_tables` emits one table
                 # per pass with the pass in its heading. The pass is a property of
@@ -927,6 +893,13 @@ def summarize(records: List[Dict[str, Any]],
     from report.loaders import calibration_targets, operating_points
     summary["operating_points"] = operating_points(records)
     summary["calibration_targets"] = calibration_targets(records)
+    # The cross-engine concurrency headline, built from the same operating
+    # points so a unit that missed its recall target is unranked here and
+    # marked in the table by one derivation. Client-bound points never set a
+    # peak; see `report/operating.py`.
+    from report.operating import concurrency_peaks
+    summary["concurrency_peaks"] = concurrency_peaks(
+        records, summary["operating_points"])
 
     # PR 5 §5.2. Built here for the reason `filter_strategies` and
     # `churn_during_writes` are: the matching rule is the correctness
@@ -975,6 +948,87 @@ def summarize(records: List[Dict[str, Any]],
             summary["failed_phases"].append(phase)
 
     return summary
+
+
+
+def _floor_entry(points: List[Dict[str, Any]],
+                 frontier: List[Dict[str, Any]],
+                 records: List[Dict[str, Any]], manifest: Dict[str, Any],
+                 engine: str, dataset: str, resource_pass: Any,
+                 gaps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """§4's figures for one engine: the reference build's, and the sweep's.
+
+    QPS at a recall floor is the comparison an operator actually makes: "how
+    fast is it, at accuracy I can accept?" -- and it is only that comparison
+    when the figure describes the index the rest of the report measured. On
+    `full-20260825` it did not: one frontier over every build swept gave
+    Percona Search 138 / 124 / 88 from the unquantized index, beside load,
+    build and concurrency figures from the scalar one, which peaks at 0.892.
+    So the unprefixed `qps_at_recall_N` fields -- the headline, the floor
+    chart, `recall_floor_gaps` -- are taken from the reference build alone
+    (`report/builds.py` says where it comes from) and are None where that
+    build never reached the floor, whatever another build did. The `best_`
+    fields keep the whole sweep's frontier for the second table, and every
+    figure in both carries the build it came from (`_build`, the
+    `build_signature`; `_build_label`, the words printed under it).
+    """
+    from report import builds
+    from report.loaders import pareto_frontier
+
+    build, source = builds.reference_build(points, records, manifest, engine,
+                                           dataset, resource_pass)
+    reference = ([p for p in points if builds.matches(p, build)]
+                 if build is not None else [])
+    reference_frontier = pareto_frontier(reference)
+
+    entry: Dict[str, Any] = {
+        "reference_build": build,
+        "reference_build_label": builds.spell_build(build),
+        "reference_source": source,
+        "points": len(reference),
+        "sweep_points": len(points),
+        "sweep_builds": len({builds.build_signature(p) for p in points}),
+        # Which storage engine reached each floor, not only how fast. The
+        # frontier spans every configuration swept, so on the tuned pass
+        # "MariaDB 12.3: 1,176 QPS" was a MyISAM result -- printing it
+        # unattributed credits it to the default build.
+        "storage_engines": sorted({p.get("storage_engine") for p in points
+                                   if p.get("storage_engine")}),
+    }
+    entry.update(builds.floor_figures(reference_frontier, ""))
+    entry.update(builds.floor_figures(frontier, "best_"))
+    # The reference build's ceiling, which is what the "—" footnote prints:
+    # "its reference build peaks at 0.892" is the sentence the 25 Aug post
+    # needed and did not have.
+    entry["reference_max_recall"] = (
+        max((p.get("recall_at_k") or 0) for p in reference)
+        if reference else None)
+    entry["max_recall"] = entry["reference_max_recall"]
+    # The floor columns compare engines at an accuracy the operator accepts,
+    # which is only a comparison if both engines have measurements near it.
+    # ef_search cannot go below k and MHNSW exposes no ef_construction, so
+    # with M pinned there is no MariaDB configuration returning recall below
+    # about 0.975: its 0.90 and 0.95 figures are one measurement printed
+    # twice. Recording the lowest recall reached is what lets the report say
+    # so -- of the reference build, because that is what the cells describe.
+    entry["min_recall"] = (min((p.get("recall_at_k") or 0) for p in reference)
+                           if reference else None)
+    entry["sweep_min_recall"] = min((p.get("recall_at_k") or 0)
+                                    for p in points)
+    entry["sweep_max_recall"] = max((p.get("recall_at_k") or 0)
+                                    for p in frontier)
+    for floor in builds.FLOORS:
+        key = f"qps_at_recall_{int(floor * 100)}"
+        if entry[key] is None:
+            continue
+        if entry["min_recall"] > floor:
+            gaps.append({
+                "engine": engine, "dataset": dataset, "floor": floor,
+                "lowest_recall": entry["min_recall"],
+                "measured_at": entry[f"{key}_recall"],
+                "qps": entry[key],
+            })
+    return entry
 
 
 def attach_peak_rss(records: List[Dict[str, Any]],

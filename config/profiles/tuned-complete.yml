@@ -59,7 +59,13 @@ default_resource_pass: tuned
 
 resources:
   cpu:
-    client_cpus: 16
+    # One client CPU per two clients of the largest count below, never fewer
+    # than four: 16 for the 1-32 sweep, which is what this line pinned by hand
+    # before `auto` existed. The ann fingerprint hashes the resolved count, so
+    # the switch did not move this profile's results tree; a host whose pool
+    # cannot spare 16 after the server set now refuses the run instead of
+    # quietly sharing cores.
+    client_cpus: auto
   # No extras override: the tuned pass resolves memory from host_fraction and
   # sweeps InnoDB only, which is what this profile wants.
 

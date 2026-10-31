@@ -261,9 +261,46 @@ class ResolvedResources:
         }
 
 
+#: The fewest client CPUs `client_cpus: auto` resolves to. The pass default is
+#: 4, and a one-client sweep needs no fewer than it already gets.
+AUTO_CLIENT_CPUS_FLOOR = 4
+
+
+def auto_client_cpus(max_clients: int) -> int:
+    """What `client_cpus: auto` resolves to for a sweep up to `max_clients`.
+
+    One client CPU per two clients, never fewer than four. Each client is a
+    forked OS process that spends most of a query waiting on the server, so
+    two share a CPU without becoming the ceiling; one per client would take
+    from the server the cores the comparison is about. `tuned-complete`
+    pinned 16 by hand for its 32-client sweep, which is this rule.
+    """
+    return max(AUTO_CLIENT_CPUS_FLOOR, -(-int(max_clients) // 2))
+
+
+def _is_auto(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() == "auto"
+
+
+def profile_max_clients(profile: Dict[str, Any]) -> Optional[int]:
+    """The largest client count the profile's concurrency sweep asks for."""
+    counts = ((profile or {}).get("ops", {}) or {}).get("client_counts") or [1]
+    try:
+        return max(int(c) for c in counts)
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_resources(resources: Dict[str, Any], engine: str,
-                      sysinfo: Any) -> ResolvedResources:
-    """Turn a resource profile plus the detected hardware into concrete limits."""
+                      sysinfo: Any,
+                      max_clients: Optional[int] = None) -> ResolvedResources:
+    """Turn a resource profile plus the detected hardware into concrete limits.
+
+    `max_clients` is the largest client count of the run's concurrency sweep,
+    which `client_cpus: auto` sizes the client cpuset from. Only a caller that
+    knows the profile can supply it, so auto without it is refused rather
+    than guessed.
+    """
     from harness.metrics.sysinfo import format_cpuset, recommended_cpuset
 
     cpu_cfg = resources.get("cpu", {}) or {}
@@ -278,7 +315,21 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     allow_smt = bool(cpu_cfg.get("allow_smt", False))
 
     want_server = int(cpu_cfg.get("server_cpus", 0) or 0)
-    want_client = int(cpu_cfg.get("client_cpus", 2) or 2)
+    # `auto` sizes the client set from the sweep instead of a hand-kept pin.
+    # A 32-client sweep from the pass default of 4 client CPUs measures the
+    # clients' ceiling and publishes it as the engine's, which is why
+    # `tuned-complete` pinned 16 by hand -- and nothing kept that number in
+    # step with its `client_counts`.
+    auto_client = _is_auto(cpu_cfg.get("client_cpus"))
+    if auto_client:
+        if not max_clients:
+            raise ValueError(
+                "resources.cpu.client_cpus is `auto`, which is sized from the "
+                "largest concurrency client count, and none was given to "
+                "resolve it against")
+        want_client = auto_client_cpus(max_clients)
+    else:
+        want_client = int(cpu_cfg.get("client_cpus", 2) or 2)
 
     # Resolve against the topology we were handed, not the live machine. In a
     # run they are the same host; in anything that passes a topology in, they
@@ -293,6 +344,23 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     if want_server <= 0:
         # "all available", minus what the client needs.
         want_server = max(1, len(pool) - want_client)
+
+    if auto_client and want_server + want_client > len(pool):
+        # A FAILURE, not the warning a numeric pin gets below. A pin is an
+        # operator's explicit choice and sharing cores is a visible trade they
+        # made; `auto` is a promise that the clients will not be the ceiling,
+        # and quietly shrinking the set breaks it in exactly the runs -- the
+        # big sweeps -- where it matters. Taken after the server set, so the
+        # server keeps the cores the pass gave it.
+        left = max(0, len(pool) - want_server)
+        raise ValueError(
+            f"resources.cpu.client_cpus: auto needs {want_client} client "
+            f"CPU(s) for a sweep up to {max_clients} clients, but the "
+            f"{len(pool)}-CPU pool (prefer_cores={prefer}, "
+            f"allow_smt={allow_smt}) has only {left} left after the "
+            f"{want_server}-CPU server set. Lower the largest client count, "
+            f"give the server fewer CPUs, or pin client_cpus to a number to "
+            f"accept shared cores.")
 
     if want_server + want_client > len(pool):
         warnings.append(
@@ -351,7 +419,13 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         mem_cfg.get("server_limit_gb", ""), mem_cfg.get("host_fraction", ""),
         mem_cfg.get("buffer_fraction", ""), mem_cfg.get("graph_cache_fraction", ""),
         mem_cfg.get("maintenance_fraction", ""),
-        cpu_cfg.get("server_cpus", ""), cpu_cfg.get("client_cpus", ""),
+        # The RESOLVED count for `auto`, the declared one otherwise. The
+        # signature keys the shared ann tree, and `auto` over a 1-32 sweep is
+        # the same 16 CPUs `tuned-complete` used to pin -- hashing the word
+        # would move that profile's tree and re-measure every recall point
+        # for nothing.
+        cpu_cfg.get("server_cpus", ""),
+        want_client if auto_client else cpu_cfg.get("client_cpus", ""),
         build_cfg.get("threads", ""), build_cfg.get("max_threads", ""),
     ))
 

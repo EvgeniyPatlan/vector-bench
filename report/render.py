@@ -729,6 +729,10 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
     if scaling:
         parts.append(scaling)
 
+    fixed = _fixed_ef_section(records or [])
+    if fixed:
+        parts.append(fixed)
+
     if summary.get("recall_floor_gaps"):
         parts.append(
             "\n### Recall floors an engine never approached\n\n"
@@ -1076,6 +1080,41 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
     return "".join(parts)
 
 
+def _fixed_ef_section(records: List[Dict[str, Any]]) -> str:
+    """Validity: throughput measured at one ef_search, not at one recall.
+
+    `ef_mode: fixed` gives every engine the same `ef_search`, which is the
+    same *intention* and not the same accuracy -- two engines at ef 100 can
+    sit at recall 0.98 and 0.80, and the faster one may simply be doing less
+    work per query. §6 says so for the operating-point table; a reader who
+    starts at §7's throughput needs it in Validity, with the ef named.
+    """
+    from report.operating import is_fixed_ef
+    # `is_fixed_ef`, not `ef_mode == "fixed"`: records from before ops
+    # measurement version 4 carry no `ef_mode` and WERE fixed -- the 25 Aug
+    # run is one, and it is the run this section was written for.
+    fixed = [r for r in records
+             if r.get("phase") in ("concurrency", "filtered", "churn")
+             and is_fixed_ef(r)]
+    if not fixed:
+        return ""
+    efs = sorted({r.get("ef_search") for r in fixed
+                  if r.get("ef_search") is not None})
+    named = ", ".join(str(ef) for ef in efs) or "unrecorded"
+    return (
+        "\n### Throughput at a fixed ef_search, not at a fixed recall\n\n"
+        f"This run measured at a fixed ef -- `ef_mode: fixed`, or a harness "
+        f"from before ops measurement version 4, which had no other mode and "
+        f"records no `ef_mode`: every engine's concurrency, "
+        f"filtered and churn figures were measured at ef_search = {named}, "
+        f"whatever recall that bought each engine. Throughput is therefore "
+        f"**not compared at equal recall** in §7-§9 -- an engine with a "
+        f"higher QPS there may be answering a cheaper, less accurate query. "
+        f"The Recall@k column beside each figure is the measure of how far "
+        f"apart they were; `ef_mode: calibrated` holds every engine to one "
+        f"recall target instead.\n")
+
+
 def _scaling_refused_section(summary: Dict[str, Any]) -> str:
     """Validity: the scaling efficiencies this report refuses to publish.
 
@@ -1369,13 +1408,14 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
                     if (value != "—" and at is not None and lowest is not None
                             and lowest > floor / 100.0):
                         value += " †"
-                    return value
+                    return _with_build(value, entry.get(
+                        f"qps_at_recall_{floor}_build_label"))
 
                 # The range, not only the best. Two identical floor columns mean
                 # the engine has no measurement between them, and the lowest recall
                 # it reached is the number that says so.
-                low, high = entry.get("min_recall"), entry.get("max_recall", 0)
-                span = f"{low:.4f} to {high:.4f}" if low is not None else f"{high:.4f}"
+                span = _recall_span(entry.get("min_recall"),
+                                    entry.get("max_recall"))
                 rows.append([
                     _label(engine),
                     cell(90), cell(95), cell(99),
@@ -1389,8 +1429,9 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
             ))
             parts.append(
                 "\n_QPS at a recall floor is the comparison an operator makes: how fast "
-                "is the engine at an accuracy I can accept. A dash means the engine did "
-                "not reach that recall anywhere in the swept grid._\n"
+                "is the engine at an accuracy I can accept. A dash means the engine's "
+                "reference build did not reach that recall; another build may have, "
+                "and the sweep table below says which._\n"
                 "\n_Each cell also carries the recall the figure was measured at. "
                 "A frontier reports the fastest configuration at or above the "
                 "floor, and that configuration is frequently well above it, so two "
@@ -1406,7 +1447,112 @@ def _headline_tables(summary: Dict[str, Any]) -> str:
                 "Lowering the graph degree M is what would produce points there; this "
                 "run pins M=16 for every engine._\n"
             )
+            parts.append(_reference_build_notes(per_engine))
+            parts.append(_sweep_table(per_engine))
     return "".join(parts) or "_No recall/QPS data in this run._\n"
+
+
+#: The heading of §4's second table. A constant because the tests split the
+#: section on it: the headline and the sweep must never be read as one table.
+SWEEP_TABLE_HEADING = "**Best of the sweep, every build**"
+
+
+def _with_build(value: str, label: Optional[str]) -> str:
+    """A floor figure with the build it came from on the line below it.
+
+    `full-20260825` printed Percona Search's 138 with nothing to say it came
+    from the unquantized index while every other figure for the engine came
+    from the scalar one. A number that names its build cannot be mistaken
+    for another build's.
+    """
+    if value == "—" or not label:
+        return value
+    return f"{value}<br>`{label}`"
+
+
+def _recall_span(low: Optional[float], high: Optional[float]) -> str:
+    if high is None:
+        return "—"
+    return f"{low:.4f} to {high:.4f}" if low is not None else f"{high:.4f}"
+
+
+def _reference_build_notes(per_engine: Dict[str, Any]) -> str:
+    """What the headline was taken from, and why a row holds dashes.
+
+    One sentence per engine whose reference build left a cell empty, giving
+    the build's own ceiling: "its reference build peaks at recall 0.892" is
+    what the 25 Aug post needed beside Percona Search, and printed 138 from
+    another index instead.
+    """
+    lines = []
+    for engine, entry in sorted(per_engine.items()):
+        build = entry.get("reference_build_label") or "not recorded"
+        if not any(entry.get(f"qps_at_recall_{f}") is None
+                   for f in (90, 95, 99)):
+            continue
+        source = entry.get("reference_source") or ""
+        if entry.get("reference_build") is None and source.startswith(
+                "ambiguous"):
+            lines.append(
+                f"- **{_label(engine)}**: the reference build is ambiguous "
+                f"-- {source.split(': ', 1)[-1]} -- so no headline figure is "
+                f"printed rather than one pooled across them. The sweep "
+                f"table below names each build's figures.\n")
+        elif entry.get("reference_build") is None:
+            lines.append(
+                f"- **{_label(engine)}**: no reference build is recorded for "
+                f"this run and the grid swept "
+                f"{entry.get('sweep_builds', 0)} builds, so no headline "
+                f"figure is printed rather than the fastest of them. The "
+                f"sweep table below has each build's figures, named.\n")
+        elif entry.get("reference_max_recall") is None:
+            lines.append(
+                f"- **{_label(engine)}**: no recall point was measured at its "
+                f"reference build (`{build}`), so every floor reads \"—\". "
+                f"The sweep table below has the builds that were measured.\n")
+        else:
+            lines.append(
+                f"- **{_label(engine)}**: its reference build (`{build}`) "
+                f"peaks at recall {entry['reference_max_recall']:.3f}; a "
+                f"\"—\" means that build has no point at or above the floor, "
+                f"whatever another build reached.\n")
+    head = ("\n_Every headline figure is the engine's **reference build** -- "
+            "the index the ops pass builds, so the number describes the same "
+            "index as §5-§9 -- and names it under the number._\n")
+    return head + ("\n" + "".join(lines) if lines else "")
+
+
+def _sweep_table(per_engine: Dict[str, Any]) -> str:
+    """The fastest figure at each floor over EVERY build the grid swept.
+
+    Real measurements, kept because a reader tuning an engine wants them, and
+    never in the headline, because they are not the index the rest of the
+    report measured. Each cell names its build.
+    """
+    rows = []
+    for engine, entry in sorted(per_engine.items()):
+        def cell(floor: int) -> str:
+            value = _fmt(entry.get(f"best_qps_at_recall_{floor}"), 0)
+            at = entry.get(f"best_qps_at_recall_{floor}_recall")
+            if value != "—" and at is not None:
+                value += f" @{at:.3f}"
+            return _with_build(value, entry.get(
+                f"best_qps_at_recall_{floor}_build_label"))
+
+        rows.append([_label(engine), cell(90), cell(95), cell(99),
+                     _recall_span(entry.get("sweep_min_recall"),
+                                  entry.get("sweep_max_recall")),
+                     str(entry.get("sweep_builds", 0)),
+                     str(entry.get("sweep_points", 0))])
+    return (f"\n{SWEEP_TABLE_HEADING}\n\n"
+            "_The same floors over every build the grid swept, including "
+            "builds the ops pass never measured. Not a headline: a cell here "
+            "may come from a different index than every other section's "
+            "figures for the engine, and says which._\n"
+            + _md_table(["Engine", "Best QPS @ recall≥0.90",
+                         "Best QPS @ recall≥0.95", "Best QPS @ recall≥0.99",
+                         "Sweep recall range", "Builds", "Sweep points"],
+                        rows))
 
 
 # The ops harness stamps a storage engine on every unit and defaults to
@@ -2029,6 +2175,7 @@ def _engines_without_an_operating_point(summary: Dict[str, Any]
 # defect exactly, one axis further out.
 def _concurrency_table(summary: Dict[str, Any]) -> str:
     rows = []
+    points = _operating_point_index(summary)
     for r in sorted(summary.get("concurrency", []),
                     key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
                                    # All four ops-unit axes sort ahead of the
@@ -2093,14 +2240,116 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _fmt(float(pool) if pool is not None else None, 0),
             _fmt(extra.get("query_reuse"), 2, "x"),
             _client_cpu_cell(extra),
+            *_operating_point_cells(r, points),
         ])
     return _md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Clients",
          "QPS", "Spread", "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
          "Scaling efficiency", "Queries in service", "Query pool", "Reuse",
-         "Client CPU"],
+         "Client CPU", "Calibrated ef", "Calibration recall"],
         rows,
-    ) + BUILD_MODE_COLUMN_NOTE + _concurrency_notes(summary)
+    ) + BUILD_MODE_COLUMN_NOTE + OPERATING_POINT_NOTE \
+        + _concurrency_notes(summary)
+
+
+#: What the two columns every concurrency and churn table ends with --
+#: "Calibrated ef" and "Calibration recall" -- mean. Spelled as literals in
+#: each header rather than unpacked from a constant, because
+#: `tests/test_e10_report_unit_join_keys.py` finds the unit tables by an AST
+#: scan for literal header lists. The calibration point is what makes a
+#: throughput figure comparable: the policy chose that ef because the sweep
+#: measured the target recall there.
+OPERATING_POINT_NOTE = (
+    "\n_**Calibrated ef** is the ef_search the calibration chose for this "
+    "unit and every throughput figure in the row was measured at; "
+    "**Calibration recall** is the recall the sweep measured there, which is "
+    "the accuracy the throughput was bought at. A status beside it means the "
+    "sweep did not put the engine at the target -- `target_unreached` "
+    f"{UNREACHED_MARK} (never got there: the throughput is at a lower recall) "
+    f"or `floor_above_target` {FLOOR_MARK} (could not be slowed to it) -- and "
+    "that unit is not ranked in the peak-throughput headline. "
+    "`<ef> (fixed)` with *not calibrated* means the unit ran at a "
+    "declared ef_search (`ef_mode: fixed`, or a record from before ops "
+    "measurement version 4), so its throughput is not at equal recall with "
+    "any other row._\n")
+
+
+#: The two cells of a unit measured at a declared ef. Words, not a dash: a
+#: dash reads as "not recorded", and the point is that no recall target was
+#: pursued, so the QPS beside it is not at any engine's equal recall.
+FIXED_EF_RECALL_CELL = "not calibrated"
+
+
+def _operating_point_cells(row: Dict[str, Any], points: Any) -> List[str]:
+    from report.operating import UNRANKED_STATUSES, is_fixed_ef, status_of
+    point = points.find(row)
+    status = status_of(row, point)
+    ef = (point or {}).get("ef_search")
+    # Records only: a churn-under-writes row is derived and carries no
+    # `extra`, so the pre-version-4 rule would read every one as fixed.
+    if point is None and row.get("phase") and is_fixed_ef(row):
+        return [f"{_fmt(row.get('ef_search'), 0)} (fixed)",
+                FIXED_EF_RECALL_CELL]
+    if ef is None and point is None:
+        return ["—", "—"]
+    recall = _fmt((point or {}).get("recall_at_k"), 4)
+    if status in UNRANKED_STATUSES:
+        mark = UNREACHED_MARK if status == "target_unreached" else FLOOR_MARK
+        recall = f"{recall} {status} {mark}"
+    return [_fmt(ef, 0), recall]
+
+
+def _operating_point_index(summary: Dict[str, Any]) -> Any:
+    from report.operating import OperatingPointIndex
+    return OperatingPointIndex(summary.get("operating_points") or [])
+
+
+def _peak_throughput_table(summary: Dict[str, Any]) -> str:
+    """The cross-engine concurrency headline, ranked only where comparable.
+
+    Built from `summary["concurrency_peaks"]` (`report/operating.py`):
+    client-bound points never set a peak, and a unit whose calibration missed
+    the target shows its status where the number would be and sorts after
+    every ranked unit -- its throughput is at a recall the others were not
+    held to.
+    """
+    peaks = summary.get("concurrency_peaks") or []
+    if not peaks:
+        return ""
+    rows = []
+    rank = 0
+    for p in peaks:
+        if p["ranked"]:
+            rank += 1
+            figure = _fmt(p["peak_qps"], 0)
+            clients = str(p.get("peak_clients") or "—")
+        else:
+            figure = f"not ranked: {p.get('status') or 'no point'}"
+            clients = "—"
+        rows.append([
+            _label(p.get("engine") or "?"), p.get("dataset") or "?",
+            p.get("resource_pass") or "—", _fmt(p.get("m"), 0),
+            p.get("build_mode") or "—", _storage(p),
+            str(rank) if p["ranked"] else "—",
+            figure, clients, _fmt(p.get("scaling_efficiency"), 2),
+            (f"{_fmt(p.get('ef_search'), 0)} (fixed)" if p.get("fixed_ef")
+             else _fmt(p.get("ef_search"), 0)),
+            (FIXED_EF_RECALL_CELL if p.get("fixed_ef")
+             else _fmt(p.get("calibration_recall"), 4)),
+            str(p.get("client_bound_excluded") or 0),
+        ])
+    return (
+        "\n**Peak throughput.** Each unit's highest concurrency QPS and the "
+        "client count it scaled to, ranked within the run. Client-bound "
+        f"points ({CLIENT_BOUND_MARK}) are excluded -- the clients were the "
+        "ceiling there -- and counted in the last column; a unit whose "
+        "calibration missed the recall target is listed but not ranked.\n"
+        + _md_table(["Engine", "Dataset", "Pass", "M", "Build mode",
+                     "Storage", "Rank", "Peak QPS", "At clients",
+                     "Scaling efficiency",
+                     "Calibrated ef", "Calibration recall",
+                     "Client-bound points excluded"], rows)
+        + "\n")
 
 
 def _efficiency_cell(extra: Dict[str, Any]) -> str:
@@ -2595,7 +2844,19 @@ def _filtered_table(summary: Dict[str, Any]) -> str:
          "Recall near_fail", "pass/fail n", "QPS", "p99 (ms)", "Index used",
          "Short results", "Queries", "Iterative scan", "Tied with"],
         rows,
-    ) + TIE_COLUMN_NOTE
+    ) + TIE_COLUMN_NOTE + FILTERED_EF_NOTE
+
+
+#: Filtered search is not calibrated on its own. The harness substitutes the
+#: ef the UNFILTERED sweep chose and runs every predicate at it, so a filtered
+#: recall below the target is the predicate's cost at that ef, not a failed
+#: calibration -- and a reader who assumes each filtered point was tuned to
+#: the target reads the recall columns backwards.
+FILTERED_EF_NOTE = (
+    "\n_Filtered search reuses the unfiltered calibrated ef: every row here "
+    "ran at the ef_search the unfiltered sweep chose for its unit (§6), with "
+    "no calibration of its own, so a recall below the target is what the "
+    "predicate cost at that ef._\n")
 
 
 def _filter_column(record: Dict[str, Any]) -> str:
@@ -2740,6 +3001,7 @@ def _churn_table(summary: Dict[str, Any]) -> str:
     from report.churn_state import churn_measurements, maintenance_state
 
     measurements = list(churn_measurements(summary.get("churn", [])))
+    points = _operating_point_index(summary)
 
     # §5.1 item 6's comparison point for a churn row. The maintenance state
     # is in the key and that is the whole reason this table has a `Repair`
@@ -2805,14 +3067,15 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             _fmt(r.get("qps"), 0),
             _fmt_bytes(r.get("index_bytes")),
             tie_cells.get(id(r), TIE_ALONE_CELL),
+            *_operating_point_cells(r, points),
         ])
     return _md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
          "Repair", "Recall@k", "Recall drop vs baseline", "QPS", "Index size",
-         "Tied with"],
+         "Tied with", "Calibrated ef", "Calibration recall"],
         rows,
-    ) + BUILD_MODE_COLUMN_NOTE + TIE_COLUMN_NOTE + _churn_notes(summary) \
-        + _churn_during_writes_table(summary)
+    ) + BUILD_MODE_COLUMN_NOTE + TIE_COLUMN_NOTE + OPERATING_POINT_NOTE \
+        + _churn_notes(summary) + _churn_during_writes_table(summary)
 
 
 #: The order the churn states are measured in, which is the order they are
@@ -2881,6 +3144,7 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
     rows_in = summary.get("churn_during_writes") or []
     if not rows_in:
         return ""
+    points = _operating_point_index(summary)
     parts = [
         "\n**Reads while the engine is taking writes.** Every number in this "
         "table comes from one pool of readers measured twice: for 30 s before "
@@ -2947,11 +3211,13 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
             # them.
             (f"{s['served_concurrency']:,.2f} of {s.get('readers')}"
              if s.get("served_concurrency") is not None else "—"),
+            *_operating_point_cells(s, points),
         ])
     parts.append(_md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
          "Readers", "Reader p99", "p99 under writes", "Reader QPS",
-         "Writer rate", "Reads in service"],
+         "Writer rate", "Reads in service", "Calibrated ef",
+         "Calibration recall"],
         table_rows))
     if any(s.get("ratio_disagrees") for s in rows_in):
         parts.append(
@@ -3417,7 +3683,8 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "Scaling efficiency of 1.0 is linear scaling. **Spread** is the range "
         "across repeated measurement windows at that point; a dash means the "
         "point was measured once and carries no error bar.\n\n",
-        (_concurrency_table(summary) if summary.get("concurrency")
+        (_concurrency_table(summary) + _peak_throughput_table(summary)
+         if summary.get("concurrency")
          else _not_measured("concurrency", profile, records)),
     ]
     for stem, paths in sorted(chart_paths.items()):
@@ -4037,6 +4304,10 @@ def _md_tables_to_html(markdown_fragment: str) -> str:
 
 def _inline_md(text: str) -> str:
     escaped = _html.escape(text)
+    # The one tag a Markdown table cell may carry, and the only way to put a
+    # second line in one: §4 prints each figure's build UNDER the number.
+    # GitHub's renderer honours `<br>` in a cell; this converter escaped it.
+    escaped = escaped.replace("&lt;br&gt;", "<br>")
     # Order matters: bold before italic, code before both.
     while "`" in escaped:
         first = escaped.find("`")
@@ -4163,7 +4434,9 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
         # markdown left the page a reader actually opens still saying
         # "No data." for a workload the profile never ran.
         ("7. Concurrency scaling",
-         _md_tables_to_html(_concurrency_table(summary) if summary.get("concurrency")
+         _md_tables_to_html(_concurrency_table(summary)
+                            + _peak_throughput_table(summary)
+                            if summary.get("concurrency")
                             else _not_measured("concurrency", profile, records)),
          figures("concurrency-")
          + _md_tables_to_html(_disclosures.structural_lines(records, _label))),

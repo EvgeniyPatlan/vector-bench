@@ -1294,9 +1294,32 @@ def estimate_load_hours(profile: Dict[str, Any], engines: List[str],
     }
 
 
+def client_cpu_line(profile: Dict[str, Any],
+                    client_cpus: Dict[str, int]) -> Optional[str]:
+    """The resolved client cpuset size beside the largest client count.
+
+    Printed before the run because the two numbers are only meaningful
+    together: a 32-client sweep from 4 client CPUs measures the clients, and
+    the report can mark such a point hollow only after the hours are spent.
+    """
+    if not client_cpus:
+        return None
+    counts = ((profile or {}).get("ops", {}) or {}).get("client_counts") or [1]
+    largest = max(int(c) for c in counts)
+    sizes = ", ".join(f"{n} client CPU(s) ({name})"
+                      for name, n in client_cpus.items())
+    return f"clients   : {sizes} for up to {largest} clients"
+
+
 def print_load_estimate(profile: Dict[str, Any], engines: List[str],
                          datasets: List[str], passes: List[str],
-                         phases: List[str]) -> None:
+                         phases: List[str],
+                         client_cpus: Optional[Dict[str, int]] = None) -> None:
+    # Before the early return below: a short run still drives its largest
+    # client count from whatever the client cpuset is.
+    line = client_cpu_line(profile, client_cpus or {})
+    if line:
+        print(line)
     estimate = estimate_load_hours(profile, engines, datasets, passes, phases)
     # The gate is the whole run, not ingest alone. It used to be ingest, which
     # meant `smoke` -- 0.5 h of loading against a 3.5 h churn ceiling across

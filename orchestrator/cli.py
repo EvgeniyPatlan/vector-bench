@@ -45,7 +45,10 @@ from orchestrator.config import (available_profiles, dedupe,  # noqa: E402
                                  engines_outside_profile, load_engine,
                                  load_profile, load_resources,
                                  merge_resource_overrides, profile_engines,
-                                 profile_engines_problem, resolve_resources)
+                                 profile_engines_problem, profile_max_clients,
+                                 resolve_resources)
+from orchestrator.reference_build import (  # noqa: E402
+    reference_build_problem, resolve_reference_build)
 from orchestrator.manifest import Manifest, new_run_id, utcnow  # noqa: E402
 # The cost estimate lives in its own module; these are re-exported because
 # `webui/control.py` and `tests/test_config.py` import them from here and the
@@ -356,6 +359,18 @@ def _resume_target(profile: Dict[str, Any]) -> Optional[str]:
     return latest
 
 
+def _cpuset_size(cpuset: str) -> int:
+    """How many CPUs a `0-3,8,10-11` cpuset string names."""
+    size = 0
+    for part in cpuset.split(","):
+        if "-" in part:
+            low, high = part.split("-", 1)
+            size += int(high) - int(low) + 1
+        elif part.strip():
+            size += 1
+    return size
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if not docker_ctl.docker_available():
         print("cannot talk to the Docker daemon", file=sys.stderr)
@@ -482,7 +497,48 @@ def cmd_run(args: argparse.Namespace) -> int:
                   f"ground truth)", file=sys.stderr)
         return 3
 
-    print_load_estimate(profile, engines, datasets, passes, phases)
+    # Two refusals before anything is loaded, both for failures that would
+    # otherwise surface only in the report, hours later and quietly.
+    #
+    # The reference build: what each engine's headline figures will be taken
+    # from. One the ann grid does not contain turns a whole report row into
+    # "—"; one the ops pass does not build is the 25 Aug defect, floor
+    # figures from one index beside load and concurrency figures from
+    # another. Resolved here, on the host, and carried to the report through
+    # `engines.<name>.presentation` because the report cannot import this.
+    max_clients = profile_max_clients(profile)
+    reference_builds: Dict[str, Dict[str, Any]] = {e: {} for e in engines}
+    client_cpus: Dict[str, int] = {}
+    problems: List[str] = []
+    for resource_pass in passes:
+        resources = merge_resource_overrides(
+            load_resources(resource_pass), profile)
+        for engine in engines:
+            problem = reference_build_problem(engine, profile, resources,
+                                              resource_pass)
+            if problem:
+                problems.append(f"{resource_pass}: {problem}")
+            else:
+                reference_builds[engine][resource_pass] = \
+                    resolve_reference_build(engine, profile, resources,
+                                            resource_pass)
+        # `client_cpus: auto` fails here rather than mid-run when the
+        # topology cannot spare it after the server set. The cpuset is
+        # engine-invariant, so the first engine stands for all.
+        try:
+            client_cpus[resource_pass] = _cpuset_size(resolve_resources(
+                resources, engines[0], info,
+                max_clients=max_clients).client_cpuset)
+        except ValueError as exc:
+            problems.append(f"{resource_pass}: {exc}")
+    if problems:
+        print("\nrefusing to start:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
+
+    print_load_estimate(profile, engines, datasets, passes, phases,
+                        client_cpus=client_cpus)
 
     if _check_free_disk(paths, engines, datasets, passes) and not args.force:
         print("  Re-run with --force to start anyway.", file=sys.stderr)
@@ -563,7 +619,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "bench": docker_ctl.image_id(
                         engine_cfg.get("image", {}).get("bench", "")),
                 },
-                presentation=engines_mod.presentation(engine),
+                # Every pass's reference build, not this pass's alone:
+                # `set_engine` replaces the engine's entry on each call, so a
+                # per-pass value here would leave the manifest holding the
+                # last pass's and the report reading it for both.
+                presentation={**engines_mod.presentation(engine),
+                              "reference_builds": reference_builds[engine]},
             )
             for warning in resolved.warnings:
                 print(f"  ! {warning}")

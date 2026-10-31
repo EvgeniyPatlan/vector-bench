@@ -8,6 +8,7 @@ perfectly credible.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -4972,7 +4973,10 @@ class TestAFloorFigureSaysWhereItWasActuallyTaken:
         assert "218 †" not in table
 
     def test_the_marker_is_explained_under_the_table(self):
-        table = self._table(self._entry())
+        # Under the HEADLINE table: §4 now ends with the best-of-sweep table,
+        # so the last `| ---` on the page is that one's.
+        from report.render import SWEEP_TABLE_HEADING
+        table = self._table(self._entry()).split(SWEEP_TABLE_HEADING)[0]
         assert "†" in table.split("| ---")[-1]
         assert "not comparable" in table
 
@@ -4984,6 +4988,26 @@ class TestAFloorFigureSaysWhereItWasActuallyTaken:
     def test_a_missing_figure_still_reads_as_a_dash(self):
         entry = self._entry(qps_at_recall_99=None, qps_at_recall_99_recall=None)
         assert "—" in self._table(entry)
+
+    def test_a_floor_figure_is_never_taken_from_another_build(self):
+        """The 25 Aug run: Percona Search's scalar index -- the one every other
+        section measured -- peaks at recall 0.892, and the post printed 138 /
+        124 / 88 from the unquantized sweep. The headline says "—" with the
+        reference build's ceiling under it; the sweep table keeps 138 and
+        names the build it came from."""
+        from report.generate import summarize
+        from report.render import SWEEP_TABLE_HEADING, _headline_tables
+        from tests.test_e26_report_build_labels import (REFERENCE, _manifest,
+                                                         _mongodb_records)
+        table = _headline_tables(summarize(_mongodb_records(),
+                                           _manifest(REFERENCE)))
+        headline, sweep = table.split(SWEEP_TABLE_HEADING)
+        row = next(l for l in headline.splitlines() if l.startswith("| Percona"))
+        assert [c.strip() for c in row.strip("|").split("|")][1:4] == \
+            ["—", "—", "—"]
+        assert "0.892" in headline
+        row = next(l for l in sweep.splitlines() if l.startswith("| Percona"))
+        assert "138" in row and "quantization=none" in row
 
 
 class TestARunMeasuresEveryEngineByDefault:
@@ -5091,7 +5115,9 @@ class TestAProfileThatNamesItsEnginesGetsThem:
         from orchestrator import cli as cli_mod
         seen = {}
 
-        def _estimate(profile, engines, datasets, passes, phases):
+        # `**_kw` for `client_cpus`, which the estimate now prints beside the
+        # largest client count; this capture is about the engine list only.
+        def _estimate(profile, engines, datasets, passes, phases, **_kw):
             seen["estimate"] = list(engines)
 
         def _disk(paths, engines, datasets, passes):
@@ -8741,3 +8767,243 @@ class TestPublishableProfiles:
     def test_runs_reaches_ann_benchmarks(self):
         source = open(os.path.join(VB_ROOT, "orchestrator", "ann_pass.py")).read()
         assert '"--runs", str(profile.get("runs", 1))' in source
+
+
+# ---------------------------------------------------------------------------
+# F6: every engine declares the build its summary figures come from
+# ---------------------------------------------------------------------------
+
+def _profile_engines(profile):
+    from orchestrator.engines import known_engines
+    return list(profile.get("engines") or known_engines())
+
+
+class TestEachEngineDeclaresAReferenceBuild:
+    """`full-20260825` published Percona Search's QPS-at-recall from the
+    unquantized sweep beside load, build and concurrency figures from the
+    scalar index, and pgvector's and Valkey's from efC=400 beside ops figures
+    at 200 and at the server default. The reference build is the one the ops
+    pass builds, declared per engine and resolved per profile and pass, and
+    the run refuses a declaration the ann grid would never measure."""
+
+    @pytest.mark.parametrize("engine", ["mariadb", "mariadb123", "alisql",
+                                        "pgvector", "valkey", "mongodb",
+                                        "percona", "myvector"])
+    def test_every_engine_config_declares_one(self, engine):
+        runtime = load_engine(engine).get("runtime") or {}
+        assert runtime.get("reference_build"), engine
+
+    def test_the_registry_carries_it(self):
+        from orchestrator import engines
+        assert dict(engines.get("pgvector").reference_build) == {
+            "m": 16, "ef_construction": "ops"}
+
+    @pytest.mark.parametrize("profile_name", available_profiles())
+    @pytest.mark.parametrize("resource_pass", PASSES)
+    def test_every_shipped_profile_contains_its_reference_builds(
+            self, profile_name, resource_pass):
+        from orchestrator.reference_build import reference_build_problem
+        profile = load_profile(profile_name)
+        resources = merge_resource_overrides(load_resources(resource_pass),
+                                             profile)
+        for engine in _profile_engines(profile):
+            problem = reference_build_problem(engine, profile, resources,
+                                              resource_pass)
+            assert problem is None, (profile_name, resource_pass, problem)
+
+    def _resolve(self, engine, profile_name, resource_pass):
+        from orchestrator.reference_build import resolve_reference_build
+        profile = load_profile(profile_name)
+        resources = merge_resource_overrides(load_resources(resource_pass),
+                                             profile)
+        return resolve_reference_build(engine, profile, resources,
+                                       resource_pass)
+
+    def test_percona_search_is_scalar_in_the_tuned_pass(self):
+        assert self._resolve("mongodb", "tuned-complete", "tuned") == {
+            "quantization": "scalar"}
+
+    def test_percona_search_is_unquantized_in_the_normalized_pass(self):
+        assert self._resolve("mongodb", "main", "normalized") == {
+            "quantization": "none"}
+
+    def test_m_sweep_pins_percona_search_unquantized_even_when_tuned(self):
+        assert self._resolve("mongodb", "m-sweep", "tuned") == {
+            "quantization": "none"}
+
+    def test_pgvector_resolves_to_what_ops_builds(self):
+        """`harness_args` reads `ann.pgvector_ef_construction`, default 200,
+        in BOTH passes -- not the tuned extras' [64, 200, 400]."""
+        assert self._resolve("pgvector", "tuned-complete", "tuned") == {
+            "m": 16, "ef_construction": 200}
+
+    def test_valkey_is_the_server_default_named(self):
+        """The ops pass passes no EF_CONSTRUCTION; valkey-search's
+        `kDefaultEFConstruction` is 200."""
+        assert self._resolve("valkey", "tuned-complete", "tuned") == {
+            "m": 16, "ef_construction": 200}
+
+    def test_the_resolution_agrees_with_the_harness_argv(self):
+        from orchestrator import ops_pass
+        profile = load_profile("main")
+        profile["ann"]["pgvector_ef_construction"] = 64
+        argv = ops_pass.harness_args(profile, 16, "pgvector", None,
+                                     "InnoDB", "post")
+        assert argv[argv.index("--ef-construction") + 1] == "64"
+        assert ops_pass.ops_ef_construction("pgvector", profile) == 64
+
+    def test_a_build_outside_the_grid_is_refused(self):
+        """ops builds pgvector at efC=100 here, and the tuned grid sweeps
+        64/200/400: no recall point would ever describe the ops index."""
+        from orchestrator.reference_build import reference_build_problem
+        profile = load_profile("main")
+        profile["ann"]["pgvector_ef_construction"] = 100
+        resources = merge_resource_overrides(load_resources("tuned"), profile)
+        problem = reference_build_problem("pgvector", profile, resources,
+                                          "tuned")
+        assert problem and "ef_construction=100" in problem
+        assert "pgvector" in problem
+
+    def test_an_m_the_grid_does_not_sweep_is_refused(self):
+        from orchestrator.reference_build import reference_build_problem
+        profile = load_profile("main")
+        profile["ann"]["m_values"] = [8, 32]
+        resources = merge_resource_overrides(load_resources("normalized"),
+                                             profile)
+        problem = reference_build_problem("mariadb", profile, resources,
+                                          "normalized")
+        assert problem and "m=16" in problem
+
+    def test_the_run_records_them_in_the_manifest_presentation(self):
+        """The report cannot import the orchestrator, so the resolved builds
+        travel the way labels and colours do."""
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        body = source.split("def cmd_run")[1].split("\ndef ")[0]
+        assert "reference_build_problem" in body
+        assert '"reference_builds"' in body
+
+
+# ---------------------------------------------------------------------------
+# F3: client CPUs sized from the sweep
+# ---------------------------------------------------------------------------
+
+class TestClientCpusAuto:
+    """A 32-client sweep driven from 4 client CPUs measures the clients. The
+    tuned-complete profile pinned 16 by hand; `auto` derives it from the
+    largest client count and refuses, before the run, a topology that cannot
+    supply it."""
+
+    def _host(self, cpus):
+        info = type("I", (), {})()
+        info.cpu = type("C", (), {"arch": "x86_64", "hybrid": False,
+                                  "performance_cpus": list(range(cpus)),
+                                  "efficiency_cpus": [], "logical_cpus": cpus,
+                                  "physical_cores": cpus,
+                                  "threads_per_core": 1, "model": "Xeon"})()
+        info.total_ram_bytes = 256 * 1024 ** 3
+        return info
+
+    def _resources(self, server_cpus, client_cpus="auto"):
+        res = load_resources("tuned")
+        res["cpu"] = dict(res["cpu"], server_cpus=server_cpus,
+                          client_cpus=client_cpus, allow_smt=True)
+        return res
+
+    def test_auto_is_half_the_largest_client_count(self):
+        from orchestrator.config import auto_client_cpus
+        assert auto_client_cpus(32) == 16
+        assert auto_client_cpus(33) == 17
+
+    def test_auto_has_a_floor_of_four(self):
+        from orchestrator.config import auto_client_cpus
+        assert auto_client_cpus(1) == 4
+        assert auto_client_cpus(4) == 4
+
+    def test_a_one_to_thirty_two_sweep_resolves_to_sixteen(self):
+        resolved = resolve_resources(self._resources(0), "pgvector",
+                                     self._host(80), max_clients=32)
+        assert len(_expand_cpuset(resolved.client_cpuset)) == 16
+
+    def test_the_client_set_is_taken_after_the_server_set(self):
+        resolved = resolve_resources(self._resources(64), "pgvector",
+                                     self._host(80), max_clients=32)
+        assert resolved.server_cpuset == "0-63"
+        assert resolved.client_cpuset == "64-79"
+
+    def test_a_pool_that_cannot_supply_it_fails_with_both_numbers(self):
+        """80 CPUs, 64 to the server: 16 left, and a 1-64 sweep needs 32."""
+        with pytest.raises(ValueError) as excinfo:
+            resolve_resources(self._resources(64), "pgvector",
+                              self._host(80), max_clients=64)
+        message = str(excinfo.value)
+        assert "32" in message and "16" in message
+
+    def test_auto_without_a_client_count_is_refused(self):
+        with pytest.raises(ValueError):
+            resolve_resources(self._resources(0), "pgvector", self._host(80))
+
+    def test_a_numeric_pin_still_works_and_still_only_warns(self):
+        resolved = resolve_resources(self._resources(78, client_cpus=8),
+                                     "pgvector", self._host(80))
+        assert any("share cores" in w for w in resolved.warnings)
+
+    def test_tuned_complete_uses_auto_and_keeps_its_fingerprint(self):
+        """16 by hand and `auto` over 1-32 are the same 16 CPUs, so the shared
+        ann tree must not move: the fingerprint hashes the resolved count."""
+        profile = load_profile("tuned-complete")
+        assert profile["resources"]["cpu"]["client_cpus"] == "auto"
+        host = self._host(80)
+        auto = resolve_resources(
+            merge_resource_overrides(load_resources("tuned"), profile),
+            "pgvector", host, max_clients=32)
+        pinned_profile = copy.deepcopy(profile)
+        pinned_profile["resources"]["cpu"]["client_cpus"] = 16
+        pinned = resolve_resources(
+            merge_resource_overrides(load_resources("tuned"), pinned_profile),
+            "pgvector", host, max_clients=32)
+        assert auto.client_cpuset == pinned.client_cpuset
+        assert auto.pass_signature == pinned.pass_signature
+        assert ann_pass.ann_fingerprint(auto) == ann_pass.ann_fingerprint(pinned)
+
+    def test_no_other_shipped_profile_changed(self):
+        for name in available_profiles():
+            if name == "tuned-complete":
+                continue
+            cpu = (load_profile(name).get("resources") or {}).get("cpu") or {}
+            assert cpu.get("client_cpus") != "auto", name
+
+    def test_the_engine_plan_resolves_auto_from_the_profile(self, tmp_path):
+        """`engine_plan.resolve_engines` is what every unit is resolved by
+        since #76; without the client count `auto` would raise there."""
+        from orchestrator.engine_plan import resolve_engines
+        from orchestrator.manifest import Manifest
+        profile = load_profile("tuned-complete")
+        plan = resolve_engines(Manifest(str(tmp_path), "auto-1"), ["tuned"],
+                               ["pgvector"], profile, self._host(80), 0,
+                               set(), [], [])
+        resolved = plan.resolved[("tuned", "pgvector")]
+        assert len(_expand_cpuset(resolved.client_cpuset)) == 16
+
+    def test_the_run_resolves_with_the_largest_client_count(self):
+        from orchestrator.config import profile_max_clients
+        assert profile_max_clients(load_profile("tuned-complete")) == 32
+        source = open(os.path.join(VB_ROOT, "orchestrator", "cli.py")).read()
+        body = source.split("def cmd_run")[1].split("\ndef ")[0]
+        assert "max_clients=" in body
+
+    def test_the_estimate_prints_the_client_cpuset_beside_the_sweep(self):
+        from orchestrator.estimate import client_cpu_line
+        line = client_cpu_line({"ops": {"client_counts": [1, 4, 32]}},
+                               {"tuned": 16})
+        assert "16 client CPU(s)" in line and "32 clients" in line
+
+
+def _expand_cpuset(text):
+    cpus = set()
+    for part in text.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            cpus.update(range(int(lo), int(hi) + 1))
+        elif part:
+            cpus.add(int(part))
+    return cpus
