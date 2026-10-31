@@ -36,6 +36,8 @@ REFERENCE_AXES = ("m", "ef_construction", "quantization")
 SOURCE_MANIFEST = "manifest"
 SOURCE_OPS = "ops index_build record"
 SOURCE_SINGLE = "only build measured"
+#: Prefix of the source when a fallback matched more than one build.
+SOURCE_AMBIGUOUS = "ambiguous"
 
 FLOORS = (0.90, 0.95, 0.99)
 
@@ -186,7 +188,10 @@ def _from_ops(records: List[Dict[str, Any]], engine: str, dataset: str,
         if params["ef_construction"] is not None or extra.get(
                 "ef_construction_tunable"):
             build["ef_construction"] = params["ef_construction"]
-    return build or None
+    # Possibly empty: a record that names no axis still says the ops pass
+    # built ONE index, and `reference_build` refuses it if that matches more
+    # than one swept build rather than falling through to a guess.
+    return build
 
 
 def reference_build(points: List[Dict[str, Any]], records: List[Dict[str, Any]],
@@ -210,14 +215,38 @@ def reference_build(points: List[Dict[str, Any]], records: List[Dict[str, Any]],
     build = _from_manifest(manifest, engine, resource_pass)
     if build:
         return build, SOURCE_MANIFEST
-    build = _from_ops(records, engine, dataset, resource_pass)
-    if build:
-        return build, SOURCE_OPS
-    shapes = {tuple(sorted(build_params(p).items())) for p in points}
-    if len(shapes) == 1:
-        return ({axis: value for axis, value in shapes.pop()
-                 if value is not None}, SOURCE_SINGLE)
-    return None, None
+    build, source = _from_ops(records, engine, dataset, resource_pass), \
+        SOURCE_OPS
+    if build is None:
+        shapes = {tuple(sorted(build_params(p).items())) for p in points}
+        if len(shapes) != 1:
+            return None, None
+        build = {axis: value for axis, value in shapes.pop()
+                 if value is not None}
+        source = SOURCE_SINGLE
+    # A FALLBACK must name exactly one build. An archived Percona Search
+    # `index_build` record with no quantization falls back to {m: 16}, which
+    # matches the scalar AND the unquantized sweep -- the 25 Aug defect again,
+    # now labelled "ops index_build record"; an m-sweep whose ops record
+    # names no M is the same. The manifest's declaration is exempt: it is
+    # the build the ops pass was told to make, resolved on the host.
+    builds = {_build_shape(p) for p in points if matches(p, build)}
+    if len(builds) > 1:
+        return None, (f"{SOURCE_AMBIGUOUS}: the {source} names "
+                      f"{spell_build(build)}, which matches {len(builds)} "
+                      f"swept builds")
+    return build, source
+
+
+def _build_shape(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    """A build's identity for the ambiguity check, storage engine excluded.
+
+    Storage is excluded on purpose: InnoDB and MyISAM at one M are one
+    reference build measured in two storage engines, both of which the ops
+    pass also measures, and §4 names the storage that won each cell.
+    """
+    return (tuple(sorted(build_params(record).items())),
+            record.get("build_mode"))
 
 
 def floor_figures(frontier: List[Dict[str, Any]], prefix: str

@@ -65,6 +65,35 @@ def status_of(row: Dict[str, Any],
     return (row.get("extra") or {}).get("calibration_status")
 
 
+#: The first ops measurement version that calibrates ef_search and stamps
+#: `extra.ef_mode` (`harness/metrics/records.py`: "VERSION 4 chose ef_search
+#: instead of declaring it"). Every earlier record ran at the profile's
+#: declared `ops.ef_search` -- 100 on every engine -- and says nothing.
+FIRST_EF_MODE_VERSION = 4
+
+
+def is_fixed_ef(record: Dict[str, Any]) -> bool:
+    """Whether a throughput record was measured at a declared, fixed ef.
+
+    `extra.ef_mode == "fixed"`, or no `ef_mode` at all on a record from
+    before version 4. The second clause is the 25 Aug run: its records carry
+    neither key, so they are implicit version 1, they ran at ef_search 100,
+    and a report that read "no ef_mode" as "nothing to say" presented
+    engines at recall 0.98 and 0.80 as comparable throughput. A version that
+    is present and not an integer is NOT assumed fixed: the mixed-version
+    guard refuses such a record anyway, and guessing here would not help.
+    """
+    from report.measurement_versions import ops_measurement_version
+
+    extra = record.get("extra") or {}
+    mode = extra.get("ef_mode")
+    if mode is not None:
+        return mode == "fixed"
+    version = ops_measurement_version(record)
+    return (isinstance(version, int) and not isinstance(version, bool)
+            and version < FIRST_EF_MODE_VERSION)
+
+
 def concurrency_peaks(records: List[Dict[str, Any]],
                       points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The peak throughput of each concurrency unit, and the client count it
@@ -91,6 +120,7 @@ def concurrency_peaks(records: List[Dict[str, Any]],
         sample = rows[0]
         point = index.find(sample)
         status = status_of(sample, point)
+        fixed = point is None and is_fixed_ef(sample)
         eligible = [r for r in rows
                     if not (r.get("extra") or {}).get("client_bound")]
         best = max(eligible, key=lambda r: r["qps"]) if eligible else None
@@ -104,9 +134,11 @@ def concurrency_peaks(records: List[Dict[str, Any]],
             "scaling_efficiency": ((best.get("extra") or {}).get(
                 "scaling_efficiency") if ranked else None),
             "client_bound_excluded": len(rows) - len(eligible),
-            # The CALIBRATED ef only: a fixed-ef run has none, and printing
-            # its ef_search under that heading would claim a calibration.
-            "ef_search": (point or {}).get("ef_search"),
+            # The CALIBRATED ef, or the declared one flagged as fixed: printing
+            # a fixed ef under a calibration heading would claim equal recall.
+            "ef_search": ((point or {}).get("ef_search") if not fixed
+                          else sample.get("ef_search")),
+            "fixed_ef": fixed,
             "calibration_recall": (point or {}).get("recall_at_k"),
         })
     peaks.sort(key=lambda p: (not p["ranked"], -(p["peak_qps"] or 0),

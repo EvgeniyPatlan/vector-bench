@@ -499,3 +499,160 @@ class TestAFixedEfRunSaysSoInValidity:
         summary = generate.summarize(records, {})
         text = render._validity_section({}, summary, records)
         assert "not compared at equal recall" not in text
+
+
+# ---------------------------------------------------------------------------
+# Review round 1
+# ---------------------------------------------------------------------------
+
+def _pre_v4(engine: str, clients: int, qps: float, *, phase="concurrency",
+            version: Optional[int] = None) -> Dict[str, Any]:
+    """An ops record from before `ef_mode` existed: fixed ef 100, no key.
+
+    The 25 Aug run's records are this shape -- no `ef_mode`, no
+    `ops_measurement_version`, so implicit version 1.
+    """
+    extra: Dict[str, Any] = {}
+    if version is not None:
+        extra["ops_measurement_version"] = version
+    record = {**_unit(engine), "phase": phase, "clients": clients,
+              "qps": qps, "ef_search": 100, "recall_at_k": 0.9,
+              "extra": extra}
+    if phase == "churn":
+        record["churn_fraction"] = 0.1
+    return record
+
+
+class TestARecordFromBeforeEfModeWasFixedEf:
+    """Version 4 is the harness that started calibrating and stamping
+    `extra.ef_mode` (`harness/metrics/records.py`, "VERSION 4 chose ef_search
+    instead of declaring it"). Everything before it ran at the profile's
+    declared ef_search. A record with no `ef_mode` and a version below 4 is
+    therefore fixed-ef, and the report must say so -- the 25 Aug run is one."""
+
+    def test_the_predicate(self):
+        from report.operating import is_fixed_ef
+        assert is_fixed_ef({"phase": "concurrency", "extra": {}})
+        assert is_fixed_ef({"phase": "concurrency",
+                            "extra": {"ops_measurement_version": 3}})
+        assert is_fixed_ef({"phase": "concurrency",
+                            "extra": {"ef_mode": "fixed",
+                                      "ops_measurement_version": 8}})
+        assert not is_fixed_ef({"phase": "concurrency",
+                                "extra": {"ops_measurement_version": 4}})
+        assert not is_fixed_ef({"phase": "concurrency",
+                                "extra": {"ef_mode": "calibrated"}})
+
+    def test_validity_names_the_ef_for_records_with_no_key(self):
+        records = [_pre_v4("pgvector", 1, 900.0), _pre_v4("mariadb", 1, 50.0)]
+        text = render._fixed_ef_section(records)
+        assert "ef_search = 100" in text
+        assert "not compared at equal recall" in text
+
+    def test_validity_names_the_ef_for_an_explicit_old_version(self):
+        records = [_pre_v4("pgvector", 1, 900.0, version=3)]
+        assert "ef_search = 100" in render._fixed_ef_section(records)
+
+    def test_a_version_4_record_without_the_key_is_not_assumed_fixed(self):
+        records = [_pre_v4("pgvector", 1, 900.0, version=4)]
+        assert render._fixed_ef_section(records) == ""
+
+    def test_the_concurrency_row_says_fixed_not_calibrated(self):
+        summary = generate.summarize([_pre_v4("pgvector", 1, 900.0)], {})
+        row = next(l for l in render._concurrency_table(summary).splitlines()
+                   if l.startswith(f"| {render._label('pgvector')} |"))
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        assert cells[-2] == "100 (fixed)"
+        assert cells[-1] == "not calibrated"
+
+    def test_the_churn_row_says_fixed_not_calibrated(self):
+        summary = generate.summarize(
+            [_pre_v4("pgvector", 1, 900.0, phase="churn")], {})
+        row = next(l for l in render._churn_table(summary).splitlines()
+                   if l.startswith(f"| {render._label('pgvector')} |"))
+        assert "100 (fixed)" in row and "not calibrated" in row
+
+    def test_the_peak_table_does_not_call_a_fixed_ef_calibrated(self):
+        summary = generate.summarize([_pre_v4("pgvector", 1, 900.0)], {})
+        line = next(l for l in render._peak_throughput_table(summary)
+                    .splitlines()
+                    if l.startswith(f"| {render._label('pgvector')} |"))
+        assert "100 (fixed)" in line and "not calibrated" in line
+
+
+class TestAFallbackThatPoolsBuildsIsAmbiguous:
+    """An archived Percona Search `index_build` record with no quantization
+    falls back to `{m: 16}`, which matches the scalar AND the unquantized
+    sweep -- the 25 Aug defect again, under a label that says "ops record".
+    A fallback that matches more than one build is refused."""
+
+    def _ops_build(self, engine, **extra):
+        return {"phase": "index_build", "engine": engine, "dataset": DATASET,
+                "resource_pass": "tuned", "m": 16, "build_mode": "post",
+                "ef_construction": None, "extra": dict(extra)}
+
+    def test_mongodb_without_quantization_reads_as_a_dash(self):
+        records = _mongodb_records() + [self._ops_build("mongodb")]
+        entry = _entry(generate.summarize(records, {}), "mongodb")
+        for floor in (90, 95, 99):
+            assert entry[f"qps_at_recall_{floor}"] is None
+        assert entry["reference_build"] is None
+        assert entry["reference_source"].startswith("ambiguous")
+        assert entry["best_qps_at_recall_90"] == 138.0
+
+    def test_an_m_sweep_with_no_m_on_the_ops_record_is_ambiguous(self):
+        records = [_recall("mariadb", 0.95, 400.0, ef_search=10, m=8),
+                   _recall("mariadb", 0.97, 300.0, ef_search=10, m=16)]
+        ops = self._ops_build("mariadb")
+        ops["m"] = None
+        entry = _entry(generate.summarize(records + [ops], {}), "mariadb")
+        assert entry["qps_at_recall_90"] is None
+        assert entry["reference_source"].startswith("ambiguous")
+
+    def test_the_footnote_says_the_build_is_ambiguous(self):
+        records = _mongodb_records() + [self._ops_build("mongodb")]
+        table = render._headline_tables(generate.summarize(records, {}))
+        headline = table.split(render.SWEEP_TABLE_HEADING)[0]
+        assert "ambiguous" in headline
+
+    def test_storage_engines_alone_do_not_make_it_ambiguous(self):
+        """InnoDB and MyISAM at one M are one reference build measured in two
+        storage engines; §4 names the storage that won each cell."""
+        a = _recall("mariadb", 0.95, 400.0, ef_search=10)
+        b = _recall("mariadb", 0.97, 300.0, ef_search=10)
+        a["storage_engine"], b["storage_engine"] = "InnoDB", "MyISAM"
+        b["extra"]["source_file"] = b["extra"]["source_file"].replace(
+            "_M_16_", "_M_16_engine_MyISAM_")
+        records = [a, b, self._ops_build("mariadb")]
+        entry = _entry(generate.summarize(records, {}), "mariadb")
+        assert entry["qps_at_recall_90"] == 400.0
+
+
+class TestTheManifestCarriesTheReferenceBuilds:
+    """`cmd_run` hands `presentation.reference_builds` to `Manifest.set_engine`
+    and the report reads it back from `run-manifest.json`. Written and read
+    through the real API, so a later change to the manifest's engine entry
+    that drops the key fails here instead of every headline going dark."""
+
+    def test_round_trip(self, tmp_path):
+        import json
+        from orchestrator import engines as engines_mod
+        from orchestrator.manifest import MANIFEST_NAME, Manifest
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        builds = {"tuned": {"quantization": "scalar"},
+                  "normalized": {"quantization": "none"}}
+        manifest = Manifest(str(run_dir), "rt-1")
+        manifest.set_engine(
+            "mongodb", str(tmp_path / "sources"), "rt", "bench",
+            {"runtime": "x", "bench": "y"},
+            presentation={**engines_mod.presentation("mongodb"),
+                          "reference_builds": builds})
+        manifest.save()
+        loaded = json.load(open(run_dir / MANIFEST_NAME))
+        assert loaded["engines"]["mongodb"]["presentation"][
+            "reference_builds"] == builds
+        summary = generate.summarize(_mongodb_records(), loaded)
+        entry = _entry(summary, "mongodb")
+        assert entry["reference_source"] == "manifest"
+        assert entry["reference_build"] == {"quantization": "scalar"}

@@ -1089,9 +1089,13 @@ def _fixed_ef_section(records: List[Dict[str, Any]]) -> str:
     work per query. §6 says so for the operating-point table; a reader who
     starts at §7's throughput needs it in Validity, with the ef named.
     """
+    from report.operating import is_fixed_ef
+    # `is_fixed_ef`, not `ef_mode == "fixed"`: records from before ops
+    # measurement version 4 carry no `ef_mode` and WERE fixed -- the 25 Aug
+    # run is one, and it is the run this section was written for.
     fixed = [r for r in records
-             if (r.get("extra") or {}).get("ef_mode") == "fixed"
-             and r.get("phase") in ("concurrency", "filtered", "churn")]
+             if r.get("phase") in ("concurrency", "filtered", "churn")
+             and is_fixed_ef(r)]
     if not fixed:
         return ""
     efs = sorted({r.get("ef_search") for r in fixed
@@ -1484,7 +1488,15 @@ def _reference_build_notes(per_engine: Dict[str, Any]) -> str:
         if not any(entry.get(f"qps_at_recall_{f}") is None
                    for f in (90, 95, 99)):
             continue
-        if entry.get("reference_build") is None:
+        source = entry.get("reference_source") or ""
+        if entry.get("reference_build") is None and source.startswith(
+                "ambiguous"):
+            lines.append(
+                f"- **{_label(engine)}**: the reference build is ambiguous "
+                f"-- {source.split(': ', 1)[-1]} -- so no headline figure is "
+                f"printed rather than one pooled across them. The sweep "
+                f"table below names each build's figures.\n")
+        elif entry.get("reference_build") is None:
             lines.append(
                 f"- **{_label(engine)}**: no reference build is recorded for "
                 f"this run and the grid swept "
@@ -2253,15 +2265,29 @@ OPERATING_POINT_NOTE = (
     "sweep did not put the engine at the target -- `target_unreached` "
     f"{UNREACHED_MARK} (never got there: the throughput is at a lower recall) "
     f"or `floor_above_target` {FLOOR_MARK} (could not be slowed to it) -- and "
-    "that unit is not ranked in the peak-throughput headline. A dash means "
-    "no calibration ran for the unit (`ef_mode: fixed`)._\n")
+    "that unit is not ranked in the peak-throughput headline. "
+    "`<ef> (fixed)` with *not calibrated* means the unit ran at a "
+    "declared ef_search (`ef_mode: fixed`, or a record from before ops "
+    "measurement version 4), so its throughput is not at equal recall with "
+    "any other row._\n")
+
+
+#: The two cells of a unit measured at a declared ef. Words, not a dash: a
+#: dash reads as "not recorded", and the point is that no recall target was
+#: pursued, so the QPS beside it is not at any engine's equal recall.
+FIXED_EF_RECALL_CELL = "not calibrated"
 
 
 def _operating_point_cells(row: Dict[str, Any], points: Any) -> List[str]:
-    from report.operating import UNRANKED_STATUSES, status_of
+    from report.operating import UNRANKED_STATUSES, is_fixed_ef, status_of
     point = points.find(row)
     status = status_of(row, point)
     ef = (point or {}).get("ef_search")
+    # Records only: a churn-under-writes row is derived and carries no
+    # `extra`, so the pre-version-4 rule would read every one as fixed.
+    if point is None and row.get("phase") and is_fixed_ef(row):
+        return [f"{_fmt(row.get('ef_search'), 0)} (fixed)",
+                FIXED_EF_RECALL_CELL]
     if ef is None and point is None:
         return ["—", "—"]
     recall = _fmt((point or {}).get("recall_at_k"), 4)
@@ -2304,7 +2330,10 @@ def _peak_throughput_table(summary: Dict[str, Any]) -> str:
             p.get("build_mode") or "—", _storage(p),
             str(rank) if p["ranked"] else "—",
             figure, clients, _fmt(p.get("scaling_efficiency"), 2),
-            _fmt(p.get("ef_search"), 0), _fmt(p.get("calibration_recall"), 4),
+            (f"{_fmt(p.get('ef_search'), 0)} (fixed)" if p.get("fixed_ef")
+             else _fmt(p.get("ef_search"), 0)),
+            (FIXED_EF_RECALL_CELL if p.get("fixed_ef")
+             else _fmt(p.get("calibration_recall"), 4)),
             str(p.get("client_bound_excluded") or 0),
         ])
     return (
