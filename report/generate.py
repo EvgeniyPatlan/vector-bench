@@ -585,9 +585,16 @@ def summarize(records: List[Dict[str, Any]],
             (build_signature(r), r.get("resource_pass")), []).append(r)
     for key, group in sorted(by_series.items(), key=lambda kv: str(kv[0])):
         ordered = sorted(group, key=lambda r: r["ef_search"])
+        # An index the overlay warmed before its first configuration (see
+        # overlay/.../vb_warmup.py, ANN_MEASUREMENT_VERSION 3) has no cold
+        # first point left to blame, so a first-step inversion on it is not
+        # the warm-up artifact and must not be labelled as one.
+        warmed = any((r.get("extra") or {}).get("index_warmup_queries")
+                     for r in group)
         for previous, current in zip(ordered, ordered[1:]):
             if current["qps"] <= previous["qps"]:
                 continue
+            first = previous["ef_search"] == ordered[0]["ef_search"]
             summary["qps_inversions"].append({
                 "engine": previous.get("engine"),
                 "dataset": previous.get("dataset"),
@@ -597,7 +604,10 @@ def summarize(records: List[Dict[str, Any]],
                 "from_qps": round(previous["qps"], 1),
                 "to_qps": round(current["qps"], 1),
                 "ratio": round(current["qps"] / previous["qps"], 2),
-                "first_in_sweep": previous["ef_search"] == ordered[0]["ef_search"],
+                "first_in_sweep": first,
+                "index_warmed": warmed,
+                "likely": ("warm-up" if first and not warmed
+                           else "unexplained"),
             })
     summary["qps_inversions"].sort(key=lambda i: -i["ratio"])
 

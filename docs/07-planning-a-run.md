@@ -186,7 +186,7 @@ estimated run time ~72.5 h typical, ~83.2 h worst case
     by the one query or slice already running when the budget expires.
   ! Neither figure includes the costs below. They are a number of queries, and
     there is no measured query rate for mariadb, alisql, pgvector to multiply them by:
-      recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set
+      recall/QPS sweep: every ann.ef_search point, `runs` times, over each dataset's query set, plus a one-time index warm-up of up to 5,000 training-set queries per built index
       churn re-measurement: ops.max_queries before churn and again after each churn fraction
       churn delete: ops.churn_fractions of the corpus removed per step, with no budget bounding the delete itself
       churn repair path: on an engine that has one it can execute at its pinned version (pgvector's VACUUM (ANALYZE); Percona Server's index replace only while capabilities.bulk_vector_index_build is true -- it is false at the pinned version, where the driver declares no repair path, runs nothing and pays neither cost), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
