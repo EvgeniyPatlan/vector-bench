@@ -300,9 +300,12 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         # median -- it is not in `samples`.
         print(f"[concurrency] {clients} client(s): one discarded warm-up "
               f"window of {duration_s:.0f}s", flush=True)
+        # Not scored: its throughput is all the record keeps of it, and a
+        # recall nobody publishes is a distance computation over every
+        # answer of a 20 s window for nothing.
         warm = _one_window(
             driver_factory, queries, clients, ctx.k, ef_search, index,
-            warmup, duration_s, truth, corpus, dataset.metric)
+            warmup, duration_s, truth, score=False)
 
         samples = []
         for attempt in range(max(1, repeats)):
@@ -747,7 +750,8 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
                 ef_search: int, index: IndexSpec, warmup: int,
                 duration_s: float, truth: numpy.ndarray,
                 corpus: Optional[numpy.ndarray] = None,
-                metric: Optional[str] = None) -> _Window:
+                metric: Optional[str] = None,
+                score: bool = True) -> _Window:
     """One warm-up and one measured window.
 
     Recall is computed here, inside the window that produced the results, so
@@ -782,9 +786,12 @@ def _one_window(driver_factory: DriverFactory, queries, clients: int, k: int,
         _warn_nothing_finished(clients, duration_s, window.inflight_discarded)
 
     results = window.results
-    recall, recall_queries = _window_recall(results, truth, k, queries,
-                                            corpus, metric)
-    overlap, _ = _window_recall_id_overlap(results, truth, k)
+    if score:
+        recall, recall_queries = _window_recall(results, truth, k, queries,
+                                                corpus, metric)
+        overlap, _ = _window_recall_id_overlap(results, truth, k)
+    else:
+        recall, recall_queries, overlap = None, 0, None
 
     return _Window(
         qps=window.qps,

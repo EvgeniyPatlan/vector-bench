@@ -323,10 +323,17 @@ class TestConcurrencyWorkload:
         real = concurrency_workload._one_window
         calls = []
 
+        scored = []
+
         def staged(*args, **kwargs):
             window = real(*args, **kwargs)
             calls.append(args[2])
+            scored.append(kwargs.get("score", True))
             if calls.count(args[2]) == 1:
+                # The warm-up window: never scored for recall (#78 review),
+                # and its recall fields say so.
+                assert window.recall is None and window.recall_queries == 0
+                assert window.recall_id_overlap is None
                 window = window._replace(qps=window.qps / 10.0)
             return window
 
@@ -339,6 +346,7 @@ class TestConcurrencyWorkload:
         rows = written(ctx)
         # One extra window per client count, and it came first.
         assert calls == [1, 1, 1, 1, 2, 2, 2, 2]
+        assert scored == [False, True, True, True] * 2
         for row in rows:
             extra = row["extra"]
             assert extra["repeats"] == 3
