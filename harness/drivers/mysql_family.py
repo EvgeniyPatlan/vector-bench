@@ -883,7 +883,8 @@ class MySQLFamilyDriver(EngineDriver):
         return found
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"incremental_index": True, "ef_construction_tunable": False}
+        return {"incremental_index": True, "ef_construction_tunable": False,
+                **self.index_format()}
 
 
 # ---------------------------------------------------------------------------
@@ -924,11 +925,19 @@ ALISQL_DIALECT = MySQLDialect(
 class MariaDBDriver(MySQLFamilyDriver):
     dialect = MARIADB_DIALECT
     name = "mariadb"
+    # `FVector { float abs2, scale; int16_t dims[]; }` in sql/vector_mhnsw.cc
+    # at both pins (11.8.8, 12.3.2): the graph table stores 16-bit vectors.
+    index_vector_format = "int16"
+    index_includes_vectors = True
 
 
 class AliSQLDriver(MySQLFamilyDriver):
     dialect = ALISQL_DIALECT
     name = "alisql"
+    # The same `FVector` with `int16_t dims[4]` in sql/vidx/vidx_hnsw.cc at
+    # AliSQL-8.0.44-2: VIDX is MHNSW's storage layout.
+    index_vector_format = "int16"
+    index_includes_vectors = True
 
 
 PERCONA_DIALECT = MySQLDialect(
@@ -1189,7 +1198,7 @@ class PerconaDriver(MySQLFamilyDriver):
         incremental = (self._index is None
                        or self._index.build_mode == "incremental")
         return {"incremental_index": incremental,
-                "ef_construction_tunable": True}
+                "ef_construction_tunable": True, **self.index_format()}
 
     def create_schema(self, index: IndexSpec) -> None:
         """CREATE TABLE, with the vector index inline only in incremental mode.

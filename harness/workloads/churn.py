@@ -43,7 +43,7 @@ import numpy
 
 from ..datasets import (FILTER_CTAG, FILTER_TAG, Dataset,
                         cached_ground_truth, filter_values, recall_at_k,
-                        recall_per_query)
+                        recall_per_query, recall_threshold_per_query)
 from ..drivers.base import EngineDriver, IndexSpec, RowAttrs
 from ..metrics.latency import LatencyCollector, Timer
 from ..metrics.records import PHASE_CHURN, Record
@@ -72,19 +72,25 @@ from .churn_readers import (DEFAULT_CHURN_READERS,  # noqa: F401
                             _reader_count, _reader_pool, _reader_shape,
                             _reader_window, _warn_reader_pool_failed,
                             reader_contention_shape, warn_empty_windows)
+from .churn_writes import (_columns, _recall_shape, _sync_shape,  # noqa: F401
+                           _write_shape, index_size_shape, indexed_rate,
+                           parallel_reinsert, synced_wait)
 from .context import RunContext
 
-# Wall clock allowed for one re-insertion. An engine that cannot write its rows
-# back in half an hour is not going to, and holding the machine to find out
-# costs a night. Overridable per profile.
-DEFAULT_CHURN_BUDGET_S = 1800.0
+# Wall clock allowed for one re-insertion; overridable per profile. 7200 s
+# since ops version 9 (was 1800): MHNSW at ~150 rows/s needs ~28 min for 25%
+# of 1M rows, two minutes inside the old cap, and `tuned-complete.yml` had
+# already raised it to 7200 for that reason.
+DEFAULT_CHURN_BUDGET_S = 7200.0
 
 DEFAULT_FRACTIONS = (0.10, 0.25)
 
 
 def _measure(driver: EngineDriver, queries: numpy.ndarray, k: int,
              id_map: Dict[int, int], truth: numpy.ndarray,
-             warmup: int = 20) -> Tuple[Dict[str, float], Dict[str, object]]:
+             warmup: int = 20, corpus: Optional[numpy.ndarray] = None,
+             metric: Optional[str] = None
+             ) -> Tuple[Dict[str, float], Dict[str, object]]:
     """Query and score against ground truth translated through `id_map`.
 
     Returns the record fields AND, separately, PR 5 §5.1 item 4's interval
@@ -126,8 +132,20 @@ def _measure(driver: EngineDriver, queries: numpy.ndarray, k: int,
     # Scored against the TRANSLATED truth, which is the whole point of this
     # function, so the interval has to be drawn from the same per-query
     # vector the mean is -- not from a second call against `truth`.
-    per_query = recall_per_query(returned, translated, k)
-    out["recall_at_k"] = round(recall_at_k(returned, translated, k), 6)
+    # Ops version 9: the distance threshold, vectors found through the
+    # INVERSE map (a new id names its original row's vector).
+    overlap = recall_at_k(returned, translated, k)
+    if corpus is not None and metric is not None:
+        row_of = {new: original for original, new in id_map.items()}
+        per_query = recall_threshold_per_query(
+            returned, translated, queries, corpus, metric, k, row_of=row_of)
+        recall = (sum(per_query) / len(returned) if returned
+                  else float("nan"))
+    else:
+        per_query = recall_per_query(returned, translated, k)
+        recall = overlap
+    out["recall_at_k"] = round(recall, 6)
+    out["recall_id_overlap"] = round(overlap, 6)
     out["qps"] = round(collector.qps(clients=1), 2)
     return out, ci_fields(PHASE_CHURN, recall_per_query=per_query or None,
                           latencies_s=latencies or None)
@@ -140,7 +158,9 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         indexed_rows: Optional[int] = None,
         budget_s: float = DEFAULT_CHURN_BUDGET_S,
         driver_factory: Optional[DriverFactory] = None,
-        readers: int = DEFAULT_CHURN_READERS) -> None:
+        readers: int = DEFAULT_CHURN_READERS,
+        writers: Optional[int] = None,
+        ingest_threads: Optional[int] = None) -> None:
     """Measure recall/QPS before churn and after each churn step.
 
     `driver_factory` and `readers` are PR 4 §4.3: a pool of readers queries
@@ -154,8 +174,14 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     `tests/test_config.py` and `tests/test_t3b_drivers.py` call this with a
     writer driver and nothing else, and a required argument would have made
     this change edit files it does not own.
+
+    `writers` (ops version 9) defaults to `ingest_threads`, the run's
+    `load_threads`; see `churn_writes.py`. Without a `driver_factory` there
+    is nothing to open connections with, so it is one writer, recorded.
     """
     queries = dataset.test[:max_queries]
+    reinsert_writers = (max(1, int(writers or ingest_threads or 1))
+                        if driver_factory is not None else 1)
     # Recomputed when only part of the training set was loaded; the shipped
     # neighbours would otherwise point at rows the engine never received.
     truth = cached_ground_truth(ctx.cache_dir, dataset, ctx.k,
@@ -199,7 +225,15 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     # a comparison of engine settings.
     driver.prepare_churn()
 
-    baseline, baseline_ci = _measure(driver, queries, ctx.k, {}, truth)
+    # Ops version 9: the index must hold the corpus the baseline is scored
+    # against; for mongot, until the highest loaded id (0..n-1) is searchable.
+    with Heartbeat("waiting for the index before the baseline",
+                   prefix=driver.name):
+        synced_before = synced_wait(driver, n_rows, present=n_rows - 1)
+
+    baseline, baseline_ci = _measure(driver, queries, ctx.k, {}, truth,
+                                     corpus=dataset.train,
+                                     metric=dataset.metric)
     print(
         f"[churn] {driver.name}: baseline recall@{ctx.k}={baseline['recall_at_k']:.4f} "
         f"qps={baseline['qps']:,.1f}"
@@ -207,12 +241,11 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
     ctx.recorder.write(Record(
         **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
         churn_fraction=0.0, rows=n_rows,
-        index_bytes=driver.index_bytes(), **baseline,
+        index_bytes=driver.index_bytes(), **_columns(baseline),
         notes="baseline before any churn",
-        # The one churn record that had no `extra` at all before PR 5. An
-        # empty dict is dropped by `Record.to_dict`, so a run whose baseline
-        # measured nothing still writes the record it always did.
-        extra=dict(baseline_ci),
+        extra={**baseline_ci, **_recall_shape(baseline),
+               "index_sync_before_baseline_s": round(synced_before, 3),
+               **index_size_shape(driver, "churn_baseline")},
     ))
 
     id_map: Dict[int, int] = {}
@@ -306,6 +339,13 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         with Heartbeat(f"deleting {len(current_ids):,} rows", prefix=driver.name):
             with Timer() as delete_timer:
                 driver.delete_ids(current_ids)
+        # Ops version 9: the deletes must be in the index before the same
+        # vectors are written back under new ids.
+        with Heartbeat("waiting for the index to drop the deleted rows",
+                       prefix=driver.name):
+            synced_after_delete = synced_wait(
+                driver, n_rows - len(current_ids),
+                absent=(int(current_ids[-1]), vectors[-1]))
 
         new_ids = list(range(next_id, next_id + len(original_ids)))
         next_id += len(original_ids)
@@ -323,7 +363,9 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         reader_during: Optional[PoolWindow] = None
         try:
             inserted, insert_seconds = _reinsert(
-                driver, new_ids, vectors, attrs, effective_budget)
+                driver, new_ids, vectors, attrs, effective_budget,
+                writers=reinsert_writers, factory=driver_factory,
+                index=index)
         finally:
             # In a `finally` because the readers are separate OS processes
             # holding connections: a writer that raises must not leave them
@@ -374,6 +416,8 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                     # that states it, because it is the only one the budget
                     # changed.
                     "churn_budget_s": budget_s,
+                    "reinsert_writers": reinsert_writers,
+                    "ingest_threads": ingest_threads,
                     **_reader_shape(driver_factory, readers, reader_count),
                     "repair_path": driver.repair_path,
                     # No `index_sync_s`, and the absence is the honest answer
@@ -456,7 +500,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         # that the numbers after it describe an index that has the writes.
         with Heartbeat(f"waiting for the index to reflect {n_rows:,} rows",
                        prefix=driver.name):
-            synced_s = driver.wait_index_synced(n_rows)
+            synced_s = synced_wait(driver, n_rows, present=max(new_ids))
 
         step_extra = {
             "rows_churned": count,
@@ -470,6 +514,16 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             # load is not stated is two different measurements under one key.
             "reinsert_rows_per_s": round(
                 len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
+            # Ops version 9: accepted (the figure above) and indexed (until
+            # the wait returned and the rows were searchable).
+            "reinsert_rows_per_s_accepted": round(
+                len(new_ids) / insert_seconds, 3) if insert_seconds else 0.0,
+            "reinsert_rows_per_s_indexed": indexed_rate(
+                len(new_ids), insert_seconds, synced_s),
+            # The report prints re-insert/load only when these are equal.
+            "reinsert_writers": reinsert_writers,
+            "ingest_threads": ingest_threads,
+            "index_sync_after_delete_s": round(synced_after_delete, 3),
             **_reader_shape(driver_factory, readers, reader_count),
             # And the status of that read load, because a reader count alone
             # does not say the readers RAN concurrently: the rate above was
@@ -494,7 +548,9 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             # run is not what anyone reads a month later.
             step_extra["readers_failed"] = str(reader_failure)
 
-        after, after_ci = _measure(driver, queries, ctx.k, id_map, truth)
+        after, after_ci = _measure(driver, queries, ctx.k, id_map, truth,
+                                   corpus=dataset.train,
+                                   metric=dataset.metric)
         drop = baseline["recall_at_k"] - after["recall_at_k"]
         print(
             f"[churn] {driver.name}: after {fraction:.0%} churn "
@@ -511,8 +567,9 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         ctx.recorder.write(Record(
             **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
             churn_fraction=fraction, rows=driver.count_rows(),
-            index_bytes=driver.index_bytes(), **after,
-            extra={**step_extra, **after_ci,
+            index_bytes=driver.index_bytes(), **_columns(after),
+            extra={**step_extra, **after_ci, **_recall_shape(after),
+                   **index_size_shape(driver, "after_churn_step"),
                    "maintenance_state": "before",
                    "recall_drop_vs_baseline": round(drop, 6)},
         ))
@@ -525,7 +582,7 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
             what = driver.maintain()
         _record_maintenance(ctx, driver, common, queries, truth, ef_search,
                             fraction, id_map, baseline, after, what,
-                            maintain_timer.elapsed, step_extra)
+                            maintain_timer.elapsed, step_extra, dataset)
 
 
 def _record_maintenance(ctx: RunContext, driver: EngineDriver,
@@ -535,7 +592,8 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
                         baseline: Dict[str, float],
                         degraded: Dict[str, float],
                         what: object, maintenance_s: float,
-                        step_extra: Dict[str, object]) -> None:
+                        step_extra: Dict[str, object],
+                        dataset: Optional[Dataset] = None) -> None:
     """Measure and record the repaired state, when there was a repair.
 
     `what` is `maintain()`'s return value: `Optional[str]` per PR 4 §4.1, a
@@ -653,7 +711,9 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     """
     if not isinstance(what, str) or not what:
         return
-    repaired, repaired_ci = _measure(driver, queries, ctx.k, id_map, truth)
+    repaired, repaired_ci = _measure(
+        driver, queries, ctx.k, id_map, truth,
+        *((20, dataset.train, dataset.metric) if dataset else ()))
     print(
         f"[churn] {driver.name}: {what} took {maintenance_s:.1f}s; "
         f"recall@{ctx.k}={repaired['recall_at_k']:.4f} "
@@ -664,8 +724,9 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     ctx.recorder.write(Record(
         **common, phase=PHASE_CHURN, ef_search=ef_search, clients=1,
         churn_fraction=fraction, rows=driver.count_rows(),
-        index_bytes=driver.index_bytes(), **repaired,
-        extra={**step_extra, **repaired_ci,
+        index_bytes=driver.index_bytes(), **_columns(repaired),
+        extra={**step_extra, **repaired_ci, **_recall_shape(repaired),
+               **index_size_shape(driver, "after_maintenance"),
                "maintenance_state": "after",
                "maintenance": what,
                "maintenance_s": round(maintenance_s, 3),
@@ -674,56 +735,9 @@ def _record_maintenance(ctx: RunContext, driver: EngineDriver,
     ))
 
 
-def _sync_shape(driver) -> Dict[str, object]:
-    """Why `index_sync_s` came out the way it did, when the driver says.
-
-    Optional, read through `getattr` exactly as `_write_shape` below reads
-    Valkey's write batch: the engines that maintain their index on the write
-    path have nothing to explain and carry no key.
-
-    It exists because a seconds-valued hook returning 0.0 is ambiguous in the
-    one direction that matters. `index_sync_s: 0.0` is what a synchronous
-    engine records, what a hook nobody implemented records, and what a mongot
-    that was already caught up records -- and H1's acceptance criterion is
-    "non-zero or a reason documented", which a bare zero cannot satisfy.
-
-    A driver that also publishes `index_sync_detail` gets that carried too,
-    as a second key. The note is prose, so reading it back means matching a
-    sentence; the detail is the same facts as fields -- the final indexed
-    count, the count expected, the polls, which condition ended the wait and
-    which signal was binding -- which is what makes "did this engine's index
-    actually arrive?" a query over a run rather than a careful read.
-    """
-    note = getattr(driver, "index_sync_note", None)
-    detail = getattr(driver, "index_sync_detail", None)
-    out = {"index_sync_note": note} if note else {}
-    if detail:
-        out["index_sync_detail"] = detail
-    return out
-
-
-def _write_shape(driver) -> Dict[str, object]:
-    """How the driver had to write, when that is not how it normally writes.
-
-    Valkey re-inserted 99,000 rows at 86 rows/s against a load that ran at
-    30,195, and almost none of that gap is the HNSW graph: pipelined writes
-    into an indexed prefix do not return at all, so the re-insert had to fall
-    back to one command per round trip while the load pipelined a thousand.
-    Comparing those two rates as though they measured the same operation would
-    attribute to the index a cost that belongs to the write shape, so the shape
-    travels with the number.
-    """
-    used = getattr(driver, "write_batch_used", None)
-    if used is None:
-        return {}
-    shape = {"write_batch_rows": used}
-    if used < getattr(driver, "load_batch_rows", used):
-        shape["write_batch_reduced"] = True
-    return shape
-
-
 def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, attrs,
-              budget_s: float):
+              budget_s: float, writers: int = 1,
+              factory: Optional[DriverFactory] = None, index=None):
     """Re-insert in slices, stopping if the budget runs out.
 
     One blocking call cannot tell a slow write path from a stalled one, and
@@ -749,7 +763,13 @@ def _reinsert(driver: EngineDriver, ids: Sequence[int], vectors, attrs,
     so that a caller mirroring a column can see that it did.
 
     Returns (rows actually written, seconds spent).
+
+    `writers > 1` with a `factory`: the same slices over that many
+    connections (`churn_writes.parallel_reinsert`, ops version 9).
     """
+    if writers > 1 and factory is not None:
+        return parallel_reinsert(driver, ids, vectors, attrs, budget_s,
+                                 writers, factory, index)
     attrs = RowAttrs.coerce(attrs)
     total = len(ids)
     # Fifty slices: enough that the budget is honoured to within 2% of itself,

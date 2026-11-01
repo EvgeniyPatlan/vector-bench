@@ -729,6 +729,10 @@ def _validity_section(manifest: Dict[str, Any], summary: Dict[str, Any],
     if scaling:
         parts.append(scaling)
 
+    warmup = _index_warmup_section(summary)
+    if warmup:
+        parts.append(warmup)
+
     fixed = _fixed_ef_section(records or [])
     if fixed:
         parts.append(fixed)
@@ -1139,50 +1143,35 @@ def _scaling_refused_section(summary: Dict[str, Any]) -> str:
         "`Scaling efficiency` divides an N-client throughput by N times a "
         "one-client throughput. **That is a statement about the engine only "
         "if N queries were actually in flight**, and at the points below "
-        "fewer than half of them were: the queries each window counted, times "
-        "their median latency, divided by the window, came out below half the "
-        "client count. The efficiency figure there is not a measurement of "
-        "how this engine scales, so the table prints "
+        "they were not: either the clients had fewer than half their queries "
+        "outstanding on average — the sum of every in-window query's "
+        "duration over the window, Little's law with no estimator in it — or "
+        "neither the median estimate nor the throughput shows the queries "
+        "being served at once. The efficiency figure there is not a "
+        "measurement of how this engine scales, so the table prints "
         f"*{SCALING_REFUSED_CELL}* in that cell and the chart's efficiency "
         "panel omits the point. **The QPS and the latency percentiles are "
         "left in place and are real**: the pool did answer that many queries "
         "at those latencies. It is the division by the client count that has "
         "no basis.\n\n"
-        "**Since `ops_measurement_version` 6 this is a tripwire rather than "
-        "an expected finding, and that changes what it can mean.** Each "
-        "client is a forked OS process with its own interpreter, so the cause "
-        "this refusal was built for is no longer in the measurement path: "
-        "until version 6 the clients were Python threads in one interpreter, "
-        "and a client library that did not release the interpreter lock "
-        "around its socket wait made them take turns. They cannot now. Three "
-        "things can still put a point here. The engine may itself answer one "
-        "query at a time, in which case there is a real finding, but it is "
-        "\"this engine serializes queries\" and not \"this engine scales at "
-        "0.25\". This harness's pool may have a defect, which is the case the "
-        "guard is kept as a tripwire for. Or the engine's service time may be "
-        "skewed far enough that the median this figure uses sits well below "
-        "the mean — **a known false positive**, because the rule was "
-        "calibrated against synthetic servers of deterministic cost; it is "
-        "being addressed separately and is not claimed sound here. "
-        "**`Queries outstanding` beside the cell narrows the field and does "
-        "not close it, and that is worth saying because the pair used to be "
-        "an answer.** Outstanding near the client count while in service "
-        "sits near one says the clients were waiting rather than being "
-        "served; it does not say what they waited for. Since version 6 the "
-        "skew above and a serializing engine whose own service time is "
-        "skewed look identical from here. The one case it does separate is a "
-        "saturated server of *deterministic* service time: a real queue "
-        "raises its median along with everything else, so it lands at its "
-        "client count — measured at 1.004 of it — and is never refused at "
-        "all. Read the Client CPU column with it.\n\n"
-        "**The two-engine argument this section used to make is gone with its "
-        "premise.** It read a refusal on one engine and not another as a "
-        "property of the client library, because the engines here do not "
-        "share one — pgvector goes through psycopg3 and the MySQL family "
-        "through MariaDB Connector/C. That inference needed both libraries' "
-        "locks to be in one interpreter with the clients, and nothing "
-        "replaces it: a per-library difference is no longer something this "
-        "measurement can see.\n",
+        "**Since `ops_measurement_version` 9 the mean-based figure is the "
+        "primary one.** Until then this section was keyed to the MEDIAN "
+        "estimate — queries × p50 ÷ window — because, while the clients were "
+        "Python threads, a client waiting for the interpreter lock still "
+        "counted as in flight and the mean was blind to it. The clients have "
+        "been separate OS processes since version 6, so that reason is gone, "
+        "and the median kept only its own bias: under a heavy tail it "
+        "undercounts by p50 ÷ mean (MariaDB 12.3 at 32 clients on "
+        "`full-20260825`, p50 34 ms against p99 1,043 ms). A skewed service "
+        "time is therefore no longer a refusal; it is noted "
+        f"`tail_dominated` ({TAIL_DOMINATED_MARK}) beside a published figure. "
+        "What remains here is a pool whose clients did not keep their "
+        "queries in flight — a fault in this harness, the case the guard is "
+        "kept as a tripwire for — or an engine that answers one query at a "
+        "time with a tail, which a client clock cannot tell apart from "
+        "clients taking turns. Read the Client CPU column with it. Records "
+        "from before version 9 were judged by the median rule and keep that "
+        "verdict.\n",
     ]
     rows = []
     for r in sorted(refused, key=lambda r: (r.get("dataset") or "",
@@ -1192,8 +1181,8 @@ def _scaling_refused_section(summary: Dict[str, Any]) -> str:
         rows.append([
             _label(r.get("engine", "?")), r.get("dataset", "?"),
             _storage(r), str(r.get("clients", "—")),
-            _fmt(extra.get("served_concurrency"), 2),
             _fmt(extra.get("outstanding_concurrency"), 2),
+            _fmt(extra.get("served_concurrency"), 2),
             _fmt(r.get("qps"), 0),
             # The figure that is not published, shown here and nowhere else.
             # Withholding it from the table and then hiding it entirely would
@@ -1203,25 +1192,52 @@ def _scaling_refused_section(summary: Dict[str, Any]) -> str:
             _fmt(extra.get("client_cpu_seconds"), 1, " s"),
         ])
     parts.append(_md_table(
-        ["Engine", "Dataset", "Storage", "Clients", "Queries in service",
-         "Queries outstanding", "QPS", "Efficiency withheld", "Client CPU"],
+        ["Engine", "Dataset", "Storage", "Clients", "In service (mean)",
+         "Median estimate", "QPS", "Efficiency withheld", "Client CPU"],
         rows))
     parts.append(
-        "\n**Queries outstanding is the exact figure and is not the one the "
-        "refusal uses.** It is the sum of every in-window query's duration "
-        "over the window — Little's law with no estimator in it — and it "
-        "**counts any wait as flight**, because from the client's clock a "
-        "query it is blocked on is in flight whatever it is blocked on. That "
-        "used to be said of the interpreter lock specifically, which was the "
-        "only cause there was; the cause is gone and the blindness is not. "
-        "Over ten readings — five synthetic drivers through the retired "
-        "thread pool and five through this one, efficiencies from 0.249 to "
-        "1.009 — it stayed between 0.84 and 1.00 of the client count on "
-        "every one: exact, and blind to the thing this section is about. It "
-        "is printed because the pair is the diagnostic — outstanding at the "
-        "client count while in service sits near one is the signature of "
-        "waiting rather than of serving.\n")
+        "\n**In service (mean)** is the exact figure the refusal reads since "
+        "version 9: the sum of every in-window query's duration over the "
+        "window. It counts any wait as flight — from the client's clock a "
+        "query it is blocked on is in flight whatever it is blocked on — "
+        "which is why it could not be the guard while the clients shared one "
+        "interpreter lock, and can be now. **Median estimate** is queries × "
+        "p50 ÷ window, the figure the guard used before version 9; the two "
+        "differ by exactly p50 ÷ mean, so a median estimate far under the "
+        "mean says the latency had a tail and nothing more.\n")
     return "".join(parts)
+
+
+def _index_warmup_section(summary: Dict[str, Any]) -> str:
+    """Validity: ann sweeps whose one-time index warm-up did not converge.
+
+    `summary["index_warmup_flags"]` (`report/generate.index_warmup_flags`):
+    a warm-up that hit its cap without two batches agreeing, or that ran
+    fewer than two batches. Either way the sweep's first configuration may
+    have met the cold cache the warm-up exists to absorb, and its QPS is
+    then the cache's, not the engine's.
+    """
+    flags = summary.get("index_warmup_flags") or []
+    if not flags:
+        return ""
+    rows = [[_label(f.get("engine") or "?"), f.get("dataset") or "?",
+             f.get("resource_pass") or "—", f.get("build") or "—",
+             _fmt(f.get("queries"), 0),
+             {True: "yes", False: "**no**"}.get(f.get("converged"), "—"),
+             _fmt(f.get("seconds"), 1, " s")]
+            for f in flags]
+    return (
+        "\n### Index warm-ups that did not settle\n\n"
+        "Each ann sweep warms its index before the first configuration, "
+        "querying until two consecutive 200-query batches agree to within 5% "
+        "or 5,000 queries have run. The sweeps below either reached that cap "
+        "without agreeing or ran fewer than 400 queries — two batches, the "
+        "least that can be compared — so the **first configuration of each "
+        "may still have been measured against a cold cache**, and a QPS "
+        "rise from it to the next point is that artefact rather than the "
+        "engine.\n"
+        + _md_table(["Engine", "Dataset", "Pass", "Build",
+                     "Warm-up queries", "Converged", "Warm-up time"], rows))
 
 
 def _known_asymmetries(summary: Optional[Dict[str, Any]] = None) -> str:
@@ -1833,6 +1849,13 @@ SCALING_REFUSED_CELL = f"{SCALING_REFUSED_MARK} not measurable"
 #: pinned together by `tests/test_g1_client_concurrency.py`.
 SCALING_CONCURRENCY_NOT_ACHIEVED = "concurrency_not_achieved"
 
+#: `extra.scaling_note` when the window's median sat under half its mean
+#: (ops version 9; `harness/metrics/scaling.SCALING_TAIL_DOMINATED`, pinned
+#: equal by a test). A NOTE: the cell carries the mark beside a published
+#: figure, and nothing is withheld for it.
+TAIL_DOMINATED = "tail_dominated"
+TAIL_DOMINATED_MARK = "△"
+
 #: Footnote marks for the two statuses the ef sweep can end on without having
 #: put an engine at the target recall. `report/charts.py` imports these rather
 #: than spelling the glyphs again: the chart's dagger and the table's dagger
@@ -2240,13 +2263,17 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
             _fmt(float(pool) if pool is not None else None, 0),
             _fmt(extra.get("query_reuse"), 2, "x"),
             _client_cpu_cell(extra),
+            # Beside the client's, so a flattening curve says whose ceiling
+            # it is: an engine out of cores, stalled, or idle behind a lock.
+            *_server_cells(r, summary.get("server_windows")),
             *_operating_point_cells(r, points),
         ])
     return _md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Clients",
          "QPS", "Spread", "Recall@k", "p50 (ms)", "p95 (ms)", "p99 (ms)",
          "Scaling efficiency", "Queries in service", "Query pool", "Reuse",
-         "Client CPU", "Calibrated ef", "Calibration recall"],
+         "Client CPU", "Server CPU", "Server CPU pressure",
+         "Calibrated ef", "Calibration recall"],
         rows,
     ) + BUILD_MODE_COLUMN_NOTE + OPERATING_POINT_NOTE \
         + _concurrency_notes(summary)
@@ -2382,7 +2409,15 @@ def _efficiency_cell(extra: Dict[str, Any]) -> str:
 
 def _served_cell(extra: Dict[str, Any], clients: Any) -> str:
     """How many queries the pool had in service, against how many it had
-    clients.
+    clients: the mean-based figure first, the median estimate second.
+
+    Ops version 9 put `outstanding_concurrency` first, labelled "(mean)", and
+    `served_concurrency` second as "median est.". The order was the other
+    way round while the guard read the median, and on `full-20260825` that
+    printed a MariaDB 12.3 32-client point as a fraction of the queries it
+    held because its p99 was thirty times its p50. A record with no
+    `outstanding_concurrency` (written before G1 recorded it) still renders
+    the median figure alone, as it always did.
 
     `served / clients` written out as a pair rather than as the ratio the
     status is computed from, because the two numbers are what a reader needs
@@ -2394,12 +2429,49 @@ def _served_cell(extra: Dict[str, Any], clients: Any) -> str:
     written before this existed, and where the window counted no query.
     """
     served = extra.get("served_concurrency")
-    if served is None:
+    outstanding = extra.get("outstanding_concurrency")
+    if served is None and outstanding is None:
         return "—"
-    text = f"{served:,.2f} of {clients}" if clients else f"{served:,.2f}"
+    of = f" of {clients}" if clients else ""
+    if outstanding is None:
+        text = f"{served:,.2f}{of}"
+    else:
+        text = f"{outstanding:,.2f}{of} (mean)"
+        if served is not None:
+            text += f" · {served:,.2f} median est."
+    if extra.get("scaling_note") == TAIL_DOMINATED:
+        text += f" {TAIL_DOMINATED_MARK}"
     if extra.get("scaling_status") == SCALING_CONCURRENCY_NOT_ACHIEVED:
         return f"{text} {SCALING_REFUSED_MARK}"
     return text
+
+
+def _server_cells(row: Dict[str, Any], windows: Dict[Any, Any]) -> List[str]:
+    """Server CPU and server CPU pressure over this row's window.
+
+    From `report/server_windows.py`, joined by the window's wall-clock ends.
+    Cores and, when the manifest recorded the cpuset, utilisation; pressure
+    is the share of the window in which a runnable task waited for CPU.
+    Dashes for a record from before ops version 9, which has no window ends.
+    """
+    from report.server_windows import window_key
+    figures = (windows or {}).get(window_key(row))
+    if not figures:
+        return ["—", "—"]
+    cores = figures.get("cpu_cores")
+    util = figures.get("cpu_util")
+    if cores is None:
+        cpu = "—"
+    elif util is not None:
+        cpu = f"{cores:,.1f} cores ({util:.0%})"
+    else:
+        cpu = f"{cores:,.1f} cores"
+    pressure = figures.get("cpu_pressure")
+    io = figures.get("io_pressure")
+    cell = "—" if pressure is None else f"{pressure:.0%}"
+    if io is not None:
+        cell += f" (io {io:.0%})"
+    return [cpu, cell]
 
 
 def _client_cpu_cell(extra: Dict[str, Any]) -> str:
@@ -2469,9 +2541,19 @@ _CONCURRENCY_NOTES = (
         f"still the case to re-measure, and `Queries in service` beside it "
         f"is the column that was added to tell the two apart.\n",
         f"\n**Queries in service** is how many queries the pool actually had "
-        f"being answered on average, against how many clients it ran: the "
-        f"queries the window counted times their median latency, divided by "
-        f"the window. **Scaling efficiency divides an N-client throughput by "
+        f"in flight on average, against how many clients it ran, two ways. "
+        f"**(mean)** is the exact figure — every in-window query's duration "
+        f"summed over the window, Little's law with no estimator — and since "
+        f"`ops_measurement_version` 9 it is the one the refusal reads. "
+        f"**median est.** is the queries the window counted times their "
+        f"MEDIAN latency over the window, the figure the guard read before "
+        f"version 9; the two differ by exactly p50 ÷ mean, and where the "
+        f"median estimate is under half the mean the cell carries "
+        f"{TAIL_DOMINATED_MARK} (`tail_dominated`) — a note that the latency "
+        f"had a heavy tail, never a refusal. The rule the rest of this "
+        f"paragraph describes is the PRE-version-9 one, still the verdict "
+        f"on any older record in this report. **Scaling efficiency divides "
+        f"an N-client throughput by "
         f"N times a one-client throughput, so it describes the engine only if "
         f"N queries were in flight** — and where this column says they were "
         f"not, the efficiency cell reads *{SCALING_REFUSED_CELL}* and no "
@@ -2488,15 +2570,28 @@ _CONCURRENCY_NOTES = (
         f"narrowed to it on purpose**: every calibration driver has a "
         f"deterministic per-query cost, so a server whose service time is "
         f"skewed enough to put its median well below its mean can still be "
-        f"refused here. A skew-triggered refusal is a known false positive "
-        f"and is being handled separately; this section does not claim the "
-        f"rule is sound. What a refusal no longer means is Python: until "
+        f"refused here. That skew-triggered refusal was this rule's known "
+        f"false positive, and it is why version 9 moved the refusal to the "
+        f"mean-based figure. What a refusal no longer means is Python: until "
         f"version 6 the clients shared one interpreter lock and a serializing "
         f"client library was the expected cause, and each client is now its "
         f"own process. An engine that answers one query at a time is the "
         f"cause that remains — read the Client CPU cell beside it, which "
         f"says whether the harness was busy while this column said it was "
-        f"not.\n",
+        f"not. Since version 9 an efficiency divided by a one-client "
+        f"baseline whose median was more than 1.4x slower than this point's "
+        f"is withheld too (`extra.efficiency_reliability: "
+        f"baseline_not_credible`): a warm baseline cannot get faster as "
+        f"clients are added, so that efficiency describes a cold baseline.\n",
+        "\n**Server CPU** is the server container's cgroup CPU over the "
+        "median window, in cores and as a share of its cpuset where the "
+        "manifest recorded one; **Server CPU pressure** is the share of the "
+        "window in which at least one of its runnable tasks waited for a CPU "
+        "(cgroup `cpu.pressure` some), with IO pressure beside it. Both are "
+        "differences of cumulative counters across the samples inside the "
+        "window, joined by the window's recorded wall-clock ends, so a dash "
+        "means a record from before ops measurement version 9 or a kernel "
+        "that publishes no pressure — never an idle server.\n",
 )
 
 
@@ -3066,16 +3161,57 @@ def _churn_table(summary: Dict[str, Any]) -> str:
             _fmt(extra.get("recall_drop_vs_baseline"), 4),
             _fmt(r.get("qps"), 0),
             _fmt_bytes(r.get("index_bytes")),
+            _reinsert_ratio_cell(r, summary.get("ingest") or []),
             tie_cells.get(id(r), TIE_ALONE_CELL),
             *_operating_point_cells(r, points),
         ])
     return _md_table(
         ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Churn",
          "Repair", "Recall@k", "Recall drop vs baseline", "QPS", "Index size",
-         "Tied with", "Calibrated ef", "Calibration recall"],
+         "Re-insert / load", "Tied with", "Calibrated ef",
+         "Calibration recall"],
         rows,
     ) + BUILD_MODE_COLUMN_NOTE + TIE_COLUMN_NOTE + OPERATING_POINT_NOTE \
+        + REINSERT_RATIO_NOTE \
         + _churn_notes(summary) + _churn_during_writes_table(summary)
+
+
+#: What the Re-insert / load column means and when it is withheld.
+REINSERT_RATIO_NOTE = (
+    "\n_**Re-insert / load** is the churn re-insert's accepted rate over the "
+    "same unit's ingest rate, printed only where both were written with the "
+    "same number of connections (`extra.reinsert_writers` = "
+    "`extra.ingest_threads`, ops measurement version 9). `full-20260825` "
+    "compared one re-insert writer with an eight-thread load, which measures "
+    "the thread pool rather than the index; a row that cannot show equal "
+    "counts says *withheld*. The load side is the WHOLE load's average rate: "
+    "the ingest record keeps no progress samples, so the rate over its last "
+    "10% of rows -- the honest comparison for an incremental graph, which "
+    "slows as it grows -- is not available, and for MHNSW, VIDX and "
+    "Percona's incremental build this ratio is therefore biased low._\n")
+
+
+def _reinsert_ratio_cell(row: Dict[str, Any],
+                         ingest: List[Dict[str, Any]]) -> str:
+    """The re-insert/load ratio, or why it is not printed (ops v9, F9)."""
+    extra = row.get("extra") or {}
+    rate = extra.get("reinsert_rows_per_s_accepted")
+    if rate is None:
+        return "—"
+    writers, threads = (extra.get("reinsert_writers"),
+                        extra.get("ingest_threads"))
+    if writers is None or threads is None or writers != threads:
+        return (f"withheld ({writers} vs {threads} writers)"
+                if writers is not None and threads is not None
+                else "withheld")
+    unit = ("engine", "dataset", "resource_pass", "m", "build_mode",
+            "storage_engine")
+    load = next((i.get("ingest_rows_per_s") for i in ingest
+                 if all(i.get(k) == row.get(k) for k in unit)
+                 and i.get("ingest_rows_per_s")), None)
+    if not load:
+        return "—"
+    return f"{rate / load:.2f}x"
 
 
 #: The order the churn states are measured in, which is the order they are

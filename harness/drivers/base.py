@@ -256,6 +256,18 @@ class EngineDriver(abc.ABC):
     #: Valkey and Percona Search inherit "none" and need no edit, which is
     #: what "No hooks" in §4.1 item 4 means.
     repair_path: str = "none"
+    #: What the bytes `index_bytes()` counts hold of the vectors (ops
+    #: measurement version 9): `float32`, `int16`, `int8`, `none` (a graph
+    #: of ids only) or `unknown`, and whether the index carries its own copy
+    #: of them at all (None = not verified). Copied onto every record that
+    #: carries `index_bytes`, because a size comparison that does not say
+    #: this compares storage formats. Set ONLY from the engine's source as
+    #: pinned: MHNSW and VIDX store `int16_t dims[]` per graph node
+    #: (`FVector` in `sql/vector_mhnsw.cc` / `sql/vidx/vidx_hnsw.cc`),
+    #: pgvector's HNSW element tuples carry the `vector` value. Every other
+    #: engine's on-disk format is not in this checkout, so it says unknown.
+    index_vector_format: str = "unknown"
+    index_includes_vectors: Optional[bool] = None
     #: Server status variables worth recording, by name, or `()` for an engine
     #: that exposes none. Read today by one caller only,
     #: `harness/workloads/build.py:_server_status`, so the values land on the
@@ -663,7 +675,23 @@ class EngineDriver(abc.ABC):
             "incremental_index": self.incremental_index,
             "async_index_build": self.async_index_build,
             "ef_construction_tunable": False,
+            **self.index_format(),
         }
+
+    def index_format(self) -> Dict[str, Any]:
+        """The two `index_vector_format` keys, for every `capabilities()`."""
+        return {"index_vector_format": self.index_vector_format,
+                "index_includes_vectors": self.index_includes_vectors}
+
+    def settle_index_bytes(self):
+        """(bytes, seconds, detail) for the size after the build has settled.
+
+        Immediate by default. Percona Search overrides it -- its directory
+        sum halves over minutes as Lucene merges -- and the InnoDB engines do
+        not: a tablespace grows when pages are ALLOCATED, not when they are
+        flushed, so a checkpoint would not move the `.ibd` size a reader sees.
+        """
+        return self.index_bytes(), 0.0, {"method": "immediate"}
 
 
 def batched(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:

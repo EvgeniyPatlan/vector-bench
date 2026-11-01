@@ -770,7 +770,14 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
                             window_start=window_start)
             if measured.served is None:
                 return measured
-            return measured._replace(served=retired["served"])
+            # BOTH figures since ops version 9, when the guard moved to
+            # `outstanding`: the retired pool's own `outstanding` stayed at
+            # the client count (the lock wait sat inside its spans, which
+            # is why the median was used), so the splice now models what a
+            # serializing pool looks like to the version-9 rule -- clients
+            # that did not keep their queries in flight.
+            return measured._replace(served=retired["served"],
+                                     outstanding=retired["served"])
 
         monkeypatch.setattr(cl, "window_concurrency", from_the_retired_pool)
         rows = run_sweep(ctx, dataset, loaded(dataset), family)
@@ -883,7 +890,14 @@ class TestTheGuardFiresOnSerializationAndNotOnASaturatedServer:
                             window_start=window_start)
             if measured.served is None:
                 return measured
-            return measured._replace(served=retired["served"])
+            # BOTH figures since ops version 9, when the guard moved to
+            # `outstanding`: the retired pool's own `outstanding` stayed at
+            # the client count (the lock wait sat inside its spans, which
+            # is why the median was used), so the splice now models what a
+            # serializing pool looks like to the version-9 rule -- clients
+            # that did not keep their queries in flight.
+            return measured._replace(served=retired["served"],
+                                     outstanding=retired["served"])
 
         monkeypatch.setattr(cl, "window_concurrency", from_the_retired_pool)
         run_sweep(ctx, dataset, loaded(dataset), "holding")
@@ -1043,7 +1057,10 @@ class TestTheReportRefusesTheFigure:
         cells = self._cells(_record())
         header, body = cells[0], cells[1:]
         cell = body[0][header.index("Queries in service")]
-        assert cell.startswith("0.95 of 4")
+        # Ops version 9: the exact mean-based figure first, the median
+        # estimate second -- the order the guard now reads them in.
+        assert cell.startswith("3.95 of 4 (mean)"), cell
+        assert "0.95 median est." in cell, cell
         assert render_mod.SCALING_REFUSED_MARK in cell
 
     def test_every_body_cell_is_filled(self):
@@ -1094,12 +1111,15 @@ class TestTheValiditySectionCarriesIt:
         # The withheld figure is shown HERE and nowhere else, so the refusal
         # is checkable rather than merely asserted.
         assert row[header.index("Efficiency withheld")] == "0.25"
-        assert row[header.index("Queries in service")] == "0.95"
-        assert row[header.index("Queries outstanding")] == "3.95"
+        # Renamed and reordered at ops version 9: mean-based first.
+        assert header.index("In service (mean)") < header.index(
+            "Median estimate")
+        assert row[header.index("In service (mean)")] == "3.95"
+        assert row[header.index("Median estimate")] == "0.95"
 
     def test_the_section_states_the_two_readings_and_the_discriminator(self):
         text = _plain(self._section(_record()))
-        for claim in ("interpreter lock", "answer one query at a time",
+        for claim in ("interpreter lock", "answers one query at a time",
                       "Client CPU"):
             assert claim in text, claim
 
@@ -1379,7 +1399,12 @@ class TestTheChurnReadersCarryItToo:
     """
 
     @staticmethod
-    def _window(served, clients=4, p99=10.0):
+    def _window(served, clients=4, p99=10.0, outstanding=None):
+        """A hand-built window. `outstanding` defaults to `served` -- a
+        narrow service time, where the two figures agree -- because since
+        ops version 9 a low `served` beside a full `outstanding` is
+        `tail_dominated` and not a refusal; a reader pool that starved is one
+        whose clients did not keep their reads in flight."""
         kwargs = {field: None for field in cl.PoolWindow._fields}
         kwargs.update(
             qps=100.0, wall_s=30.0, inflight_discarded=0,
@@ -1387,7 +1412,9 @@ class TestTheChurnReadersCarryItToo:
             client_cpu_seconds=21.6, results={},
             merged={"latency_p99_ms": p99, "latency_p50_ms": 1.0,
                     "queries_executed": 3000},
-            served_concurrency=served, outstanding_concurrency=float(clients),
+            served_concurrency=served,
+            outstanding_concurrency=(served if outstanding is None
+                                     else outstanding),
             spec=cl.PoolSpec(clients=clients, queries=100, k=K, ef_search=32))
         return cl.PoolWindow(**kwargs)
 
@@ -1414,7 +1441,7 @@ class TestTheChurnReadersCarryItToo:
             self._window(3.9), self._window(0.95), 12.0, 2000)
         assert extra["scaling_status"] == cl.SCALING_CONCURRENCY_NOT_ACHIEVED
         assert extra["served_concurrency"] == 0.95
-        assert extra["outstanding_concurrency"] == 4.0
+        assert extra["outstanding_concurrency"] == 0.95
 
     def test_the_operator_is_told_what_it_means_for_the_write_rate(self,
                                                                    capsys):

@@ -607,13 +607,17 @@ def _concurrency_windows(plan: _QueryPlan) -> Optional[_QueryTerm]:
     repeats = max(1, int(plan.ops.get("concurrency_repeats", 1)))
     if not points or duration <= 0:
         return None
-    seconds = len(points) * duration * repeats
+    # `+ 1`: ops measurement version 9 runs one discarded warm-up window,
+    # same length, before each client count's first repeat
+    # (`harness/workloads/concurrency.py`). The run pays it, so this counts it.
+    seconds = len(points) * duration * (repeats + 1)
     return _QueryTerm(
         name="concurrency windows",
         typical_s=seconds,
         worst_s=seconds,
         basis=(f"{len(points)} client count(s) x {duration:.0f}s"
                + (f" x {repeats} repeat(s)" if repeats > 1 else "")
+               + " + one warm-up window each"
                + " per ops unit, fixed by the profile not by the engine"),
         bounded=True,
     )
@@ -872,7 +876,11 @@ def _churn_reinsert(plan: _QueryPlan) -> Optional[_QueryTerm]:
     fractions = [float(f) for f in plan.ops.get("churn_fractions", [0.1])]
     # `or 0.0` so a key present with value null means "no cap" rather than a
     # TypeError, matching `_filtered_search` and `ops_pass`'s `_budget_arg`.
-    budget = float(plan.ops.get("churn_budget_s", 1800) or 0.0)
+    # The same default `ops_pass` passes the harness (7200 s since ops
+    # measurement version 9), so the estimate and the run cannot disagree.
+    from orchestrator.ops_pass import DEFAULT_CHURN_BUDGET_S
+    budget = float(plan.ops.get("churn_budget_s", DEFAULT_CHURN_BUDGET_S)
+                   or 0.0)
     uncapped = budget <= 0
     # None means no ingest rate has ever been measured for this engine, which
     # is a different state from a rate of zero and is reported differently:

@@ -140,12 +140,32 @@ def spell_build(build: Optional[Dict[str, Any]]) -> str:
     if "ef_construction" in build:
         value = build["ef_construction"]
         parts.append(f"efC={value if value is not None else 'server default'}")
+    # The same word `build_label` prints, and only the non-default one.
+    if build.get("build_mode") == "incremental":
+        parts.append("incremental")
     return " ".join(parts) or "not recorded"
 
 
 def matches(record: Dict[str, Any], build: Dict[str, Any]) -> bool:
+    """Whether `record` is a point of `build`.
+
+    `build_mode` is matched against the record's own field, and only when
+    the record HAS one: the ann overlay declares the axis for pgvector alone,
+    so an ann point with no `build_mode` is not excluded by an ops record
+    that names one. Before this, `_build_shape` counted build_mode and this
+    ignored it, so an archived pgvector run with post and incremental curves
+    at one M was "ambiguous" even when its ops pass had built one of them.
+    """
     params = build_params(record)
-    return all(params.get(axis) == value for axis, value in build.items())
+    for axis, value in build.items():
+        if axis == "build_mode":
+            mode = record.get("build_mode")
+            if mode is not None and mode != value:
+                return False
+            continue
+        if params.get(axis) != value:
+            return False
+    return True
 
 
 def _from_manifest(manifest: Dict[str, Any], engine: str,
@@ -188,6 +208,12 @@ def _from_ops(records: List[Dict[str, Any]], engine: str, dataset: str,
         if params["ef_construction"] is not None or extra.get(
                 "ef_construction_tunable"):
             build["ef_construction"] = params["ef_construction"]
+    # The build mode the ops pass built, when it built exactly one: the
+    # ambiguity check below counts build modes, so the fallback has to be
+    # able to name one or a pgvector run with both curves can never resolve.
+    modes = {r.get("build_mode") for r in builds} - {None}
+    if len(modes) == 1:
+        build["build_mode"] = modes.pop()
     # Possibly empty: a record that names no axis still says the ops pass
     # built ONE index, and `reference_build` refuses it if that matches more
     # than one swept build rather than falling through to a guess.

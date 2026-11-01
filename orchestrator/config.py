@@ -236,6 +236,10 @@ class ResolvedResources:
     #: results tree by engine.
     pass_signature: str = ""
     warnings: List[str] = field(default_factory=list)
+    #: mongod's WiredTiger cache. Zero for every engine that is not mongodb.
+    #: Set explicitly since ops measurement version 9 -- see the mongodb
+    #: branch of `resolve_resources` for the run that made it necessary.
+    wiredtiger_cache_bytes: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -250,6 +254,7 @@ class ResolvedResources:
             "maintenance_bytes": self.maintenance_bytes,
             "mongot_heap_bytes": self.mongot_heap_bytes,
             "maxmemory_bytes": self.maxmemory_bytes,
+            "wiredtiger_cache_bytes": self.wiredtiger_cache_bytes,
             "io_threads": self.io_threads,
             "pass_signature": self.pass_signature,
             "build_threads": self.build_threads,
@@ -538,6 +543,17 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
     graph_cache_bytes = int(server_bytes * graph_fraction)
     maintenance_bytes = int(server_bytes * maint_fraction)
 
+    # mongod's WiredTiger cache IS this engine's buffer pool, so it is given
+    # the buffer share every other engine's main cache gets, rather than a
+    # number of its own. Until ops measurement version 9 the framework never
+    # set it: `config/engines/mongodb.yml` declared a
+    # `wiredtiger_cache_fraction: 0.6` that nothing read, and on
+    # `full-20260825` MongoDB ran on the server's own default (57-64 GB, from
+    # the server log) beside a 42.3 GB InnoDB buffer pool -- the one engine
+    # whose main cache was sized by its vendor's heuristic rather than by the
+    # resource pass. The flag takes GB; `server_args` renders this in GB.
+    wiredtiger_cache_bytes = buffer_bytes if engine == "mongodb" else 0
+
     total_allocated = (buffer_bytes + graph_cache_bytes + maintenance_bytes
                        + mongot_heap_bytes)
     if total_allocated > server_bytes * 0.9:
@@ -628,6 +644,7 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
         maintenance_bytes=maintenance_bytes,
         mongot_heap_bytes=mongot_heap_bytes,
         maxmemory_bytes=maxmemory_bytes,
+        wiredtiger_cache_bytes=wiredtiger_cache_bytes,
         io_threads=io_threads,
         pass_signature=pass_signature,
         build_threads=build_threads,
@@ -644,8 +661,22 @@ def resolve_resources(resources: Dict[str, Any], engine: str,
 SERVER_ARG_KEYS = (
     "buffer_bytes", "graph_cache_bytes", "maintenance_bytes", "build_threads",
     "server_cpu_count", "maxmemory_bytes", "mongot_heap_bytes",
-    "server_memory_bytes", "io_threads",
+    "server_memory_bytes", "io_threads", "wiredtiger_cache_gb",
 )
+
+
+def wiredtiger_cache_gb(resolved: "ResolvedResources") -> str:
+    """`--wiredTigerCacheSizeGB`'s value: GB with two decimals.
+
+    The flag takes a float in GB (mongod's floor is 0.25), and the resolved
+    figure is bytes like every other one here. Two decimals is 10 MB of
+    resolution against a cache measured in tens of GB, so nothing is lost
+    that a reader of `engines_resolved` would want back.
+    """
+    # `getattr`: several callers hand `server_args` a hand-built stand-in for
+    # `ResolvedResources` that predates the field, and only mongodb renders it.
+    cache = getattr(resolved, "wiredtiger_cache_bytes", 0) or 0
+    return f"{max(0.25, cache / GB):.2f}"
 
 
 def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
@@ -669,6 +700,7 @@ def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
         "io_threads": resolved.io_threads,
         "mongot_heap_bytes": resolved.mongot_heap_bytes,
         "server_memory_bytes": resolved.server_memory_bytes,
+        "wiredtiger_cache_gb": wiredtiger_cache_gb(resolved),
     }
 
     rendered: List[str] = []

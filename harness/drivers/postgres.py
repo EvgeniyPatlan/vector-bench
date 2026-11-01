@@ -679,8 +679,14 @@ class PostgresDriver(EngineDriver):
         except Exception:
             return "unknown"
 
+    #: `HnswElementTupleData` carries the `Vector data` (src/hnsw.h at
+    #: v0.8.6), and this driver indexes the `vector` type, which is float32.
+    index_vector_format = "float32"
+    index_includes_vectors = True
+
     def capabilities(self) -> Dict[str, Any]:
-        return {"incremental_index": False, "ef_construction_tunable": True}
+        return {"incremental_index": False, "ef_construction_tunable": True,
+                **self.index_format()}
 
 
 DRIVERS = {}

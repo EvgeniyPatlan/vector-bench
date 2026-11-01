@@ -201,7 +201,11 @@ These are the reasons the code looks over-defensive. Do not relax them.
   the correct answer set, and reusing unfiltered neighbours scores every engine against the
   wrong targets.
 - **Recall is ann-benchmarks' distance-threshold definition**, not an id intersection
-  (`report/loaders.py:knn_recall`), so numbers stay comparable to published results.
+  (`report/loaders.py:knn_recall`), so numbers stay comparable to published results. The
+  ops path uses the same rule since ops measurement version 9 (`harness/datasets.py`
+  `recall_threshold`); before it, ops recall was an id overlap under the same name. Every ops
+  record says which in `extra.recall_kind`, and `report/crosscheck.py` compares only matching
+  kinds.
 - **MariaDB and AliSQL ship a 16 MiB graph cache by default** (`mhnsw_max_cache_size`,
   `vidx_hnsw_cache_size`). The framework sets both from the resource pass; leaving the default
   judges a vendor on a value it plainly intended you to change.
@@ -240,13 +244,17 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~796 h of ingest before a single query runs, and ~1,163 h of run time
+--resource-pass both` is ~796 h of ingest before a single query runs, and ~1,820 h of run time
 in the worst case once querying is counted — all eight engines, which is what that command
 measures when `--engines` is omitted. **The two figures do not cover the same engines.** The
 run-time figure covers all eight; the ingest figure covers the seven with a measured rate.
 MyVector, the eighth, has none: the estimator names it in `engines_without_ingest_rate` and
 prints that the ingest total is a floor, and its query terms (concurrency windows, churn) are
-in the 1,163 h — its filtered-search term is not, because its driver declines that workload.
+in the 1,820 h — its filtered-search term is not, because its driver declines that workload.
+That figure was ~1,163 h until ops measurement version 9 raised the default churn budget from
+1800 s to 7200 s per step and added one discarded warm-up window per concurrency client count:
+the worst case charges the whole cap to every churn step of every unit, so the cap, not any
+engine, moved it.
 The ingest half
 used to cover six: Percona's rate was measured and unmodelled, the estimator named it in
 `engines_without_ingest_rate` rather than folding it in, and the published 726 h was a floor
