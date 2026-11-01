@@ -979,6 +979,37 @@ def _churn_reader_baseline(plan: _QueryPlan) -> Optional[_QueryTerm]:
         bounded=True)
 
 
+def _mongot_index_settle(plan: _QueryPlan) -> Optional[_QueryTerm]:
+    """mongot's index-size settle after each build (ops version 9).
+
+    `harness/drivers/mongo.py:MongoDriver.settle_index_bytes` re-reads
+    mongot's directory sum every `SETTLE_INTERVAL_S` until two readings
+    agree within 1%, or until `SETTLE_CAP_S` -- because Lucene keeps merging
+    segments for minutes after a build (`full-20260825` read 15.1 GiB after
+    the load and 7.2 GiB at the churn baseline). Version 9 added that wait
+    and the estimate did not count it, so the printed worst case was short by
+    up to ten minutes per mongodb unit. Typical is one interval (the fewest
+    readings that can agree); worst is the cap. mongodb only: every other
+    engine's settle is immediate.
+    """
+    if plan.engine != "mongodb" or "build" not in plan.workloads:
+        return None
+    return _QueryTerm(
+        name="mongot index-size settle",
+        typical_s=MONGOT_SETTLE_INTERVAL_S, worst_s=MONGOT_SETTLE_CAP_S,
+        basis=(f"one {MONGOT_SETTLE_INTERVAL_S:.0f}s reading interval typical, "
+               f"the {MONGOT_SETTLE_CAP_S:.0f}s cap worst, after each mongodb "
+               f"build"),
+        bounded=True)
+
+
+#: `harness.drivers.mongo.SETTLE_INTERVAL_S` / `SETTLE_CAP_S` at their
+#: defaults (both env-overridable inside the container, which the host cannot
+#: see). Pinned against the harness by `tests/test_estimate.py`.
+MONGOT_SETTLE_INTERVAL_S = 30.0
+MONGOT_SETTLE_CAP_S = 600.0
+
+
 #: Seconds of reader traffic before each churn step's deletes. Matches
 #: `harness.workloads.churn_readers.READER_BASELINE_WINDOW_S`, which is not
 #: importable here -- the orchestrator runs on the host and the harness runs in
@@ -1078,6 +1109,7 @@ _QUERY_TERMS: Tuple[Callable[[_QueryPlan], Optional[_QueryTerm]], ...] = (
     _filtered_search,
     _churn_reinsert,
     _churn_reader_baseline,
+    _mongot_index_settle,
 )
 
 
