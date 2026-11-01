@@ -611,6 +611,11 @@ def _concurrency_windows(plan: _QueryPlan) -> Optional[_QueryTerm]:
     # same length, before each client count's first repeat
     # (`harness/workloads/concurrency.py`). The run pays it, so this counts it.
     seconds = len(points) * duration * (repeats + 1)
+    # `ops.profile_window_clients`: one more window of the same length at
+    # that count, outside the measured repeats, for the perf profile.
+    profiled = plan.ops.get("profile_window_clients")
+    if profiled is not None and int(profiled) in points:
+        seconds += duration
     return _QueryTerm(
         name="concurrency windows",
         typical_s=seconds,

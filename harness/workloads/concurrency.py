@@ -240,7 +240,8 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         max_queries: int = WHOLE_TEST_SET, repeats: int = 1,
         indexed_rows: Optional[int] = None,
         profile_window_clients: Optional[int] = None,
-        profile_ack_dir: Optional[str] = None) -> None:
+        profile_ack_dir: Optional[str] = None,
+        wait_sampler: bool = False) -> None:
     """Measure QPS and latency at each client count.
 
     Each point runs for a fixed duration rather than a fixed query count, so a
@@ -270,8 +271,11 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
     pointing at rows the engine never received, understating every engine at
     once in a way that reads as a result.
 
-    `profile_window_clients` names the client count whose FIRST measured
-    repeat the orchestrator profiles with perf; see `profile_window.py`.
+    `profile_window_clients` names the client count that gets one extra,
+    profiled window after its measured repeats -- never one of them; see
+    `_profiled_window`. `wait_sampler` lets a sampling engine (pgvector)
+    sample its wait events DURING the window, which is off by default because
+    it is load the other engines' windows do not carry.
     """
     queries = _query_pool(dataset.test, max_queries)
 
@@ -320,7 +324,6 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             warmup, duration_s, truth, score=False)
 
         samples = []
-        profiled_repeat: Optional[int] = None
         for attempt in range(max(1, repeats)):
             label = (f" (run {attempt + 1} of {repeats})" if repeats > 1 else "")
             print(f"[concurrency] {clients} client(s){label}: warming up "
@@ -330,27 +333,31 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             # immediately before and after the window and never inside it.
             # See `server_waits.py`; a snapshot that took a second must not
             # move the window's QPS, and the suite pins that it does not.
-            profiled = (profile_window_clients is not None and attempt == 0
-                        and clients == int(profile_window_clients))
-            capture = WaitCapture(driver_factory, meta_driver).begin()
-            profile = (ProfileWindow(profile_ack_dir, clients) if profiled
-                       else None)
-            if profile is not None:
-                profile.begin()
+            # (pgvector's opt-in sampler is the one exception, and it is
+            # disclosed on every record -- see `wait_sampler`.)
+            capture = WaitCapture(driver_factory, meta_driver,
+                                  sampler=wait_sampler).begin()
             try:
                 sample = _one_window(
                     driver_factory, queries, clients, ctx.k, ef_search, index,
                     warmup, duration_s, truth, corpus, dataset.metric)
             finally:
-                if profile is not None:
-                    profile.end()
                 waits = capture.finish()
-            # Only an acknowledged window is claimed: without the ack the
-            # orchestrator never started perf, and the record must not say
-            # a profile covers it.
-            if profile is not None and profile.acknowledged:
-                profiled_repeat = attempt + 1
             samples.append(sample._replace(server_waits=waits))
+
+        # The perf profile gets its OWN window, after the measured repeats
+        # and outside `samples`, exactly as the version-9 warm-up window is
+        # outside them: perf sampling every server thread at 99 Hz with call
+        # graphs is load on the machine being measured, so a profiled window
+        # must never be a candidate for the published median. Same client
+        # count, same length; its throughput is recorded so the cost of the
+        # profiler is visible beside the figures it did not touch.
+        profile_extra: Dict[str, object] = {}
+        if (profile_window_clients is not None
+                and clients == int(profile_window_clients)):
+            profile_extra = _profiled_window(
+                profile_ack_dir, driver_factory, queries, clients, ctx.k,
+                ef_search, index, warmup, duration_s, truth)
 
         # The median window, not an average of several: latency percentiles
         # from one measured window mean something, and the mean of several
@@ -535,12 +542,44 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                 WAITS_KEY: (window.server_waits or {}).get(WAITS_KEY),
                 REASON_KEY: (window.server_waits or {}).get(
                     REASON_KEY, "not captured"),
-                # Which repeat the perf profile covers, when this client count
-                # was the profiled one. Not necessarily the median window.
-                **({"profiled_repeat": profiled_repeat}
-                   if profiled_repeat is not None else {}),
+                # The extra, never-selected window perf profiled, when this
+                # client count was the designated one.
+                **profile_extra,
             },
         ))
+
+
+def _profiled_window(ack_dir: Optional[str], driver_factory: DriverFactory,
+                     queries, clients: int, k: int, ef_search: int,
+                     index: IndexSpec, warmup: int, duration_s: float,
+                     truth: numpy.ndarray) -> Dict[str, object]:
+    """One unscored window bracketed by the perf handshake.
+
+    The handshake -- the begin mark, the wait of up to `ACK_TIMEOUT_S` for
+    the orchestrator's ack, and the end mark -- is outside `_one_window`, so
+    it is outside the barrier-opened span even of this window. Returns the
+    record keys: the window's QPS and whether perf was acknowledged. An
+    unacknowledged window says so: either the orchestrator never answered or
+    perf could not start, and `profile.json` (when written) says which.
+    """
+    print(f"[concurrency] {clients} client(s): one extra window for the perf "
+          f"profile, not measured", flush=True)
+    profile = ProfileWindow(ack_dir, clients)
+    profile.begin()
+    try:
+        window = _one_window(driver_factory, queries, clients, k, ef_search,
+                             index, warmup, duration_s, truth, score=False)
+    finally:
+        profile.end()
+    return {"profile_window_qps": round(window.qps, 2), "profile_window": {
+        "duration_s": duration_s,
+        "acknowledged": bool(profile.acknowledged),
+        # The orchestrator's own word on perf: "recording", or
+        # "unavailable: <why>". Said even when nobody answered.
+        "perf": (profile.perf_status if profile.acknowledged else
+                 "no acknowledgement: the orchestrator did not answer, so no "
+                 "perf profile covers this window"),
+    }}
 
 
 def _query_pool(test: numpy.ndarray, max_queries: int) -> numpy.ndarray:

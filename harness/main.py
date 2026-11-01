@@ -33,6 +33,7 @@ from .workloads import churn as churn_workload  # noqa: E402
 from .workloads import concurrency as concurrency_workload  # noqa: E402
 from .workloads import filtered as filtered_workload  # noqa: E402
 from .workloads.context import RunContext  # noqa: E402
+from .workloads.server_waits import sampler_disclosure  # noqa: E402
 
 ALL_WORKLOADS = ("build", "concurrency", "filtered", "churn")
 
@@ -261,6 +262,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="the server was started with performance_schema "
                         "mutex/rwlock wait instruments ON; stamped on every "
                         "record because it changes server behaviour")
+    p.add_argument("--server-wait-sampler", action="store_true",
+                   help="let a sampling engine (pgvector) sample its wait "
+                        "events DURING each window; off by default because "
+                        "it is load the other engines' windows do not carry")
     p.add_argument("--profile-window-clients", type=int, default=None,
                    help="client count whose first measured concurrency "
                         "window the orchestrator profiles with perf")
@@ -401,6 +406,12 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"driver, not run. {reason}", file=sys.stderr)
     if declined:
         recorder.declare_run_extra(declined_workloads=declined)
+    # Stamped on every record when the sampler ran, because then every
+    # window of this engine carried a sampling backend the other engines'
+    # windows did not. Absent otherwise, so a default record is unchanged.
+    sampled = sampler_disclosure(driver, args.server_wait_sampler)
+    if sampled is not None:
+        recorder.declare_run_extra(server_wait_sampler=sampled)
     facts = _query_path_facts(driver, index)
     if facts:
         recorder.declare_run_extra(**facts)
@@ -475,6 +486,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 indexed_rows=indexed_rows,
                 profile_window_clients=args.profile_window_clients,
                 profile_ack_dir=args.profile_ack_dir,
+                wait_sampler=args.server_wait_sampler,
             )
 
         # The calibrated *unfiltered* ef, not one calibrated per selectivity.
@@ -513,6 +525,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # Ops version 9: the re-insert writes with the load's thread
                 # count, and both are recorded beside its rate.
                 ingest_threads=args.load_threads,
+                wait_sampler=args.server_wait_sampler,
             )
 
     except Exception:

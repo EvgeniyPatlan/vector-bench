@@ -21,7 +21,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from .config import (ResolvedResources, engine_resolution, load_engine,
                      load_resources, merge_resource_overrides,
-                     ops_wait_instruments, profile_max_clients,
+                     ops_wait_instruments, ops_wait_sampler,
+                     profile_max_clients,
                      profile_window_clients, resolve_resources)
 from .manifest import Manifest, ResolutionChanged
 
@@ -79,6 +80,7 @@ def resolve_engines(manifest: Manifest, passes: Sequence[str],
     # Both validated here, before anything is recorded or measured, rather
     # than when the first ops unit builds its harness argv hours later.
     wait_instruments = ops_wait_instruments(profile)
+    wait_sampler = ops_wait_sampler(profile)
     profile_window_clients(profile)
     for resource_pass in passes:
         resources = merge_resource_overrides(
@@ -99,7 +101,8 @@ def resolve_engines(manifest: Manifest, passes: Sequence[str],
                 max_clients=profile_max_clients(profile))
             plan.resolved[(resource_pass, engine)] = resolved
             entry = engine_resolution(engine_cfg, resource_pass, resolved,
-                                      wait_instruments=wait_instruments)
+                                      wait_instruments=wait_instruments,
+                                      wait_sampler=wait_sampler)
             try:
                 outcome = manifest.record_engine_resolution(
                     engine, resource_pass, entry)

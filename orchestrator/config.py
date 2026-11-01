@@ -734,6 +734,39 @@ def profile_window_clients(profile: Dict[str, Any]) -> Optional[int]:
     return value
 
 
+#: The profile key that lets a sampling engine sample during the window.
+WAIT_SAMPLER_KEY = "server_wait_sampler"
+
+
+def ops_wait_sampler(profile: Dict[str, Any]) -> bool:
+    """`ops.server_wait_sampler`, default False, refused unless boolean.
+
+    **Default off because it is the one wait collector that runs INSIDE the
+    measured window.** Every other engine's wait profile is two snapshots at
+    the window's edges; pgvector has no cumulative wait-event counters, so its
+    only profile is `pg_stat_activity` sampled once a second while the clients
+    run -- an extra backend and a query whose cost grows with the client
+    count. On by default it would have measured pgvector under load no other
+    engine's window carries. When on, `engines_resolved` and every pgvector
+    record say so (`server_wait_sampler: {interval_s, concurrent: true}`).
+    """
+    value = (profile.get("ops") or {}).get(WAIT_SAMPLER_KEY, False)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"ops.{WAIT_SAMPLER_KEY} must be true or false, "
+                         f"not {value!r}")
+    return value
+
+
+def engine_wait_sampler_interval(engine_cfg: Dict[str, Any]
+                                 ) -> Optional[float]:
+    """`capabilities.wait_sampler_interval_s`, or None for a snapshot engine."""
+    caps = engine_cfg.get("capabilities") or {}
+    value = caps.get("wait_sampler_interval_s")
+    return float(value) if value else None
+
+
 def engine_wait_instruments(engine_cfg: Dict[str, Any]) -> List[str]:
     """The flags an engine declares under `server.wait_instruments`."""
     server = engine_cfg.get("server", {}) or {}
@@ -815,7 +848,8 @@ def server_env(resolved: ResolvedResources) -> Dict[str, str]:
 
 def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
                       resolved: ResolvedResources,
-                      wait_instruments: bool = False) -> Dict[str, Any]:
+                      wait_instruments: bool = False,
+                      wait_sampler: bool = False) -> Dict[str, Any]:
     """What one engine was given under one pass, for `engines_resolved`.
 
     WHY THIS IS PER ENGINE. `full-20260825` published "all six got the same
@@ -877,4 +911,12 @@ def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
             # gets these appended (see `server_args`).
             "applies_to": ["ops"],
         }
+    # Same rule for the sampler: present only when on, and only for an engine
+    # that samples, so every default entry stays byte-identical.
+    interval = engine_wait_sampler_interval(engine_cfg) if wait_sampler \
+        else None
+    if interval:
+        entry["applied"] = entry["applied"] + [WAIT_SAMPLER_KEY]
+        entry[WAIT_SAMPLER_KEY] = {"interval_s": interval, "concurrent": True,
+                                   "applies_to": ["ops"]}
     return entry

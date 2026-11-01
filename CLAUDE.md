@@ -223,7 +223,11 @@ These are the reasons the code looks over-defensive. Do not relax them.
   collector and reaches further: `concurrency` records and the churn `during_writes` record
   carry `extra.server_waits` (the engine's own wait counters, read on a side connection
   before and after each window — see `harness/workloads/server_waits.py`), so the phases
-  with no server status of any kind are `ingest`, `filtered` and `ef_calibration` — and
+  with no server status of any kind are `ingest`, `filtered` and `ef_calibration`.
+  **pgvector is the exception**: it has no cumulative wait counters, so its profile exists
+  only with `ops.server_wait_sampler: true`, which samples `pg_stat_activity` *during* the
+  window and so perturbs pgvector's window and no other engine's; off by default, stated on
+  every record when on — and
   the gauge is a figure that
   **omits the node map
   (~30–50 B/node) and so is a floor on graph memory, not a measurement of it**. See

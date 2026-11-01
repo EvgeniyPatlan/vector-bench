@@ -15,10 +15,20 @@ counter engines and wrong for pgvector, whose sampler would then be reading
 connection is never touched, because the clients are forked processes that own
 theirs.
 
-**pgvector's sampler is a forked PROCESS, not a thread.** Postgres keeps no
-cumulative wait time, so its `pg_stat_activity` is sampled once a second for
-the whole window -- and the window's clients are forked after the sampler
-starts. A thread alive in the parent at that fork is exactly what
+**pgvector's sampler is OPT-IN, and the one thing here that runs DURING a
+window.** Postgres keeps no cumulative wait-event counters, so the only way to
+see what its backends wait on is to sample `pg_stat_activity` while they run --
+an extra backend and a query whose cost grows with the client count, inside
+the span the QPS divides by. Every other engine only snapshots at the edges,
+so sampling by default would measure pgvector under load the others are not
+under. It therefore runs only with `ops.server_wait_sampler: true`, which
+every record then states (`extra.server_wait_sampler`); off, pgvector records
+`server_waits: None` with `SAMPLER_OFF_REASON`, and edge-only samples are NOT
+substituted -- a point-in-time view of idle backends before and after a window
+is not a delta of anything.
+
+**The sampler is a forked PROCESS, not a thread.** The window's clients are
+forked after the sampler starts. A thread alive in the parent at that fork is exactly what
 `tests/test_g4_pool_teardown.py` exists to forbid (CPython's multi-threaded
 fork `DeprecationWarning`, and a lock held by the thread is held forever in
 every child), and `ClientPool` starts its own attendant threads only after
@@ -43,6 +53,11 @@ from .client_process import _MP
 #: does not take the wait seconds as the measured window's alone.
 COVERS = "the window plus its pool warm-up and teardown"
 
+#: Why a sampling engine has no wait profile by default.
+SAMPLER_OFF_REASON = (
+    "postgres has no cumulative wait-event counters; sampling is opt-in "
+    "(ops.server_wait_sampler) because it runs during the window")
+
 #: The record keys. A prefix is prepended for the churn reader windows.
 WAITS_KEY = "server_waits"
 REASON_KEY = "server_waits_reason"
@@ -53,7 +68,7 @@ class WaitCapture:
     """
 
     def __init__(self, driver_factory: Optional[Callable[[], Any]],
-                 like: Any = None):
+                 like: Any = None, sampler: bool = False):
         """`like` is a driver the workload already holds, of the class the
         factory makes. When it overrides nothing, the factory is never
         called: a driver costs a connection, and on the test fake it costs a
@@ -61,6 +76,9 @@ class WaitCapture:
         suite's recall figures moved by 0.01 when this was not checked."""
         self._factory = driver_factory
         self._like = like
+        #: Whether a sampling engine may sample during the window
+        #: (`ops.server_wait_sampler`). Off: no process is started.
+        self._sampler_allowed = bool(sampler)
         self._driver: Any = None
         self._before: Optional[Dict[str, Any]] = None
         self._reason: Optional[str] = None
@@ -79,6 +97,10 @@ class WaitCapture:
                                                      "wait_snapshot"):
             self._reason = NOT_IMPLEMENTED
             return self
+        if (self._like is not None and not self._sampler_allowed
+                and getattr(self._like, "wait_sample_interval_s", None)):
+            self._reason = SAMPLER_OFF_REASON
+            return self
         try:
             driver = self._factory()
             self._driver = driver
@@ -86,6 +108,10 @@ class WaitCapture:
                 self._reason = NOT_IMPLEMENTED
                 return self
             self._interval = getattr(driver, "wait_sample_interval_s", None)
+            if self._interval and not self._sampler_allowed:
+                self._reason = SAMPLER_OFF_REASON
+                self._interval = None
+                return self
             if self._interval:
                 # The sampler opens its own connection in the child; this
                 # parent-side instance is only used for `wait_delta`.
@@ -236,9 +262,9 @@ def _overrides(driver: Any, name: str) -> bool:
 
 def capture_window(driver_factory: Optional[Callable[[], Any]],
                    run: Callable[[], Any], prefix: str = "",
-                   like: Any = None):
+                   like: Any = None, sampler: bool = False):
     """`(run(), wait keys)` with the capture wrapped around the call."""
-    capture = WaitCapture(driver_factory, like).begin()
+    capture = WaitCapture(driver_factory, like, sampler).begin()
     try:
         result = run()
     except BaseException:
@@ -247,5 +273,18 @@ def capture_window(driver_factory: Optional[Callable[[], Any]],
     return result, capture.finish(prefix)
 
 
-__all__ = ["COVERS", "REASON_KEY", "WAITS_KEY", "WaitCapture",
-           "capture_window"]
+def sampler_disclosure(driver: Any, enabled: bool) -> Optional[Dict[str, Any]]:
+    """`extra.server_wait_sampler` for a run, or None when nothing sampled.
+
+    Only an engine that samples gets the key, and only when the profile
+    turned sampling on: that is the one case in which the measured windows
+    carried load the other engines' did not.
+    """
+    interval = getattr(driver, "wait_sample_interval_s", None)
+    if not (enabled and interval):
+        return None
+    return {"interval_s": float(interval), "concurrent": True}
+
+
+__all__ = ["COVERS", "REASON_KEY", "SAMPLER_OFF_REASON", "WAITS_KEY",
+           "WaitCapture", "capture_window", "sampler_disclosure"]

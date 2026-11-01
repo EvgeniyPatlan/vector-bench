@@ -1,8 +1,9 @@
 """`perf record -g` of the server over one designated concurrency window.
 
 `ops.profile_window_clients` (default null, off) names a client count; for
-each ops unit the orchestrator profiles the server over that count's first
-measured window. Wait counters say WHAT the server waited on; a CPU profile
+each ops unit the harness runs one EXTRA window at that count after the
+measured repeats -- never a candidate for the published median -- and the
+orchestrator profiles the server over it. Wait counters say WHAT the server waited on; a CPU profile
 says where the time went when it was not waiting -- the two halves of telling
 an engine that serializes from one that is saturated.
 
@@ -356,21 +357,26 @@ class ProfileWatcher:
             window.meta.update(status="unavailable", reason=str(exc))
             started = False
         self._active = window
+        status = "recording"
         if not started:
+            status = (f"unavailable: "
+                      f"{window.meta.get('reason') or 'perf did not start'}")
             self.results.append(window.stop())
             self._active = None
-        self._ack(token)
+        self._ack(token, status)
 
     def _finish(self) -> None:
         if self._active is not None:
             self.results.append(self._active.stop())
             self._active = None
 
-    def _ack(self, token: str) -> None:
+    def _ack(self, token: str, status: str) -> None:
+        """Release the harness, telling it whether perf is recording, so the
+        record can say when its profile window has no profile."""
         try:
             os.makedirs(self.ack_dir, exist_ok=True)
             with open(os.path.join(self.ack_dir, f"ack-{token}"), "w") as fh:
-                fh.write("ok\n")
+                fh.write(status + "\n")
         except OSError as exc:
             print(f"[ops] could not acknowledge the profiled window: {exc}",
                   flush=True)

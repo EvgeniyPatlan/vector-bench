@@ -1,7 +1,10 @@
 """Tell the orchestrator when the one profiled concurrency window runs.
 
 `ops.profile_window_clients` asks for a `perf record -g` of the server over
-ONE concurrency window per engine. perf runs on the host, against the server
+ONE concurrency window per ops unit -- an EXTRA window at that client count,
+run after its measured repeats and never one of them, because perf sampling
+every server thread with call graphs is load the published windows must not
+carry (`concurrency._profiled_window`). perf runs on the host, against the server
 container's cgroup (`orchestrator/perf_window.py`); the harness runs in a
 container and is the only party that knows when that window begins. The two
 already share one channel the orchestrator reads line by line -- the harness's
@@ -18,15 +21,15 @@ and one directory both can write, the ops results mount. So:
 **Every step is outside the timed span.** The wait for the ack happens before
 `ClientPool.start`, whose barrier is where the window opens; the end mark is
 printed after `pool.stop()`. Nothing inside the window prints, sleeps or
-polls. The profile therefore also covers the pool's warm-up queries, which
-are the same queries against the same index, and its teardown; the profile's
-own metadata records the window's wall-clock ends beside perf's, so a reader
-can see the margin.
+polls. The profile therefore also covers that window's pool warm-up and
+teardown; `profile.json` records perf's own start and end.
 
 **A missing ack costs a bounded wait and nothing else.** An orchestrator that
 never answers (an older host, a lab session) leaves the harness waiting
-`ACK_TIMEOUT_S` and then measuring as normal; the window is not skipped and
-nothing is recorded as profiled.
+`ACK_TIMEOUT_S` and then running the extra window unprofiled, and the record
+says so (`extra.profile_window.acknowledged: false`). The ack's content is
+the orchestrator's word on perf -- `recording` or `unavailable: <why>` -- and
+lands in `extra.profile_window.perf`.
 """
 
 from __future__ import annotations
@@ -56,6 +59,9 @@ class ProfileWindow:
         self.timeout_s = float(timeout_s)
         self.token = uuid.uuid4().hex[:12]
         self.acknowledged: Optional[bool] = None
+        #: What the orchestrator wrote in the ack: `recording`, or
+        #: `unavailable: <reason>` when perf could not start.
+        self.perf_status: Optional[str] = None
 
     def begin(self) -> bool:
         print(f"{BEGIN_MARK} clients={self.clients} token={self.token}",
@@ -69,6 +75,8 @@ class ProfileWindow:
             if os.path.exists(path):
                 self.acknowledged = True
                 try:
+                    with open(path) as fh:
+                        self.perf_status = fh.read().strip() or None
                     os.remove(path)
                 except OSError:
                     pass

@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from . import docker_ctl
 from . import engines as engines_mod
 from .config import (ResolvedResources, engine_wait_instruments,
-                     ops_wait_instruments, profile_window_clients,
+                     engine_wait_sampler_interval, ops_wait_instruments,
+                     ops_wait_sampler, profile_window_clients,
                      server_args, server_env)
 from .perf_window import ProfileWatcher
 
@@ -1404,6 +1405,9 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
     if (ops_wait_instruments(profile)
             and engine_wait_instruments(_engine_cfg_or_empty(engine))):
         args += ["--server-wait-instruments"]
+    if (ops_wait_sampler(profile)
+            and engine_wait_sampler_interval(_engine_cfg_or_empty(engine))):
+        args += ["--server-wait-sampler"]
     window = profile_window_clients(profile)
     if window is not None:
         args += ["--profile-window-clients", str(window)]

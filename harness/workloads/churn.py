@@ -161,8 +161,12 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         driver_factory: Optional[DriverFactory] = None,
         readers: int = DEFAULT_CHURN_READERS,
         writers: Optional[int] = None,
-        ingest_threads: Optional[int] = None) -> None:
+        ingest_threads: Optional[int] = None,
+        wait_sampler: bool = False) -> None:
     """Measure recall/QPS before churn and after each churn step.
+
+    `wait_sampler` is `ops.server_wait_sampler`: whether a sampling engine
+    may sample its wait events during the reader windows (off by default).
 
     `driver_factory` and `readers` are PR 4 §4.3: a pool of readers queries
     the index while the writer re-inserts, so the record says what a mixed
@@ -325,7 +329,8 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
                         ef_search, index, unit,
                         f"{reader_count}-reader baseline before the "
                         f"{fraction:.0%} deletes", driver.name,
-                        READER_BASELINE_WINDOW_S), "reader_baseline_", driver)
+                        READER_BASELINE_WINDOW_S), "reader_baseline_", driver,
+                    wait_sampler)
                 reader_waits.update(base_waits)
             except PoolError as exc:
                 # Caught here for the same reason the during-writes pool's
@@ -362,7 +367,8 @@ def run(ctx: RunContext, driver: EngineDriver, dataset: Dataset,
         reader_pool = None
         during_capture = None
         if reader_baseline is not None:
-            during_capture = WaitCapture(driver_factory, driver).begin()
+            during_capture = WaitCapture(driver_factory, driver,
+                                         wait_sampler).begin()
             reader_pool = _reader_pool(driver_factory, queries, reader_count,
                                        ctx.k, ef_search, index, unit)
             reader_pool.start(

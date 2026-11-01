@@ -2285,16 +2285,20 @@ LIMITER_NOTE = (
     "\n_**What limited throughput** puts the measured components of each "
     "point side by side: the client container's CPU, the server's CPU and "
     "CPU pressure over the same window, and the server's own largest wait "
-    "(performance_schema for the MySQL family, sampled pg_stat_activity for "
-    "pgvector, INFO commandstats for Valkey -- service time, not waiting -- "
-    "and mongod's lock waits for MongoDB), read on a separate connection "
-    "before and after the window and so also spanning the pool's warm-up. "
+    "(performance_schema for the MySQL family, INFO commandstats for "
+    "Valkey -- service time, not waiting -- and mongod's lock waits for "
+    "MongoDB), read on a separate connection before and after the window "
+    "and so also spanning the pool's warm-up. "
     "**Largest measured** names the largest of the first three shares and "
     "is not a verdict: a wait profile has no common unit with them and is "
     "shown, not ranked. A dash with a reason means the engine could not "
     "say, which is not the same as nothing waited. **Profile** links the "
-    "perf stacks for the one window `ops.profile_window_clients` named, "
-    "which is that point's first repeat and covers its warm-up too._\n")
+    "perf stacks for the one EXTRA window `ops.profile_window_clients` "
+    "asked for: same client count and length, run after the measured "
+    "repeats and never one of them, so no published figure was taken under "
+    "the profiler. pgvector has no cumulative wait counters; its wait column "
+    "is a dash unless `ops.server_wait_sampler` sampled pg_stat_activity "
+    "during the window, which every such record states._\n")
 
 
 def _limiter_table(summary: Dict[str, Any]) -> str:
