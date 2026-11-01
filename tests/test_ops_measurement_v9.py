@@ -586,3 +586,125 @@ class TestTheReportReadsTheNewFields:
         assert "Index warm-ups that did not settle" in text
         assert "**no**" in text
         assert render._index_warmup_section({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# #78 review: the writer pool's merge, through every REAL driver class
+# ---------------------------------------------------------------------------
+
+def _real_classes():
+    from harness.drivers.postgres import _driver_classes
+    return _driver_classes()
+
+
+def _stubbed(cls, plan=None):
+    """A real driver instance with its connection stubbed out: `connect`,
+    `close` and `insert_rows` replaced ON THE INSTANCE, so the class -- its
+    properties, its attributes, its `__init__` -- is the real one."""
+    driver = cls(ConnectionSpec(host="h", port=1))
+    driver.connect = lambda: None
+    driver.close = lambda: setattr(driver, "_closed", True)
+
+    def insert_rows(ids, vectors, attrs):
+        if plan is not None:
+            plan(driver, ids)
+    driver.insert_rows = insert_rows
+    return driver
+
+
+class TestTheWriterMergeSurvivesEveryRealDriver:
+    """#78 review finding 1: `_inherit` wrote through
+    `ValkeyDriver.write_batch_used`, a read-only property, and raised
+    AttributeError in `parallel_reinsert`'s `finally` -- after the rows were
+    written, so the step wrote no record and the remaining writers'
+    connections leaked."""
+
+    @pytest.mark.parametrize("name", sorted(_real_classes()))
+    def test_parallel_reinsert_completes_and_closes_every_writer(self, name):
+        from harness.workloads.churn_writes import parallel_reinsert
+        cls = _real_classes()[name]
+
+        def plan(driver, ids):
+            # Whatever per-connection state the real class keeps, set the
+            # way its own insert path sets it.
+            if "_newest_inserted_id" in vars(driver):
+                driver._newest_inserted_id = max(int(i) for i in ids)
+            if "_write_batch" in vars(driver):
+                driver._write_batch = 1000
+
+        main = _stubbed(cls)
+        writers = []
+
+        def factory():
+            writers.append(_stubbed(cls, plan))
+            return writers[-1]
+
+        written, _s = parallel_reinsert(
+            main, list(range(100)), numpy.zeros((100, 4), dtype="<f4"),
+            numpy.zeros(100), 60.0, 4, factory)
+        assert written == 100
+        assert len(writers) == 4
+        assert all(getattr(w, "_closed", False) for w in writers)
+        if "_newest_inserted_id" in vars(main):
+            assert main._newest_inserted_id == 99
+
+    def test_no_inherited_name_is_a_property_or_a_slot_on_any_driver(self):
+        """The audit, executable: every attribute `INHERITED` merges is a
+        plain instance attribute wherever a real driver class has it."""
+        from harness.workloads.churn_writes import INHERITED
+        for name, cls in _real_classes().items():
+            # `abc.ABC` declares an empty `__slots__`; what matters is that
+            # every class below it gives its instances a `__dict__`, which is
+            # what `_inherit` reads and writes.
+            assert "__dict__" in dir(cls(ConnectionSpec(host="h", port=1))), \
+                name
+            for attr in INHERITED:
+                assert not isinstance(getattr(cls, attr, None), property), \
+                    (name, attr)
+
+    def test_a_reduced_valkey_batch_survives_the_merge(self):
+        """One writer fell back to one row per write; three kept 1,000. The
+        main driver still holds the load's 1,000. Honest: the merged batch is
+        1 and `_write_shape` says `write_batch_reduced`. Mutant (max): 1,000
+        and no caveat -- the re-insert compared as if pipelined."""
+        from harness.drivers.valkey import ValkeyDriver
+        from harness.workloads.churn_writes import (_write_shape,
+                                                    parallel_reinsert)
+        main = _stubbed(ValkeyDriver)
+        assert main.write_batch_used == main.load_batch_rows
+        writers = []
+
+        def plan(driver, ids):
+            driver._write_batch = 1 if driver is writers[0] else 1000
+
+        def factory():
+            writers.append(_stubbed(ValkeyDriver, plan))
+            return writers[-1]
+
+        parallel_reinsert(main, list(range(200)),
+                          numpy.zeros((200, 4), dtype="<f4"),
+                          numpy.zeros(200), 60.0, 4, factory)
+        assert main.write_batch_used == 1
+        assert _write_shape(main) == {"write_batch_rows": 1,
+                                      "write_batch_reduced": True}
+
+    def test_a_writer_that_fails_to_connect_does_not_leak_the_others(self):
+        from harness.drivers.mysql_family import MariaDBDriver
+        from harness.workloads.churn_writes import parallel_reinsert
+        made = []
+
+        def factory():
+            driver = _stubbed(MariaDBDriver)
+            made.append(driver)
+            if len(made) == 3:
+                def refuse():
+                    raise ConnectionError("refused")
+                driver.connect = refuse
+            return driver
+
+        with pytest.raises(ConnectionError):
+            parallel_reinsert(_stubbed(MariaDBDriver), list(range(10)),
+                              numpy.zeros((10, 4), dtype="<f4"),
+                              numpy.zeros(10), 60.0, 4, factory)
+        assert len(made) == 3
+        assert all(getattr(d, "_closed", False) for d in made)

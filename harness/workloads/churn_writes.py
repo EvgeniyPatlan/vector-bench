@@ -66,8 +66,8 @@ def parallel_reinsert(driver, ids: Sequence[int], vectors, attrs,
     the count.
 
     Anything a writer driver learned that the main driver's later calls need
-    is copied back: `_newest_inserted_id` (mongot's sync probe) and
-    `write_batch_used` (Valkey's write shape), each the max over writers.
+    is copied back -- see `INHERITED` for which attributes, merged how, and
+    why never through a property.
     """
     attrs = RowAttrs.coerce(attrs)
     total = len(ids)
@@ -76,13 +76,7 @@ def parallel_reinsert(driver, ids: Sequence[int], vectors, attrs,
     started = time.time()
     done: List[int] = []
     failures: List[str] = []
-    workers = []
-    for _ in range(writers):
-        worker = factory()
-        worker.connect()
-        if index is not None:
-            worker._index = index
-        workers.append(worker)
+    workers: List[Any] = []
 
     def write(worker) -> None:
         while True:
@@ -101,31 +95,78 @@ def parallel_reinsert(driver, ids: Sequence[int], vectors, attrs,
             done.append(end - begin)
 
     try:
+        # Opened inside the `try`, so a connect that fails for the third
+        # writer still closes the two already open.
+        for _ in range(writers):
+            worker = factory()
+            workers.append(worker)
+            worker.connect()
+            if index is not None:
+                worker._index = index
         with Heartbeat(f"re-inserting {total:,} rows over {writers} "
                        f"writer(s)", prefix=driver.name):
             with ThreadPoolExecutor(max_workers=writers) as pool:
                 list(pool.map(write, workers))
     finally:
+        # Each worker in its own try/finally: a merge that raised used to
+        # skip every later worker's `close()` and replace the result the
+        # rows had already been written for -- the step then wrote no record
+        # at all.
         for worker in workers:
-            _inherit(driver, worker)
             try:
-                worker.close()
-            except Exception:
-                pass
+                _inherit(driver, worker)
+            except Exception as exc:
+                print(f"[churn] {driver.name}: could not copy a writer's "
+                      f"state back: {type(exc).__name__}: {exc}")
+            finally:
+                try:
+                    worker.close()
+                except Exception:
+                    pass
     if failures:
         print(f"[churn] {driver.name}: re-insert stopped after "
               f"{sum(done):,} rows: {failures[0]}")
     return sum(done), time.time() - started
 
 
+#: The writer-side state the main driver's LATER calls read, and how several
+#: writers' values merge. Audited against every real driver class
+#: (`MySQLFamilyDriver` and its MariaDB, AliSQL, Percona and MyVector
+#: subclasses, `PostgresDriver`, `MongoDriver`, `ValkeyDriver`): these are the
+#: only two such attributes, each is a plain instance attribute of exactly one
+#: class, and neither is a property or a slot -- which
+#: `tests/test_ops_measurement_v9.py` re-checks over the registry.
+#:
+#: * `_newest_inserted_id` (mongot's sync probe): MAX -- the newest row any
+#:   writer wrote is the one the wait must find.
+#: * `_write_batch` (Valkey's re-insert batch, published through the
+#:   READ-ONLY property `write_batch_used`): MIN -- the reduction is the fact
+#:   `_write_shape`'s `write_batch_reduced` exists to report, and a max over
+#:   the main driver's untouched 1,000 would erase a writer that fell back to
+#:   one row per write. The first version of this merged through the
+#:   property, which raised AttributeError after the rows were written.
+INHERITED = {"_newest_inserted_id": max, "_write_batch": min}
+
+
 def _inherit(driver, worker) -> None:
-    """Copy back the per-connection state the main driver's later calls read."""
-    for name in ("_newest_inserted_id", "write_batch_used"):
-        theirs = getattr(worker, name, None)
+    """Copy back the per-connection state the main driver's later calls read.
+
+    Read and written through the instance dictionaries, never through
+    `getattr`/`setattr` on a name that could be a property: an attribute the
+    worker never set is skipped, and one the main driver does not hold as a
+    plain attribute is refused rather than shadowed.
+    """
+    theirs_all = vars(worker)
+    mine_all = vars(driver)
+    for name, merge in INHERITED.items():
+        theirs = theirs_all.get(name)
         if theirs is None:
             continue
-        mine = getattr(driver, name, None)
-        setattr(driver, name, theirs if mine is None else max(mine, theirs))
+        if isinstance(getattr(type(driver), name, None), property):
+            raise TypeError(f"{type(driver).__name__}.{name} is a property; "
+                            f"refusing to write through it")
+        mine = mine_all.get(name)
+        mine_all[name] = theirs if mine is None else merge(mine, theirs)
 
 
 def synced_wait(driver, expected_rows: int, *,
