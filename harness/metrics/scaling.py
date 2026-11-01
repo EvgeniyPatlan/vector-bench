@@ -415,6 +415,19 @@ def scaling_status(served: Optional[float],
       client count, efficiency low, which is the engine ceiling this guard has
       always had to publish.
 
+    **WHAT THIS GUARD DOES NOT DETECT, said plainly because the rule's name
+    invites the opposite reading.** A server that genuinely answers ONE query
+    at a time is, from the clients' clocks, indistinguishable from a
+    saturated one: every client waits inside its call, so `outstanding` is
+    about N; the queue raises the whole latency distribution, so `served` is
+    about N too; and the throughput is flat, so the efficiency is about 1/N.
+    It is published `ok`, with that low efficiency. What the guard detects is
+    CLIENT-SIDE starvation (`outstanding / N < 0.5`) and the both-low residue.
+    Server-side serialization versus saturation is not separated by any
+    figure computed here; the server's own CPU and pressure over the window
+    (`report/server_windows.py`, the report's Server CPU columns) are the
+    evidence for that, and they are beside the figure rather than in it.
+
     `outstanding=None` is the pre-version-9 rule, byte for byte: kept so the
     mutation probes and the archived-record recomputations that call it
     without the keyword keep testing the arithmetic they were written about.

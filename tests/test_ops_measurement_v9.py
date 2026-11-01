@@ -566,6 +566,27 @@ class TestTheReportReadsTheNewFields:
         assert render.SCALING_REFUSED_MARK not in cell
         assert render._efficiency_cell(extra) == "0.97"
 
+    def test_nothing_claims_the_guard_catches_a_one_query_server(self):
+        """#78 review finding 3. Under the v9 rule a server answering one
+        query at a time looks saturated (outstanding ~N, served ~N,
+        efficiency ~1/N) and is published `ok`. The three places a reader
+        meets the rule say so, and say what does see it. Checked as
+        vocabulary over whitespace-normalised text, so a reflow passes and a
+        deletion does not."""
+        def plain(text):
+            return " ".join(text.replace("*", "").split())
+
+        notes = plain("".join(render._CONCURRENCY_NOTES))
+        doc = plain(scaling.scaling_status.__doc__)
+        with open(os.path.join(VB_ROOT, "docs", "05-methodology.md")) as fh:
+            methodology = plain(fh.read())
+        for where, text in (("render", notes), ("scaling", doc),
+                            ("docs/05", methodology)):
+            lowered = text.lower()
+            assert "client-side starvation" in lowered, where
+            assert "one query at a time" in lowered, where
+            assert "server cpu" in lowered, where
+
     def test_a_warm_up_that_did_not_settle_is_in_validity(self):
         from report import generate
         rec = {"phase": "recall_qps", "engine": "valkey", "dataset": "d",
