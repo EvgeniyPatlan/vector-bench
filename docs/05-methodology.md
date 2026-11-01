@@ -1475,3 +1475,54 @@ invalidates comparison with every run measured before it — including the
 2026-10-14 run above, which is the first that ever stamped a version 5. That
 is an `OPS_MEASUREMENT_VERSION` bump by the same rule version 3's query-pool
 change earned one, and it is version **6**.
+
+### 7.1 Server-side evidence: wait counters and CPU profiles
+
+The version-9 guard above cannot tell a server that serializes from one that
+is saturated, and neither can the Server CPU and pressure columns on their
+own: both readings are "server CPU below its cpuset, clients not bound". What
+can is the engine's own account of what its threads waited on, so every
+concurrency record (and the churn `during_writes` record, for both reader
+windows) carries `extra.server_waits`: the top ten events by wait time, their
+counts and the total, differenced from the engine's counters.
+
+| Engine | Source | Unit |
+| --- | --- | --- |
+| MySQL family | `performance_schema.events_waits_summary_global_by_event_name` (excluding `idle`), plus `SHOW ENGINE INNODB MUTEX` when it returns rows | seconds waited |
+| pgvector | `pg_stat_activity` sampled once a second, active client backends only | samples per wait event (`CPU (no wait event)` when none) |
+| Valkey | `INFO commandstats`, plus `LATENCY LATEST` spikes stamped inside the window | seconds of command *service* time, not waiting |
+| MongoDB | `serverStatus` lock acquisition waits and ticket gauges; mongot's metrics endpoint when reachable | seconds waited |
+
+The snapshots are read on a **separate connection**, immediately before and
+after the window and never inside it, so the deltas also span the pool's
+warm-up and teardown (`server_waits.covers` says so). When an engine cannot
+say — MariaDB's `performance_schema` is off by default — the record carries
+`server_waits: null` and `server_waits_reason`; an empty event list is
+reserved for "measured, and nothing waited".
+
+**Latch waits are opt-in.** With the shipped settings the MySQL-family
+profiles contain file IO, table IO and table-lock waits but no mutex or
+rwlock, because those instruments are off by default. `ops.server_wait_instruments:
+true` turns them on (and `performance_schema` itself on MariaDB) for the ops
+servers only. **It changes the server being measured**: every latch
+acquisition then reads a timer. Measure the overhead first — the same `smoke`
+unit with the key off and on — and do not publish throughput from a profile
+that has it on without saying so; while it is on, `engines_resolved` lists it
+under `applied` and every record carries `extra.server_wait_instruments`.
+
+**CPU profiles are optional.** `ops.profile_window_clients: <N>` has the
+orchestrator run `perf record -g` against the server container's cgroup for
+the first measured window at N clients, per ops unit, writing `perf.data`,
+`folded.txt` and `profile.json` under `<run>/profiles/<unit>-c<N>/`. perf is
+used only if the host already has it and permits it; otherwise the reason
+(not installed, `perf_event_paranoid`, missing CAP_PERFMON) is written and the
+run continues.
+
+The report's **What limited throughput** table puts client CPU, server CPU,
+server CPU pressure, the top server wait and the profile link side by side and
+names only the largest of the three CPU shares. It draws no conclusion beyond
+that.
+
+None of this needed an `OPS_MEASUREMENT_VERSION` bump: the snapshots are
+outside the timed span, the instruments are off by default, and no identity
+or published figure reads the new keys.

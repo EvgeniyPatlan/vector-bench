@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy
 
+from .engine_waits import postgres_delta, postgres_sample
 from .base import (DATABASE, FILTER_COLUMNS, FILTER_CTAG, FILTER_TAG, TABLE,
                    ConnectionSpec, EngineDriver, IndexSpec, LoadResult,
                    RowAttrs, checked_filter_column)
@@ -678,6 +679,20 @@ class PostgresDriver(EngineDriver):
             return str(self._cur.fetchone()[0])
         except Exception:
             return "unknown"
+
+    #: Postgres keeps no cumulative per-event wait time, so the capture
+    #: samples `pg_stat_activity` once a second from a sampler process in the
+    #: harness container, on its own connection -- never one a client holds, which
+    #: would make the sampler a participant in the window it describes.
+    wait_sample_interval_s = 1.0
+
+    def wait_snapshot(self):
+        if self._cur is None:
+            return None, "no connection"
+        return postgres_sample(self._cur)
+
+    def wait_delta(self, before, after):
+        return postgres_delta(before, after, self.wait_sample_interval_s)
 
     #: `HnswElementTupleData` carries the `Vector data` (src/hnsw.h at
     #: v0.8.6), and this driver indexes the `vector` type, which is float32.

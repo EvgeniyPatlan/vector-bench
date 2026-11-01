@@ -253,6 +253,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="pgvector only: one or more of off | relaxed_order | "
                         "strict_order, comma-separated")
 
+    # Server-side evidence of what limited throughput. Both decided on the
+    # host from the profile (`ops.server_wait_instruments`,
+    # `ops.profile_window_clients`); the harness only records the first and
+    # signals the window for the second.
+    p.add_argument("--server-wait-instruments", action="store_true",
+                   help="the server was started with performance_schema "
+                        "mutex/rwlock wait instruments ON; stamped on every "
+                        "record because it changes server behaviour")
+    p.add_argument("--profile-window-clients", type=int, default=None,
+                   help="client count whose first measured concurrency "
+                        "window the orchestrator profiles with perf")
+    p.add_argument("--profile-ack-dir", default=None,
+                   help="directory the orchestrator acknowledges a profiled "
+                        "window's start in")
     p.add_argument("--run-id", required=True)
     p.add_argument("--resource-pass", default="normalized",
                    choices=("normalized", "tuned"))
@@ -363,6 +377,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # target and the status are not known until the sweep has run, and are
     # declared afterwards. See `Recorder.declare_run_extra`.
     recorder = Recorder(args.output, run_extra={"ef_mode": args.ef_mode})
+    if args.server_wait_instruments:
+        # On every record, not only on the ones that read waits: the
+        # instruments are a server setting, and a build or filtered figure
+        # measured with them on was measured on a different server. Absent
+        # (not False) when off, so a default run's records are unchanged.
+        recorder.declare_run_extra(server_wait_instruments=True)
     ctx = RunContext(
         run_id=args.run_id,
         resource_pass=args.resource_pass,
@@ -453,6 +473,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_queries=args.concurrency_queries,
                 repeats=args.concurrency_repeats,
                 indexed_rows=indexed_rows,
+                profile_window_clients=args.profile_window_clients,
+                profile_ack_dir=args.profile_ack_dir,
             )
 
         # The calibrated *unfiltered* ef, not one calibrated per selectivity.

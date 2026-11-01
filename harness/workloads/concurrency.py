@@ -110,6 +110,8 @@ from .clients import (CLIENT_BOUND_UTIL,  # noqa: F401
                       SERVED_CONCURRENCY_FLOOR, Answer, ClientPool,
                       DriverFactory, Instruments, client_cpu, shard_queries)
 from .context import RunContext
+from .profile_window import ProfileWindow
+from .server_waits import REASON_KEY, WAITS_KEY, WaitCapture
 
 _client_cpu = client_cpu
 _shard_queries = shard_queries
@@ -189,6 +191,11 @@ class _Window(NamedTuple):
     #: perf_counter instants the spans use are not comparable across hosts.
     window_started_at: Optional[float] = None
     window_ended_at: Optional[float] = None
+    #: The server's own wait profile around this window, as the two record
+    #: keys `server_waits.WaitCapture.finish` returns. Carried on the sample
+    #: for the reason the recall is: the waits beside the median window's
+    #: QPS must be that window's.
+    server_waits: Optional[Dict[str, object]] = None
 
 
 #: `extra.efficiency_reliability` values. A cold one-client baseline inflates
@@ -231,7 +238,9 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         client_counts: Sequence[int] = (1, 2, 4, 8, 16, 32),
         duration_s: float = 20.0, warmup: int = 50,
         max_queries: int = WHOLE_TEST_SET, repeats: int = 1,
-        indexed_rows: Optional[int] = None) -> None:
+        indexed_rows: Optional[int] = None,
+        profile_window_clients: Optional[int] = None,
+        profile_ack_dir: Optional[str] = None) -> None:
     """Measure QPS and latency at each client count.
 
     Each point runs for a fixed duration rather than a fixed query count, so a
@@ -260,6 +269,9 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
     training set would otherwise have its recall scored against neighbours
     pointing at rows the engine never received, understating every engine at
     once in a way that reads as a result.
+
+    `profile_window_clients` names the client count whose FIRST measured
+    repeat the orchestrator profiles with perf; see `profile_window.py`.
     """
     queries = _query_pool(dataset.test, max_queries)
 
@@ -308,14 +320,37 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             warmup, duration_s, truth, score=False)
 
         samples = []
+        profiled_repeat: Optional[int] = None
         for attempt in range(max(1, repeats)):
             label = (f" (run {attempt + 1} of {repeats})" if repeats > 1 else "")
             print(f"[concurrency] {clients} client(s){label}: warming up "
                   f"({warmup} queries each), then measuring for "
                   f"{duration_s:.0f}s", flush=True)
-            samples.append(_one_window(
-                driver_factory, queries, clients, ctx.k, ef_search, index,
-                warmup, duration_s, truth, corpus, dataset.metric))
+            # The server's wait counters, read on a side connection
+            # immediately before and after the window and never inside it.
+            # See `server_waits.py`; a snapshot that took a second must not
+            # move the window's QPS, and the suite pins that it does not.
+            profiled = (profile_window_clients is not None and attempt == 0
+                        and clients == int(profile_window_clients))
+            capture = WaitCapture(driver_factory, meta_driver).begin()
+            profile = (ProfileWindow(profile_ack_dir, clients) if profiled
+                       else None)
+            if profile is not None:
+                profile.begin()
+            try:
+                sample = _one_window(
+                    driver_factory, queries, clients, ctx.k, ef_search, index,
+                    warmup, duration_s, truth, corpus, dataset.metric)
+            finally:
+                if profile is not None:
+                    profile.end()
+                waits = capture.finish()
+            # Only an acknowledged window is claimed: without the ack the
+            # orchestrator never started perf, and the record must not say
+            # a profile covers it.
+            if profile is not None and profile.acknowledged:
+                profiled_repeat = attempt + 1
+            samples.append(sample._replace(server_waits=waits))
 
         # The median window, not an average of several: latency percentiles
         # from one measured window mean something, and the mean of several
@@ -492,6 +527,18 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                     if window.served_concurrency is not None else None),
                 "scaling_status": status,
                 "scaling_note": note,
+                # What the SERVER waited on over the median window, from its
+                # own counters -- the evidence that tells a server that
+                # serializes from one that is saturated, which the CPU and
+                # pressure columns cannot. `None` beside a reason when the
+                # engine could not say; never an empty profile for "unknown".
+                WAITS_KEY: (window.server_waits or {}).get(WAITS_KEY),
+                REASON_KEY: (window.server_waits or {}).get(
+                    REASON_KEY, "not captured"),
+                # Which repeat the perf profile covers, when this client count
+                # was the profiled one. Not necessarily the median window.
+                **({"profiled_repeat": profiled_repeat}
+                   if profiled_repeat is not None else {}),
             },
         ))
 

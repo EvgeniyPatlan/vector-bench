@@ -22,7 +22,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from . import docker_ctl
 from . import engines as engines_mod
-from .config import ResolvedResources, server_args, server_env
+from .config import (ResolvedResources, engine_wait_instruments,
+                     ops_wait_instruments, profile_window_clients,
+                     server_args, server_env)
+from .perf_window import ProfileWatcher
+
+#: Where, inside the client container, the harness waits for the profiled
+#: window's acknowledgement. Under the results mount, which is the one
+#: directory both sides can write; see `perf_window.ProfileWatcher`.
+PROFILE_ACK_SUBDIR = ".vb-profile"
 from .manifest import utcnow
 
 
@@ -235,8 +243,15 @@ class OpsRun:
 
     def __init__(self, engine: str, engine_cfg: Dict[str, Any],
                  resolved: ResolvedResources, resource_pass: str,
-                 paths: Dict[str, str], run_id: str, dataset: str, tag: str):
+                 paths: Dict[str, str], run_id: str, dataset: str, tag: str,
+                 wait_instruments: bool = False,
+                 profile_window_clients: Optional[int] = None):
         self.engine = engine
+        # Both from the profile, through `config.ops_wait_instruments` and
+        # `config.profile_window_clients`; off by default, which keeps the
+        # server's argv and the harness's byte-identical to before.
+        self.wait_instruments = bool(wait_instruments)
+        self.profile_window_clients = profile_window_clients
         self.engine_cfg = engine_cfg
         self.resolved = resolved
         self.resource_pass = resource_pass
@@ -319,7 +334,8 @@ class OpsRun:
                 f"  ./run-benchmark.sh build --engines {self.engine}"
             )
 
-        flags = server_args(self.engine_cfg, self.resource_pass, self.resolved)
+        flags = server_args(self.engine_cfg, self.resource_pass, self.resolved,
+                            wait_instruments=self.wait_instruments)
         data_mount = ("/var/lib/postgresql" if self.engine == "pgvector"
                       else "/var/lib/vbench")
 
@@ -516,6 +532,7 @@ class OpsRun:
             detach=False,
         )
 
+        watcher = self._profile_watcher(image, spec)
         sampler = None
         if memory_timeseries:
             sampler = docker_ctl.MemorySampler(self.server_name, memory_timeseries)
@@ -523,7 +540,7 @@ class OpsRun:
         try:
             captured: List[str] = []
             rc = docker_ctl.run_foreground(spec, timeout=timeout_s,
-                                           sink=captured)
+                                           sink=captured, line_filter=watcher)
             saved = docker_ctl.save_phase_log(
                 self.paths["run_dir"], self.engine, self.dataset,
                 f"ops-{self.tag}", self.resource_pass, captured)
@@ -539,6 +556,29 @@ class OpsRun:
                 sampler.stop()
                 print(f"[ops] captured {sampler.samples} memory samples "
                       f"-> {os.path.basename(memory_timeseries)}")
+
+    def _profile_watcher(self, bench_image: str,
+                         spec: "docker_ctl.ContainerSpec"
+                         ) -> Optional[ProfileWatcher]:
+        """The perf `line_filter` for this unit, or None when profiling is off.
+
+        Also tells the harness where to wait for the ack, by appending to the
+        spec's command -- the only place the container path is known.
+        """
+        if self.profile_window_clients is None:
+            return None
+        host_ack = os.path.join(self.paths["ops_results"], PROFILE_ACK_SUBDIR)
+        os.makedirs(host_ack, exist_ok=True)
+        spec.command = [*spec.command, "--profile-ack-dir",
+                        f"/results/{PROFILE_ACK_SUBDIR}"]
+        stem = f"{self.engine}-{self.dataset}-{self.resource_pass}-{self.tag}"
+        return ProfileWatcher(
+            self.server_name, os.path.join(self.paths["run_dir"], "profiles"),
+            stem, host_ack,
+            meta={"engine": self.engine, "dataset": self.dataset,
+                  "resource_pass": self.resource_pass, "unit": self.tag,
+                  "run_id": self.run_id},
+            bench_image=bench_image)
 
     def run_script(self, script: str, args: List[str],
                    interactive: bool = False,
@@ -1357,7 +1397,25 @@ def harness_args(profile: Dict[str, Any], m: int, engine: str,
         modes = _iterative_scan_modes(iterative_scan)
         if modes:
             args += ["--iterative-scan", modes]
+    # Conditional, unlike `--ef-mode`: both are server-side evidence, off by
+    # default, and an absent flag is exactly "off". The instruments flag is
+    # emitted only for an engine that declares instruments, because only
+    # there did the server change (`config.engine_wait_instruments`).
+    if (ops_wait_instruments(profile)
+            and engine_wait_instruments(_engine_cfg_or_empty(engine))):
+        args += ["--server-wait-instruments"]
+    window = profile_window_clients(profile)
+    if window is not None:
+        args += ["--profile-window-clients", str(window)]
     return args
+
+
+def _engine_cfg_or_empty(engine: str) -> Dict[str, Any]:
+    from .config import load_engine
+    try:
+        return load_engine(engine)
+    except Exception:
+        return {}
 
 
 def ops_ef_construction(engine: str, profile: Dict[str, Any]) -> Optional[int]:

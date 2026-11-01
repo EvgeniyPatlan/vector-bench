@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy
 
+from .engine_waits import mongo_delta, mongo_snapshot
 from .base import (DATABASE, FILTER_COLUMNS, FILTER_TAG, TABLE, ConnectionSpec,
                    EngineDriver, IndexSpec, LoadResult, RowAttrs,
                    checked_filter_column)
@@ -698,6 +699,19 @@ class MongoDriver(EngineDriver):
         except Exception:
             version = "?"
         return f"Percona Server for MongoDB {version} / mongot"
+
+    def wait_snapshot(self):
+        """mongod's lock-acquisition waits and ticket gauges, plus mongot's
+        Prometheus counters when reachable. The search itself runs in mongot,
+        so mongod's locks describe only the half of a query that fetches
+        documents; the reason recorded beside a missing mongot block says
+        why the other half is not there."""
+        if self._conn is None:
+            return None, "no connection"
+        return mongo_snapshot(self._conn, self.spec.host)
+
+    def wait_delta(self, before, after):
+        return mongo_delta(before, after)
 
     def capabilities(self) -> Dict[str, Any]:
         caps = super().capabilities()
