@@ -1327,9 +1327,14 @@ def _run_unit(phase: str, engine: str, dataset: str, profile: Dict[str, Any],
                             engine, profile, resources, resource_pass),
                         bulk_vector_index_build=bulk_build,
                     )
-                    with ops_pass.OpsRun(engine, engine_cfg, resolved,
-                                         resource_pass, paths, run_id,
-                                         dataset, tag) as run:
+                    with ops_pass.OpsRun(
+                            engine, engine_cfg, resolved, resource_pass,
+                            paths, run_id, dataset, tag,
+                            wait_instruments=ops_pass.ops_wait_instruments(
+                                profile),
+                            profile_window_clients=(
+                                ops_pass.profile_window_clients(profile)),
+                    ) as run:
                         rc = run.run_harness(harness_args, output,
                                              memory_timeseries=memory_ts)
                     if rc == 0:

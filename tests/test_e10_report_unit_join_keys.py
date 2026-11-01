@@ -1110,7 +1110,9 @@ class TestEveryOpsUnitTableSpellsTheUnitColumnsTheSameWay:
     #: 9 -> 10: §7's peak-throughput headline (`_peak_throughput_table`). It
     #: ranks concurrency UNITS -- one row per (engine, pass, M, build mode,
     #: storage) -- so it names all four axes like every other unit table.
-    OPS_UNIT_TABLE_COUNT = 10
+    #: 10 -> 11: §7's "What limited throughput" table (`_limiter_table`), one
+    #: row per concurrency point, so the same four axes and the client count.
+    OPS_UNIT_TABLE_COUNT = 11
 
     def test_every_ops_unit_header_names_every_axis(self):
         """The header side of `ops_unit`, over the FILE rather than a list.

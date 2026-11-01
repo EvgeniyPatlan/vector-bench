@@ -679,12 +679,116 @@ def wiredtiger_cache_gb(resolved: "ResolvedResources") -> str:
     return f"{max(0.25, cache / GB):.2f}"
 
 
+#: The profile key that turns the MySQL-family wait instruments on.
+WAIT_INSTRUMENTS_KEY = "server_wait_instruments"
+
+
+def ops_wait_instruments(profile: Dict[str, Any]) -> bool:
+    """`ops.server_wait_instruments`, default False, refused unless boolean.
+
+    **Default off because turning it on changes the server being measured.**
+    performance_schema's mutex and rwlock instruments put a timer read on
+    every latch acquisition, which is the hot path of exactly the
+    concurrency windows they are meant to explain, and on MariaDB they also
+    switch performance_schema itself on (its default is OFF) and with it the
+    memory that allocates. Measure the overhead in a `smoke` run -- the same
+    unit with the key off and on -- before turning it on for a profile whose
+    numbers are published; while it is on, `engines_resolved` and every
+    record say so (`extra.server_wait_instruments`).
+
+    Refused rather than coerced: YAML's `"false"` is a non-empty string and
+    would be truthy, which is a server flag nobody asked for.
+    """
+    value = (profile.get("ops") or {}).get(WAIT_INSTRUMENTS_KEY, False)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"ops.{WAIT_INSTRUMENTS_KEY} must be true or false, "
+                         f"not {value!r}")
+    return value
+
+
+#: The profile key naming the concurrency client count to profile with perf.
+PROFILE_WINDOW_KEY = "profile_window_clients"
+
+
+def profile_window_clients(profile: Dict[str, Any]) -> Optional[int]:
+    """`ops.profile_window_clients`: None (off, the default) or a client count
+    the profile actually measures.
+
+    Refused when it names a count not in `ops.client_counts`: the harness
+    would never reach that window, perf would never start, and the run
+    would end with no profile and nothing saying why.
+    """
+    ops = profile.get("ops") or {}
+    value = ops.get(PROFILE_WINDOW_KEY)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"ops.{PROFILE_WINDOW_KEY} must be a client count "
+                         f"or null, not {value!r}")
+    counts = [int(c) for c in ops.get("client_counts", [1])]
+    if value not in counts:
+        raise ValueError(f"ops.{PROFILE_WINDOW_KEY} is {value}, which is not "
+                         f"one of ops.client_counts {counts}")
+    return value
+
+
+#: The profile key that lets a sampling engine sample during the window.
+WAIT_SAMPLER_KEY = "server_wait_sampler"
+
+
+def ops_wait_sampler(profile: Dict[str, Any]) -> bool:
+    """`ops.server_wait_sampler`, default False, refused unless boolean.
+
+    **Default off because it is the one wait collector that runs INSIDE the
+    measured window.** Every other engine's wait profile is two snapshots at
+    the window's edges; pgvector has no cumulative wait-event counters, so its
+    only profile is `pg_stat_activity` sampled once a second while the clients
+    run -- an extra backend and a query whose cost grows with the client
+    count. On by default it would have measured pgvector under load no other
+    engine's window carries. When on, `engines_resolved` and every pgvector
+    record say so (`server_wait_sampler: {interval_s, concurrent: true}`).
+    """
+    value = (profile.get("ops") or {}).get(WAIT_SAMPLER_KEY, False)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"ops.{WAIT_SAMPLER_KEY} must be true or false, "
+                         f"not {value!r}")
+    return value
+
+
+def engine_wait_sampler_interval(engine_cfg: Dict[str, Any]
+                                 ) -> Optional[float]:
+    """`capabilities.wait_sampler_interval_s`, or None for a snapshot engine."""
+    caps = engine_cfg.get("capabilities") or {}
+    value = caps.get("wait_sampler_interval_s")
+    return float(value) if value else None
+
+
+def engine_wait_instruments(engine_cfg: Dict[str, Any]) -> List[str]:
+    """The flags an engine declares under `server.wait_instruments`."""
+    server = engine_cfg.get("server", {}) or {}
+    return [str(a) for a in (server.get("wait_instruments") or [])]
+
+
 def server_args(engine_cfg: Dict[str, Any], resource_pass: str,
-                resolved: ResolvedResources) -> List[str]:
-    """Render an engine's server flags with the resolved values substituted."""
+                resolved: ResolvedResources,
+                wait_instruments: bool = False) -> List[str]:
+    """Render an engine's server flags with the resolved values substituted.
+
+    `wait_instruments` appends the engine's `server.wait_instruments` flags
+    (`ops_wait_instruments`). Only the ops path passes it: the waits are read
+    around ops windows, and the ann results tree is shared across runs and
+    keyed without it, so an instrumented recall curve would be reused later
+    under a manifest that says the server was not instrumented.
+    """
     server = engine_cfg.get("server", {}) or {}
     args: List[str] = list(server.get("common", []) or [])
     args += list(server.get(resource_pass, []) or [])
+    if wait_instruments:
+        args += engine_wait_instruments(engine_cfg)
 
     substitutions = {
         "buffer_bytes": resolved.buffer_bytes,
@@ -743,7 +847,9 @@ def server_env(resolved: ResolvedResources) -> Dict[str, str]:
 
 
 def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
-                      resolved: ResolvedResources) -> Dict[str, Any]:
+                      resolved: ResolvedResources,
+                      wait_instruments: bool = False,
+                      wait_sampler: bool = False) -> Dict[str, Any]:
     """What one engine was given under one pass, for `engines_resolved`.
 
     WHY THIS IS PER ENGINE. `full-20260825` published "all six got the same
@@ -779,7 +885,7 @@ def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
     if resolved.graph_cache_bytes == 0 and "graph_cache_bytes" in applied:
         # `server_args` drops a zero cache-size flag; so does this record.
         applied.remove("graph_cache_bytes")
-    return {
+    entry = {
         "resolved": resolved.as_dict(),
         "server_args": server_args(engine_cfg, resource_pass, resolved),
         "applied": applied,
@@ -790,3 +896,27 @@ def engine_resolution(engine_cfg: Dict[str, Any], resource_pass: str,
             "env": server_env(resolved),
         },
     }
+    # Only when ON and only for an engine that declares instruments, so a
+    # default run's entry is byte-identical to one written before the key
+    # existed -- `record_engine_resolution` refuses a resume whose entry
+    # differs, and an always-present `false` would refuse every resume of
+    # every run recorded before it.
+    flags = engine_wait_instruments(engine_cfg) if wait_instruments else []
+    if flags:
+        entry["applied"] = applied + [WAIT_INSTRUMENTS_KEY]
+        entry[WAIT_INSTRUMENTS_KEY] = {
+            "enabled": True,
+            "flags": flags,
+            # `server_args` above is what the ann path starts; the ops server
+            # gets these appended (see `server_args`).
+            "applies_to": ["ops"],
+        }
+    # Same rule for the sampler: present only when on, and only for an engine
+    # that samples, so every default entry stays byte-identical.
+    interval = engine_wait_sampler_interval(engine_cfg) if wait_sampler \
+        else None
+    if interval:
+        entry["applied"] = entry["applied"] + [WAIT_SAMPLER_KEY]
+        entry[WAIT_SAMPLER_KEY] = {"interval_s": interval, "concurrent": True,
+                                   "applies_to": ["ops"]}
+    return entry

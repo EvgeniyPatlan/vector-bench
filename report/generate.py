@@ -1500,6 +1500,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[report] merged records -> {merged_path}")
 
     summary = summarize(records, manifest, memory)
+    # The perf profiles `ops.profile_window_clients` asked for, keyed like the
+    # memory series plus the client count, for the limiter table's links.
+    # From the run directory, which `summarize` is not given.
+    from report.limiters import profile_index
+    summary["profiles"] = profile_index(run_dir, out_dir)
     # Set here rather than built inside `summarize`, because `summarize`'s
     # inputs cannot produce it: by the time it is called the excluded records
     # are gone, and a census of them is exactly the thing the remaining

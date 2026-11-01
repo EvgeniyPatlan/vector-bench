@@ -17,6 +17,7 @@ from __future__ import annotations
 import html as _html
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from report import disclosures as _disclosures
@@ -2279,6 +2280,64 @@ def _concurrency_table(summary: Dict[str, Any]) -> str:
         + _concurrency_notes(summary)
 
 
+#: What the limiter table is and, as importantly, what it is not.
+LIMITER_NOTE = (
+    "\n_**What limited throughput** puts the measured components of each "
+    "point side by side: the client container's CPU, the server's CPU and "
+    "CPU pressure over the same window, and the server's own largest wait "
+    "(performance_schema for the MySQL family, INFO commandstats for "
+    "Valkey -- service time, not waiting -- and mongod's lock waits for "
+    "MongoDB), read on a separate connection before and after the window "
+    "and so also spanning the pool's warm-up. "
+    "**Largest measured** names the largest of the first three shares and "
+    "is not a verdict: a wait profile has no common unit with them and is "
+    "shown, not ranked. A dash with a reason means the engine could not "
+    "say, which is not the same as nothing waited. **Profile** links the "
+    "perf stacks for the one EXTRA window `ops.profile_window_clients` "
+    "asked for: same client count and length, run after the measured "
+    "repeats and never one of them, so no published figure was taken under "
+    "the profiler. pgvector has no cumulative wait counters; its wait column "
+    "is a dash unless `ops.server_wait_sampler` sampled pg_stat_activity "
+    "during the window, which every such record states._\n")
+
+
+def _limiter_table(summary: Dict[str, Any]) -> str:
+    """One "what limited throughput" row per concurrency point."""
+    from report.limiters import (largest_component, profile_cell,
+                                 top_wait_cell)
+    from report.server_windows import window_key
+    windows = summary.get("server_windows") or {}
+    rows = []
+    for r in sorted(summary.get("concurrency", []),
+                    key=lambda r: (r.get("dataset", ""), r.get("engine", ""),
+                                   r.get("resource_pass") or "",
+                                   r.get("m") or 0,
+                                   r.get("build_mode") or "",
+                                   r.get("storage_engine") or "",
+                                   r.get("clients") or 0)):
+        extra = r.get("extra") or {}
+        figures = windows.get(window_key(r)) or {}
+        server, pressure = _server_cells(r, windows)
+        rows.append([
+            _label(r.get("engine", "?")), r.get("dataset", "?"),
+            r.get("resource_pass") or "—", _fmt(r.get("m"), 0),
+            r.get("build_mode") or "—", _storage(r),
+            str(r.get("clients", "—")),
+            _client_cpu_cell(extra), server, pressure,
+            top_wait_cell(extra),
+            profile_cell(r, summary.get("profiles")),
+            largest_component(extra.get("client_cpu_util"),
+                              figures.get("cpu_util"),
+                              figures.get("cpu_pressure")),
+        ])
+    return ("\n#### What limited throughput\n" + _md_table(
+        ["Engine", "Dataset", "Pass", "M", "Build mode", "Storage", "Clients",
+         "Client CPU", "Server CPU", "Server CPU pressure", "Top server wait",
+         "Profile", "Largest measured"],
+        rows,
+    ) + LIMITER_NOTE)
+
+
 #: What the two columns every concurrency and churn table ends with --
 #: "Calibrated ef" and "Calibration recall" -- mean. Spelled as literals in
 #: each header rather than unpacked from a constant, because
@@ -3835,6 +3894,7 @@ def render_markdown(manifest: Dict[str, Any], summary: Dict[str, Any],
         "across repeated measurement windows at that point; a dash means the "
         "point was measured once and carries no error bar.\n\n",
         (_concurrency_table(summary) + _peak_throughput_table(summary)
+         + _limiter_table(summary)
          if summary.get("concurrency")
          else _not_measured("concurrency", profile, records)),
     ]
@@ -4474,6 +4534,10 @@ def _inline_md(text: str) -> str:
             break
         escaped = (escaped[:first] + "<strong>" + escaped[first + 2:second]
                    + "</strong>" + escaped[second + 2:])
+    # `[text](href)`, which the limiter table's profile column uses. After
+    # escaping, so the href is already attribute-safe.
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>',
+                     escaped)
     return escaped
 
 
@@ -4587,6 +4651,7 @@ def render_html(manifest: Dict[str, Any], summary: Dict[str, Any],
         ("7. Concurrency scaling",
          _md_tables_to_html(_concurrency_table(summary)
                             + _peak_throughput_table(summary)
+                            + _limiter_table(summary)
                             if summary.get("concurrency")
                             else _not_measured("concurrency", profile, records)),
          figures("concurrency-")

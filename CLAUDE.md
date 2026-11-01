@@ -218,8 +218,17 @@ These are the reasons the code looks over-defensive. Do not relax them.
   engine would be unable to finish the load where two merely slowed down. It is set to `0`
   (unlimited) so the container's memory limit bounds it like every other engine, and
   `Innodb_hnsw_memory_used` is recorded **on the `index_build` record only** — not on
-  `ingest`, `concurrency`, `filtered`, `churn` or `ef_calibration`, so the audit trail covers
-  one of the six ops phases and the other five are uncollected — and it is a figure that
+  `ingest`, `concurrency`, `filtered`, `churn` or `ef_calibration`, so the audit trail for
+  that gauge covers one of the six ops phases. Server-side *wait* evidence is a separate
+  collector and reaches further: `concurrency` records and the churn `during_writes` record
+  carry `extra.server_waits` (the engine's own wait counters, read on a side connection
+  before and after each window — see `harness/workloads/server_waits.py`), so the phases
+  with no server status of any kind are `ingest`, `filtered` and `ef_calibration`.
+  **pgvector is the exception**: it has no cumulative wait counters, so its profile exists
+  only with `ops.server_wait_sampler: true`, which samples `pg_stat_activity` *during* the
+  window and so perturbs pgvector's window and no other engine's; off by default, stated on
+  every record when on — and
+  the gauge is a figure that
   **omits the node map
   (~30–50 B/node) and so is a floor on graph memory, not a measurement of it**. See
   `docs/09-adding-percona-server.md` §3.
@@ -244,17 +253,19 @@ These are the reasons the code looks over-defensive. Do not relax them.
 
 Ingest dominates everything. MHNSW and VIDX build their graph on every INSERT (~150 and ~55
 rows/s on 1M rows), and **every M value reloads the whole corpus**. `--profile full
---resource-pass both` is ~796 h of ingest before a single query runs, and ~1,820 h of run time
+--resource-pass both` is ~796 h of ingest before a single query runs, and ~1,824 h of run time
 in the worst case once querying is counted — all eight engines, which is what that command
 measures when `--engines` is omitted. **The two figures do not cover the same engines.** The
 run-time figure covers all eight; the ingest figure covers the seven with a measured rate.
 MyVector, the eighth, has none: the estimator names it in `engines_without_ingest_rate` and
 prints that the ingest total is a floor, and its query terms (concurrency windows, churn) are
-in the 1,820 h — its filtered-search term is not, because its driver declines that workload.
+in the 1,824 h — its filtered-search term is not, because its driver declines that workload.
 That figure was ~1,163 h until ops measurement version 9 raised the default churn budget from
 1800 s to 7200 s per step and added one discarded warm-up window per concurrency client count:
 the worst case charges the whole cap to every churn step of every unit, so the cap, not any
-engine, moved it.
+engine, moved it. It was ~1,820 h until the estimate counted mongot's index-size settle
+(`SETTLE_CAP_S`, 600 s after every mongodb build), which version 9 added to the run and not
+to the estimate.
 The ingest half
 used to cover six: Percona's rate was measured and unmodelled, the estimator named it in
 `engines_without_ingest_rate` rather than folding it in, and the published 726 h was a floor

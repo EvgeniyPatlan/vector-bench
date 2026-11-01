@@ -575,6 +575,48 @@ class EngineDriver(abc.ABC):
         """
         return {}
 
+    # -- server-reported waits, per measured window ------------------------
+    #
+    # A fifth optional hook pair, added the way `status_counters` /
+    # `status_gauges` were: a no-op default on the base class, so an engine
+    # that overrides nothing writes `server_waits: null` with the reason
+    # below and needs no code. The capture lives in
+    # `harness/workloads/server_waits.py`; see `harness/drivers/server_waits.py`
+    # for why a wait profile is the evidence the version-9 server CPU and
+    # pressure columns could not supply.
+
+    #: Seconds between samples for an engine whose wait accounting is a
+    #: point-in-time view rather than a cumulative counter (pgvector's
+    #: `pg_stat_activity`). None for every engine with counters, for which
+    #: two snapshots -- one before the window, one after -- are enough.
+    wait_sample_interval_s: Optional[float] = None
+
+    def wait_snapshot(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """`(snapshot, None)` or `(None, why not)`. Never raises.
+
+        Called on a SEPARATE connection -- the capture opens its own driver
+        through the factory -- immediately before and immediately after a
+        window, and never inside it: a performance_schema scan is not free,
+        and paying for it inside the span the QPS divides by would charge
+        the instrument to the engine. A sampling engine
+        (`wait_sample_interval_s` set) is instead called once per interval
+        from a sampler process the capture forks before the clients (a
+        thread alive at their fork is what `tests/test_g4_pool_teardown.py`
+        forbids), on the sampler's own connection.
+        """
+        # Imported here, not at the top: line numbers in this file are cited
+        # by `tests/test_e13_percona_churn_repair_is_a_noop.py`.
+        from .server_waits import NOT_IMPLEMENTED
+        return None, NOT_IMPLEMENTED
+
+    def wait_delta(self, before: Dict[str, Any], after: Dict[str, Any]
+                   ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """The window's waits from two snapshots, in the shape
+        `harness/drivers/server_waits.py` documents; `(None, why)` when the
+        two cannot be differenced."""
+        from .server_waits import NOT_IMPLEMENTED
+        return None, NOT_IMPLEMENTED
+
     # -- query ----------------------------------------------------------
 
     @abc.abstractmethod

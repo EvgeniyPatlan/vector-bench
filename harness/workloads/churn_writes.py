@@ -145,6 +145,14 @@ def parallel_reinsert(driver, ids: Sequence[int], vectors, attrs,
 #:   the main driver's untouched 1,000 would erase a writer that fell back to
 #:   one row per write. The first version of this merged through the
 #:   property, which raised AttributeError after the rows were written.
+#:
+#: NOT inherited, deliberately: Valkey's `_probed` and `_largest_working`.
+#: They are the stall ladder's own bookkeeping -- whether this connection
+#: has already run `_diagnose_stalled_write`, and the largest size it found
+#: returning -- and the main driver never reads them after a re-insert: its
+#: next writes start from `_write_batch`, which IS inherited (as the min), so
+#: the ladder's conclusion survives even though its scratch state does not.
+#: Safe for as long as nothing outside `insert_rows` reads either one.
 INHERITED = {"_newest_inserted_id": max, "_write_batch": min}
 
 

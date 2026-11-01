@@ -110,6 +110,8 @@ from .clients import (CLIENT_BOUND_UTIL,  # noqa: F401
                       SERVED_CONCURRENCY_FLOOR, Answer, ClientPool,
                       DriverFactory, Instruments, client_cpu, shard_queries)
 from .context import RunContext
+from .profile_window import ProfileWindow
+from .server_waits import REASON_KEY, WAITS_KEY, WaitCapture
 
 _client_cpu = client_cpu
 _shard_queries = shard_queries
@@ -189,6 +191,11 @@ class _Window(NamedTuple):
     #: perf_counter instants the spans use are not comparable across hosts.
     window_started_at: Optional[float] = None
     window_ended_at: Optional[float] = None
+    #: The server's own wait profile around this window, as the two record
+    #: keys `server_waits.WaitCapture.finish` returns. Carried on the sample
+    #: for the reason the recall is: the waits beside the median window's
+    #: QPS must be that window's.
+    server_waits: Optional[Dict[str, object]] = None
 
 
 #: `extra.efficiency_reliability` values. A cold one-client baseline inflates
@@ -231,7 +238,10 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
         client_counts: Sequence[int] = (1, 2, 4, 8, 16, 32),
         duration_s: float = 20.0, warmup: int = 50,
         max_queries: int = WHOLE_TEST_SET, repeats: int = 1,
-        indexed_rows: Optional[int] = None) -> None:
+        indexed_rows: Optional[int] = None,
+        profile_window_clients: Optional[int] = None,
+        profile_ack_dir: Optional[str] = None,
+        wait_sampler: bool = False) -> None:
     """Measure QPS and latency at each client count.
 
     Each point runs for a fixed duration rather than a fixed query count, so a
@@ -260,6 +270,12 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
     training set would otherwise have its recall scored against neighbours
     pointing at rows the engine never received, understating every engine at
     once in a way that reads as a result.
+
+    `profile_window_clients` names the client count that gets one extra,
+    profiled window after its measured repeats -- never one of them; see
+    `_profiled_window`. `wait_sampler` lets a sampling engine (pgvector)
+    sample its wait events DURING the window, which is off by default because
+    it is load the other engines' windows do not carry.
     """
     queries = _query_pool(dataset.test, max_queries)
 
@@ -313,9 +329,35 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
             print(f"[concurrency] {clients} client(s){label}: warming up "
                   f"({warmup} queries each), then measuring for "
                   f"{duration_s:.0f}s", flush=True)
-            samples.append(_one_window(
-                driver_factory, queries, clients, ctx.k, ef_search, index,
-                warmup, duration_s, truth, corpus, dataset.metric))
+            # The server's wait counters, read on a side connection
+            # immediately before and after the window and never inside it.
+            # See `server_waits.py`; a snapshot that took a second must not
+            # move the window's QPS, and the suite pins that it does not.
+            # (pgvector's opt-in sampler is the one exception, and it is
+            # disclosed on every record -- see `wait_sampler`.)
+            capture = WaitCapture(driver_factory, meta_driver,
+                                  sampler=wait_sampler).begin()
+            try:
+                sample = _one_window(
+                    driver_factory, queries, clients, ctx.k, ef_search, index,
+                    warmup, duration_s, truth, corpus, dataset.metric)
+            finally:
+                waits = capture.finish()
+            samples.append(sample._replace(server_waits=waits))
+
+        # The perf profile gets its OWN window, after the measured repeats
+        # and outside `samples`, exactly as the version-9 warm-up window is
+        # outside them: perf sampling every server thread at 99 Hz with call
+        # graphs is load on the machine being measured, so a profiled window
+        # must never be a candidate for the published median. Same client
+        # count, same length; its throughput is recorded so the cost of the
+        # profiler is visible beside the figures it did not touch.
+        profile_extra: Dict[str, object] = {}
+        if (profile_window_clients is not None
+                and clients == int(profile_window_clients)):
+            profile_extra = _profiled_window(
+                profile_ack_dir, driver_factory, queries, clients, ctx.k,
+                ef_search, index, warmup, duration_s, truth)
 
         # The median window, not an average of several: latency percentiles
         # from one measured window mean something, and the mean of several
@@ -492,8 +534,52 @@ def run(ctx: RunContext, driver_factory: DriverFactory, dataset: Dataset,
                     if window.served_concurrency is not None else None),
                 "scaling_status": status,
                 "scaling_note": note,
+                # What the SERVER waited on over the median window, from its
+                # own counters -- the evidence that tells a server that
+                # serializes from one that is saturated, which the CPU and
+                # pressure columns cannot. `None` beside a reason when the
+                # engine could not say; never an empty profile for "unknown".
+                WAITS_KEY: (window.server_waits or {}).get(WAITS_KEY),
+                REASON_KEY: (window.server_waits or {}).get(
+                    REASON_KEY, "not captured"),
+                # The extra, never-selected window perf profiled, when this
+                # client count was the designated one.
+                **profile_extra,
             },
         ))
+
+
+def _profiled_window(ack_dir: Optional[str], driver_factory: DriverFactory,
+                     queries, clients: int, k: int, ef_search: int,
+                     index: IndexSpec, warmup: int, duration_s: float,
+                     truth: numpy.ndarray) -> Dict[str, object]:
+    """One unscored window bracketed by the perf handshake.
+
+    The handshake -- the begin mark, the wait of up to `ACK_TIMEOUT_S` for
+    the orchestrator's ack, and the end mark -- is outside `_one_window`, so
+    it is outside the barrier-opened span even of this window. Returns the
+    record keys: the window's QPS and whether perf was acknowledged. An
+    unacknowledged window says so: either the orchestrator never answered or
+    perf could not start, and `profile.json` (when written) says which.
+    """
+    print(f"[concurrency] {clients} client(s): one extra window for the perf "
+          f"profile, not measured", flush=True)
+    profile = ProfileWindow(ack_dir, clients)
+    profile.begin()
+    try:
+        window = _one_window(driver_factory, queries, clients, k, ef_search,
+                             index, warmup, duration_s, truth, score=False)
+    finally:
+        profile.end()
+    return {"profile_window_qps": round(window.qps, 2), "profile_window": {
+        "duration_s": duration_s,
+        "acknowledged": bool(profile.acknowledged),
+        # The orchestrator's own word on perf: "recording", or
+        # "unavailable: <why>". Said even when nobody answered.
+        "perf": (profile.perf_status if profile.acknowledged else
+                 "no acknowledgement: the orchestrator did not answer, so no "
+                 "perf profile covers this window"),
+    }}
 
 
 def _query_pool(test: numpy.ndarray, max_queries: int) -> numpy.ndarray:

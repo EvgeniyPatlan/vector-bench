@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy
 
+from .engine_waits import mysql_delta, mysql_snapshot
 from .base import (DATABASE, FILTER_CTAG, FILTER_TAG, TABLE, ConnectionSpec,
                    EngineDriver, IndexSpec, LoadResult, RowAttrs,
                    checked_filter_column)
@@ -881,6 +882,21 @@ class MySQLFamilyDriver(EngineDriver):
             # looks a name up in.
             found[name] = value
         return found
+
+    def wait_snapshot(self):
+        """performance_schema's global wait summary on this connection.
+
+        The whole family, MyVector included: the table is MySQL's, not any
+        vendor's. MariaDB ships performance_schema OFF, so its records say so
+        unless `ops.server_wait_instruments` turned it on -- see
+        `harness/drivers/engine_waits.py:mysql_snapshot`.
+        """
+        if self._cur is None:
+            return None, "no connection"
+        return mysql_snapshot(self._cur)
+
+    def wait_delta(self, before, after):
+        return mysql_delta(before, after)
 
     def capabilities(self) -> Dict[str, Any]:
         return {"incremental_index": True, "ef_construction_tunable": False,

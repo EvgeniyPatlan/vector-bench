@@ -1315,7 +1315,7 @@ class TestTheWholeQueryEstimateForMain:
         e = est("main")
         assert [t["name"] for t in e["query_terms"]] == [
             "concurrency windows", "filtered search", "churn re-insert",
-            "churn reader baseline"]
+            "churn reader baseline", "mongot index-size settle"]
         # `churn re-insert`'s TYPICAL moved with the seventh engine's RATE,
         # and this is the one place the ingest table reaches the query
         # estimate: the typical figure is rows divided by the engine's load
@@ -1356,8 +1356,12 @@ class TestTheWholeQueryEstimateForMain:
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 9.63
-        assert e["query_hours_worst"] == 85.30
+        # +0.02 / +0.33: mongot's index-size settle, one 30 s interval
+        # typical and the 600 s cap worst, after each of mongodb's two
+        # builds. Version 9 added the wait to the run and not to the
+        # estimate until the server-wait-evidence change counted it.
+        assert e["query_hours"] == 9.65
+        assert e["query_hours_worst"] == 85.63
         # The totals move with the ENGINE LIST as well as with the ann M
         # grid. Over six engines these were 100.16 and 116.39, before the
         # iterative-scan modes added 2.0 h to pgvector alone. The INGEST half
@@ -1365,8 +1369,8 @@ class TestTheWholeQueryEstimateForMain:
         # in `engines_without_ingest_rate` and contributed nothing to it; it
         # is 100.44 over seven now that its rate is measured, and the 7.38 h
         # of the difference is ingest and not query time.
-        assert e["typical_total_hours"] == 110.07
-        assert e["worst_case_total_hours"] == 185.74
+        assert e["typical_total_hours"] == 110.09
+        assert e["worst_case_total_hours"] == 186.07
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1390,7 +1394,7 @@ class TestTheWholeQueryEstimateForMain:
         # inputs.
         assert e["query_per_engine_hours"] == {
             "mariadb": 1.46, "alisql": 3.47, "pgvector": 0.85,
-            "mariadb123": 1.92, "mongodb": 0.37, "valkey": 0.37,
+            "mariadb123": 1.92, "mongodb": 0.39, "valkey": 0.37,
             "percona": 0.83, "myvector": 0.37,
         }
         # The asymmetry is back, for the eighth engine: MyVector has query
@@ -1541,7 +1545,10 @@ class TestTheExtensionPoint:
         monkeypatch.setattr(est_mod, "_QUERY_TERMS",
                             tuple(est_mod._QUERY_TERMS) + (_one_hour_per_pass_term,))
         after = est("main")
-        assert [t["name"] for t in after["query_terms"]][-1] == "test term"
+        # In the list, not necessarily last: the tally orders terms by first
+        # appearance, and `mongot index-size settle` first appears at the
+        # mongodb engine, after the test term's first (mariadb) appearance.
+        assert "test term" in [t["name"] for t in after["query_terms"]]
         # 14.0 and not 12.0: `_one_hour_per_pass_term` is one hour per
         # (engine, dataset, pass) and `main` is seven engines x two datasets
         # x one pass. Six engines gave 12.0.
@@ -1564,7 +1571,7 @@ class TestTheExtensionPoint:
         # 0.74 h now that `churn re-insert` can model a duration for it.
         # 7.78 with MyVector, whose 0.28 h is its concurrency windows and
         # reader baseline -- no churn duration, since it has no rate.
-        assert est("main")["query_hours"] == 9.63  # ops v9 inputs
+        assert est("main")["query_hours"] == 9.65  # + mongot settle
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 8 ops units per dataset x 2 datasets = 16 per pass.
@@ -1694,7 +1701,9 @@ class TestThePrintedOutput:
         `~0.0 h typical` alone would read as free. It is only not misleading
         because the worst case sits on the same line."""
         out = printed("main")
-        assert "filtered search        ~0.0 h typical, ~10.0 h worst case" in out
+        # Padded to the longest term name, `mongot index-size settle`.
+        assert ("filtered search           ~0.0 h typical, ~10.0 h worst case"
+                in out)
         # Anchored on the `=`, because "3,000 queries per ops unit" is a
         # substring of "13,000 queries per ops unit" -- the shape that has
         # cost this series four tests.
@@ -1703,7 +1712,7 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~185.7 h worst case" in out  # ops v9 inputs
+        assert "~186.1 h worst case" in out  # + mongot settle
         assert "~110.1 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
@@ -1794,7 +1803,8 @@ class TestThePrintedOutput:
         assert "churn re-insert" in out
         # ~20.1 h since ops v9's 7,200 s budget: four 2 h churn ceilings
         # per engine step where there were four half hours.
-        assert "~20.1 h worst case" in out
+        # ~20.2 h with mongot's 600 s settle cap counted.
+        assert "~20.2 h worst case" in out
         # MyVector, the eighth engine, is named as unmeasured; nothing else is.
         assert "No measured ingest rate for myvector, so" in " ".join(out.split())
         assert est("smoke")["engines_without_ingest_rate"] == ["myvector"]
