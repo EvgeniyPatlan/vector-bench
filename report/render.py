@@ -3344,9 +3344,10 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
                == SCALING_CONCURRENCY_NOT_ACHIEVED else ""),
             # What the readers actually had in service, against how many there
             # were. The evidence for both marks above, in the row that carries
-            # them.
-            (f"{s['served_concurrency']:,.2f} of {s.get('readers')}"
-             if s.get("served_concurrency") is not None else "—"),
+            # them -- mean-based first and the median estimate second since
+            # ops version 9, through the one cell function the concurrency
+            # table uses, so the two tables cannot read the pair differently.
+            _served_cell(s, s.get("readers")),
             *_operating_point_cells(s, points),
         ])
     parts.append(_md_table(
@@ -3389,10 +3390,15 @@ def _churn_during_writes_table(summary: Dict[str, Any]) -> str:
             f"\n{SCALING_REFUSED_MARK} **The readers did not run "
             f"concurrently at {len(serialized)} of these points**, so neither "
             f"the p99 ratio nor the writer rate beside it is evidence about "
-            f"the engine. `Reads in service` is the queries each "
-            f"during-writes window counted times their median latency over "
-            f"the window; below half the reader count, the pool was answering "
-            f"about one read at a time whatever it was asked for. **The "
+            f"the engine. `Reads in service` is, first, the sum of every "
+            f"in-window read's duration over the window (mean) and, second, "
+            f"the reads counted times their median latency (median est.); "
+            f"since ops measurement version 9 the refusal reads the first, so "
+            f"below half the reader count the readers did not keep their reads "
+            f"in flight. A median estimate far below the mean is "
+            f"{TAIL_DOMINATED_MARK} `tail_dominated` -- a heavy-tailed read "
+            f"latency, not a refusal; records from before version 9 were "
+            f"judged on the median and keep that verdict. **The "
             f"writer rate was measured against those same reads**, so it is "
             f"not a figure about an engine under a known read load either; "
             f"the churn step record carries this status as "

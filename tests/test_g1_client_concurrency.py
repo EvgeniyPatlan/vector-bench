@@ -1474,9 +1474,34 @@ class TestTheChurnReadersCarryItToo:
         anything has to reach it there.
         """
         shape = crw.reader_contention_shape(self._window(0.95))
-        assert shape == {"reader_served_concurrency": 0.95,
+        # Ops version 9 carries the mean-based figure the status is judged on
+        # and the heavy-tail note beside the median estimate.
+        assert shape == {"reader_outstanding_concurrency": 0.95,
+                         "reader_served_concurrency": 0.95,
                          "reader_scaling_status":
-                             cl.SCALING_CONCURRENCY_NOT_ACHIEVED}
+                             cl.SCALING_CONCURRENCY_NOT_ACHIEVED,
+                         "reader_scaling_note": None}
+
+    def test_a_heavy_tailed_reader_window_is_noted_and_not_refused(self):
+        """#78 review finding 2: the F2 artefact on the reader path. A pool
+        whose four readers kept their reads in flight (outstanding 3.9) but
+        whose median sat far below its mean (served 0.95) used to be refused,
+        and the writer rate beside it marked invalid -- for one engine's tail
+        and not another's. Honest (v9): `ok` + `tail_dominated`, on the step
+        record and on the during-writes record. Mutant (the pre-v9 rule, the
+        median alone): `concurrency_not_achieved`."""
+        window = self._window(0.95, outstanding=3.9)
+        shape = crw.reader_contention_shape(window)
+        assert shape["reader_scaling_status"] == cl.SCALING_OK
+        assert shape["reader_scaling_note"] == "tail_dominated"
+        extra = crw._during_writes_extra(self._window(3.9), window, 12.0,
+                                         2000)
+        assert extra["scaling_status"] == cl.SCALING_OK
+        assert extra["scaling_note"] == "tail_dominated"
+        assert extra["reader_under_writes_scaling_note"] == "tail_dominated"
+        from harness.metrics import scaling
+        assert scaling.scaling_status(0.95, 4) == \
+            cl.SCALING_CONCURRENCY_NOT_ACHIEVED
 
     def test_a_step_with_no_reader_pool_carries_no_key_at_all(self):
         """`{}` and not a null, which is `_reader_shape`'s own convention.
@@ -1548,7 +1573,25 @@ class TestTheDuringWritesTableSaysIt:
         mark = render_mod.SCALING_REFUSED_MARK
         assert mark in row[header.index("Writer rate")]
         assert mark in row[header.index("p99 under writes")]
-        assert row[header.index("Reads in service")] == "0.95 of 4"
+        # Mean-based first since ops version 9, the median as an estimate.
+        assert row[header.index("Reads in service")] == \
+            f"3.95 of 4 (mean) · 0.95 median est. {render_mod.SCALING_REFUSED_MARK}"
+
+    def test_a_tail_dominated_reader_row_is_marked_and_the_writer_is_not(self):
+        """#78 review finding 2, in the table: a v9 reader window that kept
+        its reads in flight with a heavy tail carries the note and leaves the
+        writer rate unmarked."""
+        rows = self._rows(cl.SCALING_OK)
+        rows[0]["scaling_note"] = "tail_dominated"
+        text = render_mod._churn_during_writes_table(
+            {"churn_during_writes": rows})
+        cells = _table_cells(text)
+        header, row = cells[0], cells[1]
+        cell = row[header.index("Reads in service")]
+        assert render_mod.TAIL_DOMINATED_MARK in cell
+        assert render_mod.SCALING_REFUSED_MARK not in cell
+        assert render_mod.SCALING_REFUSED_MARK not in row[
+            header.index("Writer rate")]
 
     def test_the_footnote_explains_the_writer_specifically(self):
         text = _plain(render_mod._churn_during_writes_table(
