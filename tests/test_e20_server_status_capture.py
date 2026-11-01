@@ -794,9 +794,14 @@ class TestTheRecordIsAdditive:
         # `FakeDriver.capabilities()` declares exactly one key on purpose
         # (see its `_capabilities`), so this set is the fake's and not the
         # seven engines'. What it pins is that `build.py` added nothing.
+        # Ops measurement version 9 added the index-size provenance to every
+        # index_build record (`harness/workloads/index_size.py`); those four
+        # are named here so the set stays literal.
         assert set(built["extra"]) == {
             "incremental_index", "separable_build",
             records.OPS_MEASUREMENT_VERSION_KEY,
+            "size_read_at", "index_bytes_after_build",
+            "index_size_settle_s", "index_size_settle",
         }, built["extra"]
 
     def test_only_the_index_build_record_carries_it(self):
@@ -899,7 +904,9 @@ class TestNoMeasurementVersionBumpIsOwed:
     """
 
     def test_the_ops_version_is_unchanged(self):
-        assert records.OPS_MEASUREMENT_VERSION == 8
+        # `>= 8` since version 9 (ops v9 bumped for F2-F11, a later change):
+        # what this pins is that THIS change did not bump, not the value.
+        assert records.OPS_MEASUREMENT_VERSION >= 8
 
     def test_the_new_key_reaches_no_identity_component(self):
         from report import charts, generate, loaders

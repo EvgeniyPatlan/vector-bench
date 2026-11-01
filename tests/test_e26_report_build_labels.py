@@ -627,6 +627,41 @@ class TestAFallbackThatPoolsBuildsIsAmbiguous:
         entry = _entry(generate.summarize(records, {}), "mariadb")
         assert entry["qps_at_recall_90"] == 400.0
 
+    def test_the_ops_build_mode_narrows_a_pgvector_fallback(self):
+        """#77 review: `_build_shape` counted build_mode and `matches()`
+        ignored it, so an archived pgvector run with post AND incremental
+        curves at one M was "ambiguous" although its ops pass built one.
+
+        Honest: the ops record's `post` picks the post curve (400 q/s, not
+        the incremental 300). Mutant (the ops pass names both modes): still
+        ambiguous, because then there really are two builds."""
+        post = _recall("pgvector", 0.95, 400.0, ef_search=40,
+                       ef_construction=200, build_mode="post")
+        inc = _recall("pgvector", 0.95, 300.0, ef_search=40,
+                      ef_construction=200, build_mode="incremental")
+        ops = self._ops_build("pgvector", ef_construction_tunable=True)
+        ops["ef_construction"] = 200
+        entry = _entry(generate.summarize([post, inc, ops], {}), "pgvector")
+        assert entry["qps_at_recall_90"] == 400.0, entry
+        assert not str(entry["reference_source"]).startswith("ambiguous")
+
+        both = dict(ops, build_mode="incremental")
+        entry = _entry(generate.summarize([post, inc, ops, both], {}),
+                       "pgvector")
+        assert entry["qps_at_recall_90"] is None
+        assert entry["reference_source"].startswith("ambiguous")
+
+    def test_an_ann_point_without_a_build_mode_still_matches(self):
+        """The ann overlay declares build_mode for pgvector only; a mariadb
+        point without one must not be excluded by an ops record that says
+        `post`."""
+        from report import builds
+        point = _recall("mariadb", 0.95, 400.0, ef_search=10)
+        point.pop("build_mode")
+        assert builds.matches(point, {"m": 16, "build_mode": "post"})
+        assert not builds.matches(dict(point, build_mode="incremental"),
+                                  {"m": 16, "build_mode": "post"})
+
 
 class TestTheManifestCarriesTheReferenceBuilds:
     """`cmd_run` hands `presentation.reference_builds` to `Manifest.set_engine`

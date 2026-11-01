@@ -115,17 +115,18 @@ answer the questions the smoke run raised without spending a fortnight.
 The table above is loading only, and so was the only estimate this framework
 printed for most of its life. **Querying is not free**, and for a profile like
 `smoke` it is most of the cost: half an hour of loading against a churn budget
-that can run for two. What the estimator prints now is both, the same three
+that can run for eight (two hours per step since ops measurement version 9,
+up from half an hour). What the estimator prints now is both, the same three
 engines:
 
 | Profile | Passes | Ingest | Query, typical | Query, worst case | Run, worst case |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `dev` | 1 | ~0.0 h | ~0.01 h | ~0.2 h | **~0.2 h** |
-| `smoke` | 1 | ~0.3 h | ~0.06 h | ~2.7 h | **~3.0 h** |
-| `quick` | 1 | ~36.2 h | ~1.92 h | ~12.3 h | **~48.5 h** |
-| `main` | 1 | ~68.1 h | ~4.34 h | ~15.1 h | **~83.2 h** |
-| `full` | 2 | ~532.0 h | ~46.15 h | ~181.6 h | **~713.6 h** |
-| `mariadb-blog` | 1 | ~21.3 h | ~1.25 h | ~2.8 h | **~24.2 h** |
+| `dev` | 1 | ~0.0 h | ~0.01 h | ~0.2 h | **~0.21 h** |
+| `smoke` | 1 | ~0.3 h | ~0.07 h | ~8.7 h | **~9.01 h** |
+| `quick` | 1 | ~36.2 h | ~2.69 h | ~36.4 h | **~72.61 h** |
+| `main` | 1 | ~68.1 h | ~5.78 h | ~39.5 h | **~107.58 h** |
+| `full` | 2 | ~532.0 h | ~79.33 h | ~473.6 h | **~1005.63 h** |
+| `mariadb-blog` | 1 | ~21.3 h | ~1.69 h | ~7.6 h | **~28.95 h** |
 
 The ingest column differs from the table above it because that one was computed
 by hand from §1's three headline rates, while the estimator uses the measured
@@ -138,7 +139,7 @@ bug, and that is the point of printing it. Two things to understand about what
 it is:
 
 * It is a bound over **the configuration, not the machine.** Where a cost is a
-  budget — `ops.churn_budget_s`, half an hour per churn step — the worst case
+  budget — `ops.churn_budget_s`, two hours per churn step by default — the worst case
   is that budget, whatever the engine does inside it. Where it is a modelled
   duration, it is modelled from rates measured on one machine and yours will
   differ. The typical figure is what the configuration should cost; the worst
@@ -170,17 +171,17 @@ estimated ingest time (loading only, before any queries):
     ann.m_values or the dataset list to cut it roughly proportionally.
 
 estimated query time (the parts the profile puts a clock on):
-  concurrency windows    ~1.0 h
-                           5 client count(s) x 30s x 3 repeat(s) per ops unit, fixed by the profile not by the engine
+  concurrency windows    ~1.3 h
+                           5 client count(s) x 30s x 3 repeat(s) + one warm-up window each per ops unit, fixed by the profile not by the engine
   filtered search        ~0.0 h typical, ~6.0 h worst case
                            e.g. 2 filter column(s) x 3 selectivities x 1 iterative-scan mode x 500 queries = 3,000 queries per ops unit, at a rate nothing here has measured; 300s cap/point bounds it
-  churn re-insert        ~3.2 h typical, ~8.0 h worst case
-                           e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 1800s cap/step
+  churn re-insert        ~4.3 h typical, ~32.0 h worst case
+                           e.g. 295,878 rows written back at ~147 rows/s (the load rate; re-insert can be far slower), 7200s cap/step
   churn reader baseline  ~0.1 h
                            2 churn fraction(s) x 30s of 4 reader(s) before each step's deletes, fixed by the profile not by the engine
-  subtotal ~4.3 h typical, ~15.1 h worst case
+  subtotal ~5.8 h typical, ~39.5 h worst case
 
-estimated run time ~72.5 h typical, ~83.2 h worst case
+estimated run time ~73.9 h typical, ~107.6 h worst case
   Plan against the worst case: a run materially longer than it is a bug.
   Each budgeted term tests its deadline before starting work, so it can overrun
     by the one query or slice already running when the budget expires.
@@ -192,7 +193,6 @@ estimated run time ~72.5 h typical, ~83.2 h worst case
       churn repair path: on an engine that has one it can execute at its pinned version (pgvector's VACUUM (ANALYZE); Percona Server's index replace only while capabilities.bulk_vector_index_build is true -- it is false at the pinned version, where the driver declares no repair path, runs nothing and pays neither cost), driver.maintain() per churn fraction plus a third ops.max_queries measurement of the repaired index -- the repair has no measured rate at any corpus size and nothing caps either
       concurrency warm-up: 50 queries per client before each measured window
       filtered ground truth: exact top-k recomputed by brute force over the qualifying rows of every (column, selectivity), over the whole test set rather than ops.max_queries and outside ops.filtered_budget_s; cached per (dataset, metric, k, column, threshold, rows) and shared across engines, ops units and passes, so paid once each -- measured at ~150 s per million qualifying rows (5-8% spread, near dimension-independent below ~256), which is ~6.7 min for main's two datasets x two columns
-
 ```
 
 Read it. It is the cheapest part of the whole exercise.

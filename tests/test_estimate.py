@@ -421,7 +421,12 @@ class TestTotalHoursStillMeansIngest:
         the wrong thing to print."""
         e = est("main", engines=["pgvector"])
         assert e["total_hours"] == 0.91
-        assert e["worst_case_total_hours"] == 9.48
+        # Ops measurement version 9: the churn budget default is 7200 s per
+        # step (was 1800) and every client count pays one discarded
+        # warm-up window, so the figures below moved from the ones the
+        # docstring narrates; the arithmetic is the same with those two
+        # inputs.
+        assert e["worst_case_total_hours"] == 21.64
         assert e["long_run"] is False
 
 
@@ -459,9 +464,10 @@ class TestTheConcurrencyTermIsTimeNotQueries:
     def test_main(self):
         # 2.25 and not 2.00: MyVector, the eighth engine, adds one ops unit per
         # dataset -- 9 units x 2 datasets = 18 unit-instances x 450 s.
+        # 3.00 since ops version 9: (3 repeats + 1 warm-up window) per point.
         t = term(est("main"), "concurrency windows")
-        assert t["typical_hours"] == 2.25
-        assert t["worst_hours"] == 2.25
+        assert t["typical_hours"] == 3.00
+        assert t["worst_hours"] == 3.00
         assert t["bounded"] is True
 
     def test_the_client_count_list_is_counted_not_summed(self):
@@ -474,8 +480,8 @@ class TestTheConcurrencyTermIsTimeNotQueries:
                                         "max_queries": 500}}
         e = estimate_load_hours(profile, ["mariadb"], ["glove-100-angular"],
                                 ["normalized"], ["ops"])
-        # 6 x 30 s = 180 s = 0.05 h
-        assert term(e, "concurrency windows")["typical_hours"] == 0.05
+        # 6 x 30 s x (1 + 1 warm-up window, ops v9) = 360 s = 0.10 h
+        assert term(e, "concurrency windows")["typical_hours"] == 0.10
 
     def test_pgvector_runs_every_build_mode_so_it_costs_twice(self):
         base = {"enabled": True, "workloads": ["concurrency"], "m_values": [16],
@@ -485,10 +491,11 @@ class TestTheConcurrencyTermIsTimeNotQueries:
                "ann": {"pgvector_build_modes": ["post", "incremental"]}}
         one = {"name": "t", "ops": base, "ann": {"pgvector_build_modes": ["post"]}}
         args = (["pgvector"], ["glove-100-angular"], ["normalized"], ["ops"])
+        # Each window count doubled by ops v9's one warm-up window per point.
         assert term(estimate_load_hours(two, *args),
-                    "concurrency windows")["typical_hours"] == 0.10
+                    "concurrency windows")["typical_hours"] == 0.20
         assert term(estimate_load_hours(one, *args),
-                    "concurrency windows")["typical_hours"] == 0.05
+                    "concurrency windows")["typical_hours"] == 0.10
 
     def test_more_ops_m_values_cost_proportionally(self):
         base = {"enabled": True, "workloads": ["concurrency"],
@@ -497,7 +504,8 @@ class TestTheConcurrencyTermIsTimeNotQueries:
         three = {"name": "t", "ops": {**base, "m_values": [8, 16, 32]}}
         e = estimate_load_hours(three, ["mariadb"], ["glove-100-angular"],
                                 ["normalized"], ["ops"])
-        assert term(e, "concurrency windows")["typical_hours"] == 0.15
+        # x 2 for ops v9's warm-up window at each point.
+        assert term(e, "concurrency windows")["typical_hours"] == 0.30
 
     def test_repeats_multiply_because_the_runner_already_honours_them(self):
         """ops_pass.harness_args passes --concurrency-repeats today, defaulting
@@ -510,8 +518,10 @@ class TestTheConcurrencyTermIsTimeNotQueries:
         plain = estimate_load_hours({"name": "t", "ops": base}, *args)
         thrice = estimate_load_hours(
             {"name": "t", "ops": {**base, "concurrency_repeats": 3}}, *args)
-        assert term(plain, "concurrency windows")["typical_hours"] == 0.05
-        assert term(thrice, "concurrency windows")["typical_hours"] == 0.15
+        # (repeats + 1): ops v9's warm-up window is not a repeat, and it is
+        # paid once per point however many repeats follow it.
+        assert term(plain, "concurrency windows")["typical_hours"] == 0.10
+        assert term(thrice, "concurrency windows")["typical_hours"] == 0.20
 
     def test_a_point_with_more_clients_than_queries_is_skipped(self):
         """The workload skips it, so the estimate must not charge for it."""
@@ -520,8 +530,9 @@ class TestTheConcurrencyTermIsTimeNotQueries:
                 "concurrency_duration_s": 30, "max_queries": 4}
         e = estimate_load_hours({"name": "t", "ops": base}, ["mariadb"],
                                 ["glove-100-angular"], ["normalized"], ["ops"])
-        # Only 1, 2 and 4 clients can run against four queries: 3 x 30 s.
-        assert term(e, "concurrency windows")["typical_hours"] == 0.03
+        # Only 1, 2 and 4 clients can run against four queries: 3 x 30 s,
+        # twice each with ops v9's warm-up window = 180 s.
+        assert term(e, "concurrency windows")["typical_hours"] == 0.05
 
 
 class TestTheChurnFractionsAreCumulative:
@@ -548,7 +559,8 @@ class TestTheChurnFractionsAreCumulative:
     def test_worst_case_is_the_budget_per_step(self):
         e = estimate_load_hours(self.PROFILE, ["mariadb"],
                                 ["glove-100-angular"], ["normalized"], ["ops"])
-        assert term(e, "churn re-insert")["worst_hours"] == 1.00
+        # 2 x 7,200 s (the ops v9 default budget) = 4.00 h.
+        assert term(e, "churn re-insert")["worst_hours"] == 4.00
 
     def test_a_single_fraction_is_one_step(self):
         """10% alone: 118,351 rows / 147 = 805.11 s = 0.22 h, budget once."""
@@ -557,7 +569,8 @@ class TestTheChurnFractionsAreCumulative:
         t = term(estimate_load_hours(profile, ["mariadb"],
                                      ["glove-100-angular"], ["normalized"],
                                      ["ops"]), "churn re-insert")
-        assert (t["typical_hours"], t["worst_hours"]) == (0.22, 0.50)
+        # Budget once: 7,200 s since ops v9.
+        assert (t["typical_hours"], t["worst_hours"]) == (0.22, 2.00)
 
     def test_the_subset_a_profile_loads_is_what_gets_churned(self):
         """A profile that loads 20,000 rows of fashion-mnist churns 10% of
@@ -571,7 +584,7 @@ class TestTheChurnFractionsAreCumulative:
                                 ["normalized"], ["ops"])
         t = term(e, "churn re-insert")
         assert t["typical_seconds"] == pytest.approx(2000 / 745.0, abs=0.01)
-        assert t["worst_hours"] == 0.50
+        assert t["worst_hours"] == 2.00
 
 
 class TestTheFilteredTermChargesEveryModeItWillMeasure:
@@ -1243,8 +1256,16 @@ class TestACapIsPrintedAsACapNotADuration:
                                         "churn_fractions": [0.10, 0.25]}}
         t = term(estimate_load_hours(profile, ["alisql"], ["glove-100-angular"],
                                      ["normalized"], ["ops"]), "churn re-insert")
-        assert t["typical_hours"] == 1.00
-        assert t["worst_hours"] == 1.00
+        # Under the ops v9 default of 7,200 s neither step reaches the cap:
+        # typical is the modelled 2,361 + 3,541 s = 1.64 h, worst 2 x 7,200 s.
+        # The cap-collapse this test is named for is pinned at 1,800 below.
+        assert t["typical_hours"] == 1.64
+        assert t["worst_hours"] == 4.00
+        capped = {"name": "t", "ops": {**profile["ops"],
+                                       "churn_budget_s": 1800}}
+        t = term(estimate_load_hours(capped, ["alisql"], ["glove-100-angular"],
+                                     ["normalized"], ["ops"]), "churn re-insert")
+        assert (t["typical_hours"], t["worst_hours"]) == (1.00, 1.00)
 
     def test_a_profile_may_lower_the_budget(self):
         """ops.churn_budget_s is honoured by ops_pass.harness_args today."""
@@ -1304,10 +1325,15 @@ class TestTheWholeQueryEstimateForMain:
         # 1,000,000 at 427, one ops unit each. Its WORST did not move: the
         # budget is a ceiling the profile sets per step and has always applied
         # to every engine whether or not anyone had measured it.
-        assert term(e, "churn re-insert")["typical_hours"] == 5.23
+        # Ops measurement version 9: the churn budget default is 7200 s per
+        # step (was 1800) and every client count pays one discarded
+        # warm-up window, so the figures below moved from the ones the
+        # docstring narrates; the arithmetic is the same with those two
+        # inputs.
+        assert term(e, "churn re-insert")["typical_hours"] == 6.33
         # 18.00, not 16.00: MyVector's two ops units are budgeted like every
         # engine's, while its TYPICAL adds nothing -- no measured rate.
-        assert term(e, "churn re-insert")["worst_hours"] == 18.00
+        assert term(e, "churn re-insert")["worst_hours"] == 72.00
         assert term(e, "filtered search")["typical_hours"] == 0.0
         # 10.0 and not 8.00 because the iterative-scan modes now reach the
         # run. `main` declares two and only pgvector has the knob, so of the
@@ -1330,8 +1356,8 @@ class TestTheWholeQueryEstimateForMain:
         # is charged per OPS unit, and `ops.m_values` is untouched by T5b.
         # That is the half of the D1 change worth pinning -- if a query term
         # ever starts scaling with the ann grid, these two lines catch it.
-        assert e["query_hours"] == 7.78
-        assert e["query_hours_worst"] == 30.55
+        assert e["query_hours"] == 9.63
+        assert e["query_hours_worst"] == 85.30
         # The totals move with the ENGINE LIST as well as with the ann M
         # grid. Over six engines these were 100.16 and 116.39, before the
         # iterative-scan modes added 2.0 h to pgvector alone. The INGEST half
@@ -1339,8 +1365,8 @@ class TestTheWholeQueryEstimateForMain:
         # in `engines_without_ingest_rate` and contributed nothing to it; it
         # is 100.44 over seven now that its rate is measured, and the 7.38 h
         # of the difference is ingest and not query time.
-        assert e["typical_total_hours"] == 108.22
-        assert e["worst_case_total_hours"] == 130.99
+        assert e["typical_total_hours"] == 110.07
+        assert e["worst_case_total_hours"] == 185.74
 
     def test_the_totals_are_the_sums_a_reader_can_do_on_the_printed_lines(self):
         e = est("main")
@@ -1357,10 +1383,15 @@ class TestTheWholeQueryEstimateForMain:
         # because query terms are spans the profile puts a clock on and need
         # no engine rate, while the ingest figure is rows divided by a rate
         # and needs one. It now has a rate, so both splits name all seven.
+        # Ops measurement version 9: the churn budget default is 7200 s per
+        # step (was 1800) and every client count pays one discarded
+        # warm-up window, so the figures below moved from the ones the
+        # docstring narrates; the arithmetic is the same with those two
+        # inputs.
         assert e["query_per_engine_hours"] == {
-            "mariadb": 1.38, "alisql": 2.28, "pgvector": 0.68,
-            "mariadb123": 1.84, "mongodb": 0.29, "valkey": 0.29,
-            "percona": 0.74, "myvector": 0.28,
+            "mariadb": 1.46, "alisql": 3.47, "pgvector": 0.85,
+            "mariadb123": 1.92, "mongodb": 0.37, "valkey": 0.37,
+            "percona": 0.83, "myvector": 0.37,
         }
         # The asymmetry is back, for the eighth engine: MyVector has query
         # figures (spans the profile clocks) and no ingest one (no rate).
@@ -1533,7 +1564,7 @@ class TestTheExtensionPoint:
         # 0.74 h now that `churn re-insert` can model a duration for it.
         # 7.78 with MyVector, whose 0.28 h is its concurrency windows and
         # reader baseline -- no churn duration, since it has no rate.
-        assert est("main")["query_hours"] == 7.78
+        assert est("main")["query_hours"] == 9.63  # ops v9 inputs
 
     def test_scope_unit_is_charged_per_ops_unit_and_pass(self, monkeypatch):
         """main has 8 ops units per dataset x 2 datasets = 16 per pass.
@@ -1649,8 +1680,9 @@ class TestThePrintedOutput:
         # this block is asserted against the whole printed output, and it
         # moved with the ann grid where the two query figures below did not.
         assert "pgvector ~0.9 h" in out
-        assert "~5.2 h typical" in out
-        assert "~18.0 h worst case" in out
+        # The churn line, at ops v9's 7,200 s budget.
+        assert "~6.3 h typical" in out
+        assert "~72.0 h worst case" in out
 
     def test_a_term_with_a_ceiling_but_no_duration_prints_both(self):
         """Filtered search used to print "cost not quantified", because it had
@@ -1671,8 +1703,8 @@ class TestThePrintedOutput:
 
     def test_the_total_is_printed(self):
         out = printed("main")
-        assert "~131.0 h worst case" in out
-        assert "~108.2 h typical" in out
+        assert "~185.7 h worst case" in out  # ops v9 inputs
+        assert "~110.1 h typical" in out
 
     def test_the_bug_criterion_is_only_claimed_when_it_holds(self, monkeypatch):
         """Two adjacent lines used to say the worst case was a figure a run
@@ -1760,7 +1792,9 @@ class TestThePrintedOutput:
         out = printed("smoke")
         assert "estimated ingest time" in out
         assert "churn re-insert" in out
-        assert "~6.0 h worst case" in out
+        # ~20.1 h since ops v9's 7,200 s budget: four 2 h churn ceilings
+        # per engine step where there were four half hours.
+        assert "~20.1 h worst case" in out
         # MyVector, the eighth engine, is named as unmeasured; nothing else is.
         assert "No measured ingest rate for myvector, so" in " ".join(out.split())
         assert est("smoke")["engines_without_ingest_rate"] == ["myvector"]

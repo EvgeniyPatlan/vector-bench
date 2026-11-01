@@ -230,7 +230,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--churn-fractions", default="0.10,0.25")
     # An engine that stalls re-inserting must release the machine and record
     # what it managed, rather than holding the run until someone notices.
-    p.add_argument("--churn-budget", type=float, default=1800.0)
+    p.add_argument("--churn-budget", type=float,
+                   default=churn_workload.DEFAULT_CHURN_BUDGET_S)
     # PR 4 §4.3 item 2. A churn number measured with nothing else touching the
     # index describes a maintenance window, not a database under load, and the
     # two can differ by more than the engines differ from each other. 0 turns
@@ -487,6 +488,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # readers saw.
                 driver_factory=driver_factory,
                 readers=args.churn_readers,
+                # Ops version 9: the re-insert writes with the load's thread
+                # count, and both are recorded beside its rate.
+                ingest_threads=args.load_threads,
             )
 
     except Exception:

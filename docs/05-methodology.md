@@ -1188,8 +1188,21 @@ measured window reports two figures derived from the spans it already keeps:
 | Field | What it is |
 | --- | --- |
 | `extra.outstanding_concurrency` | The exact time-average number of queries **outstanding**: the sum of every in-window query's duration, divided by the window. No estimator, no distributional assumption. |
-| `extra.served_concurrency` | The queries the window counted times their **median** latency, divided by the window — the robust estimate of how many were **in service**. |
-| `extra.scaling_status` | `ok`, or `concurrency_not_achieved` when `served_concurrency` fell below half the client count. |
+| `extra.served_concurrency` | The queries the window counted times their **median** latency, divided by the window — a median **estimate** of how many were in service; `served / outstanding` is exactly `p50 / mean`. |
+| `extra.scaling_status` | `ok`, or `concurrency_not_achieved`. Since `ops_measurement_version` 9: when `outstanding_concurrency` fell below half the client count, or when both the median estimate and a credible scaling efficiency did. Before version 9: when `served_concurrency` fell below half the client count. |
+| `extra.scaling_note` | Version 9: `tail_dominated` when `served / outstanding < 0.5` — the latency had a heavy tail. A note, never a refusal. |
+
+**What the version-9 guard detects, and what it does not.** It detects
+client-side starvation — the clients kept fewer than half their queries
+outstanding — and the residue where both the median estimate and a credible
+efficiency are under half. It does **not** detect a server that answers one
+query at a time: from the clients' clocks that server is a saturated one
+(outstanding ≈ N, the median ≈ N because the queue raises it, efficiency ≈
+1/N), and it is published `ok` with its low efficiency. Serialization inside
+the server and saturation of it are not distinguished by these figures; the
+report's Server CPU and Server CPU pressure columns, taken from the server's
+own cgroup over the same window, are the evidence for that.
+| `extra.efficiency_reliability` | Version 9: `baseline_not_credible` when the one-client median was more than 1.4x this point's, in which case `scaling_efficiency` is null. |
 
 Where the status is `concurrency_not_achieved` the report prints no scaling
 efficiency for that point at all, the chart's efficiency panel omits it, and

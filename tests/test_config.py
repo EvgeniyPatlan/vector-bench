@@ -8281,7 +8281,10 @@ class TestEachConcurrencyPointIsRepeated:
         shipped = load_profile("main")
         once = {**shipped, "ops": {k: v for k, v in shipped["ops"].items()
                                    if k != "concurrency_repeats"}}
-        assert windows(shipped) == windows(once) * 3
+        # (repeats + 1) / (1 + 1): ops measurement version 9 adds one
+        # discarded warm-up window per point, paid once whatever the repeat
+        # count, so three repeats cost 4 windows against 2 for one.
+        assert windows(shipped) == windows(once) * 2
 
 
 # ---------------------------------------------------------------------------

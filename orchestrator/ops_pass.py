@@ -1082,7 +1082,7 @@ DEFAULT_FILTERED_BUDGET_S = 300
 #: importable here -- the orchestrator runs on the host and the harness runs
 #: in a container -- and was a bare literal in the argument list until the
 #: `null` fix needed to pass it to `_budget_arg` as a default.
-DEFAULT_CHURN_BUDGET_S = 1800
+DEFAULT_CHURN_BUDGET_S = 7200
 
 #: The filter columns the filtered workload measures when a profile says
 #: nothing. Both, matching `harness.datasets.FILTER_COLUMNS`, and pinned

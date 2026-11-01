@@ -383,6 +383,47 @@ def _filter_columns_present(records: List[Dict[str, Any]],
     return ordered + sorted(present - set(ordered))
 
 
+#: The fewest warm-up queries that can have converged: `vb_warmup` compares
+#: two consecutive batches of `WARMUP_BATCH` (200), so a count under two
+#: batches ended early -- a query raised, or the sample was that small --
+#: and the first configuration may still have met a cold cache. Not imported
+#: from the overlay, which is not on this package's path in the report image.
+MIN_CONVERGED_WARMUP_QUERIES = 400
+
+
+def index_warmup_flags(recall_records: List[Dict[str, Any]]
+                       ) -> List[Dict[str, Any]]:
+    """One row per (engine, dataset, pass, build) whose ann index warm-up
+    did not converge or ran fewer than `MIN_CONVERGED_WARMUP_QUERIES`.
+
+    For the Validity section (#75's review): ANN_MEASUREMENT_VERSION 3 warms
+    the index until two batch means agree, and a sweep whose warm-up gave up
+    at the cap, or stopped before it could compare, has a first point that
+    may be the cold-cache artefact the warm-up exists to remove. Records that
+    predate the warm-up carry neither key and are not flagged here; the QPS
+    inversion table already labels their first steps.
+    """
+    from report.builds import build_label
+    seen: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for r in recall_records:
+        extra = r.get("extra") or {}
+        queries = extra.get("index_warmup_queries")
+        converged = extra.get("index_warmup_converged")
+        if queries is None and converged is None:
+            continue
+        short = queries is not None and queries < MIN_CONVERGED_WARMUP_QUERIES
+        if converged is not False and not short:
+            continue
+        key = (r.get("engine"), r.get("dataset"), r.get("resource_pass"),
+               build_label(r))
+        seen.setdefault(key, {
+            "engine": r.get("engine"), "dataset": r.get("dataset"),
+            "resource_pass": r.get("resource_pass"), "build": key[3],
+            "queries": queries, "converged": converged,
+            "seconds": extra.get("index_warmup_seconds")})
+    return [seen[k] for k in sorted(seen, key=str)]
+
+
 def summarize(records: List[Dict[str, Any]],
               manifest: Optional[Dict[str, Any]] = None,
               memory: Optional[Dict[str, List[Dict[str, Any]]]] = None
@@ -900,6 +941,13 @@ def summarize(records: List[Dict[str, Any]],
     from report.operating import concurrency_peaks
     summary["concurrency_peaks"] = concurrency_peaks(
         records, summary["operating_points"])
+    # Ops version 9: the server's CPU and pressure over each concurrency
+    # window, joined by timestamp from the `mem-*.jsonl` samples. Beside the
+    # Client CPU column, so a flattening curve says whose ceiling it is.
+    from report.server_windows import server_windows
+    summary["server_windows"] = server_windows(records, memory, manifest)
+    # And the ann warm-up that did not converge or ran short (#75).
+    summary["index_warmup_flags"] = index_warmup_flags(recall_records)
 
     # PR 5 §5.2. Built here for the reason `filter_strategies` and
     # `churn_during_writes` are: the matching rule is the correctness

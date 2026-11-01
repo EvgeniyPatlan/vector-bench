@@ -1792,7 +1792,9 @@ class TestTheProseSaysWhatTheCodeDoes:
         assert "during_writes" in block
         assert "reinsert_rows_per_s" in block
         assert "2,134 ops records" in block
-        assert records.OPS_MEASUREMENT_VERSION == 8
+        # `>= 8` since version 9 (ops v9 bumped for F2-F11, a later change):
+        # what this pins is that THIS change did not bump, not the value.
+        assert records.OPS_MEASUREMENT_VERSION >= 8
 
     def test_a_version_5_figure_is_still_refused_against_an_older_one(self):
         """The guard the "no archived record carries a 5" argument rests on.
@@ -1814,7 +1816,9 @@ class TestTheProseSaysWhatTheCodeDoes:
         start loading beside reader-contended version 5 ones and the argument
         in the block would be wrong rather than merely unverified here.
         """
-        assert records.OPS_MEASUREMENT_VERSION == 8
+        # `>= 8` since version 9 (ops v9 bumped for F2-F11, a later change):
+        # what this pins is that THIS change did not bump, not the value.
+        assert records.OPS_MEASUREMENT_VERSION >= 8
         assert 5 not in records.OPS_MEASUREMENT_EQUIVALENT_VERSIONS
         assert not records.ops_versions_measure_the_same_thing([1, 5])
         # And the pair the archive actually contains stays comparable.

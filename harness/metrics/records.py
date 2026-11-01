@@ -513,7 +513,80 @@ SCHEMA_VERSION = 1
 # records against their OWN manifest, not against this constant -- so
 # `full-20261015-215006` regenerates unchanged. What needs a report per
 # version is a directory this change's harness appended to.
-OPS_MEASUREMENT_VERSION = 8
+#
+# VERSION 9 -- WHAT `full-20260825` PUBLISHED THAT ITS RECORDS COULD NOT
+# BACK. One bump for all of it, because every item below changes what an
+# existing field means or how a published figure was taken, and a run that
+# straddled any one of them would put two measurements under one label.
+#
+#     F2  concurrency  `scaling_status` is judged on `outstanding_concurrency`
+#                      (exact, mean-based) instead of `served_concurrency`
+#                      (queries x p50 / window). The median was chosen while
+#                      the clients were threads, when a lock wait inside a
+#                      span made the mean blind; with process clients (v6)
+#                      that reason is gone and the median only undercounted
+#                      heavy tails -- MariaDB 12.3 at 32 clients, p50 34 ms,
+#                      p99 1,043 ms. A low median is now `extra.scaling_note:
+#                      tail_dominated`, a note and never a refusal; the
+#                      residue (BOTH in-service estimators under the floor)
+#                      still refuses. `extra.scaling_efficiency` is null with
+#                      `extra.efficiency_reliability: baseline_not_credible`
+#                      where `scaling.baseline_is_credible` says the one-client
+#                      median was cold (p50_1 / p50_n > 1.4); new keys
+#                      `baseline_p50_ratio`, `window_started_at`,
+#                      `window_ended_at`. The report's "in service" cell
+#                      prints the mean first and the median as an estimate.
+#     F7  concurrency  one discarded warm-up window, same clients and length,
+#                      before each client count's first repeat
+#                      (`extra.warmup_window_qps`, never selected) -- the
+#                      first repeat at 1 client ran cold, +/-22-24% spread.
+#     F8  calibration, `recall_at_k` is ann-benchmarks' distance threshold
+#         concurrency, (`datasets.recall_threshold`, the rule of
+#         filtered,    `report/loaders.py:knn_recall`), where it was an ID
+#         churn        overlap under the same name; the overlap is kept as
+#                      `extra.recall_id_overlap`, and every ops recall says
+#                      which in `extra.recall_kind`. A pre-v9 ops record is
+#                      read as `id_overlap`; `report/crosscheck.py` compares
+#                      only matching kinds. Equal on a corpus with no ties at
+#                      the k-th distance, different where there are.
+#     F9  churn        re-insert over `extra.reinsert_writers` connections,
+#                      default the run's ingest `load_threads` (was 1 against
+#                      an 8-thread load), with `ingest_threads` beside it;
+#                      `reinsert_rows_per_s_accepted` and
+#                      `reinsert_rows_per_s_indexed` (rows / time until
+#                      `wait_index_synced` returned); the sync wait
+#                      also runs before the baseline and after the deletes
+#                      (`index_sync_before_baseline_s`,
+#                      `index_sync_after_delete_s`) -- Percona Search's
+#                      mongot was measured before it had caught up; the
+#                      budget default is 7200 s (was 1800).
+#     F10 build, churn `index_bytes` on `index_build` is read after a settle
+#                      step (mongot: two directory sums 30 s apart within
+#                      1%), with `extra.index_bytes_after_build`,
+#                      `index_size_settle_s`, `size_read_at`,
+#                      `index_vector_format`, `index_includes_vectors` and,
+#                      for mongot, `index_bytes_by_kind` -- 15.1 GiB after
+#                      the load and 7.2 GiB at the churn baseline were one
+#                      index before and after a merge.
+#     F10 every phase  top-level `quantization` from `record_defaults`.
+#     F4  mongodb      WiredTiger's cache is set from the resource pass's
+#                      buffer share (`--wiredTigerCacheSizeGB`) instead of
+#                      the server default, 57-64 GB on that run beside a
+#                      42.3 GB InnoDB buffer pool. Every MongoDB ops number
+#                      moves with it. ANN_MEASUREMENT_VERSION is NOT bumped
+#                      for the ann side of this: PR #75 moved it to 3 and no
+#                      run has been made since, so no version-3 ann figure
+#                      exists to be confused with.
+#     F11 (sampler)    `mem-*.jsonl` rows carry cgroup cpu/io pressure (None
+#                      when unreadable, never 0); not an ops record field,
+#                      listed because the concurrency table's new server
+#                      columns join on it.
+#
+# WHAT MOVES FOR AN ARCHIVED RUN: nothing -- the report reads a v8 record's
+# verdict, recall and size the way they were written, and labels the recall
+# `id_overlap`. What a v9 run cannot be is a continuation of a v8 one, which
+# `refuse_mixed_measurement_versions` now enforces for 8 against 9.
+OPS_MEASUREMENT_VERSION = 9
 
 #: Key under `Record.extra` that `Recorder.write` stamps the version into.
 #: Lives in `extra` rather than as a column because SCHEMA_VERSION stays 1.
@@ -627,6 +700,12 @@ class Record:
     ef_construction: Optional[int] = None
     ef_search: Optional[int] = None
     build_mode: Optional[str] = None         # pgvector: "post" | "incremental"
+    #: Percona Search's build axis ("none" | "scalar" | "binary"), stamped on
+    #: every ops record since ops measurement version 9 -- the ann records
+    #: already carried it, and an ops record without it could not be told
+    #: which of the two tuned/normalized indexes it measured. None (and so
+    #: absent, `to_dict` drops it) for every engine without the knob.
+    quantization: Optional[str] = None
     k: Optional[int] = None
 
     # --- quality ------------------------------------------------------
